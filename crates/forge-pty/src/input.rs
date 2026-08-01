@@ -4,11 +4,22 @@
 //! This is the part that decides whether the hosted app *feels* right. Getting
 //! it subtly wrong shows up as double-typed characters, dead arrow keys, or
 //! escape sequences leaking into the prompt as literal text.
+//!
+//! Public because [`encode_key`], [`encode_paste`] and [`encode_mouse`] are
+//! useful to anyone driving a pty of their own — a [`PtySession`] user never
+//! needs them, since the session encodes on their behalf.
+//!
+//! [`DsrScanner`] and [`dsr_reply`] are for that same reader-loop-of-your-own
+//! caller and for nobody else: `PtySession` owns both ends of its stream and
+//! answers the query itself. If you are writing the reader loop, this is the
+//! thing you must not leave out — see the type's own documentation.
+//!
+//! [`PtySession`]: crate::PtySession
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// The `xterm` modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
 fn modifier_param(m: KeyModifiers) -> u8 {
@@ -26,7 +37,11 @@ fn ctrl_byte(c: char) -> Option<u8> {
         '\\' => 0x1c,
         ']' => 0x1d,
         '^' => 0x1e,
-        '_' | '/' => 0x1f,
+        // `-` shares 0x1f with `_` because on a US layout it is the same
+        // physical key, and terminals have always sent US-ASCII 0x1f for
+        // either. Claude declares `ctrl+-` as chat:undo; without this arm the
+        // key encodes to nothing and the undo silently never arrives.
+        '_' | '/' | '-' => 0x1f,
         '?' => 0x7f,
         _ => return None,
     })
@@ -193,10 +208,6 @@ pub fn encode_mouse(
     mode: MouseProtocolMode,
     encoding: MouseProtocolEncoding,
 ) -> Option<Vec<u8>> {
-    if mode == MouseProtocolMode::None {
-        return None;
-    }
-
     let (base, pressed) = match ev.kind {
         MouseEventKind::Down(b) => (button_num(b), true),
         MouseEventKind::Up(b) => (button_num(b), false),
@@ -208,7 +219,10 @@ pub fn encode_mouse(
         MouseEventKind::ScrollRight => (67, true),
     };
 
-    // Honour what the app actually enabled.
+    // Honour what the app actually enabled. All five modes are decided here and
+    // nowhere else — an earlier `if mode == None` guard above this match said
+    // the same thing twice and read as if the two were protecting different
+    // things.
     let motion = matches!(ev.kind, MouseEventKind::Drag(_) | MouseEventKind::Moved);
     match mode {
         MouseProtocolMode::None => return None,
@@ -277,6 +291,10 @@ mod tests {
         assert_eq!(enc(KeyCode::Char('c'), KeyModifiers::CONTROL), vec![3]);
         assert_eq!(enc(KeyCode::Char('a'), KeyModifiers::CONTROL), vec![1]);
         assert_eq!(enc(KeyCode::Char(' '), KeyModifiers::CONTROL), vec![0]);
+        // Claude binds `ctrl+-` to chat:undo, and `-` and `_` are one key on a
+        // US layout. Dropping either encodes the undo to nothing at all.
+        assert_eq!(enc(KeyCode::Char('_'), KeyModifiers::CONTROL), vec![0x1f]);
+        assert_eq!(enc(KeyCode::Char('-'), KeyModifiers::CONTROL), vec![0x1f]);
     }
 
     #[test]

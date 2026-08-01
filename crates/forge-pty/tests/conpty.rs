@@ -15,12 +15,20 @@
 //! Answering it with `ESC [ row ; col R` makes everything work: the same
 //! `cmd /c echo hi` then completes in under half a second.
 //!
-//! Two corollaries, both baked into `main.rs`:
+//! Two corollaries, both baked into `session.rs`:
 //!
 //! - Answer DSR from the reader thread, which means the pty writer has to be
 //!   shared with the input loop rather than owned by it.
 //! - Use `try_wait()` polling, never `wait()`. Even once DSR is answered, the
 //!   reader has no reliable EOF to block on.
+//!
+//! These deliberately hand-roll their own pty plumbing instead of using
+//! `PtySession`. They pin *ConPTY's* behaviour, not ours; routing them through
+//! our own code would mean a bug in `session.rs` could make them agree with it.
+
+// Spawns cmd.exe unconditionally. The crate is presented as reusable, so its
+// test suite should not fail to run elsewhere — it just has nothing to say.
+#![cfg(windows)]
 
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -41,8 +49,8 @@ fn wait_for_exit(
     false
 }
 
+use forge_pty::vt100;
 use portable_pty::{CommandBuilder, PtySize};
-use tui_term::vt100;
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
@@ -109,7 +117,7 @@ fn render(args: &[&str]) -> vt100::Parser {
 }
 
 /// The core finding, as an executable regression test. If the "ignore DSR" arm
-/// ever starts passing, Windows has changed and `main.rs` can be simplified.
+/// ever starts passing, Windows has changed and `session.rs` can be simplified.
 #[test]
 fn conpty_stalls_until_the_dsr_query_is_answered() {
     let run = |answer_dsr: bool| {

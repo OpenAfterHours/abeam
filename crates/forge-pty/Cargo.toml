@@ -1,0 +1,18 @@
+[package]
+name = "forge-pty"
+description = "Host a child process in a pty and render it, correctly, on Windows ConPTY."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+portable-pty.workspace = true
+thiserror.workspace = true
+vt100.workspace = true
+
+# examples/host.rs only. The library itself stays renderer-agnostic so that a
+# consumer using something other than ratatui pays nothing for the demo.
+[dev-dependencies]
+ratatui.workspace = true
+tui-term.workspace = true

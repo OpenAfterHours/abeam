@@ -1,0 +1,46 @@
+[package]
+name = "forge"
+description = "A terminal multiplexer for a Claude Code workflow: Claude in one pane, git and files in the other."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+forge-pty.workspace = true
+ratatui.workspace = true
+tui-term.workspace = true
+
+# --- the right-hand panes ------------------------------------------------
+# The file watcher is forge's whole reason to exist, so it is not optional:
+# debounce it, because one save from an editor fires several events.
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
+# gitignore-aware walking. A file list that includes `target/` is useless.
+ignore = "0.4.31"
+
+# Markdown. `tui-markdown` was here as the quick path and is gone: it renders
+# to a `Text` and defers wrapping to the widget, and the viewer scrolls by
+# physical row, so it could not indent a continuation under its own bullet or
+# keep a quote gutter unbroken. The pane drives the parser directly instead.
+pulldown-cmark = "0.13.4"
+
+# Syntax highlighting. `default-fancy` swaps oniguruma for fancy-regex, which
+# keeps the build pure Rust — no C toolchain, no oniguruma build step.
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+
+# Column-correct text. A terminal pane measures in cells, not chars: CJK and
+# emoji are two cells wide and `str::len` will lie to you about both.
+unicode-width = "0.2.2"
+
+# Also deliberately absent, having been tried and not needed: `textwrap` (the
+# viewer wraps with a first-line and a continuation prefix, which is the whole
+# point of its wrapper and not something a general one does), `similar` (there
+# is no diff view yet — the git pane shows status and per-file line counts) and
+# `chrono` (commit ages are unix timestamps subtracted from `now`, which needs
+# no calendar). Put any of them back when something actually calls for it.
+#
+# Deliberately absent from the start: any git library. The git pane shells out
+# to `git`, which already knows this user's config, credentials and worktree
+# layout. `git status --porcelain=v2` and `git log --format=...` are trivial to
+# parse and cost nothing to build.
