@@ -449,6 +449,13 @@ impl App {
                 self.set_right_view(target);
             }
 
+            // Deliberately does not switch to the viewer or take focus. Unlike
+            // the view keys, this changes nothing about *what* is on screen, so
+            // dragging the reader into view to restyle it would be a surprise —
+            // and the common case is pressing it while already looking at a
+            // document from the left pane.
+            Action::ToggleReaderTheme => self.viewer.toggle_theme(),
+
             Action::FocusLeft => self.focus = Focus::Left,
             Action::FocusRight => {
                 if self.right_inner.is_some() {
@@ -816,6 +823,20 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::ALT)
     }
 
+    /// The same frame, as background colours. The reader is the one pane that
+    /// paints its own, so this is how a test sees a palette rather than a
+    /// layout.
+    fn page(app: &mut App, width: u16, height: u16) -> Vec<ratatui::style::Color> {
+        let mut term = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.ui(f)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.bg)
+            .collect()
+    }
+
     /// Render one frame and flatten it, so a test can ask what is on screen
     /// rather than what the code meant to put there.
     fn screen(app: &mut App, width: u16, height: u16) -> String {
@@ -827,6 +848,35 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    /// The whole wire for F3: the global table resolves it, `act` dispatches it,
+    /// and the reader repaints. Each end is tested on its own — this is the only
+    /// thing that would catch the dispatch arm being dropped in the middle.
+    #[test]
+    fn f3_repaints_the_reader_and_leaves_the_rest_of_the_frame_alone() {
+        let mut fx = app();
+        fx.handle_key(alt(KeyCode::Char('e'))).unwrap();
+
+        let before = page(&mut fx, 120, 24);
+        fx.handle_key(key(KeyCode::F(3))).unwrap();
+        let after = page(&mut fx, 120, 24);
+        assert_ne!(before, after, "F3 never reached the reader");
+
+        // The left pane and the borders are not the reader's to repaint, so
+        // most of the frame is untouched — this would fail if the palette had
+        // leaked out of the viewer's rect into the shell's chrome.
+        let same = before.iter().zip(&after).filter(|(a, b)| a == b).count();
+        assert!(
+            same > before.len() / 2,
+            "F3 repainted {} of {} cells — that is more than the reader",
+            before.len() - same,
+            before.len()
+        );
+
+        // And back, so the key is a toggle rather than a one-way trip.
+        fx.handle_key(key(KeyCode::F(3))).unwrap();
+        assert_eq!(page(&mut fx, 120, 24), before);
     }
 
     #[test]

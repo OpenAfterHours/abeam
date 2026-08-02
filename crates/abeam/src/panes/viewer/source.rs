@@ -20,6 +20,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
+use super::theme::Mode;
+
 /// Past this, highlighting is skipped and the file is shown as plain text.
 ///
 /// Measured rather than guessed, because the first number here was guessed and
@@ -44,7 +46,7 @@ const TAB: usize = 4;
 /// Deliberately not syntect's `find_syntax_for_file`, which re-opens the file
 /// to sniff its first line. We already hold the text, and the pane must not do
 /// I/O it can avoid on the draw path.
-pub fn highlight_file(text: &str, path: &Path) -> Vec<Vec<Span<'static>>> {
+pub fn highlight_file(text: &str, path: &Path, mode: Mode) -> Vec<Vec<Span<'static>>> {
     let set = &assets().syntaxes;
     let syntax = path
         .extension()
@@ -57,13 +59,13 @@ pub fn highlight_file(text: &str, path: &Path) -> Vec<Vec<Span<'static>>> {
                 .and_then(|n| set.find_syntax_by_extension(n))
         })
         .or_else(|| first_line_syntax(set, text));
-    highlight_with(text, syntax)
+    highlight_with(text, syntax, mode)
 }
 
 /// Highlight a fenced block, choosing the grammar from the fence's info
 /// string. An unknown or absent language is not an error — plenty of fences
 /// are `text`, `console`, or nothing at all.
-pub fn highlight_code(text: &str, lang: &str) -> Vec<Vec<Span<'static>>> {
+pub fn highlight_code(text: &str, lang: &str, mode: Mode) -> Vec<Vec<Span<'static>>> {
     let assets = assets();
     let token = lang.split_whitespace().next().unwrap_or("");
     let syntax = if token.is_empty() {
@@ -74,7 +76,7 @@ pub fn highlight_code(text: &str, lang: &str) -> Vec<Vec<Span<'static>>> {
             .find_syntax_by_token(token)
             .or_else(|| assets.syntaxes.find_syntax_by_extension(token))
     };
-    highlight_with(text, syntax)
+    highlight_with(text, syntax, mode)
 }
 
 /// One unstyled span per line. The fallback for everything above, and for
@@ -85,7 +87,11 @@ pub fn plain(text: &str, style: Style) -> Vec<Vec<Span<'static>>> {
         .collect()
 }
 
-fn highlight_with(text: &str, syntax: Option<&SyntaxReference>) -> Vec<Vec<Span<'static>>> {
+fn highlight_with(
+    text: &str,
+    syntax: Option<&SyntaxReference>,
+    mode: Mode,
+) -> Vec<Vec<Span<'static>>> {
     let assets = assets();
     let Some(syntax) = syntax else {
         return plain(text, Style::default());
@@ -94,7 +100,7 @@ fn highlight_with(text: &str, syntax: Option<&SyntaxReference>) -> Vec<Vec<Span<
         return plain(text, Style::default());
     }
 
-    let mut hl = HighlightLines::new(syntax, &assets.theme);
+    let mut hl = HighlightLines::new(syntax, assets.theme(mode));
     lines(text)
         .map(|line| {
             let expanded = expand_tabs(line);
@@ -154,9 +160,14 @@ fn first_line_syntax<'a>(set: &'a SyntaxSet, text: &str) -> Option<&'a SyntaxRef
     set.find_syntax_by_first_line(first)
 }
 
-/// Foreground only. A theme's background would be painted over the terminal's
-/// own, which is the single most reliable way to make a TUI look broken on
-/// somebody else's colour scheme.
+/// Foreground only, still — but for a different reason than it used to be.
+///
+/// This once discarded the background to avoid painting over the terminal's.
+/// The pane now paints its own page (`theme::Theme::base`), so the reason is
+/// that there would be *two* backgrounds: syntect emits one per token, and a
+/// per-token background paints a ragged block behind the code that stops at the
+/// end of each line. The page underneath is picked to pair with the syntax
+/// theme, so dropping this one costs nothing and the two agree anyway.
 fn convert(style: syntect::highlighting::Style) -> Style {
     let fg = style.foreground;
     let mut out = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
@@ -174,25 +185,44 @@ fn convert(style: syntect::highlighting::Style) -> Style {
 
 struct Assets {
     syntaxes: SyntaxSet,
-    theme: Theme,
+    dark: Theme,
+    light: Theme,
+}
+
+impl Assets {
+    fn theme(&self, mode: Mode) -> &Theme {
+        match mode {
+            Mode::Dark => &self.dark,
+            Mode::Light => &self.light,
+        }
+    }
 }
 
 fn assets() -> &'static Assets {
     static ASSETS: OnceLock<Assets> = OnceLock::new();
     ASSETS.get_or_init(|| {
         let mut themes = ThemeSet::load_defaults();
-        // Dark, mid-contrast, and it does not rely on a background colour to
-        // separate tokens — which matters, because we throw the background
-        // away. There is no way to detect the host terminal's palette, so this
-        // is a choice made once for everyone.
-        let theme = themes
-            .themes
-            .remove("base16-ocean.dark")
-            .or_else(|| themes.themes.remove("base16-eighties.dark"))
-            .unwrap_or_default();
+        // Both are taken here rather than one on demand, because the cost is in
+        // `load_defaults` — the dump holds every theme and is deserialised
+        // whole either way. Taking the second one now means F3 never pays a
+        // second hitch.
+        //
+        // Each is mid-contrast and separates tokens by hue rather than by
+        // background, which matters because we discard their backgrounds and
+        // paint the pane's own instead. The fallbacks are in the same dump and
+        // exist so a syntect that renames a theme degrades to a wrong-but-
+        // legible one rather than to `Theme::default`, which is black on black.
+        let mut take = |first: &str, second: &str| {
+            themes
+                .themes
+                .remove(first)
+                .or_else(|| themes.themes.remove(second))
+                .unwrap_or_default()
+        };
         Assets {
             syntaxes: SyntaxSet::load_defaults_newlines(),
-            theme,
+            dark: take(Mode::Dark.syntax(), "base16-eighties.dark"),
+            light: take(Mode::Light.syntax(), "Solarized (light)"),
         }
     })
 }
@@ -209,20 +239,44 @@ mod tests {
 
     #[test]
     fn every_source_line_becomes_exactly_one_row() {
-        let rows = highlight_code("fn a() {}\nfn b() {}\n", "rust");
+        let rows = highlight_code("fn a() {}\nfn b() {}\n", "rust", Mode::Dark);
         // Trailing newline yields a trailing empty row, same as an editor.
         assert_eq!(flat(&rows), ["fn a() {}", "fn b() {}", ""]);
     }
 
     #[test]
     fn a_known_language_actually_gets_colour() {
-        let rows = highlight_code("let x = 1;", "rust");
+        let rows = highlight_code("let x = 1;", "rust", Mode::Dark);
         assert!(rows[0].iter().any(|s| s.style.fg.is_some()));
+    }
+
+    /// The reason the light palette exists at all. A dark syntax theme is
+    /// mid-tone pastels chosen for a `#2b303b` background; on a white page they
+    /// are washed out rather than merely wrong, which is the state a reader in
+    /// a bright room was trying to escape.
+    #[test]
+    fn the_two_modes_highlight_the_same_code_in_different_colours() {
+        let dark = highlight_code("let x = 1;", "rust", Mode::Dark);
+        let light = highlight_code("let x = 1;", "rust", Mode::Light);
+        assert_eq!(flat(&dark), flat(&light), "the text itself must not change");
+
+        let colours =
+            |rows: &[Vec<Span<'_>>]| rows.iter().flatten().map(|s| s.style.fg).collect::<Vec<_>>();
+        assert_ne!(colours(&dark), colours(&light));
+        // Both are real themes rather than one of them being `Theme::default`,
+        // which is what a renamed theme in a future syntect would silently
+        // leave behind — and which highlights everything black on black.
+        assert!(colours(&dark).iter().any(Option::is_some));
+        assert!(colours(&light).iter().any(Option::is_some));
     }
 
     #[test]
     fn an_unknown_language_degrades_to_plain_text_rather_than_failing() {
-        let rows = highlight_code("!!! not a language !!!", "definitely-not-a-language");
+        let rows = highlight_code(
+            "!!! not a language !!!",
+            "definitely-not-a-language",
+            Mode::Dark,
+        );
         assert_eq!(flat(&rows), ["!!! not a language !!!"]);
     }
 
@@ -235,14 +289,14 @@ mod tests {
     #[test]
     fn a_file_too_big_to_highlight_is_still_shown() {
         let big = "let x = 1;\n".repeat(HIGHLIGHT_MAX_BYTES / 11 + 10);
-        let rows = highlight_code(&big, "rust");
+        let rows = highlight_code(&big, "rust", Mode::Dark);
         assert!(rows.len() > HIGHLIGHT_MAX_BYTES / 11);
         assert_eq!(rows[0][0].content.as_ref(), "let x = 1;");
     }
 
     #[test]
     fn extension_lookup_finds_a_grammar_for_a_real_path() {
-        let rows = highlight_file("fn main() {}", Path::new("src/main.rs"));
+        let rows = highlight_file("fn main() {}", Path::new("src/main.rs"), Mode::Dark);
         assert!(rows[0].iter().any(|s| s.style.fg.is_some()));
     }
 }

@@ -70,6 +70,7 @@ mod files;
 mod load;
 mod markdown;
 mod source;
+mod theme;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -78,13 +79,13 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::pane::{Handled, Pane};
 use crate::scroll::{self, Scroll};
-use crate::text::{self, dim, wrap};
+use crate::text::{self, wrap};
 use browse::Browser;
 use files::Scan;
 use load::{LoadError, Loaded};
@@ -134,6 +135,11 @@ pub struct ViewerPane {
     /// save, the next `Tab` or the watcher to quietly put the rendering back.
     raw: bool,
 
+    /// Light or dark, for the same reason and with the same scope as `raw`:
+    /// a decision about how to read, held by the pane, surviving the next
+    /// document. F3 flips it.
+    theme: theme::Mode,
+
     /// The document laid out for `laid_out` columns. Rebuilt when either the
     /// document or the width changes, and never otherwise.
     lines: Vec<Line<'static>>,
@@ -167,6 +173,7 @@ impl ViewerPane {
             state: State::Empty,
             mode: Mode::Doc,
             raw: false,
+            theme: theme::Mode::default(),
             lines: Vec::new(),
             laid_out: 0,
             dirty: true,
@@ -177,6 +184,23 @@ impl ViewerPane {
             scan,
             watching: false,
         }
+    }
+
+    /// Flip the reader between its light and dark palettes.
+    ///
+    /// The laid-out document holds baked styles, so this has to invalidate it —
+    /// a palette that only took effect on the next file would look like a key
+    /// that did nothing. Relaying it out is the same work a width change
+    /// already costs, and it happens once per press rather than per frame.
+    ///
+    /// Scoped to this pane on purpose: the git and diagnostics views draw in
+    /// named ANSI colours that already follow the terminal's own palette, and
+    /// the two pty views are drawing whatever their child sent. This is the one
+    /// pane whose colours are abeam's to choose.
+    pub fn toggle_theme(&mut self) {
+        self.theme = self.theme.flipped();
+        self.dirty = true;
+        self.browse.set_theme(self.theme);
     }
 
     /// Told once at startup, so the empty screen can admit it when there is no
@@ -398,19 +422,18 @@ impl ViewerPane {
         if width == 0 {
             return Vec::new();
         }
+        let t = self.theme.theme();
         match &self.state {
-            State::Empty => empty_hint(width, self.watching),
+            State::Empty => empty_hint(width, self.watching, t),
             State::Failed { path, why } => {
                 let mut lines = vec![
                     Line::from(Span::styled(
                         self.label(path),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
                     )),
                     Line::default(),
                 ];
-                lines.extend(text::block(&why.message(), width, dim()));
+                lines.extend(text::block(&why.message(), width, t.dim()));
                 lines.push(Line::default());
                 // Naming Alt+G is a small layering leak — the globals are the
                 // shell's — and it earns it. This screen is where someone
@@ -419,7 +442,7 @@ impl ViewerPane {
                 lines.extend(text::block(
                     "r to retry · Tab for the next markdown file · Alt+G for git",
                     width,
-                    dim(),
+                    t.dim(),
                 ));
                 lines
             }
@@ -429,9 +452,9 @@ impl ViewerPane {
                 // reader looking at the source of a document wants to see the
                 // line numbers they are about to talk about.
                 let mut lines = match &doc.body {
-                    Body::Markdown(text) if !self.raw => markdown::render(text, width),
+                    Body::Markdown(text) if !self.raw => markdown::render(text, width, self.theme),
                     Body::Markdown(text) | Body::Source(text) => {
-                        source_lines(text, &doc.path, width)
+                        source_lines(text, &doc.path, width, self.theme)
                     }
                 };
                 if doc.truncated {
@@ -443,7 +466,7 @@ impl ViewerPane {
                             load::human(doc.bytes)
                         ),
                         width,
-                        dim(),
+                        t.dim(),
                     ));
                 }
                 lines
@@ -540,6 +563,18 @@ impl Pane for ViewerPane {
         if inner.width == 0 || inner.height == 0 {
             return;
         }
+
+        // The page, before anything is written on it.
+        //
+        // This is the one pane in abeam that paints a background rather than
+        // letting the terminal's show through, and it is what makes F3 worth
+        // having: a reader in a bright room gets a bright page without also
+        // having to reconfigure their terminal. ratatui styles are patches, so
+        // one fill here is enough — every span drawn on top names a foreground
+        // and inherits this background, and the rows with no text on them at
+        // all keep both. The fill covers the whole rect including the scrollbar
+        // column, which is why it is not folded into the `Paragraph` below.
+        f.render_widget(Block::new().style(self.theme.theme().base()), inner);
 
         if matches!(self.mode, Mode::Browse) {
             // A pending file stays pending. Being drawn is the signal that this
@@ -695,8 +730,8 @@ impl Pane for ViewerPane {
 /// Source files get a line-number gutter, because "look at line 42" is how
 /// anyone talks about code. A wrapped continuation gets a blank number, which
 /// is the only thing distinguishing it from the next line.
-fn source_lines(text: &str, path: &Path, width: usize) -> Vec<Line<'static>> {
-    let rows = source::highlight_file(text, path);
+fn source_lines(text: &str, path: &Path, width: usize, mode: theme::Mode) -> Vec<Line<'static>> {
+    let rows = source::highlight_file(text, path, mode);
     let numbers = width >= LINE_NUMBER_MIN_WIDTH;
     let digits = if numbers {
         rows.len().to_string().len().max(3)
@@ -708,7 +743,10 @@ fn source_lines(text: &str, path: &Path, width: usize) -> Vec<Line<'static>> {
     for (i, row) in rows.into_iter().enumerate() {
         let (first, cont) = if numbers {
             (
-                vec![Span::styled(format!("{:>digits$} ", i + 1), dim())],
+                vec![Span::styled(
+                    format!("{:>digits$} ", i + 1),
+                    mode.theme().dim(),
+                )],
                 vec![Span::raw(format!("{:>digits$} ", ""))],
             )
         } else {
@@ -719,8 +757,8 @@ fn source_lines(text: &str, path: &Path, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn empty_hint(width: usize, watching: bool) -> Vec<Line<'static>> {
-    let hint = |s: &str| text::block(s, width, dim());
+fn empty_hint(width: usize, watching: bool, t: &theme::Theme) -> Vec<Line<'static>> {
+    let hint = |s: &str| text::block(s, width, t.dim());
     let mut lines = hint(
         "Nothing open yet. This pane follows the markdown written under this \
          directory, and renders whatever it is pointed at.",
@@ -751,6 +789,7 @@ mod tests {
     use crossterm::event::{KeyEventKind, KeyModifiers, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -993,11 +1032,105 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
 
         for (w, h) in [(0, 0), (1, 1), (2, 20), (25, 1), (60, 20)] {
-            term.draw(|f| pane.render(f, Rect::new(0, 0, w, h))).unwrap();
+            term.draw(|f| pane.render(f, Rect::new(0, 0, w, h)))
+                .unwrap();
         }
         // ...and after all that the pane is still usable.
-        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10))).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
         assert!(!pane.lines.is_empty());
+    }
+
+    /// The whole point of F3, and the one behaviour no other test would catch:
+    /// this pane paints a page rather than letting the terminal's background
+    /// show through, so a reader gets a bright page in a bright room without
+    /// also reconfiguring their terminal.
+    #[test]
+    fn the_reader_paints_its_own_page_and_f3_repaints_it() {
+        let dir = TempDir::new("view-theme-page");
+        let path = dir.write("doc.md", b"# heading\n\nshort body\n");
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        // Every cell, including the blank rows below the text and the column
+        // the scrollbar reserves — a page with holes in it is not a page.
+        let page = |pane: &mut ViewerPane| -> Vec<Color> {
+            let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+                .unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.bg)
+                .collect()
+        };
+
+        for cell in page(&mut pane) {
+            assert_eq!(
+                cell,
+                theme::DARK.bg,
+                "the terminal's background shows through"
+            );
+        }
+
+        pane.toggle_theme();
+        for cell in page(&mut pane) {
+            assert_eq!(cell, theme::LIGHT.bg, "F3 did not repaint the page");
+        }
+    }
+
+    /// A laid-out document holds baked styles. Without the invalidation in
+    /// `toggle_theme` the new palette would only reach the *next* file, which
+    /// from the reader's side is a key that did nothing.
+    #[test]
+    fn f3_restyles_the_document_already_on_screen() {
+        let dir = TempDir::new("view-theme-relayout");
+        let path = dir.write("doc.md", b"# heading\n");
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        let heading = |pane: &mut ViewerPane| {
+            pane.ensure_layout(40);
+            pane.lines[0]
+                .spans
+                .iter()
+                .find(|s| s.content.contains("heading"))
+                .and_then(|s| s.style.fg)
+                .expect("the heading is coloured")
+        };
+
+        let before = heading(&mut pane);
+        assert_eq!(before, theme::DARK.heading(1).fg.unwrap());
+
+        pane.toggle_theme();
+        assert_eq!(heading(&mut pane), theme::LIGHT.heading(1).fg.unwrap());
+    }
+
+    /// The list and the document are two halves of one pane. They are drawn on
+    /// separate frames, so nothing but this wire keeps them from disagreeing
+    /// about what colour the page is.
+    #[test]
+    fn f3_reaches_the_file_list_as_well_as_the_document() {
+        let dir = TempDir::new("view-theme-list");
+        dir.write("a.md", b"# a\n");
+        let mut pane = quiet(dir.path());
+        pane.toggle_browse();
+        pane.toggle_theme();
+
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+        // Two legitimate backgrounds here, not one: the selected row repaints
+        // its own. Both have to come from the palette that was switched to, and
+        // neither may be the terminal's.
+        for cell in term.backend().buffer().content() {
+            assert!(
+                cell.bg == theme::LIGHT.bg || cell.bg == theme::LIGHT.sel_bg,
+                "the list kept the old page: {:?}",
+                cell.bg
+            );
+        }
     }
 
     #[test]
@@ -1012,7 +1145,8 @@ mod tests {
         assert!(pane.title().starts_with("files"));
 
         let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10))).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
         assert_eq!(pane.path(), Some(path.as_path()));
         assert!(pane.pending.is_none());
     }
@@ -1133,7 +1267,8 @@ mod tests {
         pane.follow(fresh.clone());
 
         let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10))).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
 
         assert!(pane.path().is_none(), "the document view is untouched");
         assert!(pane.has_pending(), "and the shell can still mark the border");
@@ -1143,7 +1278,8 @@ mod tests {
 
         // Leaving the list is what releases it, exactly as the mark says.
         pane.toggle_browse();
-        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10))).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
         assert_eq!(pane.path(), Some(fresh.as_path()));
     }
 
@@ -1170,7 +1306,8 @@ mod tests {
         assert!(!pane.has_pending(), "the queue was superseded, not stacked");
 
         let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10))).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
         assert_eq!(
             pane.path(),
             Some(chosen.as_path()),
@@ -1238,7 +1375,8 @@ mod tests {
         let mut pane = quiet(dir.path());
         pane.toggle_browse();
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 6))).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 6)))
+            .unwrap();
 
         let before = pane.title();
         assert_eq!(
@@ -1246,10 +1384,7 @@ mod tests {
             Handled::Yes,
             "the view moved"
         );
-        assert_eq!(
-            pane.handle_key(key(KeyCode::Enter)).unwrap(),
-            Handled::Yes
-        );
+        assert_eq!(pane.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
         assert_eq!(
             pane.path().and_then(|p| p.file_name()),
             Some(std::ffi::OsStr::new("f00.md")),

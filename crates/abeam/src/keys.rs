@@ -45,6 +45,13 @@ pub enum Action {
     ToggleHelp,
     /// Show the pty instrument, or put back whatever it displaced.
     ToggleDiag,
+    /// Flip the file reader between its light and dark palettes.
+    ///
+    /// Global rather than a key the viewer handles, so it works from the left
+    /// pane — the reader is a thing you *glance* at, and reaching for it with
+    /// `Alt+E` first to change how it looks would defeat the point. It affects
+    /// no other view; see `panes::viewer::theme`.
+    ToggleReaderTheme,
     /// Send the *next* keystroke to Claude verbatim, bypassing everything here.
     ///
     /// The pressure-release valve. If a future Claude release binds `Alt+G`,
@@ -77,6 +84,12 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // exactly the letters a diagnostics key would want. F-keys are bound
         // by Claude in no context at all, which is already why F1 is safe.
         KeyCode::F(2) if bare => Some(Action::ToggleDiag),
+        // F3 for the same reason as F2: the letters a theme key would want
+        // under Alt — `t` for theme, `l` for light, `d` for dark — are all
+        // spoken for. `Alt+T` is Claude's outright, and `Alt+L`/`Alt+D` are
+        // readline bindings its prompt editor handles without declaring them.
+        // No F-key is bound by Claude in any context.
+        KeyCode::F(3) if bare => Some(Action::ToggleReaderTheme),
 
         _ if !alt => None,
 
@@ -118,6 +131,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("Alt+Q", "quit (press twice while Claude is running)"),
     ("F1", "this help"),
     ("F2", "pty diagnostics, and back"),
+    ("F3", "file reader: light / dark page"),
     ("Ctrl+\\ or F12", "send the next key to Claude verbatim"),
     ("", ""),
     ("j / k, arrows", "right pane, when focused: scroll a line"),
@@ -230,6 +244,10 @@ mod tests {
             global(&k(KeyCode::F(2), KeyModifiers::NONE)),
             Some(Action::ToggleDiag)
         );
+        assert_eq!(
+            global(&k(KeyCode::F(3), KeyModifiers::NONE)),
+            Some(Action::ToggleReaderTheme)
+        );
     }
 
     #[test]
@@ -243,7 +261,7 @@ mod tests {
             KeyModifiers::ALT,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ] {
-            for n in [1u8, 2, 12] {
+            for n in [1u8, 2, 3, 12] {
                 assert_eq!(
                     global(&k(KeyCode::F(n), mods)),
                     None,
@@ -262,7 +280,9 @@ mod tests {
             assert_eq!(k.is_empty(), what.is_empty(), "half-empty help row: {k:?}");
         }
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
-        for expected in ["Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2"] {
+        for expected in [
+            "Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2", "F3",
+        ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),
                 "{expected} is bound but not in the F1 overlay"

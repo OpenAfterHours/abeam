@@ -87,6 +87,7 @@ to Claude untouched.
 | `Alt+E` | right pane → files / markdown (again for the file list) |
 | `Alt+S` | right pane → a shell, **and focus it** (again to hand focus back) |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
+| `F3` | file reader → light / dark page |
 | `Alt+Left` / `Alt+Right` | move focus |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
 | `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
@@ -303,9 +304,15 @@ trusting it with real work.
   build, measured — and going over that is visible: the pane says where it
   stopped. Highlighting gives up above 64 KiB and shows plain text. A slow
   network share can still stall the frame that opens a file.
-- **Source highlighting assumes a dark terminal** (base16-ocean.dark). A TUI
-  cannot ask the terminal for its palette. Backgrounds are discarded so that a
-  light theme is washed out rather than unreadable.
+- **The reader is the only pane that paints its own background.** `F3` gives it
+  a light or a dark page — with a matching syntax theme, since base16-ocean.dark
+  on a white page is washed out — and that is what makes one key enough in a
+  bright room. Everything else still draws in named ANSI colours on the
+  terminal's own background, so the git and diagnostics views follow whatever
+  profile the terminal has and the two pty views show whatever their child sent.
+  A TUI still cannot ask the terminal for its palette; the reader sidesteps the
+  question by owning every colour inside its own rect. The choice is per session
+  and starts dark — there is nowhere to persist it until there is a config file.
 - **UTF-16 files are reported as binary.** The sniff is a NUL byte in the first
   8 KiB, which is what git does.
 - **Two Claude features are unreachable inside abeam**, and both will be reported

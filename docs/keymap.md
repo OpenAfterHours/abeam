@@ -33,6 +33,7 @@ today. Typing at Claude is byte-for-byte what the pty spike did.
 | `Alt+Q` | quit (press twice while a child is live) |
 | `F1` | key help overlay |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
+| `F3` | file reader → light / dark page (no other view changes) |
 | `Ctrl+\` or `F12` | literal-next: send the following key to Claude verbatim |
 
 `Alt+E` pressed while the files view is already showing opens the file list, so
@@ -58,6 +59,14 @@ diagnostics binding would reach for — `Alt+D` for "diagnostics", `Alt+I` for
 readline word commands, and the audit below already caught one *undeclared*
 readline binding (`Alt+F`). F-keys have no such ambiguity: none is bound by
 Claude in any context, which is the same reason `F1` and `F12` are safe.
+
+`F3` is an F-key for exactly the same reason, and the letters it would have
+wanted are a worse set still: `Alt+T` for "theme" is Claude's outright, and
+`Alt+L` for "light" and `Alt+D` for "dark" are both in the classic readline set
+the audit below found Claude handling without declaring. It is global rather
+than a key the viewer handles, so it works while Claude has focus — the reader
+is a pane you glance at, and having to enter it before you could change how it
+looks would defeat the point.
 
 Right pane, only when focused. Plain keys, because Claude never sees them.
 Deliberately the same vocabulary as Claude's own transcript view, so there is

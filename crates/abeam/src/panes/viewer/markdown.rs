@@ -13,14 +13,14 @@
 //! forty columns wide, almost every list item wraps.
 
 use pulldown_cmark::{
-    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, Options, Parser, Tag, TagEnd,
 };
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::source;
-use crate::text::dim;
+use super::theme::{Mode, Theme};
 use crate::text::wrap::{self, pad_to, spans_width};
 
 /// Two cells, so nested quotes stay legible without a separator.
@@ -38,19 +38,6 @@ const MIN_COL: usize = 8;
 /// Floor for an individual column once the grid is being squeezed.
 const FLOOR_COL: usize = 4;
 
-/// Colour by level rather than size, since a terminal has no size. Distinct
-/// hues beat shades: a reader skimming for the next section is pattern
-/// matching, not reading.
-fn heading_style(level: HeadingLevel) -> Style {
-    let colour = match level {
-        HeadingLevel::H1 => Color::Magenta,
-        HeadingLevel::H2 => Color::Cyan,
-        HeadingLevel::H3 => Color::Green,
-        _ => Color::Yellow,
-    };
-    Style::default().fg(colour).add_modifier(Modifier::BOLD)
-}
-
 pub fn options() -> Options {
     // Everything here is something Claude actually writes: tables in design
     // docs, task lists in plans, `> [!NOTE]` alerts, YAML front matter. Left
@@ -63,11 +50,11 @@ pub fn options() -> Options {
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
 }
 
-pub fn render(source: &str, width: usize) -> Vec<Line<'static>> {
+pub fn render(source: &str, width: usize, mode: Mode) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();
     }
-    let mut r = Renderer::new(width);
+    let mut r = Renderer::new(width, mode);
     for event in Parser::new_ext(source, options()) {
         r.event(event);
     }
@@ -90,6 +77,14 @@ struct TableAcc {
 
 struct Renderer {
     width: usize,
+    /// The palette every span here is coloured from. Held as a `&'static`
+    /// rather than threaded per call because a document is rendered as one
+    /// unit — a theme that could change halfway down would be a bug, not a
+    /// feature — and both palettes are statics anyway.
+    theme: &'static Theme,
+    /// The same choice, in the form `source` wants it: syntect's themes are
+    /// held separately and picked by name.
+    mode: Mode,
     out: Vec<Line<'static>>,
 
     /// Inline spans of the block being built, not yet wrapped.
@@ -118,9 +113,11 @@ struct Renderer {
 }
 
 impl Renderer {
-    fn new(width: usize) -> Self {
+    fn new(width: usize, mode: Mode) -> Self {
         Self {
             width,
+            theme: mode.theme(),
+            mode,
             out: Vec::new(),
             spans: Vec::new(),
             style: Style::default(),
@@ -170,15 +167,17 @@ impl Renderer {
             Event::End(tag) => self.end(tag),
             Event::Text(t) => self.push_text(&t),
             Event::Code(t) => {
-                let style = self.style.fg(Color::Yellow);
+                let style = self.style.fg(self.theme.code);
                 self.spans.push(Span::styled(t.to_string(), style));
             }
             Event::Html(t) | Event::InlineHtml(t) => {
-                self.spans.push(Span::styled(t.to_string(), dim()))
+                self.spans.push(Span::styled(t.to_string(), self.theme.dim()))
             }
             Event::FootnoteReference(label) => {
-                self.spans
-                    .push(Span::styled(format!("[^{label}]"), dim().add_modifier(Modifier::BOLD)));
+                self.spans.push(Span::styled(
+                    format!("[^{label}]"),
+                    self.theme.dim().add_modifier(Modifier::BOLD),
+                ));
             }
             Event::SoftBreak => self.spans.push(Span::raw(" ")),
             Event::HardBreak => self.flush_inline(),
@@ -187,22 +186,22 @@ impl Renderer {
                 let (first, _) = self.prefixes();
                 let avail = self.width.saturating_sub(spans_width(&first)).max(1);
                 let mut line = first;
-                line.push(Span::styled("─".repeat(avail), dim()));
+                line.push(Span::styled("─".repeat(avail), self.theme.dim()));
                 self.out.push(Line::from(line));
                 self.need_blank = true;
             }
             Event::TaskListMarker(done) => {
                 let (glyph, colour) = if done {
-                    ("✔ ", Color::Green)
+                    ("✔ ", self.theme.ok)
                 } else {
-                    ("☐ ", Color::DarkGray)
+                    ("☐ ", self.theme.dim)
                 };
                 self.spans.push(Span::styled(glyph, Style::default().fg(colour)));
             }
             // Maths is not enabled, so these cannot arrive; showing the source
             // is still better than dropping it if that ever changes.
             Event::InlineMath(t) | Event::DisplayMath(t) => {
-                self.spans.push(Span::styled(t.to_string(), dim()));
+                self.spans.push(Span::styled(t.to_string(), self.theme.dim()));
             }
         }
     }
@@ -254,7 +253,7 @@ impl Renderer {
                 self.start_block();
                 let marker = vec![Span::styled(
                     format!("[^{label}] "),
-                    dim().add_modifier(Modifier::BOLD),
+                    self.theme.dim().add_modifier(Modifier::BOLD),
                 )];
                 let w = spans_width(&marker);
                 self.marker = Some((marker, w));
@@ -286,13 +285,13 @@ impl Renderer {
                 self.link = Some((self.spans.len(), dest_url.to_string()));
                 self.push_style(
                     Style::default()
-                        .fg(Color::Blue)
+                        .fg(self.theme.link)
                         .add_modifier(Modifier::UNDERLINED),
                 );
             }
             Tag::Image { .. } => {
-                self.spans.push(Span::styled("[image: ", dim()));
-                self.push_style(dim());
+                self.spans.push(Span::styled("[image: ", self.theme.dim()));
+                self.push_style(self.theme.dim());
             }
 
             Tag::DefinitionList | Tag::DefinitionListTitle | Tag::DefinitionListDefinition => {}
@@ -309,10 +308,10 @@ impl Renderer {
                 let (mut first, mut rest) = self.prefixes();
                 let hashes = format!("{} ", "#".repeat(level as usize));
                 let pad = " ".repeat(hashes.width());
-                first.push(Span::styled(hashes, dim()));
+                first.push(Span::styled(hashes, self.theme.dim()));
                 rest.push(Span::raw(pad));
                 let content = std::mem::take(&mut self.spans);
-                let content = restyle(content, heading_style(level));
+                let content = restyle(content, self.theme.heading(level as u8));
                 self.out
                     .extend(wrap::wrap_spans(content, self.width, &first, &rest));
                 self.need_blank = true;
@@ -381,13 +380,13 @@ impl Renderer {
                         .map(|s| s.content.as_ref())
                         .collect();
                     if text.trim() != url.trim() && !url.is_empty() {
-                        self.spans.push(Span::styled(format!(" ({url})"), dim()));
+                        self.spans.push(Span::styled(format!(" ({url})"), self.theme.dim()));
                     }
                 }
             }
             TagEnd::Image => {
                 self.pop_style();
-                self.spans.push(Span::styled("]", dim()));
+                self.spans.push(Span::styled("]", self.theme.dim()));
             }
 
             TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::MetadataBlock(_) => {
@@ -449,7 +448,7 @@ impl Renderer {
 
     fn quote_prefix(&self) -> Vec<Span<'static>> {
         (0..self.quote_depth)
-            .map(|_| Span::styled(QUOTE_GUTTER, dim()))
+            .map(|_| Span::styled(QUOTE_GUTTER, self.theme.dim()))
             .collect()
     }
 
@@ -487,11 +486,13 @@ impl Renderer {
 
     fn next_marker(&mut self) -> Vec<Span<'static>> {
         let depth = self.lists.len();
+        // Read before the list below is borrowed mutably.
+        let bullet = self.theme.accent;
         match self.lists.last_mut() {
             Some(ListLevel { next: Some(n) }) => {
                 let text = format!("{n}. ");
                 *n += 1;
-                vec![Span::styled(text, Style::default().fg(Color::Cyan))]
+                vec![Span::styled(text, Style::default().fg(bullet))]
             }
             _ => {
                 // Bullet by depth, so a nested list is distinguishable when it
@@ -501,7 +502,7 @@ impl Renderer {
                     2 => "◦ ",
                     _ => "▪ ",
                 };
-                vec![Span::styled(glyph, Style::default().fg(Color::Cyan))]
+                vec![Span::styled(glyph, Style::default().fg(bullet))]
             }
         }
     }
@@ -510,11 +511,11 @@ impl Renderer {
     /// marker itself is swallowed by the parser.
     fn alert_label(&mut self, kind: BlockQuoteKind) {
         let (label, colour) = match kind {
-            BlockQuoteKind::Note => ("ⓘ Note", Color::Blue),
-            BlockQuoteKind::Tip => ("✱ Tip", Color::Green),
-            BlockQuoteKind::Important => ("‼ Important", Color::Magenta),
-            BlockQuoteKind::Warning => ("⚠ Warning", Color::Yellow),
-            BlockQuoteKind::Caution => ("⚠ Caution", Color::Red),
+            BlockQuoteKind::Note => ("ⓘ Note", self.theme.info),
+            BlockQuoteKind::Tip => ("✱ Tip", self.theme.ok),
+            BlockQuoteKind::Important => ("‼ Important", self.theme.special),
+            BlockQuoteKind::Warning => ("⚠ Warning", self.theme.warn),
+            BlockQuoteKind::Caution => ("⚠ Caution", self.theme.danger),
         };
         let mut line = self.quote_prefix();
         line.push(Span::styled(
@@ -529,9 +530,9 @@ impl Renderer {
         // blank line the author wrote.
         let body = text.strip_suffix('\n').unwrap_or(text);
         let rows = if dim_all {
-            source::plain(body, dim())
+            source::plain(body, self.theme.dim())
         } else {
-            source::highlight_code(body, lang)
+            source::highlight_code(body, lang, self.mode)
         };
 
         let (pfirst, prest) = self.prefixes();
@@ -543,8 +544,8 @@ impl Renderer {
             let mut first = if i == 0 { pfirst.clone() } else { prest.clone() };
             let mut cont = prest.clone();
             if gutter {
-                first.push(Span::styled(CODE_GUTTER, dim()));
-                cont.push(Span::styled(CODE_WRAP_GUTTER, dim()));
+                first.push(Span::styled(CODE_GUTTER, self.theme.dim()));
+                cont.push(Span::styled(CODE_WRAP_GUTTER, self.theme.dim()));
             }
             self.out
                 .extend(wrap::hard_wrap(row, self.width, &first, &cont));
@@ -573,7 +574,7 @@ impl Renderer {
         }
 
         let widths = fit(&t, cols, content);
-        let sep = Span::styled(" │ ", dim());
+        let sep = Span::styled(" │ ", self.theme.dim());
         let mut first_line = true;
 
         let mut emit_row = |out: &mut Vec<Line<'static>>, row: &[Vec<Span<'static>>], head: bool| {
@@ -608,7 +609,7 @@ impl Renderer {
             emit_row(&mut self.out, &t.header, true);
             let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
             let mut line = prest.clone();
-            line.push(Span::styled(rule.join("─┼─"), dim()));
+            line.push(Span::styled(rule.join("─┼─"), self.theme.dim()));
             self.out.push(Line::from(line));
         }
         for row in &t.rows {
@@ -650,7 +651,7 @@ impl Renderer {
                 if room >= 2 {
                     first.push(Span::styled(
                         format!("{}: ", clip_label(&label, room)),
-                        dim().add_modifier(Modifier::BOLD),
+                        self.theme.dim().add_modifier(Modifier::BOLD),
                     ));
                 }
                 let mut cont = prest.to_vec();
@@ -758,6 +759,7 @@ fn restyle_bold(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::theme;
     use super::*;
 
     fn text(lines: &[Line<'_>]) -> Vec<String> {
@@ -789,24 +791,24 @@ mod tests {
 
     #[test]
     fn headings_are_marked_by_level_and_coloured() {
-        let out = render("# One\n\n## Two\n", 40);
+        let out = render("# One\n\n## Two\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["# One", "", "## Two"]);
         assert_eq!(
             styles_of(&out[0], "One").and_then(|s| s.fg),
-            Some(Color::Magenta)
+            theme::DARK.heading(1).fg
         );
         assert_eq!(
             styles_of(&out[2], "Two").and_then(|s| s.fg),
-            Some(Color::Cyan)
+            theme::DARK.heading(2).fg
         );
         // The hashes stay, dimmed: a terminal has no font size, so the level
         // has to be readable as text.
-        assert_eq!(styles_of(&out[0], "#").and_then(|s| s.fg), Some(Color::DarkGray));
+        assert_eq!(styles_of(&out[0], "#").and_then(|s| s.fg), Some(theme::DARK.dim));
     }
 
     #[test]
     fn emphasis_becomes_a_modifier_not_asterisks() {
-        let out = render("plain **bold** and *italic*", 40);
+        let out = render("plain **bold** and *italic*", 40, Mode::Dark);
         assert_eq!(text(&out), ["plain bold and italic"]);
         assert!(
             styles_of(&out[0], "bold")
@@ -824,17 +826,17 @@ mod tests {
 
     #[test]
     fn inline_code_is_coloured_and_keeps_its_text() {
-        let out = render("call `do_thing()` now", 40);
+        let out = render("call `do_thing()` now", 40, Mode::Dark);
         assert_eq!(text(&out), ["call do_thing() now"]);
         assert_eq!(
             styles_of(&out[0], "do_thing").and_then(|s| s.fg),
-            Some(Color::Yellow)
+            Some(theme::DARK.code)
         );
     }
 
     #[test]
     fn a_bullet_hangs_its_continuation_under_the_text() {
-        let out = render("- alpha beta gamma delta epsilon", 16);
+        let out = render("- alpha beta gamma delta epsilon", 16, Mode::Dark);
         assert_eq!(text(&out), ["• alpha beta", "  gamma delta", "  epsilon"]);
         assert_fits(&out, 16);
     }
@@ -843,47 +845,47 @@ mod tests {
     fn ordered_lists_count_and_nested_lists_indent() {
         // The nested bullet changes glyph as well as indent: once a list has
         // wrapped, the indent alone no longer says which level you are on.
-        let out = render("1. one\n2. two\n   - deep\n", 40);
+        let out = render("1. one\n2. two\n   - deep\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["1. one", "2. two", "   ◦ deep"]);
     }
 
     #[test]
     fn task_list_markers_render_as_boxes() {
-        let out = render("- [x] done\n- [ ] todo\n", 40);
+        let out = render("- [x] done\n- [ ] todo\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["• ✔ done", "• ☐ todo"]);
     }
 
     #[test]
     fn a_block_quote_draws_an_unbroken_gutter_including_blank_lines() {
-        let out = render("> first para\n>\n> second para\n", 40);
+        let out = render("> first para\n>\n> second para\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["▏ first para", "▏ ", "▏ second para"]);
     }
 
     #[test]
     fn a_gfm_alert_gets_a_label_because_the_parser_eats_the_marker() {
-        let out = render("> [!WARNING]\n> mind the gap\n", 40);
+        let out = render("> [!WARNING]\n> mind the gap\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["▏ ⚠ Warning", "▏ mind the gap"]);
     }
 
     #[test]
     fn fenced_code_keeps_its_indentation_and_gets_a_gutter() {
-        let out = render("```rust\nfn main() {\n    go();\n}\n```\n", 40);
+        let out = render("```rust\nfn main() {\n    go();\n}\n```\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["│ fn main() {", "│     go();", "│ }"]);
         // Highlighted, not just reproduced: past the gutter there is colour.
-        assert_eq!(out[0].spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(out[0].spans[0].style.fg, Some(theme::DARK.dim));
         assert!(out[1].spans.iter().skip(1).any(|s| s.style.fg.is_some()));
     }
 
     #[test]
     fn a_wrapped_code_line_is_marked_as_a_continuation() {
-        let out = render("```\nabcdefghijklmnopqrstuvwxyz\n```\n", 12);
+        let out = render("```\nabcdefghijklmnopqrstuvwxyz\n```\n", 12, Mode::Dark);
         assert_eq!(text(&out), ["│ abcdefghij", "┆ klmnopqrst", "┆ uvwxyz"]);
         assert_fits(&out, 12);
     }
 
     #[test]
     fn a_link_shows_its_destination_unless_that_would_repeat_it() {
-        let out = render("see [the docs](http://x.dev) ok", 60);
+        let out = render("see [the docs](http://x.dev) ok", 60, Mode::Dark);
         assert_eq!(text(&out), ["see the docs (http://x.dev) ok"]);
         assert!(
             styles_of(&out[0], "docs")
@@ -893,13 +895,13 @@ mod tests {
         );
 
         // An autolink already *is* its destination.
-        let out = render("<http://x.dev>", 60);
+        let out = render("<http://x.dev>", 60, Mode::Dark);
         assert_eq!(text(&out), ["http://x.dev"]);
     }
 
     #[test]
     fn a_table_is_aligned_when_it_fits_and_honours_the_alignment_row() {
-        let out = render("| a | bb |\n| --- | ---: |\n| 1 | 2 |\n", 40);
+        let out = render("| a | bb |\n| --- | ---: |\n| 1 | 2 |\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["a    │   bb", "─────┼─────", "1    │    2"]);
         assert_fits(&out, 40);
     }
@@ -908,7 +910,7 @@ mod tests {
     fn a_table_too_wide_for_the_pane_becomes_one_field_per_line() {
         // A grid of four-cell columns is not a grid, it is a puzzle.
         let md = "| name | description |\n| --- | --- |\n| alpha | the first one |\n";
-        let out = render(md, 14);
+        let out = render(md, 14, Mode::Dark);
         assert_eq!(
             text(&out),
             ["name: alpha", "description: ", "  the first", "  one"]
@@ -918,28 +920,28 @@ mod tests {
 
     #[test]
     fn a_rule_spans_the_pane_exactly() {
-        let out = render("a\n\n---\n\nb", 10);
+        let out = render("a\n\n---\n\nb", 10, Mode::Dark);
         assert_eq!(text(&out), ["a", "", "──────────", "", "b"]);
         assert_fits(&out, 10);
     }
 
     #[test]
     fn front_matter_is_shown_dimmed_rather_than_parsed_as_a_rule() {
-        let out = render("---\ntitle: x\n---\n\n# Body\n", 40);
+        let out = render("---\ntitle: x\n---\n\n# Body\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["│ title: x", "", "# Body"]);
     }
 
     #[test]
     fn an_empty_document_renders_to_nothing_rather_than_a_blank_page() {
-        assert!(render("", 40).is_empty());
-        assert!(render("   \n\n  \n", 40).is_empty());
+        assert!(render("", 40, Mode::Dark).is_empty());
+        assert!(render("   \n\n  \n", 40, Mode::Dark).is_empty());
     }
 
     #[test]
     fn a_zero_width_pane_produces_no_rows_at_all() {
         // The pane guards this too, but a renderer that divides by the width
         // must not be the thing that finds out.
-        assert!(render("# hello\n\n- a\n", 0).is_empty());
+        assert!(render("# hello\n\n- a\n", 0, Mode::Dark).is_empty());
     }
 
     const KITCHEN_SINK: &str = "\
@@ -965,7 +967,7 @@ tail";
         // Eight columns is where the last decoration gives up. Everything from
         // there to a plausible right pane must fit exactly.
         for width in 8..=48 {
-            assert_fits(&render(KITCHEN_SINK, width), width);
+            assert_fits(&render(KITCHEN_SINK, width, Mode::Dark), width);
         }
     }
 
@@ -975,7 +977,7 @@ tail";
         // clips the overflow; what matters is that nothing here divides by the
         // width, loops on it, or indexes past it.
         for width in 1..8 {
-            assert!(!render(KITCHEN_SINK, width).is_empty());
+            assert!(!render(KITCHEN_SINK, width, Mode::Dark).is_empty());
         }
     }
 
@@ -984,7 +986,7 @@ tail";
         // Pathological nesting in a narrow pane: the indent clamp is what
         // keeps `wrap` from being handed a prefix wider than the line.
         let md = "- a\n  - b\n    - c\n      - d\n        - e\n          - f\n";
-        let out = render(md, 8);
+        let out = render(md, 8, Mode::Dark);
         assert_fits(&out, 8);
         assert_eq!(out.len(), 6);
     }

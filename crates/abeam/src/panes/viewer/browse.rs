@@ -41,15 +41,16 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::DEFAULT_VIEWPORT;
+use super::theme;
 use crate::pane::Handled;
 use crate::scroll::{self, Scroll};
-use crate::text::{block, clip_line, dim};
+use crate::text::{block, clip_line};
 use crate::watch::in_noise;
 
 /// How many entries one directory listing will hold.
@@ -139,6 +140,12 @@ pub struct Browser {
     /// runs inside `App::new` — before the first frame — and a repository on a
     /// network share would spend that time with nothing at all on screen.
     listed: bool,
+    /// The reader's palette, mirrored from the pane so the list matches the
+    /// document it opens into. Pushed in by `ViewerPane::toggle_theme` rather
+    /// than read from a global: the list is drawn on its own frames, and two
+    /// halves of one pane disagreeing about the page colour is the one thing
+    /// this must not do.
+    theme: theme::Mode,
     sel: usize,
     scroll: Scroll,
     /// The selection moved, or the list changed, since the last frame. See
@@ -171,6 +178,7 @@ impl Browser {
             entries: Vec::new(),
             cut: false,
             listed: false,
+            theme: theme::Mode::default(),
             sel: 0,
             scroll,
             follow: false,
@@ -180,6 +188,11 @@ impl Browser {
             aligned: None,
             read_at: None,
         }
+    }
+
+    /// Mirror the pane's palette. Only `ViewerPane::toggle_theme` calls it.
+    pub fn set_theme(&mut self, mode: theme::Mode) {
+        self.theme = mode;
     }
 
     /// Line the listing up with the document on screen, if that is a different
@@ -280,7 +293,7 @@ impl Browser {
         // top of it: an elided name is worse than a narrower one.
         let text_w = inner.width - scroll::bar_width(inner.width);
         let lines: Vec<Line> = if rows == 0 {
-            block(self.nothing(), text_w as usize, dim())
+            block(self.nothing(), text_w as usize, self.theme.theme().dim())
         } else {
             (self.scroll.offset..rows)
                 .take(inner.height as usize)
@@ -714,8 +727,8 @@ impl Browser {
 
     fn line(&self, i: usize, w: usize) -> Line<'static> {
         let spans = match &self.find {
-            Some(find) => hit_spans(&self.index[find.hits[i]]),
-            None => entry_spans(&self.entries[i]),
+            Some(find) => hit_spans(&self.index[find.hits[i]], self.theme.theme()),
+            None => entry_spans(&self.entries[i], self.theme.theme()),
         };
 
         // Every row is clipped here and nowhere else. A pane that overflows its
@@ -725,11 +738,13 @@ impl Browser {
             return Line::from(spans);
         }
         // Padded to the full width, or the highlight would stop at the end of
-        // the text instead of marking the row. A named colour rather than an
-        // RGB one: this has to be legible on whatever terminal the user has.
+        // the text instead of marking the row. Both halves of the pair come
+        // from the palette — this row repaints the background under it, so a
+        // foreground inherited from the page would be a pairing nobody chose
+        // and nobody checked.
         let used: usize = spans.iter().map(|s| s.content.width()).sum();
         spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
-        Line::from(spans).style(Style::default().bg(Color::DarkGray))
+        Line::from(spans).style(self.theme.theme().selection())
     }
 
     /// What an empty list says. Never nothing: a blank pane is indistinguishable
@@ -849,10 +864,12 @@ fn list(root: &Path, dir: &Path, max: usize) -> (Vec<Entry>, bool) {
     (out, cut)
 }
 
-fn entry_spans(e: &Entry) -> Vec<Span<'static>> {
+fn entry_spans(e: &Entry, t: &theme::Theme) -> Vec<Span<'static>> {
     let style = match e.kind {
-        Kind::Parent => dim(),
-        Kind::Dir => Style::default().fg(Color::Cyan),
+        Kind::Parent => t.dim(),
+        Kind::Dir => Style::default().fg(t.accent),
+        // No colour of its own: it inherits the page's foreground, which is the
+        // palette's most legible pairing with the background under it.
         Kind::File => Style::default(),
     };
     // A leading space, matching the git view's rows: a name hard against the
@@ -867,12 +884,12 @@ fn entry_spans(e: &Entry) -> Vec<Span<'static>> {
 /// prefixes, and the name — the thing being searched for and the thing being
 /// compared between rows — is the half that would go. Putting it first means
 /// it is the half that survives.
-fn hit_spans(rel: &str) -> Vec<Span<'static>> {
+fn hit_spans(rel: &str, t: &theme::Theme) -> Vec<Span<'static>> {
     match rel.rsplit_once('/') {
         Some((dir, name)) => vec![
             Span::raw(" "),
             Span::raw(name.to_string()),
-            Span::styled(format!("  {dir}/"), dim()),
+            Span::styled(format!("  {dir}/"), t.dim()),
         ],
         None => vec![Span::raw(" "), Span::raw(rel.to_string())],
     }
