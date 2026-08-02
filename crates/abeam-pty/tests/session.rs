@@ -140,7 +140,25 @@ fn session_resize_keeps_pty_and_parser_in_agreement() {
     assert_eq!(session.stats().resizes, before);
 }
 
+/// How much history the tests below reach into, with margin. Waiting for less
+/// than they ask for is the whole of the bug described on [`with_history`].
+const HISTORY: usize = 8;
+
 /// Sixty lines into a six-row pty, so there is a known amount behind the screen.
+///
+/// Waits for **depth** and then for **quiet**, and both halves are load-bearing.
+///
+/// Depth, because the first row scrolls off long before the sixtieth, and a
+/// machine slower than the one this was written on ends up somewhere in
+/// between. This fixture used to wait for *any* scrollback at all: it passed on
+/// every desktop it ran on and failed on the first CI runner, which arrived at
+/// `scroll_by(4)` with three rows of history to move through.
+///
+/// Quiet, because the reader thread moves the offset itself as rows arrive, to
+/// keep a scrolled-back view where its reader left it — that is the behaviour
+/// `a_reader_who_has_scrolled_back_stays_where_they_are_looking` exists to pin.
+/// One row arriving between a `scroll_by` and the assertion after it is an
+/// off-by-one in a test that is *right* about everything it means to say.
 fn with_history(dir: &Dir) -> PtySession {
     let body: String = (1..=60).map(|i| format!("line-{i}\r\n")).collect();
     dir.write("many.txt", &body);
@@ -154,11 +172,28 @@ fn with_history(dir: &Dir) -> PtySession {
     )
     .expect("spawn");
 
-    until("output to scroll off a six-row screen", || {
-        let moved = session.set_scrollback(1);
+    until("enough output to scroll a six-row screen past HISTORY rows", || {
+        // Asked by going there and reading back where we landed. The return
+        // value of `set_scrollback` answers "did the view move", which a
+        // one-row history satisfies as readily as a fifty-row one — asking it
+        // instead is how the too-weak wait got written in the first place.
+        session.set_scrollback(HISTORY);
+        let reached = session.scrollback();
         session.set_scrollback(0);
-        moved
+        reached >= HISTORY
     });
+
+    // Three consecutive quiet polls rather than one: `type` finishes and then
+    // `cmd` prints its prompt, so a single quiet sample can land in the gap
+    // between the two and call a pause the end.
+    let (mut last, mut quiet) = (0, 0);
+    until("the child to stop printing", || {
+        let read = session.stats().bytes_read;
+        quiet = if read == last { quiet + 1 } else { 0 };
+        last = read;
+        quiet >= 3
+    });
+
     session
 }
 
