@@ -4,7 +4,7 @@ pub mod shell;
 pub mod terminal;
 pub mod viewer;
 
-pub use diag::DiagPane;
+pub use diag::{DiagPane, FrameStats};
 pub use git::GitPane;
 pub use shell::ShellPane;
 pub use terminal::TerminalPane;

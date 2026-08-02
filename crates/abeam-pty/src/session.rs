@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
@@ -128,11 +128,38 @@ pub struct PtyStats {
 struct Shared {
     parser: Mutex<vt100::Parser>,
     dirty: AtomicBool,
+    /// Rung by the reader thread every time `dirty` goes up. See
+    /// [`PtySession::wake_on_output`] for why a session that is only polled is
+    /// a session that renders late.
+    ///
+    /// A `OnceLock` rather than a `Mutex<Option<_>>` so the reader reads it
+    /// without taking a lock on the hot path, and so there is no window in
+    /// which a caller swaps the waker out from under a ring in flight.
+    waker: OnceLock<Box<dyn Fn() + Send + Sync>>,
     bytes: AtomicU64,
     eof: AtomicBool,
     dsr_replies: AtomicU64,
     keys_sent: AtomicU64,
     resizes: AtomicU64,
+}
+
+impl Shared {
+    /// Marks the screen changed and tells whoever is waiting. Always in that
+    /// order: a waker that fires before the flag is set can be answered by a
+    /// consumer that then sees nothing to do and goes back to sleep.
+    ///
+    /// Only the reader thread calls this. The other two places that dirty the
+    /// screen — a resize and a scrollback move — run on the caller's own thread,
+    /// which is by definition already awake, and one of them holds the parser
+    /// lock while it does it. Ringing from under that lock would run somebody
+    /// else's closure inside our critical section, which is a deadlock waiting
+    /// for its first careless waker.
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+        if let Some(wake) = self.waker.get() {
+            wake();
+        }
+    }
 }
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -226,6 +253,7 @@ impl PtySession {
         let shared = Arc::new(Shared {
             parser: Mutex::new(vt100::Parser::new(rows, cols, cfg.scrollback)),
             dirty: AtomicBool::new(true),
+            waker: OnceLock::new(),
             bytes: AtomicU64::new(0),
             eof: AtomicBool::new(false),
             dsr_replies: AtomicU64::new(0),
@@ -270,6 +298,28 @@ impl PtySession {
     /// without polling the screen contents.
     pub fn take_dirty(&self) -> bool {
         self.shared.dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// Called on the reader thread whenever output arrives, so a draw loop can
+    /// wait to be told rather than asking on a timer.
+    ///
+    /// This exists because polling sets a floor on latency that has nothing to
+    /// do with how fast anything actually is: a loop that asks every 10 ms
+    /// renders a keystroke 5 ms late on average however quick the renderer is,
+    /// and — worse for the look of it — quantises Claude's output onto a grid
+    /// it has no relationship with, so frames land unevenly. Uneven frames read
+    /// as jitter at any rate.
+    ///
+    /// `notify` runs **on the reader thread, holding nothing**, so it must not
+    /// block and must not touch the session. Ring a doorbell and return; the
+    /// news itself is [`take_dirty`](Self::take_dirty), which is sticky, so a
+    /// ring that is dropped costs nothing.
+    ///
+    /// The first caller wins and later ones are ignored — there is one draw
+    /// loop, it installs this before the first frame, and a waker that could be
+    /// replaced mid-session is a waker that can be replaced mid-ring.
+    pub fn wake_on_output(&self, notify: impl Fn() + Send + Sync + 'static) {
+        let _ = self.shared.waker.set(Box::new(notify));
     }
 
     // --- scrollback ------------------------------------------------------
@@ -495,11 +545,13 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>, writer: S
                     }
 
                     shared.bytes.fetch_add(n as u64, Ordering::Relaxed);
-                    shared.dirty.store(true, Ordering::Relaxed);
+                    shared.mark_dirty();
                 }
             }
         }
         shared.eof.store(true, Ordering::Relaxed);
-        shared.dirty.store(true, Ordering::Relaxed);
+        // The last ring, and the one that matters most: the loop has to wake to
+        // notice the child has gone rather than finding out on its next tick.
+        shared.mark_dirty();
     });
 }

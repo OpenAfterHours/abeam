@@ -86,6 +86,11 @@ fn main() -> Result<()> {
         App::new(left, root).run(&mut terminal)
     })();
 
+    // Every frame ends by emptying the frame buffer, so this should have
+    // nothing to do — but the alternate screen disappears on the next line, and
+    // anything still held would land on the primary buffer as debris. The
+    // certainty is worth one syscall on the way out.
+    let _ = std::io::Write::flush(terminal.backend_mut());
     term::restore()?;
 
     match result? {

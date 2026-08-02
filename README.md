@@ -176,6 +176,36 @@ ConPTY blocks until its opening cursor query is answered, so a red zero there
 means the session is hung rather than slow. `docs/conpty-findings.md` explains
 each field and why it is on screen.
 
+It also reports the frame clock — frames drawn, the rate over the last second,
+and the **worst** single frame in it rather than an average, because a stutter
+is one slow frame in a hundred and a mean hides exactly that. While Claude is
+producing output the rate should sit at the frame floor; a worst frame
+approaching the gap between frames means the renderer is what is setting the
+pace, and no amount of pacing will help.
+
+## Drawing
+
+Two intervals, with different jobs.
+
+Claude's output does not wait to be noticed: the pty reader rings the draw loop
+the moment bytes land, so nothing sits in a buffer waiting for a poll to come
+round. What the loop does *not* do is draw every time it is rung — Claude
+produces output far faster than a screen can show it, and drawing on every
+chunk spends the whole budget on frames nobody sees while the console write
+queue backs up. Frames are held to one every 8 ms, start to start, always
+showing the newest state. A burst becomes one frame, and the frames that go out
+land evenly, which is what reads as smooth; uneven frames read as jitter at any
+rate.
+
+The other interval is the 10 ms tick, which is now only what polls the things
+without a doorbell of their own: the git worker's channel, a viewer walk
+finishing, a shell child's exit.
+
+Each frame is written between `BeginSynchronizedUpdate` and `End` (DEC 2026), so
+a terminal that understands them composites the whole frame or none of it rather
+than showing a seam partway down a repaint. A terminal that does not know the
+sequence ignores it.
+
 ## Layout
 
 60/40 split, and below 60 columns the right pane collapses entirely rather than
@@ -288,9 +318,15 @@ trusting it with real work.
   how abeam launches its main program, not a patch.
 - **Windows only.** Not a portability bug so much as an absence of work: nothing
   outside `abeam-pty` is platform-specific, but nothing has been tried.
-- **No configuration.** Keybindings, the split ratio and the refresh interval are
-  all constants. Claude's own bindings are user-configurable, so abeam's should
-  be too before anyone else uses it.
+- **No configuration.** Keybindings, the split ratio and both drawing intervals
+  are all constants. Claude's own bindings are user-configurable, so abeam's
+  should be too before anyone else uses it.
+- **A scrolling pane is a full repaint.** ratatui diffs by cell and has no notion
+  of a scroll region, so when Claude's output scrolls, every row has changed and
+  the whole pane is rewritten — about 10 KB of escape sequences, measured at a
+  118×45 pane. Windows Terminal keeps up with that comfortably; it is still the
+  structural ceiling on how cheap a frame can get, and the thing to attack next
+  if the F2 worst-frame figure ever says the renderer is the limit.
 - **No diff view.** The git pane shows *which* files changed and by how many
   lines, not what changed in them.
 - **The first source file with code in it costs a visible hitch** of 100–200 ms,

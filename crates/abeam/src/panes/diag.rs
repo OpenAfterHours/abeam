@@ -36,11 +36,31 @@ use crate::text::{self, clip_line, dim};
 /// for one in a 40% pane of an 80-column window.
 const LABEL: usize = 16;
 
+/// What the draw loop is managing, frozen at one instant.
+///
+/// Here rather than in [`Diagnostics`] because it describes the loop and not
+/// the pty — and it is here at all because the alternative is guessing. The
+/// question "is abeam keeping up" was, for the whole of its life before this,
+/// answerable only by looking at the screen and forming an opinion.
+///
+/// Read them together: `fps` is what the last full second managed, and `worst`
+/// is the single slowest frame in it. A healthy left pane under load sits at
+/// the frame floor with a worst well under it. A `worst` that approaches the
+/// gap between frames is the renderer, not the pacing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    pub drawn: u64,
+    pub last_ms: f32,
+    pub worst_ms: f32,
+    pub fps: f32,
+}
+
 pub struct DiagPane {
     /// `None` until the shell has shown this view once. It cannot be filled in
     /// at construction: the pane it describes is built first and owned
     /// elsewhere.
     state: Option<Diagnostics>,
+    frames: Option<FrameStats>,
     scroll: Scroll,
 }
 
@@ -48,6 +68,7 @@ impl DiagPane {
     pub fn new() -> Self {
         Self {
             state: None,
+            frames: None,
             scroll: Scroll::default(),
         }
     }
@@ -56,6 +77,12 @@ impl DiagPane {
     /// numbers are live enough to watch a resize land.
     pub fn update(&mut self, state: Diagnostics) {
         self.state = Some(state);
+    }
+
+    /// The same contract, from the same place, for the numbers the shell owns
+    /// rather than the pty.
+    pub fn update_frames(&mut self, frames: FrameStats) {
+        self.frames = Some(frames);
     }
 }
 
@@ -76,7 +103,7 @@ impl Pane for DiagPane {
         }
 
         let lines = match &self.state {
-            Some(d) => rows(d, inner.width as usize),
+            Some(d) => rows(d, self.frames, inner.width as usize),
             None => vec![Line::from(Span::styled("no session", dim()))],
         };
 
@@ -123,7 +150,7 @@ fn flag(on: bool) -> Span<'static> {
     }
 }
 
-fn rows(d: &Diagnostics, width: usize) -> Vec<Line<'static>> {
+fn rows(d: &Diagnostics, f: Option<FrameStats>, width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![
         heading("emulation state"),
         Line::default(),
@@ -179,6 +206,34 @@ fn rows(d: &Diagnostics, width: usize) -> Vec<Line<'static>> {
         "cursor",
         Span::raw(format!("{},{}", d.cursor.1, d.cursor.0)),
     ));
+
+    if let Some(f) = f {
+        lines.push(Line::default());
+        lines.push(heading("drawing"));
+        lines.push(Line::default());
+        lines.push(row("frames", Span::raw(f.drawn.to_string())));
+        // Idle is the common case and reports zero, which is the truth and not
+        // a fault: a loop with nothing to draw draws nothing. The number to
+        // read is what it climbs to while Claude is producing output.
+        lines.push(row("fps (last 1s)", Span::raw(format!("{:.0}", f.fps))));
+        lines.push(row("last frame", Span::raw(format!("{:.2} ms", f.last_ms))));
+        // The one worth watching. An average would hide the single slow frame
+        // that is the entire experience of a stutter.
+        lines.push(row(
+            "worst frame",
+            Span::styled(
+                format!("{:.2} ms", f.worst_ms),
+                // Amber once a frame costs more than the gap the pacing is
+                // trying to hold, because at that point the renderer is what is
+                // setting the rate and no amount of pacing will help.
+                if f.worst_ms >= 8.0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                },
+            ),
+        ));
+    }
 
     if d.dsr_replies == 0 {
         lines.push(Line::default());
@@ -258,7 +313,7 @@ mod tests {
         // days on that before the counter existed.
         let mut d = sample();
         d.dsr_replies = 0;
-        let lines = rows(&d, 46);
+        let lines = rows(&d, None, 46);
         assert_eq!(
             styles_of(&lines, "DSR answered"),
             [Style::default().fg(Color::Red)]
@@ -271,7 +326,7 @@ mod tests {
         assert!(text.contains("ConPTY blocks"), "got: {text}");
 
         // ...and green once it has been answered, with no alarm attached.
-        let lines = rows(&sample(), 46);
+        let lines = rows(&sample(), None, 46);
         assert_eq!(
             styles_of(&lines, "DSR answered"),
             [Style::default().fg(Color::Green)]
@@ -293,13 +348,13 @@ mod tests {
         // screen — but the instrument must not claim more than it does.
         let mut d = sample();
         d.pty_size = Some((22, 80));
-        let text: String = rows(&d, 46)
+        let text: String = rows(&d, None, 46)
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(text.contains("80x22"), "got: {text}");
         assert!(text.contains("78x22"), "got: {text}");
-        for style in styles_of(&rows(&d, 46), "parser size") {
+        for style in styles_of(&rows(&d, None, 46), "parser size") {
             assert_ne!(style.fg, Some(Color::Red), "not a check, so not an alarm");
         }
     }
@@ -334,6 +389,55 @@ mod tests {
     }
 
     #[test]
+    fn the_frame_clock_is_reported_and_a_slow_frame_is_flagged() {
+        // The reason this pane now says anything about drawing at all: abeam
+        // shipped with a 10 ms poll in front of a renderer that turned out to
+        // cost 0.75 ms, and nothing on screen could have told you that.
+        let text = |f| -> String {
+            rows(&sample(), Some(f), 46)
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+                .collect()
+        };
+
+        let healthy = FrameStats {
+            drawn: 1200,
+            last_ms: 0.71,
+            worst_ms: 2.40,
+            fps: 118.0,
+        };
+        let t = text(healthy);
+        assert!(t.contains("118"), "got: {t}");
+        assert!(t.contains("0.71 ms"), "got: {t}");
+        assert!(t.contains("2.40 ms"), "got: {t}");
+        assert_eq!(
+            styles_of(&rows(&sample(), Some(healthy), 46), "worst frame"),
+            [Style::default()],
+            "a frame inside the floor is not worth colouring"
+        );
+
+        // Once the worst frame costs more than the gap the pacing is holding,
+        // the renderer is setting the rate and the pacing cannot help.
+        let slow = FrameStats {
+            worst_ms: 9.5,
+            ..healthy
+        };
+        assert_eq!(
+            styles_of(&rows(&sample(), Some(slow), 46), "worst frame"),
+            [Style::default().fg(Color::Yellow)]
+        );
+
+        // ...and a pane that has never been drawn says nothing rather than
+        // reporting a confident zero.
+        assert!(!text(healthy).is_empty());
+        let none: String = rows(&sample(), None, 46)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(!none.contains("worst frame"), "got: {none}");
+    }
+
+    #[test]
     fn every_row_fits_the_pane_at_any_width() {
         // The right pane can be 22 columns wide in a 60-column window, and a
         // row that overflows its rect corrupts the frame.
@@ -341,8 +445,14 @@ mod tests {
         d.dsr_replies = 0;
         d.reader_finished = true;
         d.exited = Some("ExitStatus { .. }".into());
+        let f = Some(FrameStats {
+            drawn: 999_999,
+            last_ms: 12.345,
+            worst_ms: 123.456,
+            fps: 125.0,
+        });
         for width in [1usize, 8, 17, 22, 46, 100] {
-            for line in rows(&d, width) {
+            for line in rows(&d, f, width) {
                 let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
                 assert!(w <= width, "{w} cells at width {width}: {line:?}");
             }

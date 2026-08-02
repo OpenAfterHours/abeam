@@ -19,15 +19,18 @@
 //! of each other — that is what makes them individually testable — so every
 //! wire between them is here, in [`App::pump`].
 
-use std::io::Stdout;
+use std::io::{BufWriter, Stdout};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::time::{Duration, Instant};
 
 use abeam_pty::ExitStatus;
 use anyhow::Result;
+use crossterm::QueueableCommand;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -39,10 +42,41 @@ use ratatui::{Frame, Terminal};
 use crate::keys::{self, Action};
 use crate::layout as abeam_layout;
 use crate::pane::{Focus, Pane};
-use crate::panes::{DiagPane, GitPane, RightView, ShellPane, TerminalPane, ViewerPane};
+use crate::panes::{DiagPane, FrameStats, GitPane, RightView, ShellPane, TerminalPane, ViewerPane};
 use crate::watch::Watch;
 
-pub type Tui = Terminal<CrosstermBackend<Stdout>>;
+pub type Tui = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
+/// The longest the loop will sleep when nothing has woken it.
+///
+/// This is no longer the thing that paces drawing — output rings a doorbell now
+/// — so it is only what the panes without one are polled at: the git pane's
+/// channel, a viewer walk finishing, a shell child's `try_wait`.
+const TICK: Duration = Duration::from_millis(10);
+
+/// The shortest gap between two frames, start to start.
+///
+/// A floor, not a target. Claude can produce output far faster than any screen
+/// can show it, and drawing every time it does spends the whole budget on
+/// frames nobody sees while the console write queue backs up — which is what
+/// jitter *is*. Holding frames to an even cadence and always drawing the
+/// newest state coalesces a burst into one frame and makes the ones that do go
+/// out land evenly, which is what reads as smooth.
+///
+/// 8 ms is 125 fps: comfortably above any display abeam will be looked at on,
+/// and a smaller worst-case delay than the 10 ms poll it replaces, so nothing
+/// about typing got slower.
+const MIN_FRAME: Duration = Duration::from_millis(8);
+
+/// Why the loop woke up.
+enum Wake {
+    /// The console had something to say. Carried rather than re-read, because
+    /// the thread that reads them is the only one that may.
+    Input(Event),
+    /// Claude produced output. No payload — the news is the pty's sticky dirty
+    /// flag, and this only says "go and look".
+    Output,
+}
 
 pub enum Outcome {
     /// The child finished. `screen` is what its last frame said — printed to
@@ -71,6 +105,87 @@ impl Flow {
 
     fn redraw() -> Flow {
         Flow::Continue { redraw: true }
+    }
+}
+
+/// The frame clock: what decides when the next frame may go out, and what F2
+/// reports about the ones that already did.
+///
+/// It is one struct because those are the same question. The pacing is only
+/// defensible if you can see what it costs, and "is the renderer keeping up"
+/// was, until this existed, a thing that could only be guessed at from the
+/// outside — which is exactly how a 10 ms poll in front of a sub-millisecond
+/// renderer survived as long as it did.
+struct Frames {
+    /// When the last frame *began*. Start-to-start, so a slow frame does not
+    /// push the next one further out and turn one hitch into a stutter.
+    started: Instant,
+    cost: Duration,
+    drawn: u64,
+    /// Reset every [`Frames::WINDOW`]; the worst frame in the window that just
+    /// closed is what [`stats`](Frames::stats) reports, because an average
+    /// frame time hides precisely the hitch you are looking for.
+    window: Instant,
+    in_window: u32,
+    worst: Duration,
+    last_worst: Duration,
+    fps: f32,
+}
+
+impl Frames {
+    const WINDOW: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            // Far enough back that the first frame is owed immediately.
+            started: now - MIN_FRAME,
+            cost: Duration::ZERO,
+            drawn: 0,
+            window: now,
+            in_window: 0,
+            worst: Duration::ZERO,
+            last_worst: Duration::ZERO,
+            fps: 0.0,
+        }
+    }
+
+    /// How long until a frame may go out. Zero once one is owed.
+    fn due_in(&self) -> Duration {
+        MIN_FRAME.saturating_sub(self.started.elapsed())
+    }
+
+    fn due(&self) -> bool {
+        self.due_in().is_zero()
+    }
+
+    fn record(&mut self, began: Instant) {
+        self.started = began;
+        self.cost = began.elapsed();
+        self.drawn += 1;
+        self.in_window += 1;
+        self.worst = self.worst.max(self.cost);
+
+        let open = self.window.elapsed();
+        if open >= Self::WINDOW {
+            self.fps = self.in_window as f32 / open.as_secs_f32();
+            self.last_worst = self.worst;
+            self.window = Instant::now();
+            self.in_window = 0;
+            self.worst = Duration::ZERO;
+        }
+    }
+
+    fn stats(&self) -> FrameStats {
+        let ms = |d: Duration| d.as_secs_f32() * 1e3;
+        FrameStats {
+            drawn: self.drawn,
+            last_ms: ms(self.cost),
+            // Before the first window closes there is nothing to report but the
+            // window in progress, which is better than reporting zero.
+            worst_ms: ms(self.last_worst.max(self.worst)),
+            fps: self.fps,
+        }
     }
 }
 
@@ -111,6 +226,8 @@ pub struct App {
     /// function of it: a key can ask whether there *would* be a right pane
     /// without waiting for a frame to find out.
     area: Rect,
+    /// Paces the drawing and answers for it in the F2 view.
+    frames: Frames,
 }
 
 impl App {
@@ -142,14 +259,89 @@ impl App {
             left_inner: Rect::ZERO,
             right_inner: None,
             area: Rect::ZERO,
+            frames: Frames::new(),
         }
     }
 
+    /// The loop.
+    ///
+    /// It waits to be told rather than asking on a timer, and then declines to
+    /// draw more often than a screen can show. Those are two halves of one
+    /// idea: the old loop blocked 10 ms on the console before it would so much
+    /// as look at the pty, which put a 10 ms floor under a renderer measured at
+    /// 0.75 ms and quantised Claude's output onto a grid unrelated to it. Now
+    /// both sources of news arrive on one channel — the console from a thread
+    /// that may block on it, Claude from the pty reader — and [`MIN_FRAME`] is
+    /// the only thing deciding when a frame goes out.
     pub fn run(mut self, terminal: &mut Tui) -> Result<Outcome> {
+        // Bounded, because it is a doorbell and not a queue. Input uses the
+        // blocking `send` — a keystroke may never be dropped — while output
+        // uses `try_send` and lets a full channel swallow the ring, which is
+        // correct: the flag it announces is sticky and the loop is by then
+        // provably on its way to read it.
+        let (tx, rx) = mpsc::sync_channel::<Wake>(64);
+        // Deliberately only the left pane, and not the shell's pty. A
+        // `cargo build` behind the git view can produce output thousands of
+        // times a second, and every one of those rings would be a loop
+        // iteration that goes on to draw nothing — `tick_panes` already
+        // declines to spend a frame on a shell nobody is looking at. It keeps
+        // the tick it has always had.
+        self.left.wake_on_output({
+            let tx = tx.clone();
+            move || {
+                let _ = tx.try_send(Wake::Output);
+            }
+        });
+        spawn_input(tx);
+
         self.draw(terminal)?;
+        // Something has changed that the screen does not show yet. Sticky
+        // across iterations: news that arrives inside the frame floor is not
+        // lost, it is waiting for the floor to lift.
+        let mut redraw = false;
 
         loop {
-            let mut redraw = false;
+            // Sleep until there is news, or until the frame we already owe is
+            // allowed out, or until the panes without a doorbell want polling.
+            // Whichever comes first.
+            let wait = if redraw { self.frames.due_in() } else { TICK };
+
+            match rx.recv_timeout(wait) {
+                Ok(first) => {
+                    // Drain everything queued before drawing. Windows floods
+                    // Resize events during a window drag and ConPTY resize is
+                    // the flakiest operation in the stack; one batch is one
+                    // resize.
+                    let mut next = Some(first);
+                    while let Some(wake) = next.take() {
+                        match wake {
+                            Wake::Output => redraw = true,
+                            Wake::Input(ev) => match self.handle_event(ev)? {
+                                Flow::Quit => return Ok(self.finish()),
+                                Flow::Continue { redraw: wanted } => redraw |= wanted,
+                            },
+                        }
+                        next = rx.try_recv().ok();
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                // Unreachable while this loop is running: the waker holds a
+                // sender for as long as the left pane exists, and the left pane
+                // outlives this function. Treated as the console having gone
+                // rather than ignored, because the alternative to leaving is
+                // spinning on a channel that will never speak again.
+                Err(RecvTimeoutError::Disconnected) => return Ok(self.finish()),
+            }
+
+            // Everything below happens only when a frame could actually go out.
+            // Under a flood, Claude rings this loop far more often than 125
+            // times a second, and running the periodic work on every one of
+            // those wakes would put a `try_wait`, three channel polls and a
+            // watcher drain on the hot path of its output — to learn things
+            // that could not be shown until the floor lifts anyway.
+            if !self.frames.due() {
+                continue;
+            }
 
             if self.claude_exit.is_none()
                 && let Some(status) = self.left.poll_exit()?
@@ -182,26 +374,12 @@ impl App {
                 return Ok(self.finish());
             }
 
-            if event::poll(Duration::from_millis(10))? {
-                // Drain everything pending before drawing. Windows floods
-                // Resize events during a window drag and ConPTY resize is the
-                // flakiest operation in the stack; one batch is one resize.
-                loop {
-                    match self.handle_event(event::read()?)? {
-                        Flow::Quit => return Ok(self.finish()),
-                        Flow::Continue { redraw: wanted } => redraw |= wanted,
-                    }
-                    if !event::poll(Duration::ZERO)? {
-                        break;
-                    }
-                }
-            }
-
             redraw |= self.tick_panes();
             redraw |= self.pump();
 
             if redraw {
                 self.draw(terminal)?;
+                redraw = false;
             }
         }
     }
@@ -530,7 +708,24 @@ impl App {
     // --- drawing ---------------------------------------------------------
 
     fn draw(&mut self, terminal: &mut Tui) -> Result<()> {
+        let began = Instant::now();
+
+        // The frame goes out between a begin/end pair, so a host terminal that
+        // understands DEC 2026 shows all of it or none of it. Without this a
+        // frame is composited whenever the terminal next feels like it, which
+        // for a full-pane repaint means a visible seam partway down — the
+        // half-updated screen that reads as tearing rather than as slowness.
+        //
+        // Queued, not executed: `execute!` would flush here and put the begin
+        // in a syscall of its own. A terminal that does not know the sequence
+        // ignores it, which is the whole reason private modes are shaped this
+        // way.
+        terminal.backend_mut().queue(BeginSynchronizedUpdate)?;
         terminal.draw(|f| self.ui(f))?;
+        terminal.backend_mut().queue(EndSynchronizedUpdate)?;
+        std::io::Write::flush(terminal.backend_mut())?;
+
+        self.frames.record(began);
 
         // Sized from the rect that was just drawn, unconditionally, once per
         // frame. `on_resize` is a no-op when nothing changed, which is what
@@ -580,6 +775,10 @@ impl App {
             if self.right_view == RightView::Diag {
                 let state = self.left.diagnostics();
                 self.diag.update(state);
+                // The frame clock reports on the loop, not on the pty, so it
+                // comes from here rather than out of `diagnostics()`. Same
+                // rule: only on the frames that show it.
+                self.diag.update_frames(self.frames.stats());
             }
             f.render_widget(block_line(self.right_title(focused), focused), outer);
             self.right_pane().render(f, inner);
@@ -690,6 +889,34 @@ impl App {
             RightView::Diag => &self.diag,
         }
     }
+}
+
+/// Reads the console forever and forwards what it finds.
+///
+/// A thread because `event::read` is the only way to be *told* about a
+/// keystroke rather than to ask, and the loop it used to be called from now has
+/// a second thing to wait on. One reader, here, and nowhere else: crossterm's
+/// event source is global, and two threads competing for it lose keys.
+///
+/// It is never joined, for the same reason the pty reader is not — there is no
+/// way to interrupt a blocking read, and a session that hangs on the way out to
+/// wait for a keystroke nobody is going to type is worse than a thread that
+/// dies with the process.
+///
+/// A read that errors ends the thread rather than the program. The console
+/// having gone is not something the loop can do anything useful about, and it
+/// will find out on its own the moment it tries to draw.
+fn spawn_input(tx: SyncSender<Wake>) {
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            // Blocking, unlike the output doorbell: a dropped keystroke is a
+            // character missing from what somebody typed. The loop drains this
+            // channel on every pass, so the queue is short and the wait is not.
+            if tx.send(Wake::Input(ev)).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn block<'a>(title: &'a str, focused: bool) -> Block<'a> {
@@ -1269,5 +1496,59 @@ mod tests {
         release.kind = KeyEventKind::Release;
         app.handle_event(Event::Key(release)).unwrap();
         assert_eq!(app.right_view, RightView::Git);
+    }
+
+    #[test]
+    fn the_first_frame_is_owed_immediately() {
+        // The floor exists to stop frames piling up, not to delay the one that
+        // opens the session. A new clock that made the caller wait 8 ms would
+        // put that straight back into startup.
+        assert!(Frames::new().due());
+    }
+
+    #[test]
+    fn a_frame_holds_the_floor_and_then_lifts_it() {
+        let mut f = Frames::new();
+        f.record(Instant::now());
+        assert!(
+            !f.due(),
+            "two frames back to back is what the floor forbids"
+        );
+        assert!(f.due_in() <= MIN_FRAME);
+
+        std::thread::sleep(MIN_FRAME);
+        assert!(f.due(), "and it has to lift on its own");
+        assert!(f.due_in().is_zero());
+    }
+
+    #[test]
+    fn pacing_is_start_to_start_so_one_slow_frame_is_not_two() {
+        // If the floor were measured from when a frame *finished*, a frame that
+        // overran would push the next one out by its own cost on top of the
+        // gap — turning a single hitch into a visible stutter, which is the
+        // exact thing this whole mechanism exists to avoid.
+        let mut f = Frames::new();
+        f.record(Instant::now() - (MIN_FRAME * 3));
+        assert!(f.due(), "the gap has already elapsed; do not wait it again");
+    }
+
+    #[test]
+    fn the_clock_reports_the_worst_frame_rather_than_an_average() {
+        // An average is the wrong statistic here: a hitch is one frame in a
+        // hundred, and the mean of a hundred good frames and one bad one looks
+        // like a hundred and one good frames.
+        let mut f = Frames::new();
+        f.record(Instant::now());
+        let quick = f.stats().worst_ms;
+
+        f.record(Instant::now() - Duration::from_millis(40));
+        let s = f.stats();
+        assert_eq!(s.drawn, 2);
+        assert!(s.worst_ms >= 40.0, "worst was {} ms", s.worst_ms);
+        assert!(s.worst_ms > quick);
+        // The window has not closed yet, so what it reports is the window in
+        // progress — which beats a confident zero for the first second of a
+        // session, when somebody watching for a stall is most likely looking.
+        assert!(s.last_ms >= 40.0, "last was {} ms", s.last_ms);
     }
 }

@@ -67,6 +67,13 @@ impl TerminalPane {
         self.exit_status().is_some()
     }
 
+    /// Lets the app loop be told when Claude has produced something, instead of
+    /// asking on a timer. See [`PtySession::wake_on_output`] — the closure runs
+    /// on the reader thread and must only ring a doorbell.
+    pub fn wake_on_output(&self, notify: impl Fn() + Send + Sync + 'static) {
+        self.session.wake_on_output(notify);
+    }
+
     // --- scrollback ------------------------------------------------------
     //
     // Two forwards rather than an accessor for the session. The session is

@@ -15,6 +15,7 @@
 #![cfg(windows)]
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -299,4 +300,48 @@ fn a_dropped_session_does_not_leave_the_childs_children_running() {
         !Path::new(&finished).exists(),
         "a grandchild outlived the session that started it"
     );
+}
+
+/// The doorbell. Without it a draw loop can only poll, and polling is a floor
+/// on latency that has nothing to do with how fast anything is.
+#[test]
+fn output_rings_the_waker_and_a_session_nobody_installed_one_on_still_works() {
+    let rings = Arc::new(AtomicU32::new(0));
+    let session = PtySession::spawn(
+        PtyConfig::new("cmd.exe")
+            .args(["/c", "echo abeam-waker-marker"])
+            .size(24, 80),
+    )
+    .expect("spawn");
+
+    session.wake_on_output({
+        let rings = Arc::clone(&rings);
+        move || {
+            rings.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    until("the waker to be rung", || rings.load(Ordering::Relaxed) > 0);
+
+    // The ring is not the news — `take_dirty` is — so the two must agree, and
+    // the flag must still be set by the time anyone gets round to reading it.
+    assert!(session.take_dirty(), "rung without anything to show for it");
+
+    // The reader thread is the only caller, so a ring per read is the most that
+    // can have happened, and a `cmd /c echo` is one or two of those. This is
+    // not about the exact number: it is that nothing is ringing in a loop.
+    let rung = rings.load(Ordering::Relaxed);
+    assert!(rung <= 8, "{rung} rings for one line of output");
+
+    // ...and the default is silence, not a panic. Every test above this one is
+    // a session with no waker installed, but only this one says so on purpose.
+    let session = PtySession::spawn(
+        PtyConfig::new("cmd.exe")
+            .args(["/c", "echo abeam-no-waker-marker"])
+            .size(24, 80),
+    )
+    .expect("spawn");
+    until("output to arrive with nobody listening", || {
+        session.stats().bytes_read > 0
+    });
 }
