@@ -82,6 +82,11 @@ pub enum Action {
     /// again while it already has focus, it hands focus back, so the round trip
     /// to run `git branch` is one key out and the same key home.
     ShowShell,
+    /// Show the queue: work lined up for the agent. A workspace view like git
+    /// and the reader, and reached the same way — it does *not* take focus,
+    /// because the common case is glancing at what is still to come while the
+    /// agent works and you keep typing at it.
+    ShowQueue,
     FocusLeft,
     FocusRight,
     /// Scroll the right pane *without focusing it* — glancing at git or at the
@@ -166,6 +171,16 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // held to the same standard as `g` and `e`, and re-checked against the
         // installed binary when the command view landed. See docs/keymap.md.
         KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ShowShell),
+        // `a` for the agenda of work still to come. Held to the same standard
+        // as `g`, `e` and `s`, and cleared the same way: `meta+a` and `alt+a`
+        // are both absent from the 2.1.220 binary — zero matches, where the
+        // undeclared readline bindings that caught `Alt+F` do appear as text —
+        // and `a` is not in the classic readline meta set (`b f d l u c t r y
+        // n p`) that Claude's prompt editor handles without declaring. It is a
+        // letter rather than an F-key because it joins a set: `Alt+G`, `Alt+E`,
+        // `Alt+S`, `Alt+A` are the four workspace views, and a fourth spelled
+        // `F6` would be a key nobody groups with the other three.
+        KeyCode::Char('a') | KeyCode::Char('A') => Some(Action::ShowQueue),
 
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('z') | KeyCode::Char('Z') => Some(Action::ToggleZoom),
@@ -187,9 +202,13 @@ pub const HELP: &[(&str, &str)] = &[
     ("Alt+G", "right pane: git"),
     ("Alt+E", "right pane: files (again for the file list)"),
     ("Alt+S", "right pane: a shell, focused (again to leave)"),
+    ("Alt+A", "right pane: the queue of work for the agent"),
     ("F4 / F5", "move focus left / right"),
     ("Alt+J / Alt+K", "scroll right pane, without focusing it"),
-    ("Alt+PgDn / Alt+PgUp", "page right pane, without focusing it"),
+    (
+        "Alt+PgDn / Alt+PgUp",
+        "page right pane, without focusing it",
+    ),
     ("Alt+Z", "zoom: hide / show the right pane"),
     // "while a child is live", not "while the agent is running": `app::act`
     // quits outright only when the agent has exited *and* no shell is live, so
@@ -209,11 +228,23 @@ pub const HELP: &[(&str, &str)] = &[
     ("Ctrl+D / Ctrl+U", "scroll a half page"),
     ("g / G, Home / End", "jump to top / bottom"),
     ("Tab / Shift+Tab", "next / previous item"),
-    ("Enter", "git: open the file · list: open · doc: reload"),
+    (
+        "Enter",
+        "git: open the file · list: open · queue: do it now",
+    ),
     ("t", "files: rendered markdown / its source"),
     ("/", "file list: find a file anywhere under the root"),
     ("Backspace or -", "file list: up a directory"),
-    ("r", "refresh"),
+    ("r", "refresh · queue: clear what has finished"),
+    // The queue's own four. `space` is conspicuously not among them: it pages,
+    // here as in every other pane, and arming moved to `a` rather than take a
+    // key out of the shared vocabulary this table promises three rows above.
+    // A key that pages in three panes and toggles a mode in the fourth is a
+    // key nobody can learn.
+    ("i", "queue: write a new item"),
+    ("a", "queue: arm / disarm sending to the agent"),
+    ("d", "queue: delete the selected item"),
+    ("m", "queue: switch an item between send and dispatch"),
     ("Esc or q", "back to the agent (the shell keeps them)"),
 ];
 
@@ -375,7 +406,8 @@ mod tests {
         }
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
         for expected in [
-            "Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4", "F5",
+            "Alt+G", "Alt+E", "Alt+S", "Alt+A", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4",
+            "F5",
         ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),

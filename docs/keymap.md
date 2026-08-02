@@ -58,6 +58,7 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `Alt+G` | right pane → git view (focus unchanged) |
 | `Alt+E` | right pane → files / markdown view (focus unchanged) |
 | `Alt+S` | right pane → a shell, **and focus it**; again to hand focus back |
+| `Alt+A` | right pane → the queue of work for the agent (focus unchanged) |
 | `F4` / `F5` | move focus left / right |
 | `Alt+J` / `Alt+K` | scroll right pane one line — **without focusing it** |
 | `Alt+PageDown` / `Alt+PageUp` | scroll right pane one page — without focusing it |
@@ -77,6 +78,21 @@ was spending a key on a job already done twice.
 command line you have to press a second key to type into is a picture of a
 command line. It is also the only right-hand view that keeps `Esc` and `q` —
 they belong to the shell — so the border advertises the way out instead.
+
+**`Alt+A` was verified the same way, on 2026-08-02, against the same 2.1.220
+binary**: `rg -a 'meta\+a\b|alt\+a\b'` over `claude.exe` returns **zero
+matches**, where the undeclared readline bindings that caught `Alt+F` do appear
+as text — so this is the strong form of the test rather than the absence of
+documentation that would have cleared `Alt+F`. `a` is also outside the classic
+readline meta set (`b f d l u c t r y n p`) that Claude's prompt editor handles
+without declaring.
+
+It is a letter and not an F-key on purpose, and the reason is the set rather
+than the key: `Alt+G`, `Alt+E`, `Alt+S` and `Alt+A` are the four workspace
+views, and a fourth spelled `F6` would be a binding nobody groups with the
+other three. The F-key argument in `keys.rs` is about what is *structurally*
+safe in both agents, and it is still the right answer for a key that has no
+set to join — which is why `F2` and `F3` are F-keys and this is not.
 
 **`Alt+S` was verified the same way the rest of this table was**, against
 2.1.220: absent from every declared `context/bindings` block (`meta+s` and
@@ -128,8 +144,19 @@ the border says.
 
 The files view adds `t` — rendered markdown or its source — and, in the file
 list, `/` to find a file anywhere under the root and `Backspace` or `-` to climb
-a directory. None of these collides with the vocabulary above, and none can
-reach the agent: the right pane has to be focused for any of them to be seen.
+a directory. The queue view adds `i` to write an item, `a` to arm or disarm
+sending, `d` to delete one, `m` to switch an item between being typed into the
+live session and being dispatched as its own background agent, and `Enter` to
+do the selected one now. None of these collides with the vocabulary above, and
+none can reach the agent: the right pane has to be focused for any of them to
+be seen.
+
+Arming is `a` and not `space`, which was the first implementation and was
+wrong: `space` pages, in every pane, and the table above promises it by name. A
+key that pages in three panes and toggles a mode in the fourth is a key nobody
+can learn — the same argument that moved focus off `Alt+←`/`Alt+→` for every
+agent rather than making it conditional on which one was running, and it costs
+very much less to honour here.
 
 Two of them are claimed *conditionally*, which is the thing to keep straight.
 While a find is open the query eats every printable key, so `j`, `k`, `g`, `G`,

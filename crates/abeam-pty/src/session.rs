@@ -508,6 +508,21 @@ impl PtySession {
         Ok(self.child.try_wait()?)
     }
 
+    /// The child's process id, when the platform will say.
+    ///
+    /// The one thing a host can use to find the child in something *else's*
+    /// records — which is what `abeam::agentstate` does, to read the session
+    /// file Claude keeps per pid. Deliberately not a handle: this is for
+    /// identifying the process, never for signalling it. Killing is `Drop`'s,
+    /// and there is exactly one way to do it.
+    ///
+    /// Note for callers matching on it: this is the process abeam *started*,
+    /// which for a script routed through an interpreter is the interpreter.
+    /// See `abeam::launch`.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     pub fn stats(&self) -> PtyStats {
         PtyStats {
             bytes_read: self.shared.bytes.load(Ordering::Relaxed),
