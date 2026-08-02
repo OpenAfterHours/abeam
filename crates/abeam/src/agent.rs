@@ -74,14 +74,32 @@ pub struct Agent {
     pub install: &'static str,
 }
 
+/// How to install Copilot, in the words of the platform this was built for.
+///
+/// The one sentence in [`AGENTS`] that cannot be written once. It is read on
+/// the failure path, by somebody who has just been told the agent they asked
+/// for is not on their machine, so the whole of its job is to be a command they
+/// can type — and `winget` is a Windows package manager, which makes naming it
+/// to a reader on Linux worse than naming nothing at all. npm's package is the
+/// route Copilot CLI documents on every platform, which is why the Unix half
+/// leads with it.
+#[cfg(windows)]
+const COPILOT_INSTALL: &str = "Install it with `winget install GitHub.Copilot`, or run \
+                               `gh copilot` once to fetch it.";
+#[cfg(unix)]
+const COPILOT_INSTALL: &str = "Install it with `npm i -g @github/copilot`, or run \
+                               `gh copilot` once to fetch it.";
+
 /// The agents abeam knows, and the only place their names are written down.
 pub const AGENTS: &[Agent] = &[
     Agent {
         name: "claude",
-        // One candidate because there is genuinely only one name: the native
-        // installer writes `claude.exe` into `~\.local\bin` and npm writes
-        // `claude.cmd` into `%APPDATA%\npm`, and `crate::launch` already knows
-        // how to start either of those under the one name they share.
+        // One candidate because there is genuinely only one name: every route
+        // onto a machine writes the file as plain `claude` — `~/.local/bin`
+        // from the native installer, npm's global `bin` from the package, both
+        // with a `.exe` or a `.cmd` on the end of them on Windows — and
+        // `crate::launch` already knows how to start any of those under the one
+        // name they share.
         candidates: &["claude"],
         install: "Install Claude Code with its native installer, or with \
                   `npm i -g @anthropic-ai/claude-code`.",
@@ -89,13 +107,12 @@ pub const AGENTS: &[Agent] = &[
     Agent {
         name: "copilot",
         candidates: &["copilot"],
-        // Both routes onto a machine, and `gh copilot` is here as something the
-        // reader runs rather than something abeam runs for them. It is worth
-        // naming precisely because it is the one that works where the others do
-        // not: the npm package wants Node 22, which plenty of machines are not
-        // on yet.
-        install: "Install it with `winget install GitHub.Copilot`, or run \
-                  `gh copilot` once to fetch it.",
+        // Two routes on either platform, and `gh copilot` is here as something
+        // the reader runs rather than something abeam runs for them. It is
+        // worth naming precisely because it is the one that works where the
+        // package managers do not: the npm package wants Node 22, which plenty
+        // of machines are not on yet.
+        install: COPILOT_INSTALL,
     },
 ];
 
@@ -108,10 +125,13 @@ pub const DEFAULT: &str = "claude";
 
 /// The agent this name selects, if it is one abeam knows.
 ///
-/// Case-insensitively, because every other name on this platform is: `PATH`
-/// lookups are, file names are, and `abeam Claude` finding `claude.exe` while
-/// `abeam claude` finds the preset would be a distinction with no visible
-/// cause.
+/// Case-insensitively, because what is being matched is abeam's own table of
+/// names and not a file: `abeam Claude` and `abeam claude` are the same
+/// request, and one of them finding the preset while the other fell through to
+/// a `PATH` lookup for a program spelled `Claude` would be a distinction with
+/// no visible cause. Whether that lookup then folds case is the filesystem's
+/// business and `crate::launch`'s — it does on Windows and does not on Linux —
+/// and neither answer belongs in a table abeam wrote itself.
 pub fn find(name: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|a| a.name.eq_ignore_ascii_case(name))
 }
@@ -294,7 +314,7 @@ pub struct Hosted {
     /// A program typed as a path keeps the path that was typed, which is the
     /// same rule rather than an exception to it: `abeam .\tools\agent.exe` puts
     /// exactly that on the border, not the absolute path it became, and
-    /// certainly not the `cmd.exe` an npm shim routes through.
+    /// certainly not the `cmd.exe` a Windows npm shim routes through.
     ///
     /// One field, and it was briefly two. While the launcher fallback existed
     /// the border had something to say that the line abeam prints on the way
@@ -339,9 +359,9 @@ fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result<Hos
     for candidate in agent.candidates {
         match launch::resolve(candidate, args) {
             // The agent's own name, not the absolute path it turned into and
-            // not the `cmd.exe` an npm shim routes through. Those are facts
-            // about starting it, and the border has 46 columns for facts about
-            // what is taking the typing.
+            // not the `cmd.exe` a Windows npm shim routes through. Those are
+            // facts about starting it, and the border has 46 columns for facts
+            // about what is taking the typing.
             Ok(launch) => {
                 return Ok(Hosted {
                     name: agent.name.to_string(),
@@ -417,16 +437,38 @@ fn quoted(names: &[&str]) -> String {
         .join(", ")
 }
 
-/// Windows-only like the rest of the suite. The parsing half would run
-/// anywhere, but what it parses is a list of Windows program names and what it
-/// hands them to is a `PATH` walk with `PATHEXT` in it.
-///
 /// Nothing here spawns a child. The programs the resolution tests reach for are
-/// `cmd.exe` — which is on every Windows there is — and names beginning
-/// `abeam-no-such-`, which are on none.
-#[cfg(all(test, windows))]
+/// [`EVERY_MACHINE`] — the one name `PATH` is certain to find, whichever
+/// platform this is — and names beginning `abeam-no-such-`, which are on none.
+///
+/// This module used to be `#[cfg(all(test, windows))]` entire, and its own
+/// header conceded that the parsing half would run anywhere. It does, so it now
+/// runs there: an argument parser has no filesystem in it at all, and the three
+/// tests that do walk `PATH` differ between the platforms in one string — which
+/// is why that string is a constant rather than these being two sets of tests
+/// that would then be free to drift apart.
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one program every machine of this kind has, and the whole of the
+    /// difference between running the resolution tests on Windows and on Linux.
+    /// Nothing starts it: it is a name for `PATH` to find and a path to assert
+    /// about afterwards.
+    #[cfg(windows)]
+    const EVERY_MACHINE: &str = "cmd.exe";
+    #[cfg(unix)]
+    const EVERY_MACHINE: &str = "sh";
+
+    /// A program named as a path rather than as a name, which is the other
+    /// thing `ABEAM_AGENT` may hold. Spelled for the platform, because what is
+    /// asserted about it is that abeam hands it on untouched and an example
+    /// nobody at this keyboard could type is a worse example than one they
+    /// could. Never resolved, so it need not be on the machine.
+    #[cfg(windows)]
+    const A_PATH: &str = r"C:\tools\nu.exe";
+    #[cfg(unix)]
+    const A_PATH: &str = "/usr/local/bin/nu";
 
     /// A table whose every agent is certainly absent, so the failure path and
     /// the message are reachable on any machine. This is why `resolve_within`
@@ -446,7 +488,7 @@ mod tests {
         },
     ];
 
-    /// The same, except that the second agent is one every Windows has.
+    /// The same, except that the second agent is one every machine has.
     const PRESENT: &[Agent] = &[
         Agent {
             name: "abeam-test-one",
@@ -455,7 +497,7 @@ mod tests {
         },
         Agent {
             name: "abeam-test-two",
-            candidates: &["cmd.exe"],
+            candidates: &[EVERY_MACHINE],
             install: "Install abeam-test-two from the test suite.",
         },
     ];
@@ -463,7 +505,7 @@ mod tests {
     /// An agent that is installed, so that the found half is testable too.
     const DIRECT: Agent = Agent {
         name: "abeam-test-direct",
-        candidates: &["abeam-no-such-agent-d", "cmd.exe"],
+        candidates: &["abeam-no-such-agent-d", EVERY_MACHINE],
         install: "Install abeam-test-direct from the test suite.",
     };
 
@@ -500,7 +542,9 @@ mod tests {
         assert!(find("claude-code").is_none());
         assert!(find("").is_none());
 
-        // Case-insensitively, like every other name on this platform.
+        // Case-insensitively, because this table is abeam's own and `abeam
+        // Claude` is the same request as `abeam claude` on a filesystem that
+        // folds case and on one that does not.
         assert_eq!(find("Claude").expect("Claude is claude").name, "claude");
         assert_eq!(find("COPILOT").expect("COPILOT is copilot").name, "copilot");
 
@@ -523,15 +567,28 @@ mod tests {
         }
 
         // `gh copilot` is named in the hint and nowhere else in this file: it
-        // is the route that works where the other two do not — the npm package
-        // wants Node 22 — and it is a command the reader runs, not one abeam
-        // runs for them.
+        // is the route that works where the package managers do not — the npm
+        // package wants Node 22 — and it is a command the reader runs, not one
+        // abeam runs for them. It is the half of the sentence that does not
+        // change with the platform, so it is asserted without a `cfg`.
         let copilot = find("copilot").unwrap().install;
-        assert!(
-            copilot.contains("winget install GitHub.Copilot"),
-            "got: {copilot}"
-        );
         assert!(copilot.contains("gh copilot"), "got: {copilot}");
+
+        // ...and the half that does. This is a message printed to somebody
+        // whose agent is missing, so the command in it has to be one their
+        // machine could run: `winget` is not on a Linux box, and a hint naming
+        // it there would be worse than no hint at all.
+        #[cfg(windows)]
+        let installer = "winget install GitHub.Copilot";
+        #[cfg(unix)]
+        let installer = "npm i -g @github/copilot";
+        assert!(copilot.contains(installer), "got: {copilot}");
+
+        // Claude's sentence needs no such split: both of the routes it names
+        // are spelled the same everywhere, which is why it is one string.
+        let claude = find("claude").unwrap().install;
+        assert!(claude.contains("npm i -g @anthropic-ai/claude-code"));
+        assert!(!claude.contains("winget"), "got: {claude}");
     }
 
     // --- selection --------------------------------------------------------
@@ -601,10 +658,11 @@ mod tests {
             chose(&[], Some("copilot")),
             ("agent:copilot".into(), vec![])
         );
-        // ...or any program, exactly as ABEAM_SHELL may.
+        // ...or any program, exactly as ABEAM_SHELL may — including one named
+        // as a path, which is passed on as it was written.
         assert_eq!(
-            chose(&[], Some(r"C:\tools\nu.exe")),
-            (r"program:C:\tools\nu.exe".into(), vec![])
+            chose(&[], Some(A_PATH)),
+            (format!("program:{A_PATH}"), vec![])
         );
 
         // Overridden by anything typed, whichever kind each of them is.
@@ -744,14 +802,14 @@ mod tests {
 
     #[test]
     fn an_agent_that_is_installed_is_named_by_its_own_name_and_not_by_its_path() {
-        let hosted = resolve_within(&DIRECT, &args(&["--resume"]), PRESENT).expect("cmd.exe");
+        let hosted = resolve_within(&DIRECT, &args(&["--resume"]), PRESENT).expect(EVERY_MACHINE);
 
         assert_eq!(hosted.name, "abeam-test-direct");
         // Which is worth asserting only because the thing it is *not* is right
         // here: an absolute path is what gets started, and what a 46-column
         // border must never show.
         assert!(hosted.launch.program.is_absolute());
-        assert!(hosted.launch.program.ends_with("cmd.exe"));
+        assert!(hosted.launch.program.ends_with(EVERY_MACHINE));
         // The second candidate won, so the list is a list rather than a name
         // with room around it.
         assert_eq!(hosted.launch.args, args(&["--resume"]));

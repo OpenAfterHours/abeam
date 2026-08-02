@@ -30,6 +30,7 @@
 use std::os::windows::io::RawHandle;
 use std::ptr;
 
+use portable_pty::Child;
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
 use winapi::um::winnt::{
@@ -47,6 +48,27 @@ unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
 impl Job {
+    /// A job holding `child` and everything it goes on to start — the shape
+    /// `crate::tree` exports, and the one thing anything outside this module
+    /// calls. The two below are its halves.
+    ///
+    /// One call rather than two because the assignment is the half the two
+    /// platforms do not share: a Unix child is in its group before it is a
+    /// child at all, so there is no second call a caller could make that would
+    /// mean the same thing on both. It also keeps this file's worst outcome out
+    /// of a caller's reach — a job created and never assigned to is a solved
+    /// problem that kills nothing.
+    pub fn holding(child: &(dyn Child + Send + Sync)) -> Option<Job> {
+        let job = Job::kill_on_close()?;
+        if let Some(handle) = child.as_raw_handle() {
+            // Best effort. A refusal here — an ancient Windows, a job we are
+            // already in that forbids nesting — costs us the grandchildren and
+            // nothing else.
+            job.adopt(handle);
+        }
+        Some(job)
+    }
+
     /// A new unnamed job that terminates its members when it closes, or `None`
     /// if the operating system would not give us one.
     pub fn kill_on_close() -> Option<Job> {

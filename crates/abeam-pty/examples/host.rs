@@ -13,6 +13,11 @@
 //!
 //! Usage:  cargo run -p abeam-pty --example host
 //!         cargo run -p abeam-pty --example host -- powershell
+//!         cargo run -p abeam-pty --example host -- bash
+//!
+//! The argument is any program on `PATH` and the default is `claude`; the two
+//! shells above are only the usual thing to reach for when what you want to
+//! watch is the right-hand pane rather than an agent.
 //!
 //! Alt+Q detaches and exits.
 

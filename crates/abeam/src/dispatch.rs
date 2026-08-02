@@ -49,30 +49,71 @@
 //!
 //! ## What a command line cannot carry, and which install pays for it
 //!
-//! A prompt reaches a dispatched agent as an argument, and on one of the two
-//! ways Claude gets onto a Windows machine that is a real constraint rather
-//! than a formality.
+//! A prompt reaches a dispatched agent as an argument. On exactly one of the
+//! routes abeam can take that is a real constraint rather than a formality, and
+//! the asymmetry below is the most load-bearing thing in this file: the limits
+//! are `cmd.exe`'s, so they exist where `cmd.exe` does and nowhere else.
 //!
-//! A native install is `claude.exe`, which abeam starts directly. Nothing below
-//! applies to it.
+//! **On Unix there is almost nothing here to pay.** `execve` takes an array of
+//! NUL-terminated byte strings and gives them to the child unaltered, so a
+//! newline, a carriage return, a quote and an ampersand are ordinary bytes that
+//! nothing on the way parses. Nor is there a second shape of install to pay
+//! for: a `#!` script is something the kernel executes directly, so
+//! `crate::launch` never names an interpreter in front of anything and every
+//! install is the direct one. The single byte that cannot travel is a NUL, and
+//! that is not a rule anybody chose — an argument *ends* at its first NUL, so
+//! there is nowhere to put the rest of the prompt. See [`nul`].
 //!
-//! An npm install is `claude.cmd`, which `CreateProcessW` cannot run at all, so
-//! `crate::launch` starts it through `cmd.exe` — and `cmd.exe` has limits that
-//! are its own and not abeam's. **A prompt containing a newline cannot be put
-//! on such a command line in any form**: a newline ends the command outright
-//! and a carriage return truncates it, and there is no escape for either. A
-//! prompt beyond roughly eight kilobytes is longer than `cmd` will run.
+//! The "almost" is one case, and it is worth naming rather than rounding down
+//! to "there is never a shell in the chain", because there can be. A file that
+//! carries the execute bit but has neither ELF magic nor a `#!` line comes back
+//! from the kernel as `ENOEXEC`, and glibc's `execvp` answers that by silently
+//! retrying it as `execve("/bin/sh", ["/bin/sh", file, argv[1], …])`. What
+//! survives is the claim that matters: the retry hands `sh` an argument
+//! *vector* rather than a line, so it is the *file* that `sh` parses and the
+//! prompt is never a word `sh` reads — it arrives in `$6` whole, unsplit and
+//! unexpanded, exactly as it would have reached a binary. (musl declines the
+//! retry altogether, which changes whether such a file runs at all rather than
+//! what the prompt is worth once it does.)
 //!
-//! The first of those is not an edge case here, which is why it is at the top
+//! The ceiling there is `MAX_ARG_STRLEN`, which is the limit on *one* argument
+//! and so the one a prompt meets first: on Linux `32 * PAGE_SIZE`, a fixed
+//! 131 072 bytes decided at compile time, which the environment the process
+//! carries does not eat into. (`ARG_MAX` bounds the whole argument and
+//! environment block and is the much larger number; it is not what a single
+//! prompt runs into.) abeam does not enforce it, deliberately, and the reason
+//! is about the number rather than about the principle. That constant is
+//! *Linux's* — the other Unixes settle a per-argument limit differently — so a
+//! figure checked here would be exact on one kernel and a guess everywhere
+//! else. And 128 KiB is not a size anybody types: it is tens of thousands of
+//! words, where `cmd.exe`'s 8124 characters below is crossed by a perfectly
+//! ordinary 10 KB paste. A check that can never fire for a real user, at the
+//! cost of being wrong on somebody else's kernel, is not worth writing. A
+//! prompt that genuinely is too long fails at the spawn with `E2BIG`, and
+//! [`run`] gives that its own sentence, naming the prompt and its length — late,
+//! but about the right thing. **Nothing below should grow a Unix length check to
+//! match the paragraph after it.**
+//!
+//! **On Windows an npm install is `claude.cmd`**, which `CreateProcessW` cannot
+//! run at all, so `crate::launch` starts it through `cmd.exe` — and `cmd.exe`
+//! has limits that are its own and not abeam's. **A prompt containing a newline
+//! cannot be put on such a command line in any form**: a newline ends the
+//! command outright and a carriage return truncates it, and there is no escape
+//! for either. A prompt beyond roughly eight kilobytes is longer than `cmd`
+//! will run. A native install is `claude.exe`, which abeam starts directly, and
+//! none of it applies to that.
+//!
+//! The first of those is not an edge case there, which is why it is at the top
 //! of the file rather than buried next to the code. `panes::queue` turns a
 //! pasted block into a single item, so a multi-line prompt is the *ordinary*
-//! shape of a queued task — meaning that on an npm install this refusal is
-//! something a user meets on their first real dispatch. It is a refusal and
-//! never a truncation: a command line quietly cut in half is indistinguishable,
-//! from outside, from an argument injection that worked. The message names the
-//! way through, and it is a good one — the same item can still be *sent* to the
-//! session in the left pane, because that mode is typed at the agent rather
-//! than quoted for a command processor.
+//! shape of a queued task — meaning that on a Windows npm install this refusal
+//! is something a user meets on their first real dispatch, and that the same
+//! paste on Linux is simply dispatched. It is a refusal and never a truncation:
+//! a command line quietly cut in half is indistinguishable, from outside, from
+//! an argument injection that worked. The message names the way through, and it
+//! is a good one — the same item can still be *sent* to the session in the left
+//! pane, because that mode is typed at the agent rather than quoted for a
+//! command processor.
 //!
 //! ### The route out of this, not taken yet
 //!
@@ -80,7 +121,8 @@
 //! that is what `--print`'s own help means by "useful for pipes" — and a prompt
 //! arriving that way is bytes on a pipe rather than text on a command line,
 //! which dismisses both limits above at once, newline and length together. It
-//! is the obvious next move for anyone who finds the npm route in their way.
+//! is the obvious next move for anyone who finds the Windows npm route in their
+//! way.
 //!
 //! It is not taken here because of one unanswered question: `--bg` returns
 //! immediately by design, and whether it drains standard input *before* it
@@ -205,7 +247,7 @@ impl Dispatcher {
     /// returns immediately by design, so the wait is short, but it is still a
     /// wait: call it from a worker thread, never from `Pane::tick`.
     pub fn dispatch(&self, prompt: &str) -> Result<Started> {
-        run(&plan(&self.launch, prompt)?, &self.root)
+        run(&plan(&self.launch, prompt)?, &self.root, prompt)
     }
 
     /// The arguments `dispatch` will use, without running anything. Split out
@@ -278,14 +320,22 @@ pub struct Started {
 /// what has to be in its environment for those arguments to arrive.
 ///
 /// A free function over the [`Launch`] rather than a method, so that a test can
-/// hand it each of the two shapes below without a Claude on the machine and —
-/// much more to the point — without starting one.
+/// hand it each of the shapes below without a Claude on the machine and — much
+/// more to the point — without starting one.
 ///
-/// The two shapes are not two spellings of the same thing.
+/// **On Unix there is one shape.** `crate::launch` hands back a program that is
+/// its own target, always, because a `#!` script is `execve`-able and nothing is
+/// ever routed through a shell. The whole of this function there is the
+/// direct arm: [`Dispatcher::args`] is what the process is given, and the only
+/// refusals it can produce are the two that are facts about prompts rather than
+/// about command processors — an empty one, and one carrying a NUL.
+///
+/// **On Windows there are two, and they are not two spellings of the same
+/// thing.**
 ///
 /// A native install is `claude.exe`, and its arguments are a list: the `Launch`
 /// [`Dispatcher::new`] resolved carries none, so [`Dispatcher::args`] is the
-/// whole of what the process is given.
+/// whole of what the process is given. That is the same arm Unix takes.
 ///
 /// An npm install is `claude.cmd`, which `CreateProcessW` cannot start at all,
 /// so `crate::launch` names `cmd.exe` in front of it and puts the command line
@@ -301,38 +351,75 @@ pub struct Started {
 /// **rebuilt**: the script is resolved a second time with the whole argument
 /// list, by the module that owns that quoting and has the tests for it.
 ///
-/// Which is why the npm route has limits the native one does not, and they are
+/// Which is why that route has limits the direct one does not, and they are
 /// `cmd.exe`'s rather than abeam's: a prompt containing a newline cannot be put
 /// on a command line at all, and one over about eight kilobytes is longer than
 /// `cmd` will run. Both come back as sentences from `crate::launch`, and both
-/// are refusals rather than mangled commands.
+/// are refusals rather than mangled commands. Both are also, for the same
+/// reason, absent from a Linux build of this function — see the module docs
+/// before adding either back in the name of consistency.
 fn plan(launch: &Launch, prompt: &str) -> Result<Launch> {
     if is_blank(prompt) {
         return Err(nothing());
     }
+    // Before the split, because it is the one refusal that belongs to both
+    // arms and to both platforms: an argument ends at its first NUL wherever
+    // it is going. On the routed arm below `crate::launch` would refuse it a
+    // second time and say so about `cmd.exe`, which on a machine that has one
+    // is true and beside the point — the prompt was unsendable before the
+    // question of which install came up.
+    if prompt.contains('\0') {
+        return Err(nul());
+    }
     let tail = Dispatcher::args(prompt);
 
-    // An `.exe` is its own target — the one fact that tells the two shapes
-    // apart without asking what the file is called.
-    if launch.program == launch.target {
-        return Ok(Launch {
-            program: launch.program.clone(),
-            target: launch.target.clone(),
-            args: tail,
-            // Nothing to carry: an executable's arguments travel as arguments.
-            env: Vec::new(),
+    // A program that is its own target was started directly — the one fact
+    // that tells the shapes apart without asking what the file is called.
+    //
+    // Windows-only, and gated rather than left to be always-false, because on
+    // Unix `crate::launch` cannot produce anything else: there is no such thing
+    // there as a file the kernel will not execute but a shell would, so nothing
+    // is ever routed and `program` is always `target`. Left ungated, the arm
+    // below would be unreachable code carrying an error message naming
+    // `cmd.exe` at a reader who has none — which is the single worst thing an
+    // error message can do.
+    //
+    // The same fact, asserted rather than branched on, because gating the arm
+    // away also gated away the only code that would have noticed it being
+    // false. `Launch`'s fields are `pub`, so "program is its own target" is a
+    // property of `launch::unix::into_launch` alone; a `Launch` built anywhere
+    // else with the two differing would fall through to the direct arm below
+    // and have its `args` and `env` silently discarded — which reaches a user
+    // as a dispatch that ran the wrong program with none of its arguments.
+    // Debug only, so a release build never turns a strange `Launch` into a
+    // panic in front of somebody's queue; what this is for is the test run.
+    #[cfg(unix)]
+    debug_assert_eq!(
+        launch.program, launch.target,
+        "on Unix a program is always its own target, and `plan` discards the \
+         args and env of any launch where it is not"
+    );
+
+    #[cfg(windows)]
+    if launch.program != launch.target {
+        return launch::resolve(&launch.target.to_string_lossy(), &tail).map_err(|why| {
+            anyhow!(
+                "abeam could not start a background agent through `{}`, which is \
+                 a script and has to be run by cmd.exe: {why} The same item can \
+                 still be sent to the session in the left pane — that mode is \
+                 typed at the agent rather than quoted for a command processor, \
+                 so none of this applies to it.",
+                launch.target.display()
+            )
         });
     }
 
-    launch::resolve(&launch.target.to_string_lossy(), &tail).map_err(|why| {
-        anyhow!(
-            "abeam could not start a background agent through `{}`, which is a \
-             script and has to be run by cmd.exe: {why} The same item can still \
-             be sent to the session in the left pane — that mode is typed at \
-             the agent rather than quoted for a command processor, so none of \
-             this applies to it.",
-            launch.target.display()
-        )
+    Ok(Launch {
+        program: launch.program.clone(),
+        target: launch.target.clone(),
+        args: tail,
+        // Nothing to carry: an executable's arguments travel as arguments.
+        env: Vec::new(),
     })
 }
 
@@ -342,9 +429,17 @@ fn plan(launch: &Launch, prompt: &str) -> Result<Launch> {
 /// one fact about this module that cannot be established by comparing strings —
 /// that a prompt with a space and an `&` in it reaches the program as a single
 /// argument — and the only honest way to establish it is to run something and
-/// ask. The test that does points this at a `.cmd` which prints its arguments
-/// back. Nothing in the suite ever points it at a Claude.
-fn run(plan: &Launch, root: &Path) -> Result<Started> {
+/// ask. The tests that do point this at a shim which prints its arguments back:
+/// a `.cmd` on Windows, a `#!/bin/sh` script on Unix. Nothing in the suite ever
+/// points it at a Claude.
+///
+/// `prompt` is handed over a second time although it is already inside the plan,
+/// because only the caller knows which argument it is: on the direct arm it is
+/// the last one, and on the routed Windows arm it is not in `args` at all. It is
+/// used for one thing — [`too_long`], which has to name a length — and taking it
+/// as a parameter is what stops that sentence from being built by guessing which
+/// element of a vector the user wrote.
+fn run(plan: &Launch, root: &Path, prompt: &str) -> Result<Started> {
     let mut command = Command::new(&plan.program);
     command
         .args(&plan.args)
@@ -357,13 +452,100 @@ fn run(plan: &Launch, root: &Path) -> Result<Started> {
         // take those keystrokes, which is the one thing a task started
         // *in the background* must not do.
         .stdin(Stdio::null());
+
+    // A session of its own, and the *opposite* of what the hosted pane wants.
+    //
+    // `abeam_pty` puts the session in the left pane on a leash on purpose: a
+    // job object on Windows, a process group it signals on Unix, so that the
+    // agent abeam is hosting dies with abeam rather than being orphaned into
+    // somebody's terminal. A dispatched task is the other thing entirely — it
+    // was started *to outlive the keystroke that started it*, and `--bg`
+    // returns before it has done any work at all.
+    //
+    // Without this it inherits abeam's process group and abeam's controlling
+    // terminal, which puts it in the path of signals aimed at the job the user
+    // started rather than at it. Two of those are live. A `kill %1` from the
+    // shell abeam was launched from goes to the whole group rather than to one
+    // process, and a terminal that goes away — a closed window, a dropped ssh —
+    // hangs up the session: the kernel signals the foreground group, and the
+    // shell then `SIGHUP`s every job it started, abeam's group among them. A
+    // task in a group of its own is not one of those jobs.
+    //
+    // The third, a Ctrl+C at the keyboard, is the one that reads well and is
+    // inert, which is worth writing down so that nobody restores it as a
+    // reason: crossterm's raw mode clears `ISIG` on abeam's controlling
+    // terminal, so Ctrl+C arrives as the byte 0x03 in abeam's own key events
+    // and generates no `SIGINT` at all. It is a real hazard only in the sliver
+    // between abeam putting the terminal back into cooked mode and the process
+    // exiting.
+    //
+    // `setsid` rather than `process_group(0)`, which is the same claim with the
+    // important half missing and is what this did first. `process_group(0)`
+    // leaves the child in abeam's *session*, holding abeam's controlling
+    // terminal, as a group that is by definition not the foreground one — and a
+    // background process group that reads from its controlling terminal takes
+    // `SIGTTIN`, whose default action is to stop the process. So a child that
+    // opens `/dev/tty` and reads (a credential prompt, a spinner asking the
+    // terminal a question) is not killed and is not reported: it stops, its
+    // pipes never close, `Command::output` below goes on waiting, and abeam's
+    // dispatch worker hangs with it. A new session has no controlling terminal
+    // at all, so `SIGTTIN` and `SIGTTOU` cannot arise and an open of `/dev/tty`
+    // fails immediately with `ENXIO` instead of stopping anything. It closes
+    // the two live hazards above and opens nothing in their place, which
+    // `process_group(0)` could not say.
+    //
+    // What it costs is `libc` and an `unsafe` block. `pre_exec` runs between
+    // `fork` and `exec` in the child of a process that has other threads, so
+    // only async-signal-safe calls belong in it; `setsid` is one, and it is the
+    // whole of the closure — nothing there allocates, formats or takes a lock
+    // the fork did not copy.
+    //
+    // Windows is not the same and no longer claims to be. A
+    // `std::process::Command` child inherits abeam's console, and a console
+    // *does* have process groups; raw mode there clears
+    // `ENABLE_PROCESSED_INPUT`, which suppresses `CTRL_C_EVENT` and nothing
+    // else. So closing the terminal window still delivers `CTRL_CLOSE_EVENT`
+    // (and a logoff `CTRL_LOGOFF_EVENT`) to a dispatched task and kills it
+    // after the usual grace period, while the same dispatch on Linux now
+    // survives. The counterpart would be a `creation_flags` of
+    // `DETACHED_PROCESS` — a child with no console rather than a child in a new
+    // group, since a console control event reaches every process attached to
+    // the console whatever group it is in — and that is a feature with its own
+    // questions rather than a line to add here. Until somebody answers them the
+    // two platforms genuinely differ, and that is a known gap rather than
+    // something nobody has looked at.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure is what the child runs between `fork` and `exec`,
+        // so it may call only async-signal-safe functions. `setsid` is one;
+        // reading `errno` back through `last_os_error` allocates nothing.
+        //
+        // The failure is returned rather than swallowed, and it is unreachable
+        // rather than merely unlikely: `setsid` fails only for a process that
+        // is already a group leader, and a freshly forked child cannot be one
+        // because the kernel will not hand out a pid that is still in use as a
+        // process-group id. Carrying on would mean a child left in abeam's
+        // session — exactly what this closure exists to prevent — reported as a
+        // success.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     for (key, value) in &plan.env {
         command.env(key, value);
     }
 
-    let out = command
-        .output()
-        .map_err(|e| anyhow!("abeam could not start `{}`: {e}", plan.program.display()))?;
+    let out = command.output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::ArgumentListTooLong => too_long(prompt),
+        _ => anyhow!("abeam could not start `{}`: {e}", plan.program.display()),
+    })?;
 
     let started = parse_started(&String::from_utf8_lossy(&out.stdout));
 
@@ -413,6 +595,67 @@ fn nothing() -> anyhow::Error {
          to make sense of a blank one — so this would be an agent with nothing \
          to do and permission to edit the repository while it worked out what \
          that meant."
+    )
+}
+
+/// Why a NUL is refused on every platform, unlike everything else in
+/// [`plan`]'s way.
+///
+/// The newline, the carriage return and the eight-kilobyte ceiling are all
+/// `cmd.exe`'s, and a Linux build does not have them. This one is nobody's
+/// choice. A prompt reaches a dispatched agent as an argument, and an argument
+/// is a NUL-terminated string on both platforms — `execve` takes an array of
+/// them, `CreateProcessW` takes one command line that is one of them — so a NUL
+/// does not truncate the prompt so much as *define its end*, with no way to
+/// say that more follows.
+///
+/// Refused here rather than left to the spawn, which would report it as
+/// `nul byte found in provided data` out of the middle of `std`: a sentence
+/// about a Rust string, naming neither the queue item nor the fact that the
+/// prompt is what was wrong with it.
+fn nul() -> anyhow::Error {
+    anyhow!(
+        "this queue item contains a NUL byte, and a prompt reaches a background \
+         agent as an argument: an argument ends at its first NUL, so there is \
+         no way to hand over what comes after it. That is the operating \
+         system's rule rather than abeam's, and it is the one refusal here that \
+         no install and no platform lifts. A NUL in a queued task is almost \
+         always a file that has been pasted in as though it were text. The same \
+         item can still be sent to the session in the left pane — that mode \
+         writes the bytes at the pty rather than making an argument out of \
+         them, so none of this applies to it."
+    )
+}
+
+/// Why an over-long prompt is the prompt's sentence rather than the program's.
+///
+/// The only route to this is `E2BIG` at the spawn, and what `std` hands back for
+/// it is `ArgumentListTooLong`. Left to the general spawn-failure sentence it
+/// would reach the queue as ``abeam could not start `/home/x/.local/bin/claude`:
+/// Argument list too long (os error 7)``, which sends a reader to check an
+/// install that is fine — the program was found, it is startable, and the thing
+/// that was too big is the item they queued.
+///
+/// So it names the prompt, its length, and whose limit it is, to the standard
+/// `crate::launch`'s `cmd.exe` ceiling is held to. What it deliberately does not
+/// name is a number to aim under: the per-argument cap is `MAX_ARG_STRLEN`, and
+/// 128 KiB is Linux's constant rather than every Unix's — see the module docs
+/// for why abeam checks nothing here.
+///
+/// Not gated to Unix, unlike the routed arm of [`plan`]. This is a match on an
+/// error kind `std` defines everywhere rather than dead code, and Windows simply
+/// never produces it: `cmd.exe`'s own ceiling is refused with a sentence long
+/// before a spawn, and a native `claude.exe` has a limit four times larger.
+fn too_long(prompt: &str) -> anyhow::Error {
+    anyhow!(
+        "this queue item is {} bytes long and the kernel refused to carry it: a \
+         prompt reaches a background agent as a single argument, and every Unix \
+         caps how long one argument may be — 128 KiB on Linux, and less on some \
+         others. That is the operating system's limit rather than abeam's, and \
+         it belongs to every program on the machine rather than to the Claude \
+         that was found and started. Shorten the item, or put the long part in a \
+         file and ask for the file by name.",
+        prompt.len()
     )
 }
 
@@ -509,19 +752,34 @@ fn is_short(token: &str) -> bool {
     token.len() == 8 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Windows-only like the rest of the suite: what [`Dispatcher::new`] does is a
-/// `PATH` walk with `PATHEXT` in it, and what [`plan`] does with a script is
-/// build a command line for `cmd.exe`.
+/// This module used to be Windows-only in its entirety, and most of it never
+/// needed to be: what [`Dispatcher::args`], [`parse_started`], [`is_blank`] and
+/// the refusal sentences do is the same arithmetic on any machine. Three groups
+/// live here now.
+///
+/// - **Shared**, under a plain `#[cfg(test)]`: everything that is a claim about
+///   a `Vec<String>` or a sentence.
+/// - **Twinned**, one arm each: the spawning tests, where the shim is a `.cmd`
+///   reached through `cmd.exe` on Windows and a `#!/bin/sh` script the kernel
+///   executes on Unix, and the fabricated paths, which have to be paths the
+///   platform could really have produced.
+/// - **Windows-only for good**: the `%ABEAM_LAUNCH%` command-line rebuild and
+///   the `cmd.exe` length ceiling, joined by the newline and carriage-return
+///   refusals, because all four are facts about a command processor rather than
+///   about abeam. Their Unix counterpart is
+///   `a_multi_line_prompt_survives_because_execve_has_no_opinion_about_bytes`,
+///   which asserts the opposite and is the only proof that removing those
+///   refusals from a Linux build was a fix rather than a deletion.
 ///
 /// **Nothing here starts a background agent**, and that is a rule rather than
 /// an observation about what these happen to do. `claude -p --bg` would put a
 /// real unattended Claude into a real repository with edits pre-approved, and a
 /// test suite is not a thing anybody is watching. So [`Dispatcher::dispatch`]
 /// is never called: what it would work out is [`plan`], which is pure, and what
-/// would run that is [`run`], which is pointed at a `.cmd` that prints its
-/// arguments back. The only programs these tests start are that shim and the
-/// `cmd.exe` it goes through.
-#[cfg(all(test, windows))]
+/// would run that is [`run`], which is pointed at a shim that prints its
+/// arguments back. The only programs these tests start are that shim and, on
+/// Windows, the `cmd.exe` it goes through.
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
@@ -530,11 +788,20 @@ mod tests {
         list.iter().copied().map(String::from).collect()
     }
 
-    /// The `Launch` a native install produces: an `.exe` that is its own
+    /// The `Launch` a direct install produces: a program that is its own
     /// target, resolved with no arguments. Fabricated rather than found, so
-    /// that what is under test is the argument list rather than the machine.
+    /// that what is under test is the argument list rather than the machine —
+    /// and fabricated per platform, because a path that could not exist is a
+    /// fixture that quietly stops standing for anything.
+    ///
+    /// On Windows this is one of the two installs and the other is the npm
+    /// `.cmd`. On Unix it is all of them: `crate::launch` never routes
+    /// anything, so every `Launch` it produces has this shape.
     fn native() -> Launch {
+        #[cfg(windows)]
         let exe = PathBuf::from(r"C:\Users\someone\.local\bin\claude.exe");
+        #[cfg(unix)]
+        let exe = PathBuf::from("/home/someone/.local/bin/claude");
         Launch {
             program: exe.clone(),
             target: exe,
@@ -542,6 +809,14 @@ mod tests {
             env: Vec::new(),
         }
     }
+
+    /// A program abeam could plausibly be hosting that is not an agent at all,
+    /// named the way the platform's users would name one. `abeam bash` has a
+    /// queue too, and one of its two modes is not available to it.
+    #[cfg(windows)]
+    const NOT_AN_AGENT: &str = "powershell";
+    #[cfg(unix)]
+    const NOT_AN_AGENT: &str = "bash";
 
     // --- what authority is handed over ------------------------------------
 
@@ -711,18 +986,25 @@ mod tests {
         }
 
         // Anything abeam is hosting that is not an agent at all goes the same
-        // way: `abeam powershell` has a queue too, and one of its two modes is
-        // not available to it.
+        // way, and it never reaches the machine to find out: `agent::find` has
+        // already said this is not Claude, so no `PATH` is walked and the
+        // answer is the same whether or not the named shell is installed.
         let Unavailable(why) =
-            Dispatcher::new(root, "powershell").expect_err("a shell has no `--bg`");
-        assert!(why.contains("powershell"), "got: {why}");
+            Dispatcher::new(root, NOT_AN_AGENT).expect_err("a shell has no `--bg`");
+        assert!(why.contains(NOT_AN_AGENT), "got: {why}");
     }
 
     #[test]
-    fn the_hosted_agents_name_is_read_the_way_every_other_name_on_this_platform_is() {
-        // Case-insensitively, like `crate::agent::find`, like `PATH`, like file
-        // names. `abeam Claude` hosting Claude while its queue said dispatch
-        // was unavailable would be a distinction with no visible cause.
+    fn the_hosted_agents_name_is_read_the_same_way_wherever_it_was_typed() {
+        // Case-insensitively, like `crate::agent::find`. `abeam Claude` hosting
+        // Claude while its queue said dispatch was unavailable would be a
+        // distinction with no visible cause.
+        //
+        // A decision rather than an inheritance, and the difference shows on
+        // Unix. On Windows this matches how `PATH` and file names are read
+        // anyway; on Linux it does not, and it is still right — the name here
+        // is the word the user typed to say which agent they wanted, not a file
+        // name being looked up, and `Claude` and `claude` are one word.
         //
         // Whether it then *resolves* is a fact about the machine rather than a
         // decision — Claude is installed where this was written and may not be
@@ -778,14 +1060,23 @@ mod tests {
         );
     }
 
-    // --- the two installs --------------------------------------------------
+    // --- the installs ------------------------------------------------------
+    //
+    // Two on Windows, one on Unix. The first test below is the shape both
+    // platforms have; everything after it until the spawning section is the
+    // second Windows shape, and is gated because there is nothing on Unix for
+    // it to be about — `crate::launch` there never names an interpreter in
+    // front of anything, so no `Launch` it produces can reach that arm.
 
     #[test]
-    fn a_native_claude_is_started_directly_with_abeams_tail_and_nothing_else() {
+    fn a_direct_claude_is_started_with_abeams_tail_and_nothing_else() {
         let planned = plan(&native(), "do the thing").expect("a prompt that says something");
 
         assert_eq!(planned.program, native().program);
-        assert_eq!(planned.target, planned.program, "an .exe is its own target");
+        assert_eq!(
+            planned.target, planned.program,
+            "a program started directly is its own target"
+        );
         assert_eq!(planned.args, Dispatcher::args("do the thing"));
         assert!(
             planned.env.is_empty(),
@@ -793,6 +1084,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_npm_claude_has_its_command_line_rebuilt_rather_than_appended_to() {
         // The `Launch` for a `.cmd` is complete rather than a prefix: its
@@ -840,6 +1132,7 @@ mod tests {
         assert_eq!(line.matches("--bg").count(), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_prompt_a_command_processor_cannot_carry_is_refused_with_the_reason() {
         // The npm route's limits, which are `cmd.exe`'s and not abeam's: a
@@ -848,6 +1141,14 @@ mod tests {
         // through a `.cmd` at all. It is a sentence rather than a truncated
         // command, because a command line silently cut in half is
         // indistinguishable from an injection that worked.
+        //
+        // Windows-only, and it is the *test* that is platform-specific rather
+        // than the coverage: what it pins is a property of `cmd.exe`, which is
+        // not a program a Linux build can be wrong about. Its opposite number
+        // is `a_multi_line_prompt_survives_because_execve_has_no_opinion_about_
+        // bytes` below, and between them they say that the refusal is a fact
+        // about the route rather than a rule abeam has about prompts. Delete
+        // either and the pair stops saying anything.
         let dir = TempDir::new("dispatch-npm-limits");
         let script = dir.write("abeam-claude.cmd", b"@echo off\r\n");
         let resolved = launch::resolve(&script.to_string_lossy(), &[]).expect("a .cmd is routed");
@@ -855,7 +1156,6 @@ mod tests {
         for (bad, reason) in [
             ("first line\nsecond line", "newline"),
             ("first line\rsecond line", "carriage return"),
-            ("a\0b", "NUL"),
         ] {
             let refused = plan(&resolved, bad).expect_err("cmd.exe cannot carry this");
             let said = refused.to_string();
@@ -866,7 +1166,7 @@ mod tests {
             assert!(said.contains("left pane"), "got: {said}");
         }
 
-        // The ceiling, which is the worst-shaped of the four because it has no
+        // The ceiling, which is the worst-shaped of the three because it has no
         // symptom of its own. Past what `cmd` will run it starts nothing,
         // prints nothing and exits 0 — so before `crate::launch` refused it,
         // an over-long prompt drew an empty pane and reported success. Ten
@@ -884,6 +1184,30 @@ mod tests {
             "the install that does not have it: {said}"
         );
 
+        // And the one refusal on this route that is *not* `cmd.exe`'s: a NUL is
+        // caught by `plan` before it looks at the install, so what comes back
+        // here is abeam's sentence about arguments rather than
+        // `crate::launch`'s about command processors. Asserted on the routed
+        // arm specifically, because the shared test asks the same question of
+        // the native fixture and nothing else covers this one — the ordering
+        // inside `plan` is the whole of what keeps the two apart, and it is one
+        // line that can be moved.
+        let said = plan(&resolved, "a\0b")
+            .expect_err("no argv carries a NUL")
+            .to_string();
+        assert!(said.contains("NUL"), "got: {said}");
+        assert!(
+            said.contains("operating system's rule rather than abeam's"),
+            "the early check did not win on the routed arm: {said}"
+        );
+        assert!(
+            !said.contains("cmd.exe"),
+            "a NUL was reported as a fact about a command processor: {said}"
+        );
+        // The way out survives being said early. It is a real one: Send mode
+        // writes bytes at the pty rather than building an argument out of them.
+        assert!(said.contains("left pane"), "got: {said}");
+
         // The same prompts against a native install are ordinary arguments, and
         // the asymmetry is the point: this is a difference between the two
         // installs rather than a rule about prompts.
@@ -891,13 +1215,156 @@ mod tests {
         assert!(plan(&native(), &long).is_ok());
     }
 
+    #[test]
+    fn the_one_byte_no_argument_can_carry_is_refused_wherever_abeam_runs() {
+        // The refusal that is *not* `cmd.exe`'s, and the reason `plan` checks
+        // for it before it looks at the install at all. An argument is a
+        // NUL-terminated string on both platforms — `execve` takes an array of
+        // them, `CreateProcessW` takes one command line that is one of them —
+        // so a NUL does not truncate a prompt, it defines where the prompt
+        // ends, and there is no encoding for "more follows".
+        //
+        // Delete this and a queue item with a NUL in it reaches the spawn,
+        // where std refuses it as `nul byte found in provided data`: a sentence
+        // about a Rust string, in front of somebody looking at a queue.
+        for bad in ["a\0b", "\0", "trailing\0"] {
+            let refused = plan(&native(), bad).expect_err("no argv carries a NUL");
+            let said = refused.to_string();
+            assert!(said.contains("NUL"), "got: {said}");
+            // Whose rule it is, so that nobody goes looking for the abeam check
+            // that could be relaxed for them. There is not one.
+            assert!(
+                said.contains("operating system's rule rather than abeam's"),
+                "got: {said}"
+            );
+            // And the way out, which every other refusal in this module names
+            // and this one lost when it moved: the same item can still be sent
+            // to the pane on the left, where it is bytes at a pty rather than
+            // an argument.
+            assert!(said.contains("left pane"), "got: {said}");
+        }
+
+        // And a NUL is not merely whitespace to be trimmed: `is_blank` runs
+        // first, so a prompt that is *only* a NUL has to reach this refusal
+        // rather than the empty-item one, or the message would be about a
+        // composer somebody opened and thought better of.
+        assert!(
+            plan(&native(), "\0")
+                .expect_err("a NUL is not an empty prompt")
+                .to_string()
+                .contains("NUL")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_multi_line_prompt_survives_because_execve_has_no_opinion_about_bytes() {
+        // The test that proves the Windows-only gating above was a fix and not
+        // a deletion, and the one that would catch somebody restoring symmetry
+        // by putting a newline check back.
+        //
+        // `panes::queue` turns a pasted block into a single item, so a
+        // multi-line prompt is the *ordinary* shape of a queued task. On a
+        // Windows npm install it cannot be dispatched at all, because a newline
+        // ends `cmd`'s command line. `execve` has no line to end: an argument
+        // is a byte string terminated by a NUL and by nothing else, so a
+        // newline and a carriage return are bytes like any other.
+        //
+        // Asked of a real process rather than of `plan`, because `plan`
+        // returning `Ok` proves only that abeam did not refuse it — what is
+        // claimed is that the bytes reach the program, which only the program
+        // can answer.
+        let dir = TempDir::new("dispatch-multiline");
+        let script = shim(&dir, "claude", REPORTS);
+
+        let prompt = "first line\nsecond line\rthird";
+        let started = through(&script, prompt).expect("the shim runs");
+        assert!(
+            started.raw.contains(&format!("PROMPT [{prompt}]")),
+            "a multi-line prompt did not arrive intact:\n{}",
+            started.raw
+        );
+
+        // And no eight-kilobyte ceiling, because that number is `cmd.exe`'s
+        // too. What caps one argument here is `MAX_ARG_STRLEN` — 128 KiB on
+        // Linux — and abeam does not enforce it; see the module docs for why a
+        // check that could never fire is worth less than the sentence `run`
+        // builds if it ever does. Ten kilobytes is the size the Windows test
+        // uses to cross that ceiling; here it is a sixteenth of the way to one.
+        let long = "a".repeat(10_000);
+        let started = through(&script, &long).expect("the shim runs");
+        assert!(
+            started.raw.contains(&format!("PROMPT [{long}]")),
+            "a 10 KB prompt was truncated somewhere:\n{}",
+            started.raw.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_past_what_one_argument_holds_is_the_prompts_sentence_not_the_programs() {
+        // The far end of the same paragraph, and the reason `run` matches on
+        // the error kind instead of printing whatever `std` handed it. Two
+        // megabytes is past `MAX_ARG_STRLEN` on Linux and past `ARG_MAX` on the
+        // Unixes that cap the block rather than the argument, so the spawn
+        // fails with `E2BIG` wherever this runs — which is also the only way to
+        // reach this message, there being no abeam-side length check to
+        // provoke.
+        //
+        // Delete this and an over-long queue item goes back to reporting itself
+        // as ``abeam could not start `/home/x/.local/bin/claude`: Argument list
+        // too long (os error 7)``, which sends a reader to check an install
+        // that was found, is startable, and is the one thing here that is fine.
+        let dir = TempDir::new("dispatch-e2big");
+        let script = shim(&dir, "claude", REPORTS);
+
+        let long = "a".repeat(2 * 1024 * 1024);
+        let why = through(&script, &long)
+            .expect_err("no argument is two megabytes long")
+            .to_string();
+
+        // The prompt named as the cause, its length, and whose limit it is —
+        // the standard the `cmd.exe` ceiling is held to on the other platform.
+        assert!(why.contains("queue item"), "what was too big: {why}");
+        assert!(
+            why.contains(&long.len().to_string()),
+            "how big it was: {why}"
+        );
+        assert!(
+            why.contains("operating system's limit rather than abeam's"),
+            "whose limit it is: {why}"
+        );
+        assert!(
+            !why.contains("could not start"),
+            "an over-long prompt was reported as a broken install: {why}"
+        );
+    }
+
     // --- and it actually starts -------------------------------------------
     //
     // Everything above this line is a claim about a `Vec<String>`, where
     // `len() == 6` is true by construction. What is actually claimed is a fact
     // about what a *process* receives, and only a process can answer that — so
-    // below this line `cmd.exe` is asked, on the route where the answer can go
-    // wrong. The hardest inputs belong down here rather than up there.
+    // below this line one is asked: `cmd.exe` on Windows, on the route where
+    // the answer can go wrong, and `execve` on Unix, where the claim is that
+    // there is no route to go wrong on. The hardest inputs belong down here
+    // rather than up there.
+
+    /// The line a shim prints to name what it started, in the quoting its own
+    /// interpreter needs. `(` and `)` are ordinary text to `cmd` and are a
+    /// subshell to `sh`, so the Unix spelling is quoted or the script does not
+    /// parse at all — which would reach the test as "the shim printed nothing"
+    /// and send a reader looking at `run` instead of at this line.
+    ///
+    /// Shared by [`REPORTS`] and by the shim that fails *after* naming a
+    /// session, so the id and the UUID those two tests look for are written
+    /// once.
+    #[cfg(windows)]
+    const NAMES_A_SESSION: &str =
+        "echo Started agent a1b2c3d4 (550e8400-e29b-41d4-a716-446655440000)";
+    #[cfg(unix)]
+    const NAMES_A_SESSION: &str =
+        "echo \"Started agent a1b2c3d4 (550e8400-e29b-41d4-a716-446655440000)\"";
 
     /// What a shim standing in for Claude prints: an id back the way one would,
     /// then its whole argument list, then its fifth and sixth arguments on
@@ -907,17 +1374,114 @@ mod tests {
     /// The id line is first deliberately. `parse_started` takes the first thing
     /// of each shape it finds, and a temp directory's own path could contain
     /// eight hex characters on somebody's machine and not on mine.
+    ///
+    /// Two spellings of the same five lines. `%*` and `$*` both mean "the
+    /// arguments", but they are showing different things: `%*` is the command
+    /// line `cmd` was handed, so what comes back on Windows is abeam's quoting
+    /// as `cmd` received it, while `"$*"` is the argv the kernel delivered, so
+    /// what comes back on Unix is the prompt byte for byte. That difference is
+    /// the whole reason the expectations below are per platform too.
+    #[cfg(windows)]
     const REPORTS: &[&str] = &[
-        "echo Started agent a1b2c3d4 (550e8400-e29b-41d4-a716-446655440000)",
+        NAMES_A_SESSION,
         "echo ALL [%*]",
         "echo FENCE [%5]",
         "echo PROMPT [%6]",
         "echo CWD [%CD%]",
     ];
+    #[cfg(unix)]
+    const REPORTS: &[&str] = &[
+        NAMES_A_SESSION,
+        "echo \"ALL [$*]\"",
+        "echo \"FENCE [$5]\"",
+        "echo \"PROMPT [$6]\"",
+        // `$(pwd)` rather than `$PWD`, which is inherited from whatever started
+        // the test binary and is only re-derived by the shell when it notices
+        // the mismatch. What is being checked is where the *process* stands.
+        "echo \"CWD [$(pwd)]\"",
+    ];
 
-    /// A `.cmd` that does what it is told, in a directory with a space in its
-    /// name — a hazard every one of these has to survive rather than one of
-    /// them.
+    /// The prompts the spawning test sends, and the exact text the shim prints
+    /// back for each — which is not the same string on the two platforms, and
+    /// the difference is the point rather than an inconvenience.
+    ///
+    /// On Windows the prompt goes onto a command line `cmd.exe` re-parses, so
+    /// every character below is one that would end abeam's command, expand into
+    /// something else, or desync `cmd`'s quote tracking if `crate::launch` were
+    /// any less careful; what arrives back is quoted, because that quoting is
+    /// what makes it one argument.
+    ///
+    /// On Unix there is no command line and no parser: `execve` copies argv as
+    /// it stands. So the hazards are different characters — `$` and a backtick
+    /// are a *shell's* syntax, and the shim below is a shell, which is exactly
+    /// why they are worth sending: they prove that the prompt never passed
+    /// through one on the way in. What arrives back is the prompt unchanged,
+    /// and if any of these ever comes back expanded then something has started
+    /// putting prompts through `sh -c`.
+    #[cfg(windows)]
+    const PROMPTS: &[(&str, &str)] = &[
+        // `&` ends a command line and starts another; `%VAR%` expands into one.
+        (
+            "fix a & b in %APPDATA% now",
+            "\"fix a & b in %APPDATA% now\"",
+        ),
+        // The one that matters most, and the one this test went without while
+        // it looked complete without it. A double quote is the character most
+        // likely to desync `cmd`'s quote tracking, and getting it wrong does
+        // not merely mangle an argument — it puts the `&` that follows back
+        // outside a quoted region, where it separates commands again. `""` is
+        // the one spelling both `cmd` and every CRT since Visual C++ 2008 read
+        // as an embedded quote; `\"`, which MSVCRT quoting would produce, is
+        // read by `cmd` as neither. See `crate::launch`.
+        ("say \"hi\" & run --now", "\"say \"\"hi\"\" & run --now\""),
+        // Not quoted at all, because nothing in it needs quoting — and still an
+        // argument rather than a flag, purely because of where the fence put
+        // it. This is the live version of the assertion that
+        // `a_prompt_that_looks_like_a_flag_is_text_and_cannot_become_one` can
+        // only make against a vector.
+        (
+            "--dangerously-skip-permissions",
+            "--dangerously-skip-permissions",
+        ),
+    ];
+    #[cfg(unix)]
+    const PROMPTS: &[(&str, &str)] = &[
+        // `&` backgrounds a command and `;` ends one; `$HOME` and `` `id` ``
+        // are the two substitutions a shell performs on an unquoted word. All
+        // four arrive as themselves, because nothing read them as anything.
+        (
+            "fix a & b in $HOME now; run `id`",
+            "fix a & b in $HOME now; run `id`",
+        ),
+        // A quote unbalances a shell word and a `*` is a glob that a shell
+        // would replace with the names of the files beside it — which, in a
+        // directory this test controls, is a substitution that would be visible
+        // rather than merely theoretical.
+        ("say \"hi\" && run --now *", "say \"hi\" && run --now *"),
+        // The live version of the assertion that
+        // `a_prompt_that_looks_like_a_flag_is_text_and_cannot_become_one` can
+        // only make against a vector: still an argument rather than a flag,
+        // purely because of where the fence put it.
+        (
+            "--dangerously-skip-permissions",
+            "--dangerously-skip-permissions",
+        ),
+    ];
+
+    /// A shim that does what it is told, in the shape the platform can start.
+    ///
+    /// On Windows that is a `.cmd`, in a directory with a space in its name — a
+    /// hazard every one of these has to survive rather than one of them,
+    /// because the path goes onto a command line as text.
+    ///
+    /// On Unix it is a `#!/bin/sh` script with the execute bit set, at the top
+    /// of the temporary directory. The space is dropped rather than forgotten:
+    /// there is no command line for a space to split, because the path reaches
+    /// `execve` as one argument whatever is in it, so a directory with a space
+    /// would be testing the same thing as a directory without one. What *is*
+    /// load-bearing here is the execute bit, which is why this goes through
+    /// `TempDir::write_exec` — a `#!` file without it is `EACCES` at spawn.
+    #[cfg(windows)]
     fn shim(dir: &TempDir, name: &str, lines: &[&str]) -> PathBuf {
         let home = dir.path().join("with space");
         std::fs::create_dir_all(&home).expect("a directory with a space in it");
@@ -932,21 +1496,91 @@ mod tests {
         std::fs::write(&script, text).expect("write a shim");
         script
     }
+    #[cfg(unix)]
+    fn shim(dir: &TempDir, name: &str, lines: &[&str]) -> PathBuf {
+        // `\n`, and `#!/bin/sh` rather than `#!/bin/bash`: what these shims do
+        // is `echo`, `read` and `exit`, and asking for bash would make the test
+        // depend on a shell some distributions do not install.
+        let mut text = String::from("#!/bin/sh\n");
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        dir.write_exec(&format!("abeam-{name}"), text.as_bytes())
+    }
 
-    /// Dispatch `prompt` through `script`, the whole way: resolve it as an npm
-    /// install would be resolved, plan it, and run it in its own directory.
+    /// The two lines a shim needs that are not an `echo`: complaining on
+    /// standard error, and leaving with a status. Spelled per platform because
+    /// `1>&2` and `exit /b` are `cmd`'s where `>&2` and `exit` are `sh`'s —
+    /// everything else these shims do, both read the same way.
+    #[cfg(windows)]
+    fn complain(what: &str) -> String {
+        format!("echo {what} 1>&2")
+    }
+    #[cfg(unix)]
+    fn complain(what: &str) -> String {
+        format!("echo {what} >&2")
+    }
+    #[cfg(windows)]
+    const FAILS: &str = "exit /b 1";
+    #[cfg(unix)]
+    const FAILS: &str = "exit 1";
+
+    /// The name the failing shim really has on disk, which is the name the
+    /// failure message has to carry.
+    ///
+    /// A `cfg`-selected expectation rather than the stem both platforms share:
+    /// asserting only `abeam-angry` would let the Windows message name a file
+    /// that does not exist — abeam ran `abeam-angry.cmd`, and a reader given the
+    /// wrong one goes looking for it with `dir` and does not find it.
+    #[cfg(windows)]
+    const ANGRY_FILE: &str = "abeam-angry.cmd";
+    #[cfg(unix)]
+    const ANGRY_FILE: &str = "abeam-angry";
+
+    /// The directory the shim will name, spelled the way the shim will spell
+    /// it.
+    ///
+    /// Not a tidy-up: `pwd` answers with the *physical* path, every symlink
+    /// resolved, and a temporary directory is reached through one on more
+    /// Unixes than not — `/var` is a symlink to `/private/var` on macOS, so
+    /// `std::env::temp_dir()` and `pwd` disagree about a directory they both
+    /// mean. Canonicalising the expectation is what makes the comparison about
+    /// where the process stood rather than about how it got there. On Windows
+    /// `canonicalize` answers with a `\\?\` verbatim prefix that `%CD%` never
+    /// prints, so there the path is taken as it stands.
+    #[cfg(windows)]
+    fn as_reported(dir: &Path) -> String {
+        dir.to_string_lossy().to_lowercase()
+    }
+    #[cfg(unix)]
+    fn as_reported(dir: &Path) -> String {
+        std::fs::canonicalize(dir)
+            .unwrap_or_else(|_| dir.to_path_buf())
+            .to_string_lossy()
+            .to_lowercase()
+    }
+
+    /// Dispatch `prompt` through `script`, the whole way: resolve it as an
+    /// installed agent would be resolved, plan it, and run it in its own
+    /// directory.
     fn through(script: &Path, prompt: &str) -> Result<Started> {
-        let resolved = launch::resolve(&script.to_string_lossy(), &[]).expect("a .cmd is routed");
+        let resolved = launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves");
         let planned = plan(&resolved, prompt).expect("a prompt that says something");
-        run(&planned, script.parent().expect("the shim has a directory"))
+        run(
+            &planned,
+            script.parent().expect("the shim has a directory"),
+            prompt,
+        )
     }
 
     #[test]
-    fn a_prompt_reaches_an_npm_shim_as_one_argument_with_its_syntax_intact() {
-        // The question the whole routed path exists to answer, asked of the
-        // only thing that can answer it: does a queued prompt arrive at the
-        // program as a single argument, and does it arrive where a parser reads
-        // it as text.
+    fn a_prompt_reaches_a_shim_as_one_argument_with_its_syntax_intact() {
+        // The question the spawning path exists to answer, asked of the only
+        // thing that can answer it: does a queued prompt arrive at the program
+        // as a single argument, and does it arrive where a parser reads it as
+        // text. On Windows that is a claim about `crate::launch`'s quoting; on
+        // Unix it is a claim that nothing quoted anything.
         //
         // The shim also prints an identifier back, so the last leg is covered
         // here too — standard output is captured and parsed rather than
@@ -958,35 +1592,10 @@ mod tests {
         let home = script.parent().expect("the shim has a directory");
 
         // Each of these is a prompt somebody could plausibly queue, and each
-        // carries the character that would break this if the command line were
-        // built by anything less careful than `crate::launch`.
-        for (prompt, arrives) in [
-            // `&` ends a command line and starts another; `%VAR%` expands into
-            // one.
-            (
-                "fix a & b in %APPDATA% now",
-                "\"fix a & b in %APPDATA% now\"",
-            ),
-            // The one that matters most, and the one this test went without
-            // while it looked complete without it. A double quote is the
-            // character most likely to desync
-            // `cmd`'s quote tracking, and getting it wrong does not merely
-            // mangle an argument — it puts the `&` that follows back outside a
-            // quoted region, where it separates commands again. `""` is the one
-            // spelling both `cmd` and every CRT since Visual C++ 2008 read as
-            // an embedded quote; `\"`, which MSVCRT quoting would produce, is
-            // read by `cmd` as neither. See `crate::launch`.
-            ("say \"hi\" & run --now", "\"say \"\"hi\"\" & run --now\""),
-            // Not quoted at all, because nothing in it needs quoting — and
-            // still an argument rather than a flag, purely because of where the
-            // fence put it. This is the live version of the assertion that
-            // `a_prompt_that_looks_like_a_flag_is_text_and_cannot_become_one`
-            // can only make against a vector.
-            (
-                "--dangerously-skip-permissions",
-                "--dangerously-skip-permissions",
-            ),
-        ] {
+        // carries a character that would break this if the argument were ever
+        // handed to something that parses. See [`PROMPTS`] for which character
+        // matters on which platform, and why they are not the same list.
+        for (prompt, arrives) in PROMPTS.iter().copied() {
             let started = through(&script, prompt).expect("the shim runs");
 
             assert!(
@@ -998,7 +1607,7 @@ mod tests {
             // word two arguments early.
             assert!(
                 started.raw.contains("FENCE [--]"),
-                "the fence did not survive the trip through cmd.exe:\n{}",
+                "the fence did not survive the trip to the shim:\n{}",
                 started.raw
             );
             assert!(
@@ -1008,11 +1617,12 @@ mod tests {
                 "the argument list did not arrive intact:\n{}",
                 started.raw
             );
+            // Case-folded, which is Windows' rule rather than a hedge: two
+            // spellings of a path there differ in case and name one directory.
+            // On Unix they cannot, and folding both sides is merely harmless.
+            // See [`as_reported`] for the half that is not harmless.
             assert!(
-                started
-                    .raw
-                    .to_lowercase()
-                    .contains(&home.to_string_lossy().to_lowercase()),
+                started.raw.to_lowercase().contains(&as_reported(home)),
                 "a dispatched task ran somewhere other than where it was pointed:\n{}",
                 started.raw
             );
@@ -1035,22 +1645,24 @@ mod tests {
         // Nothing recognisable and a non-zero exit is a failure, and the two
         // things a reader can act on are the code and whatever the program said
         // about it. The message carries both.
-        let angry = shim(
-            &dir,
-            "angry",
-            &["echo could not authenticate 1>&2", "exit /b 1"],
-        );
+        let authenticate = complain("could not authenticate");
+        let angry = shim(&dir, "angry", &[&authenticate, FAILS]);
         let why = through(&angry, "do the thing")
             .expect_err("a failed dispatch is not a dispatch")
             .to_string();
         assert!(why.contains("could not authenticate"), "got: {why}");
         assert!(why.contains("status 1"), "got: {why}");
-        assert!(why.contains("abeam-angry.cmd"), "which program: {why}");
+        // The file it actually ran, in full. The whole of the platform
+        // difference in this test is the extension — the shim is
+        // `abeam-angry.cmd` on Windows and `abeam-angry` on Unix — and it is an
+        // expectation table rather than a shortened assertion, because the
+        // shortened one passes for a message that names a file nobody has.
+        assert!(why.contains(ANGRY_FILE), "which program: {why}");
 
         // A program that fails and says nothing is the worst of the three, and
         // "it printed nothing" is genuinely the diagnosis — an error message
         // that goes quiet here reads as abeam having lost the output.
-        let mute = shim(&dir, "mute", &["exit /b 1"]);
+        let mute = shim(&dir, "mute", &[FAILS]);
         let why = through(&mute, "do the thing")
             .expect_err("a failed dispatch is not a dispatch")
             .to_string();
@@ -1063,15 +1675,8 @@ mod tests {
         // the exit code, and the queue needs its id more than it needs the
         // complaint — an item reported as failed while its agent edits the
         // repository is the worse of the two mistakes.
-        let late = shim(
-            &dir,
-            "late",
-            &[
-                "echo Started agent a1b2c3d4 (550e8400-e29b-41d4-a716-446655440000)",
-                "echo and then something went wrong 1>&2",
-                "exit /b 1",
-            ],
-        );
+        let wrong = complain("and then something went wrong");
+        let late = shim(&dir, "late", &[NAMES_A_SESSION, &wrong, FAILS]);
         let started = through(&late, "do the thing").expect("an agent that was named is an agent");
         assert_eq!(started.id.as_deref(), Some("a1b2c3d4"));
         assert_eq!(
@@ -1080,6 +1685,28 @@ mod tests {
         );
     }
 
+    /// A shim that reports what it found on standard input, leaving a marker in
+    /// place when it found nothing at all.
+    ///
+    /// The two spellings differ in more than syntax. `set /p` leaves its
+    /// variable untouched at end of file, so the Windows version reads and then
+    /// prints. `sh`'s `read` sets its variable to what it managed to read,
+    /// which at end of file is nothing at all — so the marker is protected by
+    /// only assigning it on a successful read, which is the same test asked the
+    /// other way round.
+    #[cfg(windows)]
+    const READS_STDIN: &[&str] = &[
+        "set SAW=nothing-at-all",
+        "set /p SAW=",
+        "echo STDIN [%SAW%]",
+    ];
+    #[cfg(unix)]
+    const READS_STDIN: &[&str] = &[
+        "SAW=nothing-at-all",
+        "read LINE && SAW=\"$LINE\"",
+        "echo \"STDIN [$SAW]\"",
+    ];
+
     #[test]
     fn a_dispatched_task_cannot_read_the_console_abeam_is_typing_at() {
         // abeam's own standard input is a console in raw mode with somebody
@@ -1087,29 +1714,87 @@ mod tests {
         // take those keystrokes, which is the one thing a task started *in the
         // background* must not do — so it is handed nothing to read.
         //
-        // `set /p` leaves its variable untouched when it reads end of file, so
-        // the marker below surviving is the child having found no input at all.
+        // The marker surviving is the child having found end of file rather
+        // than a line — see [`READS_STDIN`] for how each shell says that.
         //
         // Know the failure mode before you trust the green: if `Stdio::null()`
-        // is ever dropped, this does not fail, it *hangs* — `set /p` on an
-        // inherited console waits for a line that is never typed. A hang here
-        // means what a failure would mean.
+        // is ever dropped, this does not fail, it *hangs*, because a read on an
+        // inherited terminal waits for a line that is never typed. A hang here
+        // means what a failure would mean. The one way it can pass for the
+        // wrong reason is a harness that hands the test binary a standard input
+        // already at end of file, which is why the assertion is worth reading
+        // as "nothing was inherited" rather than "nothing was there".
         let dir = TempDir::new("dispatch-stdin");
-        let script = shim(
-            &dir,
-            "stdin",
-            &[
-                "set SAW=nothing-at-all",
-                "set /p SAW=",
-                "echo STDIN [%SAW%]",
-            ],
-        );
+        let script = shim(&dir, "stdin", READS_STDIN);
 
         let started = through(&script, "do the thing").expect("the shim runs");
         assert!(
             started.raw.contains("STDIN [nothing-at-all]"),
             "a dispatched task was given something to read:\n{}",
             started.raw
+        );
+    }
+
+    /// A shim that reports which process group it was started in.
+    ///
+    /// `ps -o pgid= -p $$` is POSIX to the letter: `-o`, the `pgid` keyword and
+    /// the trailing `=` that suppresses the column heading are all in the
+    /// standard, and every Unix worth running abeam on has a `ps`. The `=` is
+    /// load-bearing — without it the answer arrives under a `PGID` header and
+    /// the parse below reads a word.
+    #[cfg(unix)]
+    const NAMES_ITS_PROCESS_GROUP: &[&str] = &["echo \"PGID [$(ps -o pgid= -p $$)]\""];
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatched_task_is_started_outside_the_group_that_can_be_signalled() {
+        // The one property of the spawn that no comparison of strings can
+        // reach, and which had no test at all until this one: the `setsid` in
+        // `run` could be deleted and every other test in this file would still
+        // pass, because a child sitting in abeam's own process group prints
+        // exactly the same arguments back. What that deletion would cost is
+        // written up beside the call — a `kill %1` at the shell abeam was
+        // started from, or the `SIGHUP` a closed terminal sends its session,
+        // sweeping up a task that was started precisely to outlive them.
+        //
+        // The claim asserted is about the *group*, because that is what all of
+        // those signals are addressed to and it is the only half a portable
+        // `ps` can be asked: no POSIX `-o` keyword names a session. So it holds
+        // for `setsid` and would have held for the `process_group(0)` that came
+        // before it — read it as "the child is out of abeam's group" rather
+        // than as a check on which of the two calls is in the file.
+        //
+        // If `ps` is missing or answers with something unparseable this fails
+        // rather than passing quietly. A test that steps aside on the machine
+        // it was written to run on is worth less than no test, because it is
+        // counted as one.
+        let dir = TempDir::new("dispatch-pgid");
+        let script = shim(&dir, "pgid", NAMES_ITS_PROCESS_GROUP);
+        let started = through(&script, "do the thing").expect("the shim runs");
+
+        let printed = started
+            .raw
+            .split_once("PGID [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(inside, _)| inside.trim().to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the shim did not report a process group at all:\n{}",
+                    started.raw
+                )
+            });
+        let theirs: i32 = printed.parse().unwrap_or_else(|_| {
+            panic!("`ps` answered {printed:?}, which is not a process group id")
+        });
+
+        // SAFETY: `getpgrp` reads the calling process's own group id, takes no
+        // arguments and touches no memory abeam owns. It is unsafe only because
+        // every function in `libc` is.
+        let ours = unsafe { libc::getpgrp() };
+        assert_ne!(
+            theirs, ours,
+            "a dispatched task was left in abeam's process group, where every \
+             signal aimed at abeam reaches it too"
         );
     }
 

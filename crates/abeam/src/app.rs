@@ -1337,19 +1337,159 @@ fn help_overlay(f: &mut Frame) {
 
 /// The wiring, tested where it lives.
 ///
-/// Everything here needs a real `App`, which needs a real pty, so it is
-/// Windows-only like the rest of the pty-backed suite. The child is
-/// `cmd /c exit` — these tests are about what the shell does with its panes,
-/// not about what the child prints. The panes themselves are tested in their
-/// own modules, with none of this.
-#[cfg(all(test, windows))]
+/// Everything here needs a real `App`, which needs a real pty and a real child
+/// at the end of it — but almost none of it needs a *particular* child. These
+/// are tests about what the shell does with its panes: queue to pty, draft and
+/// submit, view switching, focus, zoom, the double confirm, the overlay, frame
+/// pacing. What the child prints is scenery for all but four of them, which is
+/// why the whole module ran on Windows for as long as abeam did and why
+/// un-gating it needed one platform-selected child rather than thirty-one.
+///
+/// The four that do care say so on themselves: two need a child that has asked
+/// for bracketed paste, one needs a child that provably never will, and one is
+/// about ConPTY's opening handshake and has no Unix half to be about. The panes
+/// themselves are tested in their own modules, with none of this.
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agentstate::Readiness;
     use crate::panes::queue::Mode;
     use crate::testutil::TempDir;
+    use abeam_pty::PtyConfig;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    // --- the children these tests spawn ------------------------------------
+    //
+    // Chosen here rather than at every call site, and written out rather than
+    // reduced to "a shell", because the difference between them is the whole
+    // subject of three tests below. None of them is an agent and none of them
+    // needs to be.
+
+    /// A child that starts and leaves immediately.
+    ///
+    /// The fixture's default, and most of why these tests are quick. It is also
+    /// why three of them replace it: an agent that has already gone cannot be
+    /// typed at, and `poll_readiness` is careful to say so.
+    #[cfg(windows)]
+    const EXITS: (&str, &[&str]) = ("cmd.exe", &["/c", "exit"]);
+    #[cfg(unix)]
+    const EXITS: (&str, &[&str]) = ("/bin/sh", &["-c", "exit"]);
+
+    /// The shell for the one test that is about a *pane's* bookkeeping rather
+    /// than about any shell in particular.
+    ///
+    /// Named outright rather than left to `ABEAM_SHELL` or the pane's candidate
+    /// search, which would pick `pwsh` on one machine and `fish` on another and
+    /// charge a second of startup to prove something neither of them is
+    /// involved in.
+    #[cfg(windows)]
+    const A_PLAIN_SHELL: &str = "cmd.exe";
+    #[cfg(unix)]
+    const A_PLAIN_SHELL: &str = "/bin/sh";
+
+    // The three children below are all `cmd.exe` on Windows and all `cat` on
+    // Unix, and the second half of that is a decision rather than a shortage of
+    // ideas.
+    //
+    // Whether a child asks for bracketed paste is load-bearing for all three:
+    // `pump_queue` refuses to write to a pty that has not asked, so a child
+    // that asks by accident and a child that refuses to ask would each make one
+    // of these tests pass while proving the opposite of what it says. A shell
+    // cannot be trusted either way here. Any readline-backed shell enables the
+    // mode on an interactive pty — bash certainly does — and on Linux `/bin/sh`
+    // is bash on some distributions and dash on others, so the answer would
+    // depend on which image CI pulled. `cat` has no line editor, no prompt and
+    // no opinion about terminals: it copies bytes. So the mode is handed over
+    // in a *file* when it is wanted and simply absent when it is not, which
+    // makes each of these children say one thing.
+    //
+    // Named as `/bin/cat` rather than looked up on `PATH`, and that is the same
+    // trade `dispatch`'s shims make when they ask for `#!/bin/sh` and refuse to
+    // ask for `#!/bin/bash`: name what POSIX requires every system to have, at
+    // the path every mainstream distribution puts it at, and do not go
+    // searching. It is a choice rather than an oversight — a system that puts
+    // neither at those paths (NixOS, where everything lives under `/nix/store`)
+    // fails these at the spawn, and the answer there is a `PATH` lookup in the
+    // fixture rather than a different program. That is worth writing when
+    // somebody runs the suite on such a machine, and not before.
+    //
+    // They are deliberately wide. A prompt is most of fifty columns, and a
+    // queued prompt wrapping onto a second row is a needle split in half and a
+    // test that fails for a reason nobody is interested in.
+
+    /// A child that asks for bracketed paste and then stays.
+    ///
+    /// The `DECSET` is typed out of a file on the way in rather than asked for
+    /// by the child — the pty forwards it and the parser behind the pane picks
+    /// it up, which is the same route a real agent's takes.
+    #[cfg(windows)]
+    fn asks_and_stays(dir: &TempDir) -> PtyConfig {
+        dir.write("bracketed.txt", b"\x1b[?2004h");
+        PtyConfig::new("cmd.exe")
+            .args(["/k".to_string(), "type bracketed.txt".to_string()])
+            .cwd(dir.path())
+            .size(20, 200)
+    }
+    #[cfg(unix)]
+    fn asks_and_stays(dir: &TempDir) -> PtyConfig {
+        dir.write("bracketed.txt", b"\x1b[?2004h");
+        // `cat file -`: the file first, then standard input for ever, which is
+        // the whole of "emits the mode and then stays" in one process.
+        PtyConfig::new("/bin/cat")
+            .args(["bracketed.txt".to_string(), "-".to_string()])
+            .cwd(dir.path())
+            .size(20, 200)
+    }
+
+    /// A child that asks for bracketed paste and *then* leaves.
+    ///
+    /// The distinction that makes the test about an agent that has gone mean
+    /// anything: the ordinary fixture child would give the same `Unknown` for
+    /// the wrong reason, because it never enables the mode at all.
+    #[cfg(windows)]
+    fn asks_and_goes(dir: &TempDir) -> PtyConfig {
+        dir.write("bracketed.txt", b"\x1b[?2004h");
+        PtyConfig::new("cmd.exe")
+            .args(["/c".to_string(), "type bracketed.txt".to_string()])
+            .cwd(dir.path())
+            .size(20, 200)
+    }
+    #[cfg(unix)]
+    fn asks_and_goes(dir: &TempDir) -> PtyConfig {
+        dir.write("bracketed.txt", b"\x1b[?2004h");
+        // The same thing without the `-`, so it runs out of input and exits.
+        PtyConfig::new("/bin/cat")
+            .args(["bracketed.txt".to_string()])
+            .cwd(dir.path())
+            .size(20, 200)
+    }
+
+    /// A child that stays, prints enough to be known to have started, and
+    /// **provably never asks for bracketed paste**.
+    ///
+    /// The printing is not decoration. The test that uses this waits for the
+    /// pane to have read something before it looks, and on Windows ConPTY's own
+    /// opening sequence supplies that whatever the child does — on Unix nothing
+    /// reaches the pty unless the child puts it there, so a child that only
+    /// listened would leave that wait spinning until its deadline and then pass
+    /// anyway. So the file is ordinary text with no escape in it: enough to
+    /// prove the child ran, and nothing a parser could take for a request.
+    #[cfg(windows)]
+    fn never_asks(dir: &TempDir) -> PtyConfig {
+        PtyConfig::new("cmd.exe")
+            .args(["/k".to_string()])
+            .cwd(dir.path())
+            .size(20, 200)
+    }
+    #[cfg(unix)]
+    fn never_asks(dir: &TempDir) -> PtyConfig {
+        dir.write("plain.txt", b"nothing here is an escape sequence\n");
+        PtyConfig::new("/bin/cat")
+            .args(["plain.txt".to_string(), "-".to_string()])
+            .cwd(dir.path())
+            .size(20, 200)
+    }
 
     /// An `App` and the directory it was pointed at, which has to outlive it.
     ///
@@ -1381,8 +1521,9 @@ mod tests {
     fn app() -> Fixture {
         let dir = TempDir::new("app");
         dir.write("notes.md", b"# notes\n");
-        let left = TerminalPane::spawn("cmd.exe", &["/c".into(), "exit".into()], 20, 60)
-            .expect("spawn a child in a pty");
+        let (program, args) = EXITS;
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let left = TerminalPane::spawn(program, &args, 20, 60).expect("spawn a child in a pty");
         let app = App::new(left, dir.path().to_path_buf(), "claude");
         Fixture { app, dir }
     }
@@ -1439,7 +1580,7 @@ mod tests {
     /// the app's probe aimed at it.
     ///
     /// `Probe::new` reads the machine's own `~/.claude`, where the only honest
-    /// answer about a `cmd.exe` is `Unknown` — and `Unknown` is the one answer
+    /// answer about a shell is `Unknown` — and `Unknown` is the one answer
     /// indistinguishable from the whole feature having been deleted. Returned
     /// rather than dropped so the directory outlives the probe reading it.
     fn records(fx: &mut Fixture, status: &str) -> TempDir {
@@ -1461,8 +1602,8 @@ mod tests {
     /// session changes state and `Probe` re-reads the file on every poll, so
     /// this is what a turn starting looks like from out here.
     fn say(dir: &TempDir, root: &std::path::Path, status: &str) {
-        // The `cwd` goes through serde rather than being pasted in: a Windows
-        // path in JSON is a string full of escapes.
+        // The `cwd` goes through serde rather than being pasted in: a path in
+        // JSON is a string, and on Windows it is one full of escapes.
         let cwd = serde_json::to_string(&root.to_string_lossy()).expect("a JSON string");
         let record = format!(
             r#"{{"pid":{RECORD_PID},"sessionId":"s","cwd":{cwd},"startedAt":1,"peerProtocol":1,"kind":"interactive","name":"fixture","status":"{status}"}}"#
@@ -1470,29 +1611,16 @@ mod tests {
         dir.write(&format!("{RECORD_PID}.json"), record.as_bytes());
     }
 
-    /// A child in the left pane that stays at its prompt *and* has asked for
-    /// bracketed paste.
+    /// Put [`asks_and_stays`] in the left pane and wait for the mode to land.
     ///
-    /// Both halves are load-bearing and neither is free. The ordinary fixture's
-    /// `cmd /c exit` is gone before a send could reach it, and `poll_readiness`
+    /// Both halves are load-bearing and neither is free. The fixture's own
+    /// child is gone before a send could reach it, and `poll_readiness`
     /// downgrades a departed agent to `Unknown`; and a child that never enabled
     /// bracketed paste is refused by `pump_queue` at the instant of the write.
-    /// A `cmd.exe` cannot ask for the mode on its own, so it is handed the
-    /// bytes in a file and told to type them out on the way in — ConPTY
-    /// forwards the `DECSET` and the parser behind the pane picks it up.
-    ///
-    /// It is deliberately wide. A `cmd` prompt is most of fifty columns, and a
-    /// queued prompt wrapping onto a second row is a needle split in half and a
-    /// test that fails for a reason nobody is interested in.
+    /// So a test that skipped this would pass for two wrong reasons at once.
     fn stays(fx: &mut Fixture) {
-        fx.dir.write("bracketed.txt", b"\x1b[?2004h");
-        fx.app.left = TerminalPane::spawn_with(
-            abeam_pty::PtyConfig::new("cmd.exe")
-                .args(["/k".to_string(), "type bracketed.txt".to_string()])
-                .cwd(fx.dir.path())
-                .size(20, 200),
-        )
-        .expect("a child in a pty");
+        let config = asks_and_stays(&fx.dir);
+        fx.app.left = TerminalPane::spawn_with(config).expect("a child in a pty");
 
         let deadline = Instant::now() + Duration::from_secs(20);
         while !fx.app.left.bracketed_paste() && Instant::now() < deadline {
@@ -1776,18 +1904,12 @@ mod tests {
         let mut fx = app();
         let _records = records(&mut fx, "idle");
 
-        // A child that asks for bracketed paste and *then* leaves. The
-        // ordinary `cmd /c exit` would give the same `Unknown` for the wrong
-        // reason — it never enables the mode at all — and a test that passes
-        // for the wrong reason is a test of nothing.
-        fx.dir.write("bracketed.txt", b"\x1b[?2004h");
-        fx.app.left = TerminalPane::spawn_with(
-            abeam_pty::PtyConfig::new("cmd.exe")
-                .args(["/c".to_string(), "type bracketed.txt".to_string()])
-                .cwd(fx.dir.path())
-                .size(20, 200),
-        )
-        .expect("a child in a pty");
+        // A child that asks for bracketed paste and *then* leaves. The ordinary
+        // fixture child would give the same `Unknown` for the wrong reason — it
+        // never enables the mode at all — and a test that passes for the wrong
+        // reason is a test of nothing.
+        let config = asks_and_goes(&fx.dir);
+        fx.app.left = TerminalPane::spawn_with(config).expect("a child in a pty");
 
         let deadline = Instant::now() + Duration::from_secs(20);
         while (!fx.app.left.bracketed_paste() || fx.app.left.poll_exit().unwrap().is_none())
@@ -1832,13 +1954,14 @@ mod tests {
         // never enables the mode, so the downgrade under test is the only one
         // left. The record says `idle`: without that this assertion would hold
         // just as well with the probe deleted outright.
-        fx.app.left = TerminalPane::spawn_with(
-            abeam_pty::PtyConfig::new("cmd.exe")
-                .args(["/k".to_string()])
-                .cwd(fx.dir.path())
-                .size(20, 200),
-        )
-        .expect("a child in a pty");
+        //
+        // Which child is not a detail here — see [`never_asks`]. A shell is
+        // specifically the wrong one: an interactive readline shell *does* ask
+        // for bracketed paste, and on Linux whether `/bin/sh` is one of those
+        // is a fact about the distribution, so this test would assert the
+        // opposite of itself on somebody else's CI image.
+        let config = never_asks(&fx.dir);
+        fx.app.left = TerminalPane::spawn_with(config).expect("a child in a pty");
         let deadline = Instant::now() + Duration::from_secs(20);
         while fx.app.left.diagnostics().bytes_read == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -1846,8 +1969,12 @@ mod tests {
 
         assert!(!fx.app.left.has_exited(), "this child stays at its prompt");
         assert!(
+            fx.app.left.diagnostics().bytes_read > 0,
+            "the child never produced anything, so it was never really up"
+        );
+        assert!(
             !fx.app.left.bracketed_paste(),
-            "a `cmd.exe` was expected never to ask for bracketed paste"
+            "the child asked for bracketed paste, so this test proves nothing"
         );
         assert_eq!(
             fx.app.probe.readiness(),
@@ -2061,10 +2188,11 @@ mod tests {
         // prints a line. A frame re-renders the agent's whole screen, so that
         // is the agent's typing latency spent on a pane nobody is looking at.
         let mut app = app();
-        // `cmd` rather than whatever `ABEAM_SHELL` or the candidate search
-        // would pick: this test is about the shell's bookkeeping, and `pwsh`
-        // costs a second of startup to prove the same thing.
-        app.app.shell = ShellPane::new(app.dir.path().to_path_buf(), Some("cmd.exe".into()));
+        // The platform's plainest shell rather than whatever `ABEAM_SHELL` or
+        // the candidate search would pick: this test is about the pane's
+        // bookkeeping, and `pwsh` costs a second of startup to prove the same
+        // thing.
+        app.app.shell = ShellPane::new(app.dir.path().to_path_buf(), Some(A_PLAIN_SHELL.into()));
 
         app.handle_key(alt(KeyCode::Char('s'))).unwrap();
         screen(&mut app, 120, 24); // the frame that spawns it
@@ -2131,18 +2259,36 @@ mod tests {
         // reader thread answers. That is a handshake between two threads, so
         // the test waits for it rather than assuming the first frame is late
         // enough — it is not; the first frame usually sees zero bytes read.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while app.left.diagnostics().dsr_replies == 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+        //
+        // There is nothing to wait for on Unix, and that is the point rather
+        // than an omission: no opening DSR is ever sent there, so the counter
+        // stays at zero for the whole of a healthy session. Waiting would spend
+        // five seconds establishing that. See `panes::diag` — the row keeps its
+        // counter and loses its alarm, which is what makes the last assertion
+        // below true on both platforms for opposite reasons: on Windows because
+        // the query was answered, on Linux because there is no alarm to draw.
+        if cfg!(windows) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while app.left.diagnostics().dsr_replies == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
 
         let text = screen(&mut app, 120, 24);
         assert!(text.contains("DSR answered"), "got: {text}");
         assert!(text.contains("pty size"), "got: {text}");
-        // The alarm is what makes this pane worth having: it means the session
-        // is hung on the opening handshake, not merely slow. See
+        // On Windows the alarm is what makes this pane worth having: it means
+        // the session is hung on the opening handshake, not merely slow. See
         // docs/conpty-findings.md.
-        assert!(!text.contains("no DSR reply"), "got: {text}");
+        //
+        // Both halves of it, because they are spelled differently and only the
+        // title used to be pinned: the title reads `pty · no DSR reply` and the
+        // body note opens `No DSR reply yet.`, so a case-sensitive check for
+        // the title passes with the note sitting on screen underneath it. The
+        // second assertion is on `ConPTY` rather than on a phrase because it is
+        // the one word in that note which wrapping cannot split in half.
+        assert!(!text.to_lowercase().contains("no dsr reply"), "got: {text}");
+        assert!(!text.contains("ConPTY"), "got: {text}");
     }
 
     #[test]
@@ -2368,6 +2514,12 @@ mod tests {
         // releases, but the shell matches its own bindings first — without the
         // filter in `handle_event`, Alt+E would switch to the viewer and Alt+G
         // straight back on the release of the same press.
+        //
+        // The release is built here rather than typed, so this runs everywhere
+        // even though only one platform produces one unasked. That is the right
+        // way round: the filter is unconditional, a terminal that negotiates
+        // the kitty keyboard protocol reports releases on any platform, and a
+        // guard tested on one of two is a guard half tested.
         let mut app = app();
         let mut release = alt(KeyCode::Char('e'));
         release.kind = KeyEventKind::Release;

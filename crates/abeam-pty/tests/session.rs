@@ -11,10 +11,12 @@
 //! Scrollback lives down here rather than in the pane that drives it because
 //! this is the layer where a child can be made to produce a known number of
 //! lines and then stopped.
+//!
+//! Ungated, unlike `conpty.rs`: every claim above is a claim about our wrapper
+//! rather than about a pseudoconsole, and all six hold on a Unix pty. It is also
+//! the only coverage `src/tree/unix.rs` has, and the last test in this file is
+//! the whole of it — see the comment there before weakening what it spawns.
 
-#![cfg(windows)]
-
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -25,10 +27,15 @@ use abeam_pty::{PtyConfig, PtySession};
 struct Dir(std::path::PathBuf);
 
 impl Dir {
-    /// A process id and a counter rather than the thread id: `ThreadId(2)`
+    /// A process id and a counter, because these tests run in parallel and a
+    /// fixed name would have two of them in one directory.
+    ///
+    /// Not the thread id, which is the obvious source of both: `ThreadId(2)`
     /// debug-prints with brackets in it, and `cmd` parses a path containing
-    /// those as command syntax, so a batch file under one silently does
-    /// nothing at all.
+    /// those as command syntax, so a batch file under one silently does nothing
+    /// at all. `/bin/sh` is untroubled by brackets and would never have shown
+    /// it — one naming scheme that is safe everywhere beats two that are each
+    /// safe somewhere.
     fn new(name: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -54,6 +61,52 @@ impl Drop for Dir {
     }
 }
 
+/// How to print a file. The one thing these tests ask a shell for that the two
+/// shells spell differently.
+#[cfg(windows)]
+const PRINT_FILE: &str = "type";
+#[cfg(unix)]
+const PRINT_FILE: &str = "cat";
+
+/// A shell that runs `command` and then exits.
+///
+/// The two helpers below are the whole of the platform difference in this file.
+/// They deliberately stop at "which shell, asked how": what each test runs stays
+/// at the test, because a reader who cannot see what was spawned cannot tell
+/// what the assertion means.
+#[cfg(windows)]
+fn shell_running(command: &str) -> PtyConfig {
+    PtyConfig::new("cmd.exe").args(["/c", command])
+}
+#[cfg(unix)]
+fn shell_running(command: &str) -> PtyConfig {
+    PtyConfig::new("/bin/sh").args(["-c", command])
+}
+
+/// A shell that runs `command` if there is one and then stays at a prompt, so
+/// the child is still there afterwards and the reader thread is still attached
+/// to something.
+#[cfg(windows)]
+fn shell_staying(command: Option<&str>) -> PtyConfig {
+    match command {
+        Some(c) => PtyConfig::new("cmd.exe").args(["/k", c]),
+        None => PtyConfig::new("cmd.exe").arg("/k"),
+    }
+}
+#[cfg(unix)]
+fn shell_staying(command: Option<&str>) -> PtyConfig {
+    match command {
+        // `exec`, so that what is left at the prompt is the process the session
+        // spawned rather than a child of it. `try_wait` and the kill on drop
+        // both mean that process, and a test that let a second shell in would be
+        // asserting about the wrong one.
+        Some(c) => PtyConfig::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{c}; exec /bin/sh")),
+        None => PtyConfig::new("/bin/sh"),
+    }
+}
+
 /// Poll until `f` holds, or fail. Nothing here can be waited on directly:
 /// `try_wait` is the only reaping call there is (`docs/conpty-findings.md`,
 /// constraint 2) and output arrives on a thread of its own.
@@ -69,16 +122,13 @@ fn until(what: &str, mut f: impl FnMut() -> bool) {
 }
 
 /// The whole point of the crate, as one assertion: nobody outside answered the
-/// DSR query, and the child ran anyway.
+/// DSR query, and the child ran anyway. On a Unix pty there is no query to
+/// answer, so the same test says something smaller and still worth having — a
+/// child spawned into a pty runs, exits, and arrives on the screen.
 #[test]
 fn session_answers_dsr_without_the_caller_helping() {
-    let mut session = PtySession::spawn(
-        PtyConfig::new("cmd.exe")
-            .arg("/c")
-            .arg("echo abeam-session-marker")
-            .size(24, 80),
-    )
-    .expect("spawn");
+    let mut session =
+        PtySession::spawn(shell_running("echo abeam-session-marker").size(24, 80)).expect("spawn");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut exited = false;
@@ -91,8 +141,9 @@ fn session_answers_dsr_without_the_caller_helping() {
     }
     assert!(
         exited,
-        "child never exited — dsr_replies = {}, which is the first thing to \
-         check when a session looks dead",
+        "child never exited — dsr_replies = {}, which on Windows is the first \
+         thing to check when a session looks dead. On Linux nothing asks, so a \
+         zero there means nothing at all and the fault is elsewhere",
         session.stats().dsr_replies
     );
 
@@ -100,6 +151,11 @@ fn session_answers_dsr_without_the_caller_helping() {
     std::thread::sleep(Duration::from_millis(300));
 
     let stats = session.stats();
+    // ConPTY opens every session with `ESC [ 6 n` and blocks until it is
+    // answered; a Unix pty opens by saying nothing. So this is the crate's
+    // entire reason for existing on one platform and vacuous on the other, and
+    // asserting it everywhere would only mean asserting `0 > 0` on Linux.
+    #[cfg(windows)]
     assert!(
         stats.dsr_replies > 0,
         "session must answer the startup query itself"
@@ -116,8 +172,7 @@ fn session_answers_dsr_without_the_caller_helping() {
 /// The README's "pty size vs parser size must agree" diagnostic, automated.
 #[test]
 fn session_resize_keeps_pty_and_parser_in_agreement() {
-    let session =
-        PtySession::spawn(PtyConfig::new("cmd.exe").arg("/k").size(24, 80)).expect("spawn");
+    let session = PtySession::spawn(shell_staying(None).size(24, 80)).expect("spawn");
 
     // Let the shell finish starting before resizing under it.
     std::thread::sleep(Duration::from_millis(300));
@@ -134,7 +189,7 @@ fn session_resize_keeps_pty_and_parser_in_agreement() {
         );
     }
 
-    // A resize to the size we already are must not churn ConPTY — the event
+    // A resize to the size we already are must not churn the pty — the event
     // loop calls this on every window event.
     let before = session.stats().resizes;
     session.resize(20, 60).expect("no-op resize");
@@ -163,11 +218,11 @@ const HISTORY: usize = 8;
 fn with_history(dir: &Dir) -> PtySession {
     let body: String = (1..=60).map(|i| format!("line-{i}\r\n")).collect();
     dir.write("many.txt", &body);
-    // `/k`, so the child is still there afterwards and the reader thread is
-    // still attached to something: the anchoring assertion below needs both.
+    // Staying rather than exiting, so the child is still there afterwards and
+    // the reader thread is still attached to something: the anchoring assertion
+    // below needs both.
     let session = PtySession::spawn(
-        PtyConfig::new("cmd.exe")
-            .args(["/k", "type", "many.txt"])
+        shell_staying(Some(&format!("{PRINT_FILE} many.txt")))
             .cwd(&dir.0)
             .size(6, 30),
     )
@@ -184,9 +239,9 @@ fn with_history(dir: &Dir) -> PtySession {
         reached >= HISTORY
     });
 
-    // Three consecutive quiet polls rather than one: `type` finishes and then
-    // `cmd` prints its prompt, so a single quiet sample can land in the gap
-    // between the two and call a pause the end.
+    // Three consecutive quiet polls rather than one: the file finishes printing
+    // and then the shell prints its prompt, so a single quiet sample can land in
+    // the gap between the two and call a pause the end.
     let (mut last, mut quiet) = (0, 0);
     until("the child to stop printing", || {
         let read = session.stats().bytes_read;
@@ -237,7 +292,9 @@ fn a_reader_who_has_scrolled_back_stays_where_they_are_looking() {
     session.set_scrollback(3);
     let anchored = session.with_screen(|s| s.contents());
 
-    session.write(b"type many.txt\r").expect("write to the child");
+    session
+        .write(format!("{PRINT_FILE} many.txt\r").as_bytes())
+        .expect("write to the child");
     until("the child to produce another sixty lines", || {
         session.stats().bytes_read > 0 && session.scrollback() > 3
     });
@@ -251,55 +308,140 @@ fn a_reader_who_has_scrolled_back_stays_where_they_are_looking() {
     );
 }
 
+/// Is there still a process with this id? Signal 0 delivers nothing and runs
+/// only the checks that precede delivery, which is the one liveness question
+/// that does not depend on the process cooperating by writing a file.
+///
+/// A zombie answers `true` as well, being a process table entry like any other.
+/// That is harmless under an `init` that reaps promptly — every desktop, and the
+/// CI runners — but under a pid 1 that does not reap, a bare container say, an
+/// orphan can linger as one and the wait below would time out on a kill that
+/// worked. If that ever happens the fix is to read the state out of
+/// `/proc/<pid>/stat`, not to go back to asking the grandchild for a file.
+#[cfg(unix)]
+fn alive(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
 #[test]
 fn a_dropped_session_does_not_leave_the_childs_children_running() {
-    // `TerminateProcess` reaches one process. The `cargo build` a shell started
-    // is not that process, and Windows keeps no relationship for anything to
-    // walk afterwards — so without a job object, Alt+S, cargo build, Alt+Q
-    // leaves `cargo.exe` running against a pseudoconsole being torn down.
+    // The test for `src/tree`, and the only one. Killing a process kills that
+    // process: `TerminateProcess` reaches one, and so does `SIGKILL`. The
+    // `cargo build` a shell started is not that process — Windows keeps no
+    // relationship for anything to walk afterwards, and on Unix the orphan is
+    // `init`'s the moment its parent goes — so without a job object on one side
+    // and a process group on the other, Alt+S, cargo build, Alt+Q leaves the
+    // build running against a terminal being torn down.
+    //
+    // Both halves below spawn a grandchild that outlives its parent, wait until
+    // it certainly exists, drop the session, and require it to be gone. Both
+    // are also written to survive the platform's own cleanup, which would
+    // otherwise do this test's work for it and let `src/tree` be deleted with
+    // everything still green. That is the part to read before changing what
+    // they spawn.
     let dir = Dir::new("orphan");
-    let started = dir.0.join("started.txt");
-    let finished = dir.0.join("finished.txt");
-    // Two markers, and the first is what keeps this test honest. Asserting only
-    // that the second never appears would pass just as well if the grandchild
-    // had never run — a broken fixture and a working job object are the same
-    // empty directory.
-    let script = dir.write(
-        "spawn-a-grandchild.cmd",
-        // `start /min` rather than `start /b`, so the grandchild gets a console
-        // of its own. That is the case a job object is the only answer to:
-        // closing the pseudoconsole takes the processes attached to *it* down
-        // with it, which quietly disguises the problem for anything that stayed
-        // attached, and a `cargo build` is precisely the sort of long-running
-        // thing that need not have.
-        "@echo off\r\n\
-         start \"\" /min cmd.exe /c \"echo x > %~dp0started.txt & ping -n 8 127.0.0.1 >nul \
-         & echo x > %~dp0finished.txt\"\r\n",
-    );
 
-    let mut session = PtySession::spawn(
-        PtyConfig::new("cmd.exe")
-            .args(["/c", &script.to_string_lossy()])
-            .cwd(&dir.0)
-            .size(24, 80),
-    )
-    .expect("spawn");
+    #[cfg(windows)]
+    {
+        let started = dir.0.join("started.txt");
+        let finished = dir.0.join("finished.txt");
+        // Two markers, and the first is what keeps this test honest. Asserting
+        // only that the second never appears would pass just as well if the
+        // grandchild had never run — a broken fixture and a working job object
+        // are the same empty directory.
+        let script = dir.write(
+            "spawn-a-grandchild.cmd",
+            // `start /min` rather than `start /b`, so the grandchild gets a
+            // console of its own. That is the case a job object is the only
+            // answer to: closing the pseudoconsole takes the processes attached
+            // to *it* down with it, which quietly disguises the problem for
+            // anything that stayed attached, and a `cargo build` is precisely
+            // the sort of long-running thing that need not have.
+            "@echo off\r\n\
+             start \"\" /min cmd.exe /c \"echo x > %~dp0started.txt & ping -n 8 127.0.0.1 >nul \
+             & echo x > %~dp0finished.txt\"\r\n",
+        );
 
-    until("the grandchild to start", || started.exists());
-    until("the direct child to exit", || {
-        session.try_wait().expect("try_wait").is_some()
-    });
-    // Still counting down at this point, which is the only interesting moment
-    // to drop the session at.
-    assert!(!finished.exists(), "the grandchild finished before the test began");
-    drop(session);
+        let mut session = PtySession::spawn(
+            PtyConfig::new("cmd.exe")
+                .args(["/c", &script.to_string_lossy()])
+                .cwd(&dir.0)
+                .size(24, 80),
+        )
+        .expect("spawn");
 
-    // Comfortably past its own timer: still running, it would have written.
-    std::thread::sleep(Duration::from_secs(10));
-    assert!(
-        !Path::new(&finished).exists(),
-        "a grandchild outlived the session that started it"
-    );
+        until("the grandchild to start", || started.exists());
+        until("the direct child to exit", || {
+            session.try_wait().expect("try_wait").is_some()
+        });
+        // Still counting down at this point, which is the only interesting
+        // moment to drop the session at.
+        assert!(
+            !finished.exists(),
+            "the grandchild finished before the test began"
+        );
+        drop(session);
+
+        // Comfortably past its own timer: still running, it would have written.
+        std::thread::sleep(Duration::from_secs(10));
+        assert!(
+            !finished.exists(),
+            "a grandchild outlived the session that started it"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        // `sh -c` runs without job control, so the backgrounded `sleep` stays in
+        // the process group its parent leads instead of being given one of its
+        // own. That is the case `killpg` is the answer to, and the shape a real
+        // `cargo build` under a non-interactive shell has.
+        //
+        // `trap '' HUP` is what keeps this honest, and it is this branch's
+        // counterpart to the other one's `start /min`. When the direct child
+        // exits it is a session leader losing its controlling terminal, and the
+        // kernel sends `SIGHUP` to the foreground process group on its way out
+        // — which would take the grandchild with it and leave this test passing
+        // with `src/tree/unix.rs` deleted. An ignored disposition survives both
+        // `fork` and `exec`, so the `sleep` inherits it, and after that nothing
+        // short of a signal that cannot be caught will end it.
+        let started = dir.0.join("started");
+        let mut session = PtySession::spawn(
+            PtyConfig::new("/bin/sh")
+                .args(["-c", "trap '' HUP; sleep 30 & echo $! > started"])
+                .cwd(&dir.0)
+                .size(24, 80),
+        )
+        .expect("spawn");
+
+        // The pid *is* the marker: the file existing is not enough, because the
+        // shell creates it before it has written the number into it.
+        let mut grandchild = 0;
+        until("the grandchild to start", || {
+            grandchild = std::fs::read_to_string(&started)
+                .ok()
+                .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
+                .unwrap_or(0);
+            grandchild > 0
+        });
+        until("the direct child to exit", || {
+            session.try_wait().expect("try_wait").is_some()
+        });
+        // Twenty-odd seconds left on its clock at this point, which is the only
+        // interesting moment to drop the session at.
+        assert!(
+            alive(grandchild),
+            "the grandchild was gone before the session was dropped"
+        );
+        drop(session);
+
+        // Bounded rather than a flat sleep, because the kill is a signal and
+        // arrives when the scheduler gets to it; and asked of the process table
+        // rather than of a file the grandchild would have had to write.
+        until("the grandchild to go with the session that started it", || {
+            !alive(grandchild)
+        });
+    }
 }
 
 /// The doorbell. Without it a draw loop can only poll, and polling is a floor
@@ -307,12 +449,8 @@ fn a_dropped_session_does_not_leave_the_childs_children_running() {
 #[test]
 fn output_rings_the_waker_and_a_session_nobody_installed_one_on_still_works() {
     let rings = Arc::new(AtomicU32::new(0));
-    let session = PtySession::spawn(
-        PtyConfig::new("cmd.exe")
-            .args(["/c", "echo abeam-waker-marker"])
-            .size(24, 80),
-    )
-    .expect("spawn");
+    let session =
+        PtySession::spawn(shell_running("echo abeam-waker-marker").size(24, 80)).expect("spawn");
 
     session.wake_on_output({
         let rings = Arc::clone(&rings);
@@ -328,19 +466,15 @@ fn output_rings_the_waker_and_a_session_nobody_installed_one_on_still_works() {
     assert!(session.take_dirty(), "rung without anything to show for it");
 
     // The reader thread is the only caller, so a ring per read is the most that
-    // can have happened, and a `cmd /c echo` is one or two of those. This is
-    // not about the exact number: it is that nothing is ringing in a loop.
+    // can have happened, and one `echo` is one or two of those. This is not
+    // about the exact number: it is that nothing is ringing in a loop.
     let rung = rings.load(Ordering::Relaxed);
     assert!(rung <= 8, "{rung} rings for one line of output");
 
     // ...and the default is silence, not a panic. Every test above this one is
     // a session with no waker installed, but only this one says so on purpose.
-    let session = PtySession::spawn(
-        PtyConfig::new("cmd.exe")
-            .args(["/c", "echo abeam-no-waker-marker"])
-            .size(24, 80),
-    )
-    .expect("spawn");
+    let session =
+        PtySession::spawn(shell_running("echo abeam-no-waker-marker").size(24, 80)).expect("spawn");
     until("output to arrive with nobody listening", || {
         session.stats().bytes_read > 0
     });

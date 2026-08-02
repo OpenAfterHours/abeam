@@ -116,11 +116,27 @@ fn scan(root: &Path) -> Scan {
 /// `C:\Users\...`. And `/`, because on Windows the walk spells the same path
 /// with backslashes, so a query typed as `src/panes` would otherwise match
 /// nothing at all.
-fn rel(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+///
+/// The rewrite is Windows-only, and that is not tidiness. On Unix a backslash
+/// is an ordinary byte in a file name — `weird\name.rs` is one file in one
+/// directory — so rewriting it would invent a directory that is not there,
+/// show the reader a path they cannot find, and put a `/` into the string the
+/// query is matched against. There is nothing to rewrite on Unix anyway: the
+/// walk already hands back `/`.
+///
+/// Shared with `browse`, which shows the same path in its breadcrumb and must
+/// spell it the same way. Two implementations of "how a path is written down"
+/// is two places for the answer to drift.
+pub(super) fn rel(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    #[cfg(windows)]
+    {
+        rel.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        rel.into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +162,27 @@ mod tests {
             .map(|n| n.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["new.md", "old.md"]);
+    }
+
+    #[test]
+    fn the_index_spells_every_path_the_way_a_query_gets_typed() {
+        // What a person types is `src/panes`, on both platforms, and the index
+        // is what that is matched against — so on Windows the walk's
+        // backslashes have to be rewritten or the query matches nothing.
+        let root = Path::new(if cfg!(windows) { r"C:\repo" } else { "/repo" });
+        let deep = root.join("src").join("panes");
+        assert_eq!(rel(root, &deep), "src/panes");
+
+        // ...and on Unix that rewrite must not happen, which is the half a
+        // Windows-only suite could never have caught. A backslash there is an
+        // ordinary byte in a file name, so rewriting it would invent a
+        // directory that is not there and hand the reader a path that opens
+        // nothing.
+        #[cfg(unix)]
+        {
+            let odd = root.join(r"na\me.rs");
+            assert_eq!(rel(root, &odd), r"na\me.rs");
+        }
     }
 
     #[test]

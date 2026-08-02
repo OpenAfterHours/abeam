@@ -1,25 +1,22 @@
 //! What abeam is allowed to hand to `CreateProcessW`, and how a script shim is
 //! turned into something it will take.
 //!
-//! Two questions live here and they are answered separately on purpose.
+//! *Where* to look for the file is the other half of the question, it is the
+//! same hazard on every platform, and it lives in the parent module. This half
+//! is Windows' alone.
 //!
-//! **Where.** A bare name reaching `CreateProcessW` is resolved against the
-//! *calling process's* current directory before Windows consults `PATH`, so a
-//! repository containing `claude.exe` is what runs, with the user's full token.
-//! Nothing leaves this module that is not an absolute path.
-//!
-//! **What.** abeam hands `CreateProcessW` an `.exe` or a `.com` and nothing
-//! else — [`IMAGES`] is abeam's own short list rather than Windows'. That is
-//! fine until you meet an npm install, which drops three files into
-//! `%APPDATA%\npm`: `claude` (a POSIX shell script, no extension), `claude.cmd`
-//! and `claude.ps1`. Preferring the `.cmd` on its own does not help —
-//! `CreateProcessW` cannot run that either — so a `.cmd` is started by naming
-//! `cmd.exe` in front of it. The npm route is the one this module is for rather
-//! than the only route there is: GitHub Copilot's CLI also arrives as a plain
-//! executable, from `winget install GitHub.Copilot` or from `gh copilot`, and
-//! that copy never reaches this module at all. Its npm package is what a
-//! machine without either of those has, and for that machine this is the
-//! difference between "hostable" and "not".
+//! abeam hands `CreateProcessW` an `.exe` or a `.com` and nothing else —
+//! [`IMAGES`] is abeam's own short list rather than Windows'. That is fine
+//! until you meet an npm install, which drops three files into `%APPDATA%\npm`:
+//! `claude` (a POSIX shell script, no extension), `claude.cmd` and `claude.ps1`.
+//! Preferring the `.cmd` on its own does not help — `CreateProcessW` cannot run
+//! that either — so a `.cmd` is started by naming `cmd.exe` in front of it. The
+//! npm route is the one this module is for rather than the only route there is:
+//! GitHub Copilot's CLI also arrives as a plain executable, from
+//! `winget install GitHub.Copilot` or from `gh copilot`, and that copy never
+//! reaches this module at all. Its npm package is what a machine without either
+//! of those has, and for that machine this is the difference between "hostable"
+//! and "not".
 //!
 //! ## Why the command line travels in an environment variable
 //!
@@ -60,10 +57,21 @@
 //!   carets before `%*` is formed, so the space is a separator again by the time
 //!   the shim forwards it.
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use super::Launch;
+
+// The moved suite below reaches for four things that stayed in the parent
+// module when this file was split out of it, and none of them is used by the
+// code above the suite. Imported here rather than at the top of `mod tests` so
+// that the tests are the file they were before the split, line for line — the
+// only way a reader can check a move by reading it.
+#[cfg(test)]
+use super::{find, resolve, walk};
+#[cfg(test)]
 use abeam_pty::PtyConfig;
+#[cfg(test)]
+use std::ffi::OsStr;
 
 /// The extensions abeam will hand to `CreateProcessW` on their own.
 ///
@@ -103,60 +111,9 @@ const LAUNCH_VAR: &str = "ABEAM_LAUNCH";
 /// seen to work, not the longest the documentation names.
 const MAX_LINE: usize = 8124;
 
-/// What `CreateProcessW` will be asked to start, and with what.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Launch {
-    /// Always absolute, always an extension Windows can start. For a routed
-    /// script this is `cmd.exe` rather than the script.
-    pub program: PathBuf,
-    /// The file that will do the work: the same as [`program`](Self::program)
-    /// for an `.exe`, and the script itself when one is routed. What a border
-    /// should name — "cmd" is a true answer to the wrong question.
-    pub target: PathBuf,
-    /// **The complete argument list, not a prefix.** For a routed script the
-    /// caller's own arguments are already inside the command line this points
-    /// `cmd` at; appending them again would pass them twice.
-    pub args: Vec<String>,
-    /// Set on the child. Empty unless a script was routed.
-    pub env: Vec<(String, String)>,
-}
-
-impl Launch {
-    /// The pty configuration that starts it, seeded so that no caller can
-    /// forget the environment variable the command line arrived in. Forgetting
-    /// it fails as `'%ABEAM_LAUNCH%' is not recognized`, which names neither
-    /// the program nor the mistake.
-    pub fn config(&self) -> PtyConfig {
-        let mut cfg =
-            PtyConfig::new(self.program.to_string_lossy()).args(self.args.iter().cloned());
-        for (key, value) in &self.env {
-            cfg = cfg.env(key, value);
-        }
-        cfg
-    }
-}
-
-/// Turn the name of a program into something Windows can start, or into the
-/// sentence explaining why there is not one.
-pub fn resolve(program: &str, args: &[String]) -> Result<Launch, String> {
-    resolve_preferring(program, args, None)
-}
-
-/// [`resolve`], with one path to try before the `PATH` walk.
-///
-/// The hint stays out of this module because it is not knowledge about
-/// launching — it is knowledge about *shells*, that `cmd.exe` and
-/// `powershell.exe` are operating-system components with one right answer each
-/// and that PowerShell 7 has a usual home. Only the shell pane has a list of
-/// programs that is short and fixed enough for such a table to exist, so the
-/// table lives beside that list and its answer is passed in here.
-pub fn resolve_preferring(
-    program: &str,
-    args: &[String],
-    home: Option<PathBuf>,
-) -> Result<Launch, String> {
-    let found = find(program, home)?;
-
+/// The file [`super::find`] settled on, turned into something `CreateProcessW`
+/// will take — or into the sentence explaining why there is not one.
+pub(super) fn into_launch(found: PathBuf, args: &[String]) -> Result<Launch, String> {
     if is_image(&found) {
         return Ok(Launch {
             program: found.clone(),
@@ -218,50 +175,6 @@ pub fn resolve_preferring(
     ))
 }
 
-/// Where the file is, without yet asking whether it can be started.
-fn find(program: &str, home: Option<PathBuf>) -> Result<PathBuf, String> {
-    let named = Path::new(program);
-
-    let found = if named.is_absolute() {
-        // Probed rather than trusted: a path to something that has since been
-        // uninstalled should arrive as "not found" rather than as whatever
-        // `CreateProcessW` makes of it. Probing also supplies the extension, so
-        // an absolute `…\npm\claude` still finds `claude.cmd` beside it.
-        probe(named.parent().unwrap_or(named), &file_name_of(named))
-    } else if named.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
-        // A relative path names a place, and the place it names is relative to
-        // the repository on screen — the one directory in this whole question
-        // that somebody else gets to write to. `main` resolves the one it is
-        // given against the directory abeam was *run* in before it gets here,
-        // which is a different question with a different answer.
-        return Err(format!(
-            "`{program}` is a relative path, and abeam will not resolve one \
-             here: it would be resolved against the repository on screen. \
-             Give an absolute path, or a bare name to look up on PATH."
-        ));
-    } else {
-        // `is_absolute` before `is_file`, and the order is not the point — the
-        // check is. The caller's hint is a guess and it is not trusted to be
-        // absolute any more than a `PATH` entry is: `panes::shell`'s
-        // `known_home` builds it by joining onto `%SystemRoot%` or
-        // `%ProgramFiles%`, so a variable that is relative or empty makes a
-        // relative path, and `is_file()` on one of those asks about the current
-        // directory — which is the repository, and the whole thing this module
-        // exists to stop. With `SystemRoot=Windows` this returned
-        // `Windows\System32\cmd.exe` and meant it relative to whatever abeam
-        // was standing in.
-        //
-        // Worth being plain about, because it looks covered and is not: `main`
-        // stands in `%SystemRoot%` for exactly this hazard, but it is the *same
-        // variable*, so a broken `SystemRoot` takes out both defences at once
-        // and this is the one of the two that can still say no.
-        home.filter(|home| home.is_absolute() && home.is_file())
-            .or_else(|| walk_path(program))
-    };
-
-    found.ok_or_else(|| format!("`{program}` was not found on PATH."))
-}
-
 /// A `.cmd` or a `.bat`, with `cmd.exe` named in front of it.
 fn through_cmd(script: PathBuf, args: &[String]) -> Result<Launch, String> {
     let interpreter = interpreter()?;
@@ -314,9 +227,9 @@ fn interpreter() -> Result<PathBuf, String> {
 
 /// The choice itself, over the two candidates handed in rather than read.
 ///
-/// Split out for the same reason [`walk`] is: the process environment belongs
-/// to the whole test binary, and a test that set `ComSpec` to prove the order
-/// would be setting it for the two hundred tests running beside it.
+/// Split out for the same reason [`super::walk`] is: the process environment
+/// belongs to the whole test binary, and a test that set `ComSpec` to prove the
+/// order would be setting it for the two hundred tests running beside it.
 fn interpreter_from(shipped: Option<PathBuf>, comspec: Option<PathBuf>) -> Result<PathBuf, String> {
     shipped
         .into_iter()
@@ -466,37 +379,17 @@ fn append_arg(line: &mut String, arg: &str) {
     }
 }
 
-// --- finding it -----------------------------------------------------------
-
-/// Look `name` up on `PATH`, and answer only with absolute paths.
-fn walk_path(name: &str) -> Option<PathBuf> {
-    walk(&std::env::var_os("PATH")?, name)
-}
-
-/// The search itself, over a `PATH` handed in rather than read.
-///
-/// Split out so that the entries this refuses to look in can be pinned by a
-/// test without a test reaching for the process's environment or its current
-/// directory — both of which are shared by every other test running beside it.
-fn walk(path: &OsStr, name: &str) -> Option<PathBuf> {
-    std::env::split_paths(path)
-        // Drops both the empty entry a `;;` leaves behind and any genuinely
-        // relative one. Joining a name onto either gives a *relative* path, and
-        // checking whether that exists asks about the current directory — which
-        // is the repository, and the whole thing this module exists to stop.
-        .filter(|dir| dir.is_absolute())
-        .find_map(|dir| probe(&dir, name))
-}
+// --- what a name means in a directory -------------------------------------
 
 /// `name` inside `dir`, with whatever extension makes it startable.
-fn probe(dir: &Path, name: &str) -> Option<PathBuf> {
+pub(super) fn probe(dir: &Path, name: &str) -> Option<PathBuf> {
     probe_with(dir, name, &pathext())
 }
 
 /// The search inside one directory, over a `PATHEXT` handed in rather than
-/// read — split out for the same reason [`walk`] is, so that a test can pin
-/// what a customised one does without writing to an environment the whole test
-/// binary shares.
+/// read — split out for the same reason [`super::walk`] is, so that a test can
+/// pin what a customised one does without writing to an environment the whole
+/// test binary shares.
 ///
 /// `PATHEXT` matches come before the bare file, deliberately: an npm install
 /// leaves `claude`, `claude.cmd` and `claude.ps1` side by side, and the
@@ -539,7 +432,7 @@ fn probe_with(dir: &Path, name: &str, pathext: &[String]) -> Option<PathBuf> {
 
 /// A file this module has a way to run: `CreateProcessW` takes an [`IMAGES`]
 /// one as it stands, and a [`SCRIPTS`] one goes through `cmd.exe`.
-fn startable(path: &Path) -> bool {
+pub(super) fn startable(path: &Path) -> bool {
     is_image(path) || has_extension(path, SCRIPTS)
 }
 
@@ -568,12 +461,6 @@ fn is_image(path: &Path) -> bool {
     has_extension(path, IMAGES)
 }
 
-fn file_name_of(path: &Path) -> String {
-    path.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 /// Windows-only like the rest of the suite, the quoting tests included — what
 /// they are about is a `PATH` walk, a `PATHEXT`, and a parser that only ships
 /// on this platform.
@@ -596,6 +483,46 @@ mod tests {
     /// The command line for `claude.cmd` with these arguments, as one string.
     fn line(list: &[&str]) -> String {
         command_line(Path::new(r"C:\npm\claude.cmd"), &args(list)).expect("a quotable argument")
+    }
+
+    /// A `PATH` out of these directories, joined the way this platform joins
+    /// one. Written out rather than built with `std::env::join_paths`, which
+    /// returns a `Result` for a case (a directory with a `;` in its name) that
+    /// no test here has and that would only add an `unwrap` to read past.
+    fn path_of(dirs: &[&Path]) -> String {
+        dirs.iter()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// A relative `PATH` entry that really does hold a file, and the name of
+    /// that file — so that a walk which had stopped refusing relative entries
+    /// would answer `Some` rather than `None`.
+    ///
+    /// Discovered rather than written down, the same way
+    /// `a_hint_that_is_not_absolute_is_trusted_no_further_than_a_path_entry_is`
+    /// finds its own. `cargo test` runs with the crate directory as the current
+    /// one, so `("src", "main.rs")` would do — and a test that pins the layout
+    /// of the crate it lives in fails the day somebody moves a file, for a
+    /// reason that has nothing to do with what it is about.
+    fn a_relative_entry_holding_a_file() -> (PathBuf, String) {
+        let here = std::env::current_dir().expect("a current directory");
+        std::fs::read_dir(&here)
+            .expect("read the current directory")
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .find_map(|entry| {
+                let inside = std::fs::read_dir(entry.path())
+                    .ok()?
+                    .flatten()
+                    .find(|inner| inner.path().is_file())?;
+                Some((
+                    PathBuf::from(entry.file_name()),
+                    inside.file_name().to_string_lossy().into_owned(),
+                ))
+            })
+            .expect("the current directory has a subdirectory with a file in it")
     }
 
     // --- what may be started ---------------------------------------------
@@ -624,8 +551,31 @@ mod tests {
             );
         }
 
-        // ...and the planted file is genuinely there, so the `None`s above are
-        // the filter doing its job rather than the file being absent.
+        // The loop above is necessary and it is not sufficient, and this test
+        // claimed the opposite of that for as long as it existed. Nothing
+        // called `abeam-planted.exe` exists relative to the test binary's
+        // current directory either — the planted copy is in a temp directory —
+        // so every one of those entries answers `None` whether or not `walk`
+        // refuses a relative one. Delete `.filter(|dir| dir.is_absolute())` and
+        // the loop stays green, which is the one thing a test of a filter must
+        // not do.
+        //
+        // What catches it is a relative entry that genuinely holds a file: with
+        // the filter it is `None`, and without it the walk returns the file.
+        let (relative, name) = a_relative_entry_holding_a_file();
+        assert!(
+            relative.join(&name).is_file(),
+            "the entry does name a file, relatively"
+        );
+        assert_eq!(
+            walk(relative.as_os_str(), &name),
+            None,
+            "a relative PATH entry was searched, and what it names is the \
+             current directory"
+        );
+
+        // ...and an absolute entry still is, so the refusals above are the
+        // filter choosing rather than the walk having stopped working.
         assert_eq!(
             walk(dir.path().as_os_str(), planted),
             Some(dir.path().join(planted)),
@@ -635,6 +585,52 @@ mod tests {
         // The end of the same story: nothing on PATH, so nothing is started —
         // where portable-pty would have passed the bare name through.
         assert!(resolve(planted, &[]).is_err());
+    }
+
+    #[test]
+    fn a_file_windows_cannot_start_does_not_shadow_the_program_further_along_path() {
+        // [`super::walk`]'s second pass, pinned on this platform. It was added
+        // for Unix — where a directory holds one candidate and [`probe_with`]
+        // has nothing to choose between, so the preference had to be lifted to
+        // the walk — and because `walk` is shared it changed Windows too: an
+        // earlier `PATH` entry holding only something abeam cannot start no
+        // longer hides a later entry holding the program. That was previously
+        // an error, and it is a behaviour change worth a test of its own rather
+        // than one inherited from a suite that does not run here. Without this,
+        // the whole two-pass could be deleted and every Windows test would
+        // still pass.
+        //
+        // The extensionless npm shim is the file to plant, because `probe_with`
+        // finds it whatever `PATHEXT` says — it chains the bare name after the
+        // extensions — and `startable` refuses it however it was found. A
+        // `.ps1` would depend on a `PATHEXT` this machine may not have.
+        let earlier = TempDir::new("launch-shadow-earlier");
+        let later = TempDir::new("launch-shadow-later");
+        let unusable = earlier.write("abeam-agent", b"#!/bin/sh\nexec node cli.js\n");
+        let usable = later.write("abeam-agent.cmd", b"@echo off\r\n");
+
+        assert_eq!(
+            walk(
+                OsStr::new(&path_of(&[earlier.path(), later.path()])),
+                "abeam-agent"
+            ),
+            Some(usable),
+            "a POSIX shim earlier on PATH hid the .cmd behind it"
+        );
+
+        // ...and with nothing startable anywhere on it, the file that is there
+        // is still the one named, because the sentence it produces is the one
+        // the user can act on: the whole difference between "`abeam-agent` was
+        // not found on PATH" and being told what the file in `%APPDATA%\npm`
+        // actually is.
+        assert_eq!(
+            walk(OsStr::new(&path_of(&[earlier.path()])), "abeam-agent"),
+            Some(unusable.clone()),
+            "the only copy on PATH was dropped, leaving nothing to name"
+        );
+        let refused = into_launch(unusable, &[]).expect_err("it still cannot be started");
+        assert!(refused.contains("abeam-agent"), "got: {refused}");
+        assert!(refused.contains("POSIX"), "got: {refused}");
     }
 
     #[test]

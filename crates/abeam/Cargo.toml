@@ -1,9 +1,12 @@
 [package]
 name = "abeam"
-description = "A Windows terminal multiplexer for an AI coding workflow: the agent in one pane, git, files and a shell in the other. Hosts Claude Code and GitHub Copilot CLI."
+description = "A terminal multiplexer for an AI coding workflow on Windows and Linux: the agent in one pane, git, files and a shell in the other. Hosts Claude Code and GitHub Copilot CLI."
 # Five is crates.io's limit, so this is a choice rather than a list: what abeam
 # is, what it is built on, and the two agents somebody would search for by name.
-keywords = ["terminal", "tui", "conpty", "claude-code", "copilot"]
+# `pty` holds the middle slot that `conpty` used to, now that ConPTY is one of
+# two backends rather than the whole story: nobody looking for this from Linux
+# would type the Windows name, and five slots leave no room to carry both.
+keywords = ["terminal", "tui", "pty", "claude-code", "copilot"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -62,3 +65,15 @@ serde_json = "1.0.145"
 # to `git`, which already knows this user's config, credentials and worktree
 # layout. `git status --porcelain=v2` and `git log --format=...` are trivial to
 # parse and cost nothing to build.
+
+# `setsid`, for the `pre_exec` in `src/dispatch.rs`, and `getpgrp` for the test
+# that pins it. `std` offers `process_group(0)` for nothing and it is the weaker
+# call: it leaves a dispatched task holding abeam's controlling terminal as a
+# background process group, where a read from `/dev/tty` stops it with `SIGTTIN`
+# and hangs the worker thread waiting on its pipes. Not a new crate in the tree —
+# `abeam-pty` already declares libc for `cfg(unix)` and portable-pty depends on
+# it unconditionally, and libc has no features to ask for, so this changes
+# nothing about what is fetched or compiled. It is here so that a crate calling
+# libc says so in its own manifest.
+[target."cfg(unix)".dependencies]
+libc = "0.2"

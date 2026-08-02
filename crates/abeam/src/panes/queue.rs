@@ -613,6 +613,18 @@ impl QueuePane {
             // modifier on `Enter`, so abeam can tell these apart here; a
             // terminal that folds them into a bare `CR` leaves items
             // single-line, and a paste is then the way to a multi-line one.
+            //
+            // On Unix that second sentence is the usual case rather than the
+            // exception, and it is worth being plain about it: a terminal only
+            // distinguishes `Ctrl+Enter` from `Enter` if it speaks the Kitty
+            // keyboard protocol, and abeam does not ask for it (`term::setup`
+            // enables raw mode, the alternate screen, mouse capture and
+            // bracketed paste, and nothing else). So this arm is mostly
+            // unreachable on Linux and pasting is how a multi-line item gets
+            // written. Left as it is rather than papered over: requesting the
+            // protocol changes how *every* key arrives, which is a keymap
+            // question — `docs/keymap.md` — and not one to answer as a side
+            // effect of making the queue nicer.
             KeyCode::Enter if ctrl || alt => {
                 if let Some(draft) = self.composing.as_mut() {
                     draft.push('\n');

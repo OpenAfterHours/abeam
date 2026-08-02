@@ -1,8 +1,24 @@
 # Build, test and lint on every push and pull request.
 #
-# Windows only, and not as an oversight: the pty layer is ConPTY, the test
-# suites that matter are `#![cfg(windows)]`, and on any other platform they
-# would pass by saying nothing. See the README.
+# Two runners, because a suite that names a platform is only ever run by that
+# platform, and a `cfg` that excludes one is invisible from the other — it does
+# not fail there, it is not compiled there, and the run is green having said
+# nothing. Three shapes of test exist here and only the first is covered by one
+# runner:
+#
+#   - shared, the large majority: parsing, layout, wrapping, markdown, scroll
+#     arithmetic, key encoding, and every pty test in `abeam-pty/tests/session.rs`
+#   - twinned, `#[cfg(all(test, windows))]` beside `#[cfg(all(test, unix))]`:
+#     `launch`, the shell pane, and everything else that spawns a real child or
+#     asks what a program name means on this platform
+#   - Windows-only for ever: `abeam-pty/tests/conpty.rs`, which pins ConPTY's
+#     opening `ESC [ 6 n` handshake — there is nothing on the other side to twin
+#     it with, and there never will be
+#
+# Which is why this file was a single Windows job for as long as the Unix half
+# did not exist: a green tick from Linux would have meant the twinned half was
+# compiled out and the rest was passing by default. There is something on the
+# other side now, and one runner would leave it unrun. See the README.
 
 name: ci
 
@@ -22,7 +38,15 @@ concurrency:
 
 jobs:
   test:
-    runs-on: windows-latest
+    name: test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A failure on one platform is immediately a question about the other,
+      # and the default would cancel the answer to save a few runner-minutes.
+      # Both legs run to the end so that one push reports on both.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +63,9 @@ jobs:
         with:
           components: clippy
 
+      # Nothing to configure for the matrix: the cache key already carries the
+      # runner and the toolchain, so the two legs fill separate caches instead
+      # of overwriting each other with objects the other platform cannot link.
       - uses: Swatinem/rust-cache@v2
 
       # `--all-targets` throughout, or the examples bit-rot: `host.rs` is the
@@ -46,8 +73,13 @@ jobs:
       - run: cargo build --workspace --all-targets
 
       # Includes tests/end_to_end.rs, which spawns the built binary inside a
-      # ConPTY and types at it. If ConPTY behaves differently on a GitHub
-      # runner than on a desktop, this is where that shows up.
+      # real pty and types at it — ConPTY on one leg, a Unix pty on the other.
+      # If either behaves differently on a GitHub runner than on a desktop,
+      # this is where that shows up.
       - run: cargo test --workspace
 
+      # On both legs for the same reason the tests are: clippy only sees the
+      # code its target compiles, so a lint sitting in the `cfg(unix)` half is
+      # invisible from Windows and one in the `cfg(windows)` half is invisible
+      # from Linux. `-D warnings` is a gate only where something looked.
       - run: cargo clippy --workspace --all-targets -- -D warnings

@@ -1,13 +1,24 @@
 //! The pty instrument, kept because it earned its place.
 //!
 //! Every field here was, at some point during the spike, the difference between
-//! "the agent doesn't work" and a diagnosis. The one to look at first is **DSR
-//! answered**: ConPTY opens a session by asking where the cursor is and blocks
-//! until it is told, so a zero there — shown red — is not a statistic, it is an
-//! imminent hang. `bytes_read` frozen while the child is alive means the reader
-//! thread died. The two sizes are here to be compared with the pane you can see
-//! — a hosted app wrapping in the wrong place is a size that does not match the
-//! rect. All of it is written up in `docs/conpty-findings.md`.
+//! "the agent doesn't work" and a diagnosis. The one to look at first — **on
+//! Windows** — is **DSR answered**: ConPTY opens a session by asking where the
+//! cursor is and blocks until it is told, so a zero there, shown red, is not a
+//! statistic but an imminent hang. `bytes_read` frozen while the child is alive
+//! means the reader thread died. The two sizes are here to be compared with the
+//! pane you can see — a hosted app wrapping in the wrong place is a size that
+//! does not match the rect. All of it is written up in
+//! `docs/conpty-findings.md`.
+//!
+//! The DSR row is the one thing this pane says differently on the two
+//! platforms, and the difference is a fact about ConPTY rather than about
+//! abeam. Nothing opens a Unix pty with a cursor query: the kernel makes the
+//! line discipline and the child starts talking, so the counter there is zero
+//! for the whole of every healthy session. It is still shown — a hosted child
+//! may issue a DSR of its own and `abeam_pty` still answers it, so a number
+//! that moves is worth seeing — but the alarm and the sentence beside it are
+//! Windows'. Painting a permanent red on a working session would cost this pane
+//! the only thing it has, which is that a red row means something.
 //!
 //! It is a third right-hand view rather than a startup flag because the failures
 //! it explains are not reproducible on demand — you want it *while* the thing is
@@ -91,7 +102,13 @@ impl Pane for DiagPane {
         match &self.state {
             // Red in the body rather than the border: a title that shouts is a
             // title you stop reading.
-            Some(d) if d.dsr_replies == 0 => "pty · no DSR reply".into(),
+            //
+            // `cfg!(windows)` in the guard rather than a `#[cfg]` on the arm,
+            // so that both spellings of this pane's title are compiled on both
+            // platforms and neither can quietly rot. What it gates is the same
+            // thing the row's colour gates: there is no opening DSR on a Unix
+            // pty, so this title would be the permanent one there.
+            Some(d) if cfg!(windows) && d.dsr_replies == 0 => "pty · no DSR reply".into(),
             Some(d) if d.reader_finished => "pty · closed".into(),
             _ => "pty diagnostics".into(),
         }
@@ -174,13 +191,20 @@ fn rows(d: &Diagnostics, f: Option<FrameStats>, width: usize) -> Vec<Line<'stati
     // Shown as cols x rows, which is the order everyone says sizes in, and side
     // by side because what matters is whether they match the pane you can see.
     //
-    // Deliberately *not* flagged when they differ. portable-pty answers
-    // `get_size` on Windows from a field it wrote itself during the last
-    // successful resize, and `PtySession::resize` updates the parser from the
-    // same call — so the two are structurally incapable of disagreeing, and a
-    // red row here would be an instrument reporting on itself. What they are
-    // good for is the check no code can make: reading them off the screen and
-    // comparing them with the inner area of the pane you are looking at.
+    // Deliberately *not* flagged when they differ, and that is a weaker claim
+    // on one platform than on the other. On Windows portable-pty answers
+    // `get_size` from a field it wrote itself during the last successful
+    // resize, and `PtySession::resize` updates the parser from the same call,
+    // so the two are structurally incapable of disagreeing and a red row would
+    // be an instrument reporting on itself. On Unix `get_size` is a real
+    // `TIOCGWINSZ` on the master: it is the kernel's answer rather than a
+    // remembered one, so the two genuinely can disagree — a resize the kernel
+    // took and the parser did not would show here as two different numbers,
+    // and that would be worth flagging. This pane does not flag it, on either
+    // platform, and that is a gap rather than a decision that has been made.
+    // Until it is closed, what these rows are good for is the check no code can
+    // make: reading them off the screen and comparing them with the inner area
+    // of the pane you are looking at.
     let pty = match d.pty_size {
         Some((r, c)) => format!("{c}x{r}"),
         None => "unknown".to_string(),
@@ -189,16 +213,32 @@ fn rows(d: &Diagnostics, f: Option<FrameStats>, width: usize) -> Vec<Line<'stati
     lines.push(row("pty size (set)", Span::raw(pty)));
     lines.push(row("parser size", Span::raw(format!("{pcols}x{prows}"))));
     lines.push(row("bytes read", Span::raw(d.bytes_read.to_string())));
+    // The counter is on both platforms; the alarm is not, and the difference is
+    // a fact about ConPTY rather than about abeam.
+    //
+    // ConPTY opens a session by asking where the cursor is and blocks until it
+    // is told, so on Windows a zero here is a session hung on the handshake
+    // rather than a session that is merely slow — which is the single most
+    // useful thing this pane has ever said, and cost days to learn. A Unix pty
+    // asks nothing: the kernel makes the line discipline, the child starts, and
+    // nothing sends `ESC [ 6 n` unless the hosted child chooses to. So zero is
+    // what a healthy Linux session reads for its whole life, and red would be a
+    // permanent lie — from an instrument whose entire worth is that a red row
+    // means something.
+    //
+    // The row itself stays, because the number is still real: a child that
+    // does query the cursor is answered by `abeam_pty`, and watching this
+    // climb is how you know that reply went out.
+    let answered = if d.dsr_replies > 0 {
+        Style::default().fg(Color::Green)
+    } else if cfg!(windows) {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default()
+    };
     lines.push(row(
         "DSR answered",
-        Span::styled(
-            d.dsr_replies.to_string(),
-            Style::default().fg(if d.dsr_replies > 0 {
-                Color::Green
-            } else {
-                Color::Red
-            }),
-        ),
+        Span::styled(d.dsr_replies.to_string(), answered),
     ));
     lines.push(row("keys sent", Span::raw(d.keys_sent.to_string())));
     lines.push(row("resizes", Span::raw(d.resizes.to_string())));
@@ -235,7 +275,12 @@ fn rows(d: &Diagnostics, f: Option<FrameStats>, width: usize) -> Vec<Line<'stati
         ));
     }
 
-    if d.dsr_replies == 0 {
+    // Windows-only, for the reason the row's colour is, and gated with `cfg!`
+    // rather than `#[cfg]` so that the sentence is still compiled on Linux and
+    // cannot drift out of step with the row it explains. On a platform where
+    // nothing sends an opening DSR this would be on screen for the whole of
+    // every healthy session, and would be wrong every single time.
+    if cfg!(windows) && d.dsr_replies == 0 {
         lines.push(Line::default());
         lines.extend(note(
             "No DSR reply yet. ConPTY blocks until the query is answered, so if \
@@ -306,11 +351,39 @@ mod tests {
             .collect()
     }
 
+    /// Everything the pane drew, as one string.
+    fn text_of(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect()
+    }
+
+    #[test]
+    fn an_answered_dsr_query_is_green_and_carries_no_alarm() {
+        // The half that is the same everywhere: a counter that has moved is
+        // green, and there is nothing beside it. Shared, because the alarm's
+        // absence *here* is not about the platform — it is what says the alarm
+        // below is attached to the zero rather than to the row.
+        let lines = rows(&sample(), None, 46);
+        assert_eq!(
+            styles_of(&lines, "DSR answered"),
+            [Style::default().fg(Color::Green)]
+        );
+        assert!(!text_of(&lines).contains("ConPTY blocks"));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn an_unanswered_dsr_query_is_red_and_says_why() {
-        // The single most useful thing this pane does. A zero here means the
-        // session is hung on ConPTY's opening question, and the spike burned
-        // days on that before the counter existed.
+        // The single most useful thing this pane does on Windows. A zero here
+        // means the session is hung on ConPTY's opening question, and the spike
+        // burned days on that before the counter existed.
+        //
+        // Its Unix twin below asserts the opposite for the same input. Read
+        // them together: what they say between them is that the alarm belongs
+        // to ConPTY and not to abeam, so deleting either leaves the other
+        // looking like an arbitrary rule about a number.
         let mut d = sample();
         d.dsr_replies = 0;
         let lines = rows(&d, None, 46);
@@ -318,34 +391,61 @@ mod tests {
             styles_of(&lines, "DSR answered"),
             [Style::default().fg(Color::Red)]
         );
-
-        let text: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect();
+        let text = text_of(&lines);
         assert!(text.contains("ConPTY blocks"), "got: {text}");
 
-        // ...and green once it has been answered, with no alarm attached.
-        let lines = rows(&sample(), None, 46);
-        assert_eq!(
-            styles_of(&lines, "DSR answered"),
-            [Style::default().fg(Color::Green)]
+        // And the title says so too, because the pane is usually not the one
+        // being looked at when this happens.
+        let mut pane = DiagPane::new();
+        pane.update(d);
+        assert!(
+            pane.title().contains("no DSR reply"),
+            "got: {}",
+            pane.title()
         );
-        let text: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect();
-        assert!(!text.contains("ConPTY blocks"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unanswered_dsr_query_is_ordinary_where_nothing_ever_sends_one() {
+        // The state every healthy Linux session is in for its whole life.
+        // Nothing opens a Unix pty by asking where the cursor is — that is
+        // ConPTY's handshake and ConPTY's alone — so a zero here is the absence
+        // of a question rather than a missing answer, and an instrument that
+        // painted it red would be crying wolf from the first frame of every
+        // session to the last.
+        //
+        // Its Windows twin above asserts the red. Delete this one and the next
+        // person to read the row's colour will "fix" the inconsistency.
+        let mut d = sample();
+        d.dsr_replies = 0;
+        let lines = rows(&d, None, 46);
+
+        // The counter is still drawn, and that is deliberate: a hosted child
+        // may issue a DSR of its own and `abeam_pty` still answers it, so the
+        // number is real even though nothing here starts it off.
+        let text = text_of(&lines);
+        assert!(text.contains("DSR answered"), "got: {text}");
+        assert_eq!(styles_of(&lines, "DSR answered"), [Style::default()]);
+
+        // No alarm, in either of the two places it used to appear.
+        assert!(!text.contains("ConPTY blocks"), "got: {text}");
+        let mut pane = DiagPane::new();
+        pane.update(d);
+        assert_eq!(pane.title(), "pty diagnostics");
     }
 
     #[test]
     fn both_sizes_are_reported_and_neither_is_dressed_up_as_a_check() {
         // The pane used to colour the two rows red when they differed, which
-        // read as a check being performed. It is not one: portable-pty answers
-        // `get_size` from its own cache and `PtySession::resize` writes the
-        // parser from the same call, so they cannot disagree. Showing both is
-        // still worth it — the comparison a human makes is against the pane on
-        // screen — but the instrument must not claim more than it does.
+        // read as a check being performed. On Windows it is not one:
+        // portable-pty answers `get_size` from its own cache and
+        // `PtySession::resize` writes the parser from the same call, so they
+        // cannot disagree there. On Unix `get_size` is a real `TIOCGWINSZ` and
+        // they can — so what this test pins is that the pane does not flag it
+        // *yet*, on either platform, rather than that flagging it would be
+        // wrong. Showing both is worth it either way: the comparison a human
+        // makes is against the pane on screen.
         let mut d = sample();
         d.pty_size = Some((22, 80));
         let text: String = rows(&d, None, 46)

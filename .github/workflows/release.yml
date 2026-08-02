@@ -1,4 +1,4 @@
-# Build the wheel and publish it to PyPI, on a version tag.
+# Build the wheels and publish them to PyPI, on a version tag.
 #
 #   git tag v0.0.1 && git push origin v0.0.1
 #
@@ -8,7 +8,7 @@
 # below — change any of those three names and the publish is rejected, which is
 # the point of them.
 #
-# `workflow_dispatch` builds the wheel and stops, so the build can be exercised
+# `workflow_dispatch` builds the wheels and stops, so the build can be exercised
 # without spending a version number.
 
 name: release
@@ -22,14 +22,28 @@ permissions:
   contents: read
 
 jobs:
-  wheel:
-    runs-on: windows-latest
+  # Its own job because there are two builds below now and this question has one
+  # answer. Asking it once also means a mistyped tag costs the ten seconds this
+  # job takes rather than two full toolchain installs and two release builds.
+  version:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       # The wheel's version comes from Cargo.toml, and the tag is what everyone
       # will refer to. A release where those two disagree is discovered by
       # someone installing the wrong thing, so it is refused here instead.
+      #
+      # The condition is on the step and not on the job, which matters more than
+      # it looks: a skipped job skips everything that `needs` it, so guarding
+      # the job would mean `workflow_dispatch` — which has no tag to check —
+      # never reaching the builds it exists to exercise. This way the job runs
+      # and succeeds trivially, and the matrix below still fires.
+      #
+      # `shell: pwsh` on a Linux runner is deliberate, not a leftover: pwsh is
+      # preinstalled on GitHub's Ubuntu images, and keeping the script that has
+      # gated every release so far byte-identical beats retranslating it into sh
+      # for a platform change that has nothing to do with it.
       - name: The tag and the crate version must agree
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
@@ -44,26 +58,77 @@ jobs:
           }
           Write-Host "releasing $version"
 
-      - uses: dtolnay/rust-toolchain@stable
+  wheel:
+    needs: version
+    name: wheel for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One leg failing does not make the other leg's answer less interesting,
+      # and nothing is published either way — `publish` needs the whole matrix.
+      fail-fast: false
+      matrix:
+        # x86-64 on both platforms, deliberately, and the omissions are the part
+        # worth writing down. `aarch64-pc-windows-msvc` and
+        # `aarch64-unknown-linux-gnu` would each cross-compile from here in one
+        # more matrix entry, and macOS builds from the same Unix source that
+        # Linux does, so all three are a few lines away. None of the three has
+        # ever been built or run by anyone on this project, and shipping an
+        # untested binary under an install command that picks it automatically
+        # is worse than not shipping one: `uvx abeam` would resolve to it
+        # silently, and the first person to learn it does not work would be a
+        # user. Add each target when someone can run it.
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+    steps:
+      - uses: actions/checkout@v4
 
-      # Wheels for x86_64 only, deliberately. `aarch64-pc-windows-msvc` would
-      # cross-compile from here in one more line, and would be a wheel nobody
-      # has ever run — this project has never been built or tested on ARM
-      # Windows, and shipping an untested binary under an install command that
-      # picks it automatically is worse than not shipping one. Add the target
-      # when someone can run it.
+      # Only the Windows leg builds on the runner itself. `manylinux: auto`
+      # below puts the Linux build inside a container that brings its own
+      # toolchain, where this one would be installed, cached, and never invoked.
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os == 'Windows'
+
+      # `manylinux: auto` is the whole reason the Linux leg is a maturin-action
+      # invocation rather than a `cargo build` on the runner. It builds inside a
+      # manylinux container, so the wheel's glibc floor is the container's old
+      # one instead of whatever the runner image happens to ship this month. A
+      # wheel built bare on `ubuntu-latest` is tagged with that runner's glibc,
+      # and the report that prompted all of this was `uvx abeam` refusing to
+      # install on a host whose tag is `manylinux_2_39_x86_64` — publishing a
+      # wheel that is itself `manylinux_2_39` would have satisfied that one
+      # machine and left every older distro reading the same message.
+      #
+      # The Windows entry has no `manylinux` key, so the expression below
+      # expands to the empty string there. An input set to empty and an input
+      # never set are the same thing to the action, which is what makes one step
+      # serve both legs: Windows builds exactly as it did before this matrix.
       - uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release --out dist
-          target: x86_64-pc-windows-msvc
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
 
-      # No sdist. The source needs a Rust toolchain *and* Windows to build, so
-      # an sdist on PyPI would turn "not available for your platform" — which
-      # is true and clear — into a compiler error part-way through an install.
+      # Still no sdist, and the reason has narrowed rather than gone: the source
+      # no longer needs Windows, but it does need a Rust toolchain, and pip will
+      # cheerfully try anyway. An sdist turns "no wheel for your platform" —
+      # which is one line, true, and immediately actionable — into a cargo build
+      # running inside somebody's install, ending either in a linker error
+      # halfway through or, worse, in a working binary on a platform nothing
+      # here has ever been tested on.
+      #
+      # The name carries the target rather than the runner: it is the wheel that
+      # is being identified, and two targets built on one runner OS would
+      # collide under a runner-shaped name. Uniqueness is not optional —
+      # upload-artifact@v4 refuses to merge same-named uploads — and everything
+      # downstream collects these by the `wheels-*` prefix.
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-windows
+          name: wheels-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
 
@@ -72,7 +137,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     # The action that talks to PyPI is a container action, so this job cannot
-    # run on the Windows runner that built the wheel.
+    # run on the Windows runner that builds one of the two wheels; it collects
+    # both from artifacts instead.
     environment:
       name: pypi
       url: https://pypi.org/p/abeam
@@ -81,9 +147,14 @@ jobs:
       # and PyPI exchanges it for an upload token. Nothing here is a secret.
       id-token: write
     steps:
+      # `merge-multiple` flattens every matching artifact into one directory
+      # rather than one directory each. Without it the wheels land in
+      # `dist/wheels-x86_64-.../` and the publish action, which looks in `dist`
+      # and not below it, would upload nothing and say so cheerfully.
       - uses: actions/download-artifact@v4
         with:
-          name: wheels-windows
+          pattern: wheels-*
+          merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
 
@@ -97,10 +168,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: wheels-windows
+          pattern: wheels-*
+          merge-multiple: true
           path: dist
-      # The wheel attached here is the same file that went to PyPI, for anyone
-      # who would rather download a binary than install a package.
+      # The wheels attached here are the same files that went to PyPI, for
+      # anyone who would rather download a binary than install a package. Both
+      # of them: the glob is what makes the release page say, without anyone
+      # writing it in the notes, which platforms this version was built for.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}

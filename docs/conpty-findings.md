@@ -53,21 +53,39 @@ test failure. That redundancy is deliberate and is not duplication to tidy away.
 
 Any refactor must keep all five. There are tests pinning every one of them.
 
-1. **The writer is shared with the reader thread.** Do not "simplify" it back
-   into sole ownership by whatever sends input. The reader is what answers DSR.
-2. **Poll `try_wait()`. Never `wait()`** — it never returns. There is no
-   reliable EOF on the master to block against, so the reader thread must be
-   treated as an endless stream and **never joined**; let it die with the
-   process. Joining it is the obvious-looking thing to add. Do not add it.
-3. **Windows sends Press *and* Release for every key.** Forwarding both
-   double-types everything. `encode_key` drops releases. Anything that matches
-   its own bindings *before* calling `encode_key` — the app shell does — needs
-   its own release filter, or every command fires twice.
-4. **Mouse reports are gated on what the hosted app actually enabled.** Sending
-   unrequested ones dumps escape sequences into the agent's prompt.
+Three of the five are facts about *this* platform and two are general, and now
+that `abeam-pty` builds for Unix as well the difference has to be marked. A
+reader on Linux who takes the whole list as gospel goes looking for a handshake
+that never happens. Nothing here stops being a rule the code must keep — the
+marks say where each rule comes from, not which ones may be dropped.
+
+1. **The writer is shared with the reader thread.** *(ConPTY.)* Do not
+   "simplify" it back into sole ownership by whatever sends input. The reader is
+   what answers DSR. Nothing opens a Unix pty with a query, so there the sharing
+   costs a mutex and buys nothing; it stays unconditional because one shape that
+   is right on both platforms is worth more than a `cfg` inside the reader loop.
+2. **Poll `try_wait()`. Never `wait()`** *(ConPTY)* — it never returns. There is
+   no reliable EOF on ConPTY's master to block against, so the reader thread
+   must be treated as an endless stream and **never joined**; let it die with
+   the process. Joining it is the obvious-looking thing to add. Do not add it.
+   A Unix master *does* give a real EOF — dropping the slave in the parent is
+   what lets the reader see it — so on Linux this rule stops being load-bearing
+   without stopping being correct, which is not a licence to join the thread on
+   one platform and not the other.
+3. **Windows sends Press *and* Release for every key.** *(Windows console.)*
+   Forwarding both double-types everything. `encode_key` drops releases.
+   Anything that matches its own bindings *before* calling `encode_key` — the
+   app shell does — needs its own release filter, or every command fires twice.
+   A Unix terminal reports presses only, and a terminal that negotiates the
+   Kitty keyboard protocol reports releases on any platform, so the filter is
+   unconditional and its test builds the release rather than typing one.
+4. **Mouse reports are gated on what the hosted app actually enabled.**
+   *(General.)* Sending unrequested ones dumps escape sequences into the agent's
+   prompt.
 5. **`Screen::contents()` rejoins wrapped rows** into logical lines, so it tells
-   you nothing about layout. Use `Screen::rows()` for anything positional. This
-   one is not structurally enforceable — it is vt100's API, not ours.
+   you nothing about layout. *(General.)* Use `Screen::rows()` for anything
+   positional. This one is not structurally enforceable — it is vt100's API, not
+   ours.
 
 ## Other things learned
 
@@ -96,18 +114,26 @@ without abeam around it.
 | `app cursor` | DECCKM. When `on`, arrows must be sent as `ESC O A`. |
 | `bracketed paste` | When `on`, pasted text is wrapped so the agent can tell paste from typing. |
 | `mouse mode` / `encoding` | Whether the agent wants mouse reports, and in which dialect. We stay silent unless asked. |
-| `dsr_replies` | Non-zero within the first moment. **Zero means an imminent hang.** |
+| `dsr_replies` | *Windows:* non-zero within the first moment — **zero means an imminent hang**, and the pane reddens it and says so. *Unix:* nothing opens a pty by asking where the cursor is, so zero is what a healthy session reads for its whole life; the row is drawn plain and carries no alarm. A number that climbs there is a hosted child querying for itself, and `abeam-pty` answering. |
 | `pty size (set)` / `parser size` | Compare them with the *inner* area of the bordered pane — not with each other. See below. |
 | `bytes_read` | Should climb steadily. Frozen = the reader thread died. |
 
 The two size rows are not a cross-check, and the pane no longer pretends they
 are. `portable_pty::ConPtyMasterPty::get_size` answers from a field it wrote
 itself during the last successful `ResizePseudoConsole`, and `PtySession::resize`
-updates the vt100 parser from that same call — so the two agree by construction
-and their agreeing is evidence of nothing. What they are good for is the check
-no code can make: reading them off the screen and comparing them with the pane
-you are looking at. A hosted app wrapping in the wrong place is a size that does
-not match the rect.
+updates the vt100 parser from that same call — so on Windows the two agree by
+construction and their agreeing is evidence of nothing. What they are good for is
+the check no code can make: reading them off the screen and comparing them with
+the pane you are looking at. A hosted app wrapping in the wrong place is a size
+that does not match the rect.
+
+On Unix that argument does not hold, and the pane has not caught up. `get_size`
+there is a real `TIOCGWINSZ` on the master — the kernel's answer rather than a
+remembered one — so the two rows genuinely can disagree, and a resize the kernel
+took and the parser did not would show up as two different numbers. The pane
+does not flag it, on either platform. That is now a gap rather than a decision
+that has been made, and it is recorded here so the next person to look does not
+have to rediscover which half of the paragraph above is still true.
 
 ## Pass criteria
 
@@ -120,6 +146,13 @@ They have not been re-run against `abeam` itself since the git and files panes
 landed. The pty layer underneath is unchanged and its tests still pass, so a
 failure now would be in the shell — most likely in key routing, since that is
 the only part of the path the panes added anything to.
+
+They have also never been run on Linux, against anything. Every one of the six
+is a question about a pty and a hosted program rather than about ConPTY, so they
+transfer word for word and there is no second checklist to write — which is
+exactly what makes running them there the acceptance gate the Linux wheel has
+not passed. The README's "Platforms" says so where somebody about to install it
+will see it.
 
 1. **Renders.** Claude's UI appears, colours intact, no stray escape sequences
    as literal text.
@@ -145,5 +178,14 @@ Not bugs; just never exercised, so do not assume they work:
 
 - Wide-character and grapheme-cluster handling under resize.
 - Any terminal query other than DSR.
-- Anything but Windows. `tests/conpty.rs` and `tests/session.rs` are
-  `#![cfg(windows)]`, so on another platform the suite passes by saying nothing.
+- **Linux, by hand.** The suite no longer passes there by saying nothing:
+  `tests/session.rs` used to be `#![cfg(windows)]` beside `conpty.rs` and is
+  ungated now, because every claim in it is about our wrapper rather than about
+  a pseudoconsole and all of them hold on a Unix pty — and it is the only
+  coverage `src/tree/unix.rs` has, which is why its last test asserts on a real
+  grandchild. CI runs the whole workspace on both platforms. What has not
+  happened on Linux is a human at a terminal: the six pass criteria above.
+- `tests/conpty.rs` stays `#![cfg(windows)]` for ever, and that is not the same
+  admission. It pins ConPTY's own `ESC [ 6 n` handshake, and a Unix pty asks
+  nothing at startup — so over there the file would not be the same test
+  proving less, it would be a test of nothing.

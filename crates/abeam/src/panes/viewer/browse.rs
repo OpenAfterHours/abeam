@@ -766,12 +766,13 @@ impl Browser {
     /// wearing a trailing slash so a directory listing cannot be mistaken for
     /// the name of a file.
     fn here(&self) -> String {
-        let rel = self
-            .dir
-            .strip_prefix(&self.root)
-            .unwrap_or(&self.dir)
-            .to_string_lossy()
-            .replace('\\', "/");
+        // The find list's spelling, deliberately: the two are read one after
+        // the other — `Alt+E` twice, then `F5` — and a directory that is
+        // `src/panes` in one and `src\panes` in the other reads as two
+        // different places. It also carries the reason the rewrite is
+        // Windows-only, which is a thing about Unix file names rather than
+        // about this pane.
+        let rel = super::files::rel(&self.root, &self.dir);
         if rel.is_empty() {
             "./".to_string()
         } else {
