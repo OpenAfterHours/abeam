@@ -1,6 +1,6 @@
 # Build the wheel and publish it to PyPI, on a version tag.
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.0.1 && git push origin v0.0.1
 #
 # Publishing uses PyPI **trusted publishing** (OIDC): there is no API token in
 # this repository and none to leak or rotate. PyPI is configured to trust

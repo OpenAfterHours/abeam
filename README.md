@@ -199,7 +199,7 @@ pyproject.toml            maturin's instructions for wrapping the binary
 Tag it and push the tag:
 
 ```
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.0.1 && git push origin v0.0.1
 ```
 
 `release.yml` builds the wheel on Windows and uploads it to PyPI through
