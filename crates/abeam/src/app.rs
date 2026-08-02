@@ -38,10 +38,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use crate::agentstate::Probe;
 use crate::keys::{self, Action};
 use crate::layout as abeam_layout;
 use crate::pane::{Focus, Pane};
-use crate::panes::{DiagPane, FrameStats, GitPane, RightView, ShellPane, TerminalPane, ViewerPane};
+use crate::panes::{
+    DiagPane, FrameStats, GitPane, QueuePane, RightView, ShellPane, TerminalPane, ViewerPane,
+};
 use crate::watch::Watch;
 
 pub type Tui = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
@@ -66,6 +69,19 @@ const TICK: Duration = Duration::from_millis(10);
 /// and a smaller worst-case delay than the 10 ms poll it replaces, so nothing
 /// about typing got slower.
 const MIN_FRAME: Duration = Duration::from_millis(8);
+
+/// How often the agent's own idle/busy record is re-read. See
+/// [`App::poll_readiness`] for why this is a poll and not a watch.
+const READINESS_EVERY: Duration = Duration::from_millis(250);
+
+/// How often the background-agent roster is refreshed while the queue holds
+/// something dispatched.
+///
+/// Two orders of magnitude slower than the readiness read, because it is two
+/// orders of magnitude more expensive: it starts a process. Nothing waits on
+/// it — it updates rows that are already on screen — so the only cost of being
+/// late is a status a few seconds stale.
+const ROSTER_EVERY: Duration = Duration::from_secs(3);
 
 /// Why the loop woke up.
 enum Wake {
@@ -93,7 +109,9 @@ enum Flow {
     /// Keep going. `redraw` is whether anything the next frame would show has
     /// actually changed — the shell draws on it, so a key a pane declined
     /// costs nothing.
-    Continue { redraw: bool },
+    Continue {
+        redraw: bool,
+    },
     Quit,
 }
 
@@ -194,6 +212,11 @@ pub struct App {
     viewer: ViewerPane,
     shell: ShellPane,
     diag: DiagPane,
+    queue: QueuePane,
+    /// Reads the agent's own record of whether it is mid-turn. See
+    /// `crate::agentstate` — this is the only thing standing between a queued
+    /// prompt and a permission dialog.
+    probe: Probe,
     right_view: RightView,
     /// What F2 puts back. Never `Diag`.
     last_workspace_view: RightView,
@@ -227,10 +250,64 @@ pub struct App {
     area: Rect,
     /// Paces the drawing and answers for it in the F2 view.
     frames: Frames,
+    /// When the agent's idle/busy record was last read.
+    readiness_at: Instant,
+    /// When the background-agent roster was last asked for.
+    roster_at: Instant,
+    /// Whether the user has typed something at the agent that they have not
+    /// submitted.
+    ///
+    /// Tracked here rather than read from the screen because the shell is the
+    /// one party that already knows: every keystroke bound for the left pane
+    /// passes through [`App::handle_key`]. A queued prompt sent while this is
+    /// true would be spliced into the middle of a half-written message, which
+    /// is the failure nobody would think to look for.
+    draft_open: bool,
+    /// Results from work that had to leave this thread. Both of the queue's
+    /// outward actions start a process, and `Pane::tick` may not block.
+    work_tx: SyncSender<Work>,
+    work_rx: mpsc::Receiver<Work>,
+    /// One at a time, each: a slow `claude agents --json` must not stack up a
+    /// thread per loop iteration behind itself.
+    roster_running: bool,
+    dispatch_running: bool,
+    /// Something has been dispatched at least once, so the roster is worth
+    /// asking for. Sticky, and the reason a session that only ever uses the
+    /// first mode never starts a `claude agents` process.
+    dispatched_any: bool,
+    /// A sent prompt is sitting in the composer, waiting for the `Enter` that
+    /// submits it on the next pass. See [`App::pump_queue`].
+    submit_pending: bool,
+    /// The repository on screen, kept because the workers need it and they
+    /// cannot borrow from the panes that were built with it.
+    root: PathBuf,
+    /// The hosted agent's name, for the same reason.
+    agent: String,
+}
+
+/// What a worker thread has finished doing.
+enum Work {
+    Roster(Vec<crate::agentstate::Session>),
+    Dispatched(Result<crate::dispatch::Started>),
 }
 
 impl App {
-    pub fn new(left: TerminalPane, root: PathBuf) -> Self {
+    /// `agent` is the hosted agent's name as the user named it — not a path.
+    /// It decides whether background dispatch is available at all, because
+    /// `--bg` is Claude's and abeam will not reach for a different agent than
+    /// the one it was asked to host. See `crate::dispatch`.
+    pub fn new(left: TerminalPane, root: PathBuf, agent: &str) -> Self {
+        // Taken here rather than inside the probe: the record abeam is looking
+        // for is the one written *after* this moment, and a clock read at
+        // construction is the closest to the spawn anything gets.
+        let spawned_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let probe = Probe::new(root.clone(), left.process_id(), spawned_at);
+        // Bounded and small: at most one roster refresh and one dispatch are
+        // ever in flight, so anything deeper would be a queue nobody drains.
+        let (work_tx, work_rx) = mpsc::sync_channel::<Work>(8);
         let watch = Watch::start(&root);
         let mut viewer = ViewerPane::new(root.clone());
         // Told rather than discovered, so a pane that will never update says so
@@ -243,7 +320,9 @@ impl App {
             viewer,
             // No child yet. It is spawned by the first frame that draws it, so
             // a session that never asks for a command line never pays for one.
-            shell: ShellPane::new(root, std::env::var("ABEAM_SHELL").ok()),
+            queue: QueuePane::new(root.clone(), agent),
+            probe,
+            shell: ShellPane::new(root.clone(), std::env::var("ABEAM_SHELL").ok()),
             diag: DiagPane::new(),
             right_view: RightView::Git,
             last_workspace_view: RightView::Git,
@@ -259,6 +338,19 @@ impl App {
             right_inner: None,
             area: Rect::ZERO,
             frames: Frames::new(),
+            // Far enough back that the first pass reads the record rather than
+            // waiting a quarter second to find out what it is looking at.
+            readiness_at: Instant::now() - READINESS_EVERY,
+            roster_at: Instant::now() - ROSTER_EVERY,
+            draft_open: false,
+            work_tx,
+            work_rx,
+            roster_running: false,
+            dispatch_running: false,
+            dispatched_any: false,
+            submit_pending: false,
+            root,
+            agent: agent.to_string(),
         }
     }
 
@@ -373,6 +465,7 @@ impl App {
                 return Ok(self.finish());
             }
 
+            redraw |= self.poll_readiness();
             redraw |= self.tick_panes();
             redraw |= self.pump();
 
@@ -406,7 +499,123 @@ impl App {
         let shell_dirty = self.shell.tick();
         redraw |= shell_dirty && self.right_view == RightView::Shell;
 
+        // Unlike the shell's, this pane's news counts while it is hidden, and
+        // it has to: the countdown before an automatic send is drawn in the
+        // *left* title, so the one thing that must never go unredrawn is the
+        // announcement of a keystroke abeam is about to make on your behalf.
+        // It is only affordable because the pane is disciplined about saying
+        // no — see the frame-cost note on `QueuePane::tick`.
+        redraw |= self.queue.tick();
+
         redraw
+    }
+
+    /// Ask the agent's own record whether it is mid-turn, and tell the queue.
+    ///
+    /// Rate-limited rather than watched, and the trade is worth stating. A
+    /// `notify` watch on the sessions directory would be event-driven and is
+    /// what this wants to be eventually; it would also be a second watcher
+    /// thread, on a directory outside the repository, for a signal that is
+    /// already cheap to ask for — one `stat` and a sub-kilobyte read. At
+    /// [`READINESS_EVERY`] the worst-case lag is a quarter of a second in front
+    /// of a countdown measured in seconds, which nobody can perceive.
+    ///
+    /// Returns whether the answer changed, because a changed answer is the
+    /// thing that starts and stops that countdown.
+    fn poll_readiness(&mut self) -> bool {
+        if self.readiness_at.elapsed() < READINESS_EVERY {
+            return false;
+        }
+        self.readiness_at = Instant::now();
+
+        let mut readiness = self.probe.readiness();
+        // Downgraded rather than reported separately, because `Unknown` already
+        // means exactly this: abeam cannot establish that a send would be safe.
+        // Without bracketed paste every newline in a sent block submits, so a
+        // three-line prompt arrives as three — the second and third typed at an
+        // agent already busy with the first. Every agent abeam hosts enables it,
+        // so this is a floor rather than a case anyone will meet.
+        if !self.left.bracketed_paste() {
+            readiness = crate::agentstate::Readiness::Unknown;
+        }
+        // A session that has gone cannot be typed at, and its last record can
+        // sit at `idle` forever — a dead agent is the most convincingly idle
+        // thing there is.
+        if self.left.has_exited() {
+            readiness = crate::agentstate::Readiness::Unknown;
+        }
+
+        // The one event that ends a draft, and the only place this flag is ever
+        // cleared. See [`note_left_key`](Self::note_left_key) for why it is this
+        // and not a keystroke: a message that was really submitted makes the
+        // agent work, and nothing else the user can press does.
+        let mut redraw = false;
+        if readiness == crate::agentstate::Readiness::Busy && self.draft_open {
+            self.draft_open = false;
+            redraw |= self.queue.set_draft_open(false);
+        }
+        redraw | self.queue.set_readiness(readiness)
+    }
+
+    /// Remember that the user may have an unsubmitted message at the agent.
+    ///
+    /// This only ever *sets* the flag. Clearing it is
+    /// [`poll_readiness`](Self::poll_readiness)'s job and happens on one event:
+    /// the agent being observed **busy**. That asymmetry is the whole design,
+    /// and it replaced a version that tried to infer a submit from the keystroke
+    /// — which cannot be done, because the keystroke that submits and the
+    /// keystroke that does not are the same key.
+    ///
+    /// `Enter` is the case that proves it. A bare `Enter` submits, *except* when
+    /// Claude's inline autocomplete has a completion open, where it accepts the
+    /// completion and leaves the text sitting in the composer — and the
+    /// autocomplete is not on the dialog stack Claude derives its status from,
+    /// so the record still reads `idle`. Reading that `Enter` as a submit
+    /// cleared this flag over a live draft and pasted a queued prompt into the
+    /// middle of it three seconds later. `Esc` dismissing the same popup is the
+    /// same bug. Modifiers do not separate them: `Shift+Enter` inserts a
+    /// newline here and `Alt+Enter` is Copilot's only newline.
+    ///
+    /// Waiting to see the agent *busy* asks a question that has one answer. A
+    /// message that was really submitted makes the agent work; an accepted
+    /// completion does not.
+    ///
+    /// The cost is that a draft the user types and then silently abandons holds
+    /// the queue until they submit something at the agent. Submitting is the
+    /// *only* way past it — `Enter` in the queue pane grants an item its turn
+    /// and does not overrule this, because a hand-picked item pasted into a
+    /// half-written message is the same splice as an automatic one. It is at
+    /// least visible: the pane says what it is waiting for. That is the safe
+    /// direction to be wrong in.
+    fn note_left_key(&mut self, key: &KeyEvent) {
+        // Anything that could be putting text in front of the user, including
+        // the two that do it without printing: `Up` and `Down` walk the agent's
+        // history, and an idle agent holding a recalled message looks exactly
+        // like one holding nothing from out here.
+        let typing = matches!(
+            key.code,
+            KeyCode::Char(_)
+                | KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Tab
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+        );
+        if typing {
+            self.draft_open = true;
+            // Told rather than asked for, so the countdown is withdrawn on the
+            // keystroke itself rather than up to a quarter second later.
+            self.queue.set_draft_open(true);
+            // And the submit abeam still owes is abandoned. Between the paste
+            // and the `Enter` that submits it there is one pass in which the
+            // composer holds a queued prompt and the user can type into it;
+            // pressing on with the `Enter` would submit their keystrokes along
+            // with it. Dropping it strands the prompt in the composer instead,
+            // where it is visible and one backspace from gone — which is the
+            // recoverable half of the two.
+            self.submit_pending = false;
+        }
     }
 
     /// What to report on the way out.
@@ -460,6 +669,101 @@ impl App {
             redraw = true;
         }
 
+        redraw |= self.pump_queue();
+        redraw
+    }
+
+    /// The queue's two wires out, and the results of both coming back.
+    ///
+    /// This is the only place in abeam that produces input the user did not
+    /// type, so it is worth being explicit about what protects it. The
+    /// decision to send is not made here — [`QueuePane::take_send_request`]
+    /// makes it, against the agent's own idle record, the draft flag this
+    /// struct maintains, and a countdown that has been visible in the left
+    /// title for seconds. By the time a request arrives here it has already
+    /// been announced and not cancelled. What is left for this function is to
+    /// deliver it without inventing a second way to get it wrong.
+    fn pump_queue(&mut self) -> bool {
+        let mut redraw = false;
+
+        // Nothing new is taken while a submit is still owed. Two sends in
+        // consecutive passes would paste the second on top of the first and
+        // then overwrite the pending flag, so both prompts would go to the
+        // agent as one message with one `Enter` — and both items would show as
+        // sent. The `Enter` below is the only way out of this state.
+        // The bracketed-paste check comes *before* the item is taken, not after
+        // it. `take_send_request` is a drain: it marks the item `Sent` on the
+        // way out, so refusing afterwards would leave a queue reading "sent"
+        // over a prompt that was never typed. Asked here, a pty that cannot
+        // carry the text simply leaves the item pending, which is what it is.
+        // `poll_readiness` downgrades to `Unknown` on the same condition, so
+        // this is unreachable in practice — it is the check that makes the
+        // unreachability structural rather than a coincidence of ordering.
+        if !self.submit_pending
+            && self.left.bracketed_paste()
+            && let Some(text) = self.queue.take_send_request()
+        {
+            // The `Enter` is armed only by a write that actually succeeded. A
+            // pty that refused the paste and then got a bare `\r` would submit
+            // whatever the user had in the composer, which is a stray keystroke
+            // abeam invented out of its own failure.
+            self.submit_pending = self.left.send_text(&text).is_ok();
+            redraw = true;
+        } else if std::mem::take(&mut self.submit_pending) {
+            let _ = self
+                .left
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            redraw = true;
+        }
+
+        if !self.dispatch_running
+            && let Some(text) = self.queue.take_dispatch_request()
+        {
+            self.dispatch_running = true;
+            let tx = self.work_tx.clone();
+            let root = self.root.clone();
+            let agent = self.agent.clone();
+            std::thread::spawn(move || {
+                let started = crate::dispatch::Dispatcher::new(root, &agent)
+                    .map_err(|why| anyhow::anyhow!(why.0))
+                    .and_then(|d| d.dispatch(&text));
+                let _ = tx.send(Work::Dispatched(started));
+            });
+            redraw = true;
+        }
+
+        // Only while there is something dispatched to report on. A session
+        // that never uses the second mode never starts this process.
+        if !self.roster_running && self.dispatched_any && self.roster_at.elapsed() >= ROSTER_EVERY {
+            self.roster_running = true;
+            self.roster_at = Instant::now();
+            let tx = self.work_tx.clone();
+            let root = self.root.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(Work::Roster(
+                    crate::agentstate::roster(&root).unwrap_or_default(),
+                ));
+            });
+        }
+
+        while let Ok(work) = self.work_rx.try_recv() {
+            match work {
+                Work::Roster(rows) => {
+                    self.roster_running = false;
+                    redraw |= self.queue.set_roster(rows);
+                }
+                Work::Dispatched(outcome) => {
+                    self.dispatch_running = false;
+                    // Sticky, and only ever set here: it is what turns on the
+                    // roster refresh, so a session that never dispatches
+                    // anything never starts that process at all.
+                    self.dispatched_any |= outcome.is_ok();
+                    self.queue.note_dispatched(outcome);
+                    redraw = true;
+                }
+            }
+        }
+
         redraw
     }
 
@@ -484,7 +788,12 @@ impl App {
                 // takes a paste into a filter box without claiming to be a
                 // terminal.
                 let handled = match self.focus {
-                    Focus::Left => self.left.handle_paste(&text)?,
+                    Focus::Left => {
+                        // A paste into the composer is a draft like any other.
+                        self.draft_open = true;
+                        self.queue.set_draft_open(true);
+                        self.left.handle_paste(&text)?
+                    }
                     Focus::Right => self.right_pane().handle_paste(&text)?,
                 };
                 // A paste is a keystroke as far as the confirmation is
@@ -516,7 +825,13 @@ impl App {
             // keystroke into the agent while the user is looking at the shell
             // they aimed it at, invisibly.
             match self.focus {
-                Focus::Left => self.left.handle_key(key)?,
+                Focus::Left => {
+                    // Counts as typing like any other key: the escape hatch
+                    // changes who reads the keystroke, not whether it landed in
+                    // the composer.
+                    self.note_left_key(&key);
+                    self.left.handle_key(key)?
+                }
                 Focus::Right => self.right_pane().handle_key(key)?,
             };
             return Ok(Flow::redraw());
@@ -535,6 +850,7 @@ impl App {
 
         match self.focus {
             Focus::Left => {
+                self.note_left_key(&key);
                 self.left.handle_key(key)?;
                 Ok(Flow::redraw())
             }
@@ -615,6 +931,11 @@ impl App {
                     }
                 }
             }
+            // A workspace view like git and the reader, and pointedly not like
+            // the shell: it does not take focus. The common case is glancing
+            // at what is still queued while the agent works and you keep
+            // typing at it, which is the rule the whole shell is built on.
+            Action::ShowQueue => self.set_right_view(RightView::Queue),
             Action::ToggleDiag => {
                 let target = if self.right_view == RightView::Diag {
                     self.last_workspace_view
@@ -751,17 +1072,37 @@ impl App {
         }
 
         let left_focused = self.focus == Focus::Left;
-        let left_title = if self.pending_quit {
-            format!(" {} · Alt+Q again to quit ", self.left.title())
+        // Appended rather than chosen between, and that is the fix for a real
+        // failure rather than a tidy-up. These used to be arms of one `if`, so
+        // a pending quit or an exited agent took the title and the queue's
+        // countdown vanished from it — leaving abeam three seconds from typing
+        // at the agent with nothing on screen saying so. `title_note`'s own
+        // contract is that it is never silent while a send is due; the pane
+        // kept that promise and the shell broke it. Two facts about the left
+        // pane are two pieces of one title.
+        let state = if self.pending_quit {
+            Some("Alt+Q again to quit".to_string())
         } else if self.agent_exit.is_some() {
             // This is abeam outliving the session it exists for, which happens
             // only because a shell is open. Naming it matters: without that
             // word the window looks stuck, and the one thing the user needs to
             // know is that something of theirs is still alive in the other pane.
-            format!(" {} · shell open · Alt+Q to quit ", self.left.title())
+            Some("shell open · Alt+Q to quit".to_string())
         } else {
-            format!(" {} ", self.left.title())
+            None
         };
+        // The queue reports in the *left* title because everything it says is
+        // about the left pane: how much is waiting to be typed there, and — the
+        // part that has to be impossible to miss — that abeam is about to type
+        // it. Last, so that a title clipped at 46 columns loses the count
+        // before it loses the announcement.
+        let left_title = [state, self.queue.title_note()]
+            .into_iter()
+            .flatten()
+            .fold(format!(" {}", self.left.title()), |title, part| {
+                format!("{title} · {part}")
+            })
+            + " ";
         f.render_widget(block(&left_title, left_focused), split.left);
         let left_inner = self.left_inner;
         self.left.render(f, left_inner);
@@ -877,6 +1218,7 @@ impl App {
             RightView::Git => &mut self.git,
             RightView::Viewer => &mut self.viewer,
             RightView::Shell => &mut self.shell,
+            RightView::Queue => &mut self.queue,
             RightView::Diag => &mut self.diag,
         }
     }
@@ -886,6 +1228,7 @@ impl App {
             RightView::Git => &self.git,
             RightView::Viewer => &self.viewer,
             RightView::Shell => &self.shell,
+            RightView::Queue => &self.queue,
             RightView::Diag => &self.diag,
         }
     }
@@ -1002,6 +1345,8 @@ fn help_overlay(f: &mut Frame) {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use crate::agentstate::Readiness;
+    use crate::panes::queue::Mode;
     use crate::testutil::TempDir;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
@@ -1038,7 +1383,7 @@ mod tests {
         dir.write("notes.md", b"# notes\n");
         let left = TerminalPane::spawn("cmd.exe", &["/c".into(), "exit".into()], 20, 60)
             .expect("spawn a child in a pty");
-        let app = App::new(left, dir.path().to_path_buf());
+        let app = App::new(left, dir.path().to_path_buf(), "claude");
         Fixture { app, dir }
     }
 
@@ -1075,6 +1420,531 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    // --- the queue's two wires, and what stands between them and the pty ---
+    //
+    // Everything below is about `pump_queue`, `poll_readiness`, `note_left_key`
+    // and the left title: the four places where the queue, the probe and the
+    // agent's pty are joined up. Each of those three is well covered on its
+    // own — which is exactly why the joins were not, and why a mutation audit
+    // could delete the pty write from `pump_queue` and watch every queued item
+    // still report itself as sent.
+
+    /// The pid the planted records are named for. Any number does: nothing
+    /// looks for the process, and [`Probe::over`] is told which to expect.
+    const RECORD_PID: u32 = 4242;
+
+    /// A directory holding one record for the session this app is hosting, with
+    /// the app's probe aimed at it.
+    ///
+    /// `Probe::new` reads the machine's own `~/.claude`, where the only honest
+    /// answer about a `cmd.exe` is `Unknown` — and `Unknown` is the one answer
+    /// indistinguishable from the whole feature having been deleted. Returned
+    /// rather than dropped so the directory outlives the probe reading it.
+    fn records(fx: &mut Fixture, status: &str) -> TempDir {
+        let dir = TempDir::new("records");
+        say(&dir, fx.dir.path(), status);
+        fx.app.probe = Probe::over(
+            dir.path().to_path_buf(),
+            fx.dir.path().to_path_buf(),
+            Some(RECORD_PID),
+            // Spawned at the epoch, so the record's own `startedAt` is always
+            // at or after it. Which record belongs to which session is
+            // `agentstate`'s question and is settled there.
+            0,
+        );
+        dir
+    }
+
+    /// Write the record, or write it again. Claude replaces it in place as the
+    /// session changes state and `Probe` re-reads the file on every poll, so
+    /// this is what a turn starting looks like from out here.
+    fn say(dir: &TempDir, root: &std::path::Path, status: &str) {
+        // The `cwd` goes through serde rather than being pasted in: a Windows
+        // path in JSON is a string full of escapes.
+        let cwd = serde_json::to_string(&root.to_string_lossy()).expect("a JSON string");
+        let record = format!(
+            r#"{{"pid":{RECORD_PID},"sessionId":"s","cwd":{cwd},"startedAt":1,"peerProtocol":1,"kind":"interactive","name":"fixture","status":"{status}"}}"#
+        );
+        dir.write(&format!("{RECORD_PID}.json"), record.as_bytes());
+    }
+
+    /// A child in the left pane that stays at its prompt *and* has asked for
+    /// bracketed paste.
+    ///
+    /// Both halves are load-bearing and neither is free. The ordinary fixture's
+    /// `cmd /c exit` is gone before a send could reach it, and `poll_readiness`
+    /// downgrades a departed agent to `Unknown`; and a child that never enabled
+    /// bracketed paste is refused by `pump_queue` at the instant of the write.
+    /// A `cmd.exe` cannot ask for the mode on its own, so it is handed the
+    /// bytes in a file and told to type them out on the way in — ConPTY
+    /// forwards the `DECSET` and the parser behind the pane picks it up.
+    ///
+    /// It is deliberately wide. A `cmd` prompt is most of fifty columns, and a
+    /// queued prompt wrapping onto a second row is a needle split in half and a
+    /// test that fails for a reason nobody is interested in.
+    fn stays(fx: &mut Fixture) {
+        fx.dir.write("bracketed.txt", b"\x1b[?2004h");
+        fx.app.left = TerminalPane::spawn_with(
+            abeam_pty::PtyConfig::new("cmd.exe")
+                .args(["/k".to_string(), "type bracketed.txt".to_string()])
+                .cwd(fx.dir.path())
+                .size(20, 200),
+        )
+        .expect("a child in a pty");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.app.left.bracketed_paste() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            fx.app.left.bracketed_paste(),
+            "the child never asked for bracketed paste, so nothing would ever be sent"
+        );
+    }
+
+    /// A readiness poll without the quarter-second rate limit in front of it.
+    ///
+    /// [`READINESS_EVERY`] is a decision about what re-reading the record
+    /// costs, not about what it says; a test that slept through it would be
+    /// timing the poll rather than reading its answer.
+    fn polled(fx: &mut Fixture) -> bool {
+        fx.app.readiness_at = Instant::now() - READINESS_EVERY;
+        fx.app.poll_readiness()
+    }
+
+    /// The agent's screen, flattened.
+    fn agent_screen(fx: &Fixture) -> String {
+        fx.app.left.last_screen().join("\n")
+    }
+
+    /// Block until `text` is on the agent's screen, or say what was there
+    /// instead. The echo comes back through a pty on another thread, so a test
+    /// that looked once would be a test of thread scheduling.
+    fn reaches_the_agent(fx: &mut Fixture, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let screen = agent_screen(fx);
+            if screen.contains(text) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{text:?} never reached the agent. The screen says:\n{screen}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// How many keystrokes abeam has produced on the user's behalf.
+    ///
+    /// The pty counts these itself, and counts *only* keys: `send_text` writes
+    /// its paste without touching the tally. So this is exactly the number of
+    /// `Enter`s the queue has submitted, minus whatever the test typed on
+    /// purpose — which is the only way to tell a prompt left sitting in the
+    /// composer from one that was sent.
+    fn keys_sent(fx: &Fixture) -> u64 {
+        fx.app.left.diagnostics().keys_sent
+    }
+
+    #[test]
+    fn a_queued_prompt_reaches_the_pty_and_is_submitted_on_the_pass_after_it() {
+        // The survivor that alarmed the audit most: delete the `send_text` from
+        // `pump_queue` and the whole suite stayed green, because the item was
+        // marked `Sent` by the pane before the text ever left it and nothing
+        // anywhere asked the pty what it had actually been given.
+        //
+        // The second half is the other one. The paste and the `Enter` are two
+        // decisions a pass apart — the first is one backspace from gone and the
+        // second is not — so a test that only checked "the prompt arrived"
+        // would let both the missing `Enter` and an `Enter` sent along with the
+        // paste through.
+        let mut fx = app();
+        let _records = records(&mut fx, "idle");
+        stays(&mut fx);
+        polled(&mut fx);
+
+        fx.app.queue.stub_item("wire-check-alpha", Mode::Send);
+        // Armed, which is condition 1 of the four...
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        // ...and then asked for by hand, which is the same drain reached
+        // without sitting through the three-second announcement. The countdown
+        // is the pane's own field and the pane's own tests pin it; what is
+        // under test here is everything downstream of `take_send_request`.
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert!(fx.app.pump_queue(), "a send is worth a frame");
+        reaches_the_agent(&mut fx, "wire-check-alpha");
+        assert_eq!(
+            keys_sent(&fx),
+            0,
+            "the prompt was submitted on the same pass that typed it"
+        );
+        assert!(fx.app.submit_pending, "nothing owes the agent an Enter");
+
+        assert!(fx.app.pump_queue(), "the submit is worth a frame too");
+        assert_eq!(keys_sent(&fx), 1, "the Enter that submits it never went out");
+        assert!(!fx.app.submit_pending);
+
+        // And nothing is owed after that, or the queue would type a bare
+        // newline at the agent on every idle pass for the rest of the session.
+        fx.app.pump_queue();
+        assert_eq!(keys_sent(&fx), 1);
+    }
+
+    #[test]
+    fn anything_typed_at_the_agent_opens_a_draft_and_only_a_busy_agent_ends_one() {
+        let mut fx = app();
+        let records = records(&mut fx, "idle");
+        stays(&mut fx);
+
+        // Bare `Enter` is the one to read twice, and the reason this list is a
+        // list rather than a guess at which key submits: Claude's inline
+        // autocomplete consumes an `Enter` without submitting, and the
+        // autocomplete is not on the dialog stack the record is derived from,
+        // so the record still reads `idle`. Reading that `Enter` as a submit
+        // cleared this flag over a live draft and pasted a queued prompt into
+        // the middle of it three seconds later.
+        for pressed in [
+            key(KeyCode::Char('x')),
+            key(KeyCode::Backspace),
+            key(KeyCode::Delete),
+            key(KeyCode::Tab),
+            // Neither of these prints anything, and both walk the agent's
+            // history: an idle agent holding a recalled message looks exactly
+            // like one holding nothing from out here.
+            key(KeyCode::Up),
+            key(KeyCode::Down),
+            key(KeyCode::Enter),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            alt(KeyCode::Enter),
+        ] {
+            fx.app.draft_open = false;
+            fx.app.queue.set_draft_open(false);
+            fx.app.note_left_key(&pressed);
+            assert!(
+                fx.app.draft_open,
+                "{pressed:?} left the shell believing nothing had been typed"
+            );
+            assert!(
+                fx.app.queue.is_draft_open(),
+                "{pressed:?} never reached the queue, so the countdown would run on"
+            );
+        }
+
+        // ...and the keys that cannot put text in front of anybody do not open
+        // one, or the flag would be set by every glance at the screen and the
+        // queue would never drain at all.
+        for pressed in [
+            key(KeyCode::Esc),
+            key(KeyCode::Left),
+            key(KeyCode::PageUp),
+            key(KeyCode::F(6)),
+        ] {
+            fx.app.draft_open = false;
+            fx.app.queue.set_draft_open(false);
+            fx.app.note_left_key(&pressed);
+            assert!(!fx.app.draft_open, "{pressed:?} is not typing");
+        }
+
+        // One event ends a draft and it is not a keystroke. An idle agent is
+        // the state a draft *lives* in, so a poll that read the record and
+        // cleared on it would clear on the very next pass.
+        fx.app.note_left_key(&key(KeyCode::Char('h')));
+        polled(&mut fx);
+        assert!(fx.app.draft_open, "an idle agent must not end a draft");
+
+        say(&records, fx.dir.path(), "busy");
+        polled(&mut fx);
+        assert!(
+            !fx.app.draft_open,
+            "the agent going busy is the only thing that ends a draft"
+        );
+        assert!(
+            !fx.app.queue.is_draft_open(),
+            "the shell forgot the draft without telling the pane"
+        );
+    }
+
+    #[test]
+    fn the_announcement_survives_every_state_the_left_title_can_be_in() {
+        // A real bug, found and fixed: the title was an `if`/`else if` chain,
+        // so a pending quit or a departed agent took the whole of it and the
+        // queue's countdown vanished — leaving abeam three seconds from typing
+        // at the agent with nothing on screen saying so. `title_note`'s
+        // contract is that it is never silent while a send is due; the pane
+        // kept that promise and the shell broke it.
+        let mut fx = app();
+        fx.app.queue.stub_item("announce me", Mode::Send);
+        // Told outright rather than polled for. Which of the four conditions
+        // hold is `poll_readiness`'s business and is tested above; this is
+        // about what the title does once one of them has produced a countdown.
+        fx.app.queue.set_readiness(Readiness::Idle);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(
+            fx.app
+                .queue
+                .title_note()
+                .is_some_and(|note| note.contains("sending in")),
+            "the pane is not announcing a send, so this test proves nothing"
+        );
+
+        // Rendered wide on purpose. A title clipped at the border is a
+        // different failure with its own rule — `title_note` is appended last
+        // precisely so a 46-column pane loses the count before it loses the
+        // announcement — and what is under test here is the assembly.
+        let plain = screen(&mut fx, 300, 24);
+        assert!(plain.contains("sending in"), "got: {plain}");
+
+        fx.app.pending_quit = true;
+        let quitting = screen(&mut fx, 300, 24);
+        assert!(quitting.contains("Alt+Q again to quit"), "got: {quitting}");
+        assert!(
+            quitting.contains("sending in"),
+            "Alt+Q removed the only warning on screen that abeam was about to \
+             type at the agent: {quitting}"
+        );
+        fx.app.pending_quit = false;
+
+        // The fixture's own child leaves on its own, which is the other state
+        // that used to take the title.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fx.app.left.poll_exit().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = fx
+            .app
+            .left
+            .poll_exit()
+            .unwrap()
+            .expect("the fixture's child exits on its own");
+        fx.app.agent_exit = Some((status, Vec::new()));
+
+        let ended = screen(&mut fx, 300, 24);
+        assert!(ended.contains("shell open"), "got: {ended}");
+        assert!(
+            ended.contains("sending in"),
+            "the agent leaving removed the announcement: {ended}"
+        );
+    }
+
+    #[test]
+    fn a_pending_submit_is_abandoned_the_moment_the_user_types() {
+        // Between the paste and the `Enter` there is exactly one pass in which
+        // the composer holds a queued prompt and the user can type into it.
+        // Pressing on with the `Enter` would submit their keystrokes along with
+        // it; dropping it strands the prompt in the composer instead, where it
+        // is visible and one backspace from gone.
+        let mut fx = app();
+        let _records = records(&mut fx, "idle");
+        stays(&mut fx);
+        polled(&mut fx);
+
+        fx.app.queue.stub_item("wire-check-bravo", Mode::Send);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+        // Through the shell's own pump rather than straight at `pump_queue`,
+        // which the tests either side of this one do. Nothing else covers the
+        // one line joining the two, and a queue the loop never pumps is a queue
+        // that silently stops draining.
+        fx.app.pump();
+        reaches_the_agent(&mut fx, "wire-check-bravo");
+        assert!(fx.app.submit_pending, "nothing owes the agent an Enter");
+
+        fx.app.handle_key(key(KeyCode::Char('!'))).unwrap();
+        assert!(
+            !fx.app.submit_pending,
+            "a keystroke at the agent left the submit standing"
+        );
+
+        let theirs = keys_sent(&fx);
+        assert_eq!(theirs, 1, "the user's own keystroke did not reach the pty");
+        fx.app.pump();
+        assert_eq!(
+            keys_sent(&fx),
+            theirs,
+            "abeam submitted a message the user was still writing"
+        );
+    }
+
+    #[test]
+    fn the_queue_never_types_at_an_agent_that_has_gone() {
+        // A session that has gone cannot be typed at, and its last record can
+        // sit at `idle` forever: a dead agent is the most convincingly idle
+        // thing there is.
+        let mut fx = app();
+        let _records = records(&mut fx, "idle");
+
+        // A child that asks for bracketed paste and *then* leaves. The
+        // ordinary `cmd /c exit` would give the same `Unknown` for the wrong
+        // reason — it never enables the mode at all — and a test that passes
+        // for the wrong reason is a test of nothing.
+        fx.dir.write("bracketed.txt", b"\x1b[?2004h");
+        fx.app.left = TerminalPane::spawn_with(
+            abeam_pty::PtyConfig::new("cmd.exe")
+                .args(["/c".to_string(), "type bracketed.txt".to_string()])
+                .cwd(fx.dir.path())
+                .size(20, 200),
+        )
+        .expect("a child in a pty");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while (!fx.app.left.bracketed_paste() || fx.app.left.poll_exit().unwrap().is_none())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            fx.app.left.bracketed_paste(),
+            "the child never asked for bracketed paste, so `Unknown` would be free"
+        );
+        assert!(fx.app.left.has_exited(), "the child was meant to leave");
+        assert_eq!(
+            fx.app.probe.readiness(),
+            Readiness::Idle,
+            "the record itself has to say `idle`, or there is nothing to override"
+        );
+
+        fx.app.queue.stub_item("never sent", Mode::Send);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        polled(&mut fx);
+        assert_eq!(
+            fx.app.queue.title_note().as_deref(),
+            Some("queue 1"),
+            "a send was announced at an agent that is not there"
+        );
+        assert!(!fx.app.pump_queue(), "there was nothing to do");
+        assert_eq!(keys_sent(&fx), 0);
+    }
+
+    #[test]
+    fn readiness_is_unknown_while_the_agent_has_not_asked_for_bracketed_paste() {
+        // Without the mode every newline in a sent block is a submit, so a
+        // three-line prompt arrives as three — the second and third typed at an
+        // agent already busy with the first. Every agent abeam hosts enables
+        // it, so this is a floor rather than a case anyone will meet, and a
+        // floor with nothing standing on it is one that quietly goes away.
+        let mut fx = app();
+        let _records = records(&mut fx, "idle");
+
+        // Stays, so the departed-agent downgrade cannot be what answers, and
+        // never enables the mode, so the downgrade under test is the only one
+        // left. The record says `idle`: without that this assertion would hold
+        // just as well with the probe deleted outright.
+        fx.app.left = TerminalPane::spawn_with(
+            abeam_pty::PtyConfig::new("cmd.exe")
+                .args(["/k".to_string()])
+                .cwd(fx.dir.path())
+                .size(20, 200),
+        )
+        .expect("a child in a pty");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fx.app.left.diagnostics().bytes_read == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!fx.app.left.has_exited(), "this child stays at its prompt");
+        assert!(
+            !fx.app.left.bracketed_paste(),
+            "a `cmd.exe` was expected never to ask for bracketed paste"
+        );
+        assert_eq!(
+            fx.app.probe.readiness(),
+            Readiness::Idle,
+            "the record itself has to say `idle`, or there is nothing to override"
+        );
+
+        fx.app.queue.stub_item("never sent", Mode::Send);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        polled(&mut fx);
+        assert_eq!(
+            fx.app.queue.title_note().as_deref(),
+            Some("queue 1"),
+            "a send was announced at a pty that would submit every line of it"
+        );
+        assert!(!fx.app.pump_queue(), "there was nothing to do");
+        assert_eq!(keys_sent(&fx), 0);
+
+        // And the same fact re-asked at the instant of the write, which is a
+        // separate check for a reason: the pane is told what was true a quarter
+        // of a second ago, and this is the last thing standing between a stale
+        // answer and a prompt submitted one line at a time. Told outright here,
+        // because the poll above will never hand this pty an `Idle` to be stale
+        // about.
+        fx.app.queue.set_readiness(Readiness::Idle);
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+        fx.app.pump_queue();
+        assert!(
+            !agent_screen(&fx).contains("never sent"),
+            "a prompt was written to a pty that would have submitted every line of it"
+        );
+        assert!(
+            !fx.app.submit_pending,
+            "an Enter was armed by a write that was never made"
+        );
+        fx.app.pump_queue();
+        assert_eq!(keys_sent(&fx), 0, "a bare Enter went out on its own");
+    }
+
+    #[test]
+    fn two_sends_in_consecutive_passes_cannot_be_run_together() {
+        // Taking a second item while a submit is still owed would paste it on
+        // top of the first and then overwrite the pending flag, so both prompts
+        // would go to the agent as one message with one `Enter` — and both
+        // items would show as sent.
+        let mut fx = app();
+        let _records = records(&mut fx, "idle");
+        stays(&mut fx);
+        polled(&mut fx);
+
+        fx.app.queue.stub_item("wire-check-first", Mode::Send);
+        fx.app.queue.stub_item("wire-check-second", Mode::Send);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+
+        fx.app.pump_queue();
+        reaches_the_agent(&mut fx, "wire-check-first");
+
+        // The second item is made due *before* the pass that owes an `Enter`,
+        // or the pass would decline it for want of a countdown rather than
+        // because a submit is outstanding, and the test would prove nothing.
+        fx.app.queue.handle_key(key(KeyCode::Tab)).unwrap();
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+
+        fx.app.pump_queue();
+        assert_eq!(keys_sent(&fx), 1, "the first prompt was never submitted");
+        assert!(
+            !agent_screen(&fx).contains("wire-check-second"),
+            "the second prompt was pasted on top of the first: {}",
+            agent_screen(&fx)
+        );
+
+        // ...and the pass after that is free to take it.
+        fx.app.pump_queue();
+        reaches_the_agent(&mut fx, "wire-check-second");
+        assert_eq!(
+            keys_sent(&fx),
+            1,
+            "the second send inherited the first one's Enter instead of owing its own"
+        );
+    }
+
+    #[test]
+    fn the_queue_is_a_workspace_view_and_f2_remembers_it() {
+        let mut app = app();
+        screen(&mut app, 120, 24);
+
+        app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        assert_eq!(app.right_view, RightView::Queue);
+        // Pointedly not like Alt+S: the common case is glancing at what is
+        // still queued while the agent works and you keep typing at it.
+        assert_eq!(app.focus, Focus::Left);
+
+        app.handle_key(key(KeyCode::F(2))).unwrap();
+        assert_eq!(app.right_view, RightView::Diag);
+        app.handle_key(key(KeyCode::F(2))).unwrap();
+        assert_eq!(app.right_view, RightView::Queue);
     }
 
     /// The whole wire for F3: the global table resolves it, `act` dispatches it,
@@ -1476,14 +2346,20 @@ mod tests {
         release.kind = KeyEventKind::Release;
         assert!(!redraws(app.handle_event(Event::Key(release)).unwrap()));
 
-        assert!(redraws(app.handle_event(Event::Key(alt(KeyCode::Char('g')))).unwrap()));
+        assert!(redraws(
+            app.handle_event(Event::Key(alt(KeyCode::Char('g'))))
+                .unwrap()
+        ));
         assert!(redraws(app.handle_event(Event::Resize(80, 24)).unwrap()));
 
         // Focused on the git view with nothing to scroll, `j` changes nothing.
         screen(&mut app, 120, 24);
         app.handle_key(key(KeyCode::F(5))).unwrap();
         assert_eq!(app.focus, Focus::Right);
-        assert!(!redraws(app.handle_event(Event::Key(key(KeyCode::Char('j')))).unwrap()));
+        assert!(!redraws(
+            app.handle_event(Event::Key(key(KeyCode::Char('j'))))
+                .unwrap()
+        ));
     }
 
     #[test]

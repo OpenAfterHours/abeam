@@ -77,11 +77,47 @@ impl TerminalPane {
         self.exit_status().is_some()
     }
 
+    /// The hosted child's process id — how `crate::agentstate` finds this
+    /// session in the agent's own records. See [`PtySession::process_id`] for
+    /// why it can be the wrong pid, and what falls back when it is.
+    pub fn process_id(&self) -> Option<u32> {
+        self.session.process_id()
+    }
+
     /// Lets the app loop be told when the child has produced something, instead
     /// of asking on a timer. See [`PtySession::wake_on_output`] — the closure
     /// runs on the reader thread and must only ring a doorbell.
     pub fn wake_on_output(&self, notify: impl Fn() + Send + Sync + 'static) {
         self.session.wake_on_output(notify);
+    }
+
+    /// Put `text` in the hosted agent's composer, without submitting it.
+    ///
+    /// A bracketed paste rather than a run of keystrokes, and the difference is
+    /// the whole reason this exists. A multi-line prompt sent as keys submits at
+    /// the first newline, and the rest is typed at whatever the agent showed
+    /// next; wrapped in `ESC[200~ … ESC[201~` the same text arrives as one
+    /// insertion the composer takes verbatim. `abeam_pty` picks the encoding
+    /// from the mode the child actually enabled, so this quietly degrades to
+    /// raw bytes for a child that never asked for bracketed paste — which is
+    /// why a caller sending text nobody typed has to check
+    /// [`bracketed_paste`](Self::bracketed_paste) first.
+    ///
+    /// It deliberately does not submit. Submitting is a separate `Enter`, sent
+    /// a beat later, because the two are different decisions: this one the user
+    /// can still take back with a backspace, and the next one they cannot.
+    pub fn send_text(&mut self, text: &str) -> Result<()> {
+        self.session.send_paste(text)?;
+        Ok(())
+    }
+
+    /// Whether the hosted agent asked for bracketed paste.
+    ///
+    /// Without it every newline in a sent block is a submit, and one queued
+    /// three-line prompt becomes three prompts — the second and third typed at
+    /// an agent that is by then busy with the first.
+    pub fn bracketed_paste(&self) -> bool {
+        self.session.screen().bracketed_paste()
     }
 
     // --- scrollback ------------------------------------------------------

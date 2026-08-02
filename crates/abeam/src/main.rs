@@ -12,7 +12,9 @@
 //! Alt+Q quits, F1 lists the keys, F2 shows what the pty is doing.
 
 mod agent;
+mod agentstate;
 mod app;
+mod dispatch;
 mod keys;
 mod launch;
 mod layout;
@@ -119,7 +121,7 @@ fn main() -> Result<()> {
                 .cwd(&root)
                 .size(inner.height.max(1), inner.width.max(1)),
         )?;
-        App::new(left, root).run(&mut terminal)
+        App::new(left, root, &hosted.name).run(&mut terminal)
     })();
 
     // Every frame ends by emptying the frame buffer, so this should have
