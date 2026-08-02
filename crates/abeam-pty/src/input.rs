@@ -73,7 +73,10 @@ fn function_key(n: u8, m: KeyModifiers) -> Option<Vec<u8>> {
     let p = modifier_param(m);
     let seq = match n {
         1..=4 => {
-            let f = [b'P', b'Q', b'R', b'S'][(n - 1) as usize] as char;
+            // F1..F4 are the odd ones out: they end in a letter rather than a
+            // number, and it is the same letter in both the SS3 and the CSI
+            // form below.
+            let f = b"PQRS"[(n - 1) as usize] as char;
             if p != 1 {
                 format!("\x1b[1;{p}{f}")
             } else {

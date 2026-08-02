@@ -29,6 +29,12 @@ jobs:
       # Edition 2024 needs 1.85+; the code assumes let-chains, which are 1.88+.
       # `stable` is well past both, and pinning here would only mean forgetting
       # to unpin.
+      #
+      # It does mean clippy here can be newer than clippy on your machine, and a
+      # new stable can fail this job on a push that changed nothing relevant —
+      # that is the cost of `-D warnings`, and it is worth it. When it happens,
+      # `rustup toolchain install <version>` and `cargo +<version> clippy` will
+      # reproduce it locally without disturbing your default toolchain.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
