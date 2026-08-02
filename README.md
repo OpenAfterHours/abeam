@@ -36,25 +36,43 @@ take focus from Claude, and they never switch themselves — a pane that yanks
 itself into view while you are reading is delightful twice and infuriating
 thereafter.
 
+## Installing
+
+```
+uvx abeam                 # run it without installing anything
+uv tool install abeam     # or keep it on PATH
+```
+
+There is no Python in abeam. PyPI is the delivery van: the wheel's whole payload
+is a compiled Windows binary, so `uvx` fetches a few hundred kilobytes and runs
+it — no Rust toolchain, no build step, and nothing to compile on your machine.
+
 ## Requirements
 
-- **Windows.** Everything works because of specific ConPTY behaviour, and the
-  pty test suites are `#![cfg(windows)]`. The code is not portable today, and on
-  another platform the tests pass by saying nothing.
-- Rust 1.95+, MSVC toolchain. Plain `cargo build` — no vcvars wrapper.
+- **Windows, x86-64.** Everything works because of specific ConPTY behaviour,
+  and the pty test suites are `#![cfg(windows)]`. The code is not portable
+  today, and on another platform the tests pass by saying nothing. Only x86-64
+  wheels are published: ARM Windows would cross-compile in one line and would be
+  a binary nobody has ever run, so `uvx` reporting no matching wheel is the more
+  honest answer until someone can test it.
 - `git` on `PATH`, for the git pane. Its absence is reported in the pane, not
   fatal.
+- Rust 1.95+ and the MSVC toolchain — **only to build from source**. Plain
+  `cargo build`, no vcvars wrapper.
 
 ## Running it
 
 ```
-cargo run -p abeam            # hosts `claude` in the current directory
-cargo run -p abeam -- pwsh    # hosts something else
+abeam            # hosts `claude` in the current directory
+abeam pwsh       # hosts something else
 ```
 
 The first argument is the program; everything after it is passed through. The
 current directory is both the child's working directory and the root that the
 git pane and the watcher use.
+
+From a checkout, `cargo run -p abeam` and `cargo run -p abeam -- pwsh` do the
+same.
 
 ## Keys
 
@@ -172,7 +190,27 @@ crates/abeam/        the binary: shell, layout, focus, panes
 crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
 docs/conpty-findings.md   what the spike learned. Read before touching the pty.
 docs/keymap.md            the keybinding collision audit
+pyproject.toml            maturin's instructions for wrapping the binary
+.github/workflows/        ci on every push; release on a v* tag
 ```
+
+## Releasing
+
+Tag it and push the tag:
+
+```
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`release.yml` builds the wheel on Windows and uploads it to PyPI through
+**trusted publishing** — an OIDC exchange between GitHub and PyPI, so there is
+no API token in this repository to leak or rotate. PyPI is configured to trust
+one repository, one workflow file and one environment (`pypi`); renaming any of
+the three breaks the publish, deliberately.
+
+The version lives in `[workspace.package]` in `Cargo.toml` and nowhere else. The
+workflow refuses to run if the tag disagrees with it, because a release where
+those two differ is discovered by whoever installs the wrong thing.
 
 `cargo run -p abeam-pty --example host` is a complete pty host in one file, kept
 as the manual regression harness and as proof that `PtySession` is sufficient

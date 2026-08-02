@@ -1,0 +1,45 @@
+# Packaging for PyPI, so that `uvx abeam` works without a Rust toolchain.
+#
+# There is no Python in this project. maturin's `bindings = "bin"` builds the
+# Rust binary and packages it as a wheel whose only payload is that executable,
+# which is why the wheels come out `py3-none-<platform>` — one wheel per
+# platform, valid for every Python 3. `uvx abeam` then downloads a few hundred
+# kilobytes and runs it. PyO3 is not involved and there is no importable module;
+# if a Python API is ever wanted, that is the day to add it.
+
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "abeam"
+description = "One window for a Claude Code session: Claude hosted in a pty pane, with git, a file viewer and a shell beside it."
+readme = "README.md"
+requires-python = ">=3.9"
+# From `[workspace.package] version` in Cargo.toml. One version for the crate
+# and the wheel, and the release workflow refuses to run if the tag disagrees
+# with it.
+dynamic = ["version"]
+keywords = ["claude", "claude-code", "terminal", "tui", "multiplexer", "conpty"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Rust",
+    "Topic :: Software Development",
+    "Topic :: Terminals :: Terminal Emulators/X Terminals",
+]
+
+[project.urls]
+Homepage = "https://github.com/OpenAfterHours/abeam"
+Repository = "https://github.com/OpenAfterHours/abeam"
+Issues = "https://github.com/OpenAfterHours/abeam/issues"
+
+[tool.maturin]
+# A workspace, so the binary crate has to be named. Without this maturin finds
+# the virtual manifest at the root and has nothing to build.
+manifest-path = "crates/abeam/Cargo.toml"
+bindings = "bin"
+# Debug symbols are most of the artefact and none of the use.
+strip = true

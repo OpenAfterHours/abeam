@@ -1,0 +1,110 @@
+# Build the wheel and publish it to PyPI, on a version tag.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Publishing uses PyPI **trusted publishing** (OIDC): there is no API token in
+# this repository and none to leak or rotate. PyPI is configured to trust
+# exactly this repository, this workflow file, and the `pypi` environment
+# below — change any of those three names and the publish is rejected, which is
+# the point of them.
+#
+# `workflow_dispatch` builds the wheel and stops, so the build can be exercised
+# without spending a version number.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The wheel's version comes from Cargo.toml, and the tag is what everyone
+      # will refer to. A release where those two disagree is discovered by
+      # someone installing the wrong thing, so it is refused here instead.
+      - name: The tag and the crate version must agree
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}' -replace '^v', ''
+          $match = Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([^"]+)"' |
+                   Select-Object -First 1
+          if ($null -eq $match) { throw "no version found in Cargo.toml" }
+          $version = $match.Matches[0].Groups[1].Value
+          if ($tag -ne $version) {
+            throw "tag v$tag does not match the workspace version $version in Cargo.toml"
+          }
+          Write-Host "releasing $version"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Wheels for x86_64 only, deliberately. `aarch64-pc-windows-msvc` would
+      # cross-compile from here in one more line, and would be a wheel nobody
+      # has ever run — this project has never been built or tested on ARM
+      # Windows, and shipping an untested binary under an install command that
+      # picks it automatically is worse than not shipping one. Add the target
+      # when someone can run it.
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          target: x86_64-pc-windows-msvc
+
+      # No sdist. The source needs a Rust toolchain *and* Windows to build, so
+      # an sdist on PyPI would turn "not available for your platform" — which
+      # is true and clear — into a compiler error part-way through an install.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: wheel
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    # The action that talks to PyPI is a container action, so this job cannot
+    # run on the Windows runner that built the wheel.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/abeam
+    permissions:
+      # The whole of the authentication: GitHub mints a short-lived OIDC token
+      # and PyPI exchanges it for an upload token. Nothing here is a secret.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: wheel
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows
+          path: dist
+      # The wheel attached here is the same file that went to PyPI, for anyone
+      # who would rather download a binary than install a package.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/*.whl \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

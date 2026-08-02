@@ -1,2 +1,6 @@
 target/
 **/target/
+
+# maturin's output, and the scratch venv used to check a wheel by hand.
+dist/
+.venv/

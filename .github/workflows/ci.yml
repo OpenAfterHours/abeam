@@ -1,0 +1,47 @@
+# Build, test and lint on every push and pull request.
+#
+# Windows only, and not as an oversight: the pty layer is ConPTY, the test
+# suites that matter are `#![cfg(windows)]`, and on any other platform they
+# would pass by saying nothing. See the README.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's answer worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Edition 2024 needs 1.85+; the code assumes let-chains, which are 1.88+.
+      # `stable` is well past both, and pinning here would only mean forgetting
+      # to unpin.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--all-targets` throughout, or the examples bit-rot: `host.rs` is the
+      # manual pty regression harness and is not built by a plain `cargo test`.
+      - run: cargo build --workspace --all-targets
+
+      # Includes tests/end_to_end.rs, which spawns the built binary inside a
+      # ConPTY and types at it. If ConPTY behaves differently on a GitHub
+      # runner than on a desktop, this is where that shows up.
+      - run: cargo test --workspace
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
