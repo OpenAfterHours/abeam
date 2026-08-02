@@ -2,8 +2,8 @@
 //! and encode input back into it — correctly, on Windows ConPTY.
 //!
 //! ```no_run
-//! # fn main() -> Result<(), forge_pty::PtyError> {
-//! use forge_pty::{PtyConfig, PtySession};
+//! # fn main() -> Result<(), abeam_pty::PtyError> {
+//! use abeam_pty::{PtyConfig, PtySession};
 //!
 //! let session = PtySession::spawn(PtyConfig::new("claude").size(40, 100))?;
 //! session.with_screen(|s| s.size());

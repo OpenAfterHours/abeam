@@ -23,11 +23,11 @@ use std::io::Stdout;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use abeam_pty::ExitStatus;
 use anyhow::Result;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use forge_pty::ExitStatus;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -37,7 +37,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::keys::{self, Action};
-use crate::layout as forge_layout;
+use crate::layout as abeam_layout;
 use crate::pane::{Focus, Pane};
 use crate::panes::{DiagPane, GitPane, RightView, ShellPane, TerminalPane, ViewerPane};
 use crate::watch::Watch;
@@ -48,7 +48,7 @@ pub enum Outcome {
     /// The child finished. `screen` is what its last frame said — printed to
     /// the *primary* buffer by `main`, because leaving the alternate screen
     /// throws away everything drawn inside it, and a session whose transcript
-    /// vanishes on `/exit` is a worse terminal than the one forge replaced.
+    /// vanishes on `/exit` is a worse terminal than the one abeam replaced.
     Exited {
         status: ExitStatus,
         screen: Vec<String>,
@@ -90,12 +90,12 @@ pub struct App {
     focus: Focus,
     zoom: bool,
     help: bool,
-    /// The next keystroke bypasses every forge binding. See `keys::Action`.
+    /// The next keystroke bypasses every abeam binding. See `keys::Action`.
     literal_next: bool,
     /// Quitting kills a live session, so it asks twice. One bit rather than a
     /// modal dialog: any other key cancels it, which is the whole interaction.
     pending_quit: bool,
-    /// Claude's exit, and the screen it left behind, held until forge is
+    /// Claude's exit, and the screen it left behind, held until abeam is
     /// actually willing to go. Normally that is immediately; with a command
     /// still running in the shell view it is when the user says so.
     claude_exit: Option<(ExitStatus, Vec<String>)>,
@@ -127,7 +127,7 @@ impl App {
             viewer,
             // No child yet. It is spawned by the first frame that draws it, so
             // a session that never asks for a command line never pays for one.
-            shell: ShellPane::new(root, std::env::var("FORGE_SHELL").ok()),
+            shell: ShellPane::new(root, std::env::var("ABEAM_SHELL").ok()),
             diag: DiagPane::new(),
             right_view: RightView::Git,
             last_workspace_view: RightView::Git,
@@ -161,12 +161,12 @@ impl App {
                 let screen = self.left.last_screen();
                 self.claude_exit = Some((status, screen));
                 // The left title now says the session has ended, and on the
-                // path where forge stays up that is the only thing announcing
+                // path where abeam stays up that is the only thing announcing
                 // it.
                 redraw = true;
             }
 
-            // Claude leaving normally ends forge with it — that is what forge
+            // Claude leaving normally ends abeam with it — that is what abeam
             // is. The exception is an open shell session: leaving kills it, and
             // killing someone's `cargo build` because the *other* pane finished
             // is not a decision this program gets to make on its own. So it
@@ -177,7 +177,7 @@ impl App {
             // at a prompt holds the door exactly as a build does. The cost is
             // that pressing Alt+S once, early, changes how the session ends —
             // which is why the title names the shell rather than just saying
-            // forge is still here.
+            // abeam is still here.
             if self.claude_exit.is_some() && !self.shell.is_live() {
                 return Ok(self.finish());
             }
@@ -237,7 +237,7 @@ impl App {
     /// `Alt+Q` after Claude has already gone is still Claude's exit — it is the
     /// same session ending, delayed by however long the shell was busy — and
     /// reporting it as a detach would throw away both the transcript `main`
-    /// prints and the status code anything scripting forge reads.
+    /// prints and the status code anything scripting abeam reads.
     fn finish(&mut self) -> Outcome {
         match self.claude_exit.take() {
             Some((status, screen)) => Outcome::Exited { status, screen },
@@ -248,7 +248,7 @@ impl App {
     /// Everything the panes cannot say to each other. Runs once per loop
     /// iteration, and does no work at all when the watcher is quiet.
     ///
-    /// This is the reason forge exists rather than three windows: an agent
+    /// This is the reason abeam exists rather than three windows: an agent
     /// writes a file, and the git view and the document view both already know.
     fn pump(&mut self) -> bool {
         let mut redraw = false;
@@ -333,7 +333,7 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Result<Flow> {
         if std::mem::take(&mut self.literal_next) {
             // To whichever pane has focus, not to Claude. The hatch exists so
-            // forge can never permanently shadow a binding of the program you
+            // abeam can never permanently shadow a binding of the program you
             // are typing at, and once the right pane can host a shell that is
             // two programs. Sending it left regardless would deliver a keystroke
             // into Claude while the user is looking at the shell they aimed it
@@ -394,7 +394,7 @@ impl App {
             Action::Quit => {
                 // Straight out when nothing would be killed by leaving. A shell
                 // still running a command counts, even once Claude has gone —
-                // that is the whole reason forge is still on screen.
+                // that is the whole reason abeam is still on screen.
                 if confirming || (self.left.has_exited() && !self.shell.is_live()) {
                     return Ok(Flow::Quit);
                 }
@@ -433,7 +433,7 @@ impl App {
                     // the loop drains every pending event before drawing, so
                     // `Alt+S` followed by a typed command in the same batch
                     // would route those keys at a pane that will never appear.
-                    if forge_layout::split(self.area, self.zoom).right.is_some() {
+                    if abeam_layout::split(self.area, self.zoom).right.is_some() {
                         self.focus = Focus::Right;
                     }
                 }
@@ -540,9 +540,9 @@ impl App {
 
     fn ui(&mut self, f: &mut Frame) {
         self.area = f.area();
-        let split = forge_layout::split(f.area(), self.zoom);
-        self.left_inner = forge_layout::inner(split.left);
-        self.right_inner = split.right.map(forge_layout::inner);
+        let split = abeam_layout::split(f.area(), self.zoom);
+        self.left_inner = abeam_layout::inner(split.left);
+        self.right_inner = split.right.map(abeam_layout::inner);
 
         // The right pane can vanish under a narrow window while focused.
         if self.right_inner.is_none() {
@@ -553,10 +553,10 @@ impl App {
         let left_title = if self.pending_quit {
             format!(" {} · Alt+Q again to quit ", self.left.title())
         } else if self.claude_exit.is_some() {
-            // Forge has outlived the session it exists for, which happens only
-            // because a shell is open. Naming it matters: without that word the
-            // window looks stuck, and the one thing the user needs to know is
-            // that something of theirs is still alive in the other pane.
+            // This is abeam outliving the session it exists for, which happens
+            // only because a shell is open. Naming it matters: without that
+            // word the window looks stuck, and the one thing the user needs to
+            // know is that something of theirs is still alive in the other pane.
             format!(" {} · shell open · Alt+Q to quit ", self.left.title())
         } else {
             format!(" {} ", self.left.title())
@@ -914,7 +914,7 @@ mod tests {
         // prints a line. A frame re-renders Claude's whole screen, so that is
         // Claude's typing latency spent on a pane nobody is looking at.
         let mut app = app();
-        // `cmd` rather than whatever `FORGE_SHELL` or the candidate search
+        // `cmd` rather than whatever `ABEAM_SHELL` or the candidate search
         // would pick: this test is about the shell's bookkeeping, and `pwsh`
         // costs a second of startup to prove the same thing.
         app.app.shell = ShellPane::new(app.dir.path().to_path_buf(), Some("cmd.exe".into()));
@@ -1058,7 +1058,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Left);
 
         // ...and now Esc is Claude's, as it must be: it is how you leave a
-        // Claude prompt, and forge stealing it would be unusable.
+        // Claude prompt, and abeam stealing it would be unusable.
         app.handle_key(key(KeyCode::Esc)).unwrap();
         assert_eq!(app.focus, Focus::Left);
     }
@@ -1125,7 +1125,8 @@ mod tests {
 
     #[test]
     fn the_next_key_after_the_escape_hatch_reaches_claude_verbatim() {
-        // Forge must never be able to permanently shadow a Claude binding.
+        // It must never be possible for abeam to permanently shadow a Claude
+        // binding.
         let mut app = app();
         app.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL))
             .unwrap();
@@ -1160,7 +1161,7 @@ mod tests {
 
     #[test]
     fn the_help_overlay_says_any_key_and_means_any_key() {
-        // It used to mean "any key forge has no binding for". Press F1 then
+        // It used to mean "any key abeam has no binding for". Press F1 then
         // Alt+G and the overlay was still drawn on top of the git view you had
         // just asked to see, and a third keystroke was needed to get it back.
         let mut app = app();

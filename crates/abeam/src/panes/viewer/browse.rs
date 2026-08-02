@@ -24,7 +24,7 @@
 //! under the root — built by the same worker walk that finds the markdown, so
 //! it costs no extra disk — and matches the query as a *subsequence* of the
 //! root-relative path. Subsequence rather than substring because that is what
-//! lets `cfpv` reach `crates/forge/src/panes/viewer.rs`, and typing initials is
+//! lets `capv` reach `crates/abeam/src/panes/viewer.rs`, and typing initials is
 //! how anyone who has used a fuzzy finder expects to get there.
 //!
 //! The ranking is the part that makes it usable rather than merely correct. A
@@ -127,7 +127,7 @@ struct Find {
 pub struct Browser {
     root: PathBuf,
     /// The directory listed. Always the root or something under it — there is
-    /// no `..` out of the top, because forge was started *here*.
+    /// no `..` out of the top, because abeam was started *here*.
     dir: PathBuf,
     entries: Vec<Entry>,
     /// The directory held more than [`MAX_ENTRIES`], and `entries` is a prefix
@@ -202,7 +202,7 @@ impl Browser {
         let dir = doc
             .and_then(Path::parent)
             // A path from outside the root — the git view resolves against the
-            // worktree top level, which can be above where forge was started —
+            // worktree top level, which can be above where abeam was started —
             // has no place in the tree this list walks.
             .filter(|d| d.starts_with(&self.root))
             .map(Path::to_path_buf)
@@ -1274,8 +1274,9 @@ mod tests {
 
     #[test]
     fn the_root_has_nowhere_further_up_to_go() {
-        // Forge was started here. A list that walked out of the repository
-        // would be offering files no other part of the program can talk about.
+        // This is where abeam was started. A list that walked out of the
+        // repository would be offering files no other part of the program can
+        // talk about.
         let dir = tree("browse-top", &["a.md"]);
         let mut b = browser(&dir, &[]);
         assert!(ignored(b.key(key(KeyCode::Backspace))));
@@ -1522,7 +1523,7 @@ mod tests {
         let dir = tree("find-subseq", &["a.md"]);
         let mut b = browser(
             &dir,
-            &["notes/keymap.md", "src/main.rs", "crates/forge/src/app.rs"],
+            &["notes/keymap.md", "src/main.rs", "crates/abeam/src/app.rs"],
         );
 
         b.key(key(KeyCode::Char('/')));
@@ -1801,7 +1802,7 @@ mod tests {
             "browse-widths",
             &["a-really-quite-long-file-name-indeed.md", "src/main.rs"],
         );
-        let mut b = browser(&dir, &["crates/forge/src/panes/viewer/browse.rs"]);
+        let mut b = browser(&dir, &["crates/abeam/src/panes/viewer/browse.rs"]);
         for find in [false, true] {
             if find {
                 b.key(key(KeyCode::Char('/')));

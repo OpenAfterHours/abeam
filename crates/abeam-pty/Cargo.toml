@@ -1,5 +1,5 @@
 [package]
-name = "forge-pty"
+name = "abeam-pty"
 description = "Host a child process in a pty and render it, correctly, on Windows ConPTY."
 version.workspace = true
 edition.workspace = true

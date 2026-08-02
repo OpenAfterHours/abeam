@@ -1,12 +1,12 @@
-//! forge — one window for a Claude Code session.
+//! abeam — one window for a Claude Code session.
 //!
 //! Claude is hosted in the left pane, rendered by us: bytes come out of a pty,
 //! through a vt100 parser, into a ratatui widget. Nothing passes through to the
 //! real terminal. The right pane toggles between a git view and a file /
 //! markdown viewer that follows what Claude just wrote.
 //!
-//! Usage:  forge                 (hosts `claude`)
-//!         forge powershell      (hosts something else)
+//! Usage:  abeam                 (hosts `claude`)
+//!         abeam powershell      (hosts something else)
 //!
 //! Alt+Q quits, F1 lists the keys, F2 shows what the pty is doing.
 
@@ -25,8 +25,8 @@ mod testutil;
 
 use std::path::Path;
 
+use abeam_pty::PtyConfig;
 use anyhow::Result;
-use forge_pty::PtyConfig;
 
 use crate::app::{App, Outcome};
 use crate::panes::TerminalPane;
@@ -40,8 +40,8 @@ fn main() -> Result<()> {
 
     let root = std::env::current_dir()?;
 
-    // `forge ./tools/agent.exe` named a place, and meant it relative to where
-    // forge was run — which is about to stop being this process's directory.
+    // `abeam ./tools/agent.exe` named a place, and meant it relative to where
+    // abeam was run — which is about to stop being this process's directory.
     // Resolved here, while it still means that.
     let program = match Path::new(&program) {
         p if p.is_relative() && p.parent().is_some_and(|d| !d.as_os_str().is_empty()) => {
@@ -51,12 +51,12 @@ fn main() -> Result<()> {
     };
 
     // Then stand somewhere nobody else can write to, for the rest of the
-    // session. Every program forge starts, it starts by name, and Windows
+    // session. Every program abeam starts, it starts by name, and Windows
     // resolves a bare name in `CreateProcessW` against *this* process's current
-    // directory before it consults `PATH` — so with forge sitting in a
+    // directory before it consults `PATH` — so with abeam sitting in a
     // repository, a file called `claude.exe` or `pwsh.exe` committed to that
     // repository is what runs, with the user's full token. It costs nothing
-    // because every pty forge opens is given an explicit working directory, and
+    // because every pty abeam opens is given an explicit working directory, and
     // it covers the panes as well as this line. A failure leaves us exactly
     // where the program stood before, which is why it is not fatal.
     if let Some(system_root) = std::env::var_os("SystemRoot") {
@@ -93,13 +93,13 @@ fn main() -> Result<()> {
             // Onto the primary buffer, now that the alternate one is gone with
             // everything that was ever drawn on it. A session that leaves no
             // trace in your scrollback is a worse terminal than the plain one
-            // forge replaced.
+            // abeam replaced.
             for line in screen {
                 println!("{line}");
             }
             println!("{program} exited: {status:?}");
             std::io::Write::flush(&mut std::io::stdout())?;
-            // Anything scripting forge — `forge claude -p "…" && next-step`, a
+            // Anything scripting abeam — `abeam claude -p "…" && next-step`, a
             // CI wrapper — reads this, and a failed child reported as success
             // is the kind of thing that is only noticed much later.
             std::process::exit(status.exit_code() as i32);

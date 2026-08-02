@@ -3,6 +3,37 @@
 version = 4
 
 [[package]]
+name = "abeam"
+version = "0.1.0"
+dependencies = [
+ "abeam-pty",
+ "anyhow",
+ "crossterm",
+ "ignore",
+ "notify",
+ "notify-debouncer-full",
+ "pulldown-cmark",
+ "ratatui",
+ "syntect",
+ "tui-term",
+ "unicode-width",
+]
+
+[[package]]
+name = "abeam-pty"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "portable-pty",
+ "ratatui",
+ "thiserror 2.0.19",
+ "tui-term",
+ "vt100",
+ "winapi",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -503,37 +534,6 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "forge"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "forge-pty",
- "ignore",
- "notify",
- "notify-debouncer-full",
- "pulldown-cmark",
- "ratatui",
- "syntect",
- "tui-term",
- "unicode-width",
-]
-
-[[package]]
-name = "forge-pty"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "portable-pty",
- "ratatui",
- "thiserror 2.0.19",
- "tui-term",
- "vt100",
- "winapi",
-]
 
 [[package]]
 name = "fsevent-sys"

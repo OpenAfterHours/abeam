@@ -84,7 +84,7 @@ pub fn clip_line(line: Line<'static>, width: usize) -> Line<'static> {
     out
 }
 
-/// Truncate from the *left*: given `crates/forge/src/panes/git.rs` and no room,
+/// Truncate from the *left*: given `crates/abeam/src/panes/git.rs` and no room,
 /// the half worth keeping is the one with the filename in it.
 pub fn elide_left(s: &str, max: usize) -> String {
     if s.width() <= max {
@@ -143,8 +143,8 @@ mod tests {
     #[test]
     fn eliding_a_path_keeps_the_filename() {
         assert_eq!(elide_left("src/app.rs", 20), "src/app.rs");
-        assert_eq!(elide_left("crates/forge/src/panes/git.rs", 12), "…anes/git.rs");
-        let out = elide_left("crates/forge/src/panes/git.rs", 12);
+        assert_eq!(elide_left("crates/abeam/src/panes/git.rs", 12), "…anes/git.rs");
+        let out = elide_left("crates/abeam/src/panes/git.rs", 12);
         assert!(out.width() <= 12, "{out:?} is {} cells", out.width());
         assert!(out.ends_with("git.rs"), "{out:?} lost the filename");
         assert!(out.starts_with('…'));

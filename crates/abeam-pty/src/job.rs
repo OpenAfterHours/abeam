@@ -12,7 +12,7 @@
 //! A job object is the operating system's answer. Every process a member starts
 //! joins the job with it, and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` terminates
 //! all of them when the last handle to the job closes — which happens when the
-//! session drops, and equally if forge is killed outright, because the handle
+//! session drops, and equally if abeam is killed outright, because the handle
 //! goes with the process. It is also why the session closes the job *before*
 //! the master: `ClosePseudoConsole` can block while clients are still attached,
 //! and by then there are none.

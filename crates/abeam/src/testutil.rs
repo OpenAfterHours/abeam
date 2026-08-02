@@ -1,6 +1,6 @@
 //! A throwaway directory for the tests that need a real file.
 //!
-//! Most of what forge has to survive — a path that is gone, a directory where a
+//! Most of what abeam has to survive — a path that is gone, a directory where a
 //! file was, a 200 MB blob, bytes that are not text, a watcher firing on a file
 //! that has already been deleted — cannot honestly be faked behind a trait. The
 //! whole of it is a unique directory under the system temp, removed on drop.
@@ -21,7 +21,7 @@ impl TempDir {
         // Process id and a counter: `cargo test` runs these in parallel
         // threads of one process, and two runs can overlap.
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("forge-{tag}-{}-{n}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("abeam-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self(path)

@@ -1,6 +1,6 @@
 //! Noticing what the agent just did.
 //!
-//! This is the thing forge has that three separate windows do not. A wezterm
+//! This is the thing abeam has that three separate windows do not. A wezterm
 //! pane running lazygit next to one running glow is two programs that have to
 //! be told; here, one watcher tells both panes, and neither of them has to be
 //! asked.
@@ -69,10 +69,10 @@ pub fn is_markdown(path: &Path) -> bool {
 /// hands out absolute paths, so testing every component tests the root's own
 /// ancestors too. A repository living under any directory called `dist`,
 /// `target`, `venv`, `node_modules` — `D:\work\dist\myrepo`, or just running
-/// forge from inside one — would then match on the ancestor and drop *every*
+/// abeam from inside one — would then match on the ancestor and drop *every*
 /// event, silently, while still reporting a watcher that started. The same
 /// predicate walks the startup scan, so the file list would come back empty
-/// too, and forge's one reason to exist would be quietly gone.
+/// too, and abeam's one reason to exist would be quietly gone.
 pub fn in_noise(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -139,8 +139,8 @@ pub struct Watch {
 
 impl Watch {
     /// `None` if the platform refuses to watch — a network share, a path that
-    /// vanished between startup and here. Forge degrades to manual refresh and
-    /// says so on screen rather than failing to start.
+    /// vanished between startup and here. In either case abeam degrades to
+    /// manual refresh and says so on screen rather than failing to start.
     pub fn start(root: &Path) -> Option<Self> {
         let (tx, rx) = mpsc::channel();
         // The root travels with the callback because the noise filter is
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn a_cargo_build_reaches_neither_pane() {
         let fx = Fixture::new("watch-build");
-        let change = fx.classify([fx.touch("target/debug/forge.exe"), fx.touch("target/doc/x.md")]);
+        let change = fx.classify([fx.touch("target/debug/abeam.exe"), fx.touch("target/doc/x.md")]);
         assert!(change.is_empty(), "build output must not wake anything");
     }
 

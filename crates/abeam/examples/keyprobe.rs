@@ -1,6 +1,6 @@
 //! What does this terminal actually send?
 //!
-//! forge's bindings are unit-tested against synthetic `KeyEvent`s, which proves
+//! abeam's bindings are unit-tested against synthetic `KeyEvent`s, which proves
 //! the routing but says nothing about what crossterm reports on a given
 //! terminal. Windows consoles vary: some deliver `Alt+Q` as one event with the
 //! ALT modifier, some send `Esc` then `q` as two events, some swallow it
@@ -8,7 +8,7 @@
 //!
 //! Run this, press the key that is misbehaving, and read what comes out.
 //!
-//!   cargo run -p forge --example keyprobe
+//!   cargo run -p abeam --example keyprobe
 //!
 //! Press Esc three times in a row to exit.
 
@@ -54,10 +54,10 @@ fn main() -> std::io::Result<()> {
                 } else {
                     format!("{:?}", k.modifiers)
                 };
-                // The verdict line is what matters: forge's global bindings all
+                // The verdict line is what matters: abeam's global bindings all
                 // test `modifiers.contains(ALT)` against a `Char`.
                 let verdict = match (k.code, k.modifiers.contains(KeyModifiers::ALT)) {
-                    (KeyCode::Char(_), true) => "  <-- forge would see this as an Alt binding",
+                    (KeyCode::Char(_), true) => "  <-- abeam would see this as an Alt binding",
                     (KeyCode::Esc, _) => "  (a lone Esc - if Alt+key produces this plus a letter, \
                                           this terminal sends Alt as an Esc prefix)",
                     _ => "",

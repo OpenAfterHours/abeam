@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/forge", "crates/forge-pty"]
+members = ["crates/abeam", "crates/abeam-pty"]
 # A virtual manifest has no edition to infer a resolver from, so an unset
 # resolver silently means resolver 1 plus a warning as soon as a member is
 # edition 2021+. 3 is what edition-2024 members get anyway.
@@ -10,14 +10,14 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-forge-pty = { path = "crates/forge-pty" }
+abeam-pty = { path = "crates/abeam-pty" }
 
 # --- shared across the crate boundary -----------------------------------
-# These three carry *types* between forge and forge-pty. A version skew in any
+# These three carry *types* between abeam and abeam-pty. A version skew in any
 # of them is not a dependency problem, it is a type error that reads like a
 # compiler bug ("expected Screen, found Screen"). One declaration each, here.
-#   crossterm  - forge builds KeyEvent/MouseEvent, forge-pty consumes them
-#   vt100      - forge-pty produces Screen, tui-term renders it
+#   crossterm  - abeam builds KeyEvent/MouseEvent, abeam-pty consumes them
+#   vt100      - abeam-pty produces Screen, tui-term renders it
 #   tui-term   - must agree with vt100 above; bumping it means checking vt100
 crossterm = "0.29.0"
 vt100 = "0.16.2"

@@ -1,5 +1,5 @@
 [package]
-name = "forge"
+name = "abeam"
 description = "A terminal multiplexer for a Claude Code workflow: Claude in one pane, git and files in the other."
 version.workspace = true
 edition.workspace = true
@@ -7,12 +7,12 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 crossterm.workspace = true
-forge-pty.workspace = true
+abeam-pty.workspace = true
 ratatui.workspace = true
 tui-term.workspace = true
 
 # --- the right-hand panes ------------------------------------------------
-# The file watcher is forge's whole reason to exist, so it is not optional:
+# The file watcher is abeam's whole reason to exist, so it is not optional:
 # debounce it, because one save from an editor fires several events.
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"

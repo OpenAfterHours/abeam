@@ -1,6 +1,6 @@
-//! Host-terminal state: the modes forge turns on, and getting them back off.
+//! Host-terminal state: the modes abeam turns on, and getting them back off.
 //!
-//! This is deliberately forge's job and not `forge-pty`'s. A library that hosts
+//! This is deliberately abeam's job and not `abeam-pty`'s. A library that hosts
 //! a pty must not seize raw mode — its user already owns the terminal and is
 //! already inside a draw loop.
 
@@ -22,7 +22,7 @@ use crate::app::Tui;
 /// backtrace they can read.
 ///
 /// Note that `EnableMouseCapture` disables the host terminal's own text
-/// selection; copying out of forge needs Shift+drag, and which terminals honour
+/// selection; copying out of abeam needs Shift+drag, and which terminals honour
 /// that varies.
 pub fn setup() -> Result<Tui> {
     let hook = std::panic::take_hook();

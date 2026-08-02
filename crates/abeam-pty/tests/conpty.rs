@@ -49,7 +49,7 @@ fn wait_for_exit(
     false
 }
 
-use forge_pty::vt100;
+use abeam_pty::vt100;
 use portable_pty::{CommandBuilder, PtySize};
 
 const ROWS: u16 = 24;
@@ -159,10 +159,10 @@ fn conpty_stalls_until_the_dsr_query_is_answered() {
 
 #[test]
 fn child_output_reaches_the_parser() {
-    let parser = render(&["/c", "echo forge-spike-marker"]);
+    let parser = render(&["/c", "echo abeam-spike-marker"]);
     let screen = parser.screen().contents();
     assert!(
-        screen.contains("forge-spike-marker"),
+        screen.contains("abeam-spike-marker"),
         "expected marker in rendered screen, got: {screen:?}"
     );
 }

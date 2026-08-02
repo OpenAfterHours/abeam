@@ -2,14 +2,14 @@
 //!
 //! What it is for is the round trip that otherwise costs a second window:
 //! `git branch`, `uv run ruff format`, `cargo test` — run in the directory
-//! forge was pointed at, next to the Claude session that is about to be told
+//! abeam was pointed at, next to the Claude session that is about to be told
 //! what they printed. `Alt+S` out, type, `Alt+S` home.
 //!
 //! What it deliberately is not is a multiplexer. There is one child, started
 //! when the pane is first drawn and never restarted behind your back; there are
-//! no tabs and no splits. Nothing started here outlives forge either, and that
+//! no tabs and no splits. Nothing started here outlives abeam either, and that
 //! one is not free — `TerminateProcess` reaches a shell and not the `cargo
-//! build` the shell started, so `forge_pty::job` puts the whole tree in a job
+//! build` the shell started, so `abeam_pty::job` puts the whole tree in a job
 //! object and closes it with the session. It also keeps no buffer of its own:
 //! the history it scrolls through is the one the `vt100` parser behind the pty
 //! already writes into, and this pane only moves the window onto it.
@@ -48,9 +48,9 @@
 
 use std::path::{Path, PathBuf};
 
+use abeam_pty::PtyConfig;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use forge_pty::PtyConfig;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -118,7 +118,7 @@ impl ShellPane {
     pub fn new(root: PathBuf, program: Option<String>) -> Self {
         let candidates = match program {
             // An explicit program is a choice, not a first preference. Falling
-            // back from it would hide a typo in `FORGE_SHELL` behind a shell
+            // back from it would hide a typo in `ABEAM_SHELL` behind a shell
             // nobody asked for, and the mistake would surface much later as
             // "why is my profile not loading".
             Some(p) => vec![Candidate::new(p)],
@@ -135,9 +135,9 @@ impl ShellPane {
     /// Is a child still running in here?
     ///
     /// Two callers asking different questions of the same fact. The app asks
-    /// before it lets forge exit, because leaving kills whatever is in this pty
+    /// before it lets abeam exit, because leaving kills whatever is in this pty
     /// and taking down someone's `cargo build` because the *other* pane
-    /// finished is not a decision forge gets to make on its own. `Pane` asks it
+    /// finished is not a decision abeam gets to make on its own. `Pane` asks it
     /// as [`takes_input`](Pane::takes_input), because a live child is also the
     /// only thing here there is to type into.
     ///
@@ -436,9 +436,9 @@ impl Pane for ShellPane {
             // the one that used not to be. `App::draw` propagates what comes
             // back here, so a `ResizePseudoConsole` refusing in *this* pane
             // ended the Claude session in the other one and skipped the
-            // transcript forge prints on the way out. The left pane
+            // transcript abeam prints on the way out. The left pane
             // propagating is right, because if Claude's pty cannot be resized
-            // forge is over; this pane is exactly where that stops being true.
+            // abeam is over; this pane is exactly where that stops being true.
             let _ = term.on_resize(inner);
         }
         // A child that has exited is deliberately not resized. Its last screen
@@ -462,7 +462,7 @@ impl Pane for ShellPane {
 /// is most of the first screen spent on nothing. `cmd` has no equivalent flag
 /// and is given none.
 ///
-/// Matched on the file stem so an explicit `FORGE_SHELL=C:\…\pwsh.exe` is
+/// Matched on the file stem so an explicit `ABEAM_SHELL=C:\…\pwsh.exe` is
 /// recognised too, and so anything else — `bash`, `nu` — is spawned bare rather
 /// than handed a flag it will refuse to start without understanding.
 fn args_for(program: &str) -> &'static [&'static str] {
@@ -484,7 +484,7 @@ fn args_for(program: &str) -> &'static [&'static str] {
 const IMAGES: &[&str] = &["exe", "com"];
 
 /// `PATHEXT`'s default, for the rare environment that does not set it. The
-/// whole list, not an opinion about it: what forge can *start* is [`IMAGES`],
+/// whole list, not an opinion about it: what abeam can *start* is [`IMAGES`],
 /// and the two questions are answered separately on purpose.
 const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 
@@ -497,7 +497,7 @@ const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 /// `lpApplicationName` — at which point Windows resolves it against the
 /// *calling process's* current directory before it looks anywhere else.
 /// `PtyConfig::cwd` has no bearing on that; the directory in question is the
-/// one forge itself is standing in, which is the repository. So a repository
+/// one abeam itself is standing in, which is the repository. So a repository
 /// containing a file called `pwsh.exe` would have run it, with the user's full
 /// token, on the first `Alt+S` — on any machine without PowerShell 7, which is
 /// precisely the machine the [`SHELLS`] fallback exists for. `main` now stands
@@ -516,7 +516,7 @@ fn resolve(program: &str) -> Result<PathBuf, String> {
     let named = Path::new(program);
 
     let found = if named.is_absolute() {
-        // Probed rather than trusted: a `FORGE_SHELL` pointing at something
+        // Probed rather than trusted: an `ABEAM_SHELL` pointing at something
         // that has since been uninstalled should arrive here as "not found"
         // rather than as whatever `CreateProcessW` makes of it.
         probe(named.parent().unwrap_or(named), &file_name_of(named))
@@ -525,7 +525,7 @@ fn resolve(program: &str) -> Result<PathBuf, String> {
         // relative to the repository on screen — the one directory in this
         // whole question that somebody else gets to write to.
         return Err(format!(
-            "`{program}` is a relative path, and forge will not resolve one \
+            "`{program}` is a relative path, and abeam will not resolve one \
              here: it would be resolved against the repository on screen. \
              Give an absolute path, or a bare name to look up on PATH."
         ));
@@ -545,7 +545,7 @@ fn resolve(program: &str) -> Result<PathBuf, String> {
         return Err(format!(
             "`{}` is a script rather than a program. Windows starts only .exe \
              and .com directly; a .cmd or a .ps1 needs a shell named in front \
-             of it, and forge has no way to know which one you meant.",
+             of it, and abeam has no way to know which one you meant.",
             found.display()
         ));
     }
@@ -618,7 +618,7 @@ fn probe(dir: &Path, name: &str) -> Option<PathBuf> {
 /// `PATHEXT` spelled in lower case.
 ///
 /// Windows sets it in capitals and matches file names without regard to case,
-/// so the only thing the choice affects is the path forge then *shows* — in the
+/// so the only thing the choice affects is the path abeam then *shows* — in the
 /// message about a script it will not start, and in the pty diagnostics.
 /// `claude.cmd` is what a reader has on disk; `claude.CMD` is a second thing to
 /// wonder about.
@@ -651,7 +651,7 @@ fn file_name_of(path: &Path) -> String {
 /// What the pane says when nothing would start.
 ///
 /// It names every program that was tried, because the useful next move depends
-/// entirely on which list this was: a single name means `FORGE_SHELL` is wrong,
+/// entirely on which list this was: a single name means `ABEAM_SHELL` is wrong,
 /// and all three of [`SHELLS`] means this is not the Windows anyone expected.
 ///
 /// The reason from the operating system comes *last*, under the advice rather
@@ -666,7 +666,7 @@ fn failure(tried: &[String], why: &str, width: usize) -> Vec<Line<'static>> {
     };
     say(&format!("Tried: {}", tried.join(", ")), dim());
     say(
-        "Set FORGE_SHELL to the program you want, and press Enter to try again.",
+        "Set ABEAM_SHELL to the program you want, and press Enter to try again.",
         dim(),
     );
     if !why.is_empty() {
@@ -705,7 +705,7 @@ mod tests {
     }
 
     /// A pane that will spawn exactly this, bypassing the [`SHELLS`] search.
-    /// Tests need a child that exits the moment it starts, and `FORGE_SHELL`
+    /// Tests need a child that exits the moment it starts, and `ABEAM_SHELL`
     /// names a program rather than a command line.
     fn pane(dir: &TempDir, program: &str, args: &[&str]) -> ShellPane {
         ShellPane {
@@ -816,7 +816,7 @@ mod tests {
         assert!(matches!(pane.state, State::Cold));
         assert_eq!(pane.title(), "shell");
         assert!(!pane.takes_input());
-        // ...and nothing here that quitting forge would kill.
+        // ...and nothing here that quitting abeam would kill.
         assert!(!pane.is_live());
         assert!(!pane.tick());
 
@@ -838,7 +838,7 @@ mod tests {
         let mut live = pane(&dir, "cmd.exe", &[]);
         draw(&mut live, 40, 8);
         assert!(live.takes_input(), "the border promises alt+s as the way out");
-        // The same fact the app reads before it lets forge exit: quitting would
+        // The same fact the app reads before it lets abeam exit: quitting would
         // kill this child, so quitting has to ask first.
         assert!(live.is_live());
         let mut sent = hosted(&live).diagnostics().keys_sent;
@@ -856,7 +856,7 @@ mod tests {
         draw(&mut dead, 40, 8);
         wait_for_exit(&mut dead);
         assert!(!dead.takes_input());
-        assert!(!dead.is_live(), "nothing left for forge to wait for");
+        assert!(!dead.is_live(), "nothing left for abeam to wait for");
         // ...so the app can read them as "give focus back to Claude", which is
         // the only route out of a pane that is no longer hosting anything.
         for code in [KeyCode::Esc, KeyCode::Char('q')] {
@@ -1065,27 +1065,27 @@ mod tests {
         // holds. The alternative is an empty box, which is exactly what a shell
         // that has not printed anything yet also looks like.
         let dir = TempDir::new("shell-missing");
-        let mut pane = pane(&dir, "forge-no-such-shell.exe", &[]);
+        let mut pane = pane(&dir, "abeam-no-such-shell.exe", &[]);
         let screen = draw(&mut pane, 46, 12);
 
         assert!(matches!(pane.state, State::Failed { .. }));
         assert!(!pane.takes_input(), "there is nothing to type into");
         assert_eq!(pane.title(), "no shell · enter retries");
         // On screen, not merely in the struct — and naming the program, which
-        // is the only thing that tells a reader whether FORGE_SHELL is at fault.
-        assert!(screen.contains("forge-no-such-shell.exe"), "got: {screen}");
-        assert!(screen.contains("FORGE_SHELL"), "got: {screen}");
+        // is the only thing that tells a reader whether ABEAM_SHELL is at fault.
+        assert!(screen.contains("abeam-no-such-shell.exe"), "got: {screen}");
+        assert!(screen.contains("ABEAM_SHELL"), "got: {screen}");
 
-        // Enter retries, for the case where the fix was made outside forge.
+        // Enter retries, for the case where the fix was made outside abeam.
         assert_eq!(pane.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
         assert!(matches!(pane.state, State::Failed { .. }));
     }
 
     #[test]
-    fn the_child_starts_in_the_directory_forge_was_pointed_at() {
+    fn the_child_starts_in_the_directory_abeam_was_pointed_at() {
         // The whole point of this pane over a second window: a `git status`
         // typed here answers about the repository on screen, not about wherever
-        // forge happened to be launched from.
+        // abeam happened to be launched from.
         let dir = TempDir::new("shell-cwd");
         let mut pane = pane(&dir, "cmd.exe", &["/c", "cd"]);
         draw(&mut pane, 100, 8);
@@ -1102,7 +1102,7 @@ mod tests {
     fn the_powershells_are_asked_not_to_print_a_banner_and_cmd_is_not() {
         assert_eq!(args_for("pwsh.exe"), ["-NoLogo"]);
         assert_eq!(args_for("powershell.exe"), ["-NoLogo"]);
-        // An explicit FORGE_SHELL is often a full path, and is still PowerShell.
+        // An explicit ABEAM_SHELL is often a full path, and is still PowerShell.
         assert_eq!(
             args_for(r"C:\Program Files\PowerShell\7\pwsh.exe"),
             ["-NoLogo"]
@@ -1116,7 +1116,7 @@ mod tests {
 
     #[test]
     fn an_explicit_program_is_a_choice_rather_than_a_first_preference() {
-        // Falling back from FORGE_SHELL would hide a typo in it behind a shell
+        // Falling back from ABEAM_SHELL would hide a typo in it behind a shell
         // nobody asked for, and the mistake would surface much later.
         let named = ShellPane::new(PathBuf::from("."), Some("nu.exe".to_string()));
         let only: Vec<&str> = named.candidates.iter().map(|c| c.program.as_str()).collect();
@@ -1140,7 +1140,7 @@ mod tests {
         // other test here injects a single candidate, which is the one shape
         // that cannot show this.
         let dir = TempDir::new("shell-fallback");
-        let mut pane = panes(&dir, &["forge-no-such-shell.exe", "cmd.exe"]);
+        let mut pane = panes(&dir, &["abeam-no-such-shell.exe", "cmd.exe"]);
         draw(&mut pane, 40, 8);
 
         assert!(pane.is_live());
@@ -1150,10 +1150,10 @@ mod tests {
     #[test]
     fn a_search_that_finds_nothing_names_every_shell_it_looked_for() {
         // Which list this was is the whole diagnosis: one name means
-        // FORGE_SHELL is wrong, three means this is not the Windows anyone
+        // ABEAM_SHELL is wrong, three means this is not the Windows anyone
         // expected — and the reader can only tell them apart by reading them.
         let dir = TempDir::new("shell-none");
-        let missing = ["forge-no-such-a.exe", "forge-no-such-b.exe", "forge-no-such-c.exe"];
+        let missing = ["abeam-no-such-a.exe", "abeam-no-such-b.exe", "abeam-no-such-c.exe"];
         let mut pane = panes(&dir, &missing);
         let screen = draw(&mut pane, 46, 14);
 
@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_is_never_taken_from_the_directory_forge_is_looking_at() {
+    fn a_shell_is_never_taken_from_the_directory_abeam_is_looking_at() {
         // The bug this whole resolution step exists for. portable-pty hands a
         // bare name it could not find on PATH to `CreateProcessW` unchanged,
         // and Windows resolves that against the *calling process's* current
@@ -1177,8 +1177,8 @@ mod tests {
         // What has to be true is that no entry which could name the current
         // directory is ever looked in, and these are all of them.
         let dir = TempDir::new("shell-planted");
-        dir.write("forge-planted-shell.exe", b"MZ not really a program");
-        let planted = "forge-planted-shell.exe";
+        dir.write("abeam-planted-shell.exe", b"MZ not really a program");
+        let planted = "abeam-planted-shell.exe";
 
         for hostile in [";;", ";", ".", ".;", r".\tools", "..", ""] {
             assert_eq!(
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn a_relative_path_is_refused_rather_than_resolved() {
-        // `FORGE_SHELL=.\tools\sh.exe` would be resolved against the repository
+        // `ABEAM_SHELL=.\tools\sh.exe` would be resolved against the repository
         // on screen, which is the one directory in this question somebody else
         // gets to write to. Refusing says so; resolving would not.
         let refused = resolve(r".\tools\sh.exe").expect_err("a relative path is not a shell");
@@ -1251,20 +1251,20 @@ mod tests {
         // shell script `CreateProcessW` cannot run. portable-pty's own search
         // checks the exact name first and takes it.
         let dir = TempDir::new("shell-pathext");
-        dir.write("forge-probe", b"#!/bin/sh\n");
-        dir.write("forge-probe.exe", b"MZ");
+        dir.write("abeam-probe", b"#!/bin/sh\n");
+        dir.write("abeam-probe.exe", b"MZ");
         assert_eq!(
-            probe(dir.path(), "forge-probe"),
-            Some(dir.path().join("forge-probe.exe"))
+            probe(dir.path(), "abeam-probe"),
+            Some(dir.path().join("abeam-probe.exe"))
         );
 
         // With no executable beside it, the script is still what is there —
         // `resolve` is what turns that into a sentence rather than a spawn.
         let only = TempDir::new("shell-pathext-only");
-        only.write("forge-probe", b"#!/bin/sh\n");
+        only.write("abeam-probe", b"#!/bin/sh\n");
         assert_eq!(
-            probe(only.path(), "forge-probe"),
-            Some(only.path().join("forge-probe"))
+            probe(only.path(), "abeam-probe"),
+            Some(only.path().join("abeam-probe"))
         );
     }
 }

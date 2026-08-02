@@ -1,8 +1,8 @@
-# forge
+# abeam
 
 One window for a Claude Code session.
 
-Claude runs in the left pane — hosted in a pty, parsed, and drawn by forge, not
+Claude runs in the left pane — hosted in a pty, parsed, and drawn by abeam, not
 passed through to your terminal. The right pane shows the state of the git
 worktree, the document Claude just wrote, or a shell to run things in. A file
 watcher drives the first two, so neither has to be asked.
@@ -13,9 +13,9 @@ editor open purely to read the markdown Claude produced.
 ```
 ┌ claude ──────────────────────────────┐┌ git · main ↑2 · 12 changed ──────┐
 │                                      ││ Staged (1)          +40 -6       │
-│  > implement the parser              ││   M crates/forge/src/app.rs +40-6│
+│  > implement the parser              ││   M crates/abeam/src/app.rs +40-6│
 │                                      ││ Changed (1)          +7 -0       │
-│  ● Writing crates/forge/src/parse.rs ││   M docs/design.md          +7-0 │
+│  ● Writing crates/abeam/src/parse.rs ││   M docs/design.md          +7-0 │
 │                                      ││ Untracked (1)                    │
 │                                      ││   ? notes/                       │
 │                                      ││ Recent                           │
@@ -29,7 +29,7 @@ Because the right pane knows what the agent just did. A watcher on the
 repository root feeds both views: markdown Claude writes becomes the document on
 screen, and any file it touches refreshes git within one debounce interval. That
 is the only thing here you cannot assemble out of existing tools, and it is the
-reason forge exists.
+reason abeam exists.
 
 Everything else is a consequence of that. The panes are read-only, they never
 take focus from Claude, and they never switch themselves — a pane that yanks
@@ -48,8 +48,8 @@ thereafter.
 ## Running it
 
 ```
-cargo run -p forge            # hosts `claude` in the current directory
-cargo run -p forge -- pwsh    # hosts something else
+cargo run -p abeam            # hosts `claude` in the current directory
+cargo run -p abeam -- pwsh    # hosts something else
 ```
 
 The first argument is the program; everything after it is passed through. The
@@ -58,9 +58,9 @@ git pane and the watcher use.
 
 ## Keys
 
-Forge's own bindings live under `Alt` and the F-keys. **Nothing forge claims is
-a key Claude can act on** — the audit behind that is `docs/keymap.md`, and
-`crates/forge/src/keys.rs` has tests pinning it. Everything else you type goes
+Everything abeam binds lives under `Alt` and the F-keys. **Nothing abeam claims
+is a key Claude can act on** — the audit behind that is `docs/keymap.md`, and
+`crates/abeam/src/keys.rs` has tests pinning it. Everything else you type goes
 to Claude untouched.
 
 | Key | |
@@ -93,7 +93,7 @@ The shell view is the exception, and it has to be: `Esc` and `q` belong to
 whatever is running in it. `Alt+S` or `Alt+←` is the way out, and its border
 says so rather than leaving you to find out.
 
-`Ctrl+\` exists so forge can never permanently shadow a Claude binding. If a
+`Ctrl+\` exists so abeam can never permanently shadow a Claude binding. If a
 future Claude release binds `Alt+G`, `Ctrl+\` then `Alt+G` still reaches it.
 
 ## The panes
@@ -133,19 +133,19 @@ document arriving from the watcher waits while you are walking a tree, exactly
 as it waits behind the git view.
 
 **shell** — `Alt+S`, and the reason it is here rather than in another window:
-`git branch`, `uv run ruff format`, `cargo test`, run in the directory forge was
+`git branch`, `uv run ruff format`, `cargo test`, run in the directory abeam was
 pointed at, next to the session that is about to be told what they printed. It
 is a real pty — `pwsh`, falling back to `powershell` then `cmd`, or whatever
-`FORGE_SHELL` names — started the first time the view is drawn and never before,
+`ABEAM_SHELL` names — started the first time the view is drawn and never before,
 so a session that never asks for one never pays for it. `Alt+J`/`Alt+K` scroll
 its history without focusing it, which is why they are not the arrow keys the
 shell would read as history. A child that exits leaves its last screen up with
 `Enter` to start another, and while it is dead `Esc` means what it means
 everywhere else.
 
-Forge will not close out from under it, either: Claude exiting holds the door
-rather than killing whatever is running, and says `shell open · Alt+Q to quit`
-in the left title. That is "open", not "busy" — ConPTY cannot be asked whether a
+Nor will abeam close out from under it: Claude exiting holds the door rather
+than killing whatever is running, and says `shell open · Alt+Q to quit` in the
+left title. That is "open", not "busy" — ConPTY cannot be asked whether a
 command is running, so a shell sitting at a prompt holds the door exactly as a
 build does. Type `exit` in it, or `Alt+Q` twice.
 
@@ -167,18 +167,18 @@ resize.
 ## Repository
 
 ```
-crates/forge-pty/    the pty host layer: ConPTY session, input encoding, DSR
-crates/forge/        the binary: shell, layout, focus, panes
-crates/forge/tests/end_to_end.rs   forge itself, hosted in a pty and typed at
+crates/abeam-pty/    the pty host layer: ConPTY session, input encoding, DSR
+crates/abeam/        the binary: shell, layout, focus, panes
+crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
 docs/conpty-findings.md   what the spike learned. Read before touching the pty.
 docs/keymap.md            the keybinding collision audit
 ```
 
-`cargo run -p forge-pty --example host` is a complete pty host in one file, kept
+`cargo run -p abeam-pty --example host` is a complete pty host in one file, kept
 as the manual regression harness and as proof that `PtySession` is sufficient
-without forge. The one thing that reproduces the ConPTY stall itself is the
+without abeam. The one thing that reproduces the ConPTY stall itself is the
 ignore-DSR arm of `conpty_stalls_until_the_dsr_query_is_answered` in
-`crates/forge-pty/tests/conpty.rs`, which pins it in both directions.
+`crates/abeam-pty/tests/conpty.rs`, which pins it in both directions.
 
 Build and test with `--all-targets`, or the examples bit-rot:
 
@@ -202,26 +202,26 @@ Focus, zoom, help, the diagnostics view, and the literal-next escape hatch.
 → rendered rows, watcher → both panes, Enter in git → open in files — is
 covered by tests that spawn a real ConPTY child and draw real frames.
 
-On top of that, `crates/forge/tests/end_to_end.rs` does to forge what forge does
+On top of that, `crates/abeam/tests/end_to_end.rs` does to abeam what abeam does
 to Claude: it spawns **the built binary** in a ConPTY, types at it as bytes, and
 reads the screen that comes back. That is what proves the parts no in-process
-test can reach — that forge starts at all, that raw mode and the alternate
+test can reach — that abeam starts at all, that raw mode and the alternate
 screen survive being someone else's child, that `Alt+S` written as `ESC s`
 becomes the binding it should, and that a command typed into the shell view runs
 in the right directory and puts its answer on screen. Three paths are pinned that
 way today: type a command in the shell and read its output; reach a file nothing
 pointed the pane at, by `Alt+E` `Alt+E` `/`; and a copy of a real shell planted
-in the repository under the name forge is about to look for, which forge must
+in the repository under the name abeam is about to look for, which abeam must
 refuse to run. That last one is a test about an attack rather than a feature —
 Windows resolves a bare program name against the *calling* process's directory
 before it consults `PATH`, so a `pwsh.exe` committed to a cloned repo was one
-keystroke from executing. Forge now stands in `%SystemRoot%` for the whole
-session and hands its pty absolute paths only.
+keystroke from executing. For the whole session abeam now stands in
+`%SystemRoot%` and hands its pty absolute paths only.
 
 What none of it covers is a human at a terminal. The six pass criteria in
 `docs/conpty-findings.md` (rendering, one character per keystroke, editing keys,
 live resize, paste, `/exit`) were confirmed against the spike's host and have
-not been re-run against `forge` itself since the panes landed. Do that before
+not been re-run against `abeam` itself since the panes landed. Do that before
 trusting it with real work.
 
 **Not done, and known.**
@@ -235,22 +235,22 @@ trusting it with real work.
   test thought to ask about.
 - **`Alt+J` is on borrowed time.** Claude has a live `app:toggleTerminal` action
   with no default key, and its footer already prints `meta + j` as a fallback —
-  so Claude's own UI advertises a key forge has claimed. Nothing is bound today
-  and the invariant holds; the day it is bound, forge has to move.
+  so Claude's own UI advertises a key abeam has claimed. Nothing is bound today
+  and the invariant holds; the day it is bound, abeam has to move.
   `docs/keymap.md` carries the details.
 - **An npm-installed `claude` cannot be hosted.** `npm i -g` puts three files in
   `%APPDATA%\npm`: `claude` (a POSIX shell script, no extension), `claude.cmd`
   and `claude.ps1`. Windows starts only `.exe` and `.com` directly, so plain
-  `forge` fails at startup for those users — and the two obvious fixes are both
+  `abeam` fails at startup for those users — and the two obvious fixes are both
   wrong: preferring the `.cmd` does not help, because `CreateProcessW` cannot
-  run that either, and going through `cmd.exe /c` hands forge's own argv to a
+  run that either, and going through `cmd.exe /c` hands abeam's own argv to a
   command-line re-parser that treats `&`, `|` and `^` as syntax. The native
   installer (`claude.exe`) is unaffected. Fixing it properly is a decision about
-  how forge launches its main program, not a patch.
+  how abeam launches its main program, not a patch.
 - **Windows only.** Not a portability bug so much as an absence of work: nothing
-  outside `forge-pty` is platform-specific, but nothing has been tried.
+  outside `abeam-pty` is platform-specific, but nothing has been tried.
 - **No configuration.** Keybindings, the split ratio and the refresh interval are
-  all constants. Claude's own bindings are user-configurable, so forge's should
+  all constants. Claude's own bindings are user-configurable, so abeam's should
   be too before anyone else uses it.
 - **No diff view.** The git pane shows *which* files changed and by how many
   lines, not what changed in them.
@@ -270,13 +270,13 @@ trusting it with real work.
   light theme is washed out rather than unreadable.
 - **UTF-16 files are reported as binary.** The sniff is a NUL byte in the first
   8 KiB, which is what git does.
-- **Two Claude features are unreachable inside forge**, and both will be reported
-  as forge bugs: `Ctrl+Shift+B` and `Ctrl+Shift+C` are indistinguishable from
+- **Two Claude features are unreachable inside abeam**, and both will be reported
+  as abeam bugs: `Ctrl+Shift+B` and `Ctrl+Shift+C` are indistinguishable from
   `Ctrl+B` / `Ctrl+C` in legacy terminal encoding, and hold-to-talk voice needs
-  key *release* events, which forge drops for a load-bearing reason
+  key *release* events, which abeam drops for a load-bearing reason
   (`docs/conpty-findings.md`, constraint 3).
 - **`EnableMouseCapture` disables your terminal's native text selection.**
-  Copying out of forge needs Shift+drag, and which terminals honour that varies.
+  Copying out of abeam needs Shift+drag, and which terminals honour that varies.
 - **The `Alt` namespace is free against one audited Claude build** (2026-07-25).
   It is not guaranteed free forever; `Ctrl+\` is the mitigation.
 

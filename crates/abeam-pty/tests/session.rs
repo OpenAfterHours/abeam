@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use forge_pty::{PtyConfig, PtySession};
+use abeam_pty::{PtyConfig, PtySession};
 
 /// A scratch directory. `crate::testutil::TempDir` belongs to the other crate.
 struct Dir(std::path::PathBuf);
@@ -31,7 +31,7 @@ impl Dir {
     fn new(name: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
-            "forge-pty-{name}-{}-{}",
+            "abeam-pty-{name}-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -74,7 +74,7 @@ fn session_answers_dsr_without_the_caller_helping() {
     let mut session = PtySession::spawn(
         PtyConfig::new("cmd.exe")
             .arg("/c")
-            .arg("echo forge-session-marker")
+            .arg("echo abeam-session-marker")
             .size(24, 80),
     )
     .expect("spawn");
@@ -107,7 +107,7 @@ fn session_answers_dsr_without_the_caller_helping() {
 
     let contents = session.with_screen(|s| s.contents());
     assert!(
-        contents.contains("forge-session-marker"),
+        contents.contains("abeam-session-marker"),
         "expected marker in rendered screen, got: {contents:?}"
     );
 }

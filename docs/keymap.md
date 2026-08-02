@@ -13,13 +13,13 @@
 
 ## The invariant
 
-**Forge intercepts nothing Claude can act on.** Every forge binding below was
-checked against the inventory below and is a verified no-op in Claude today.
-Typing at Claude is byte-for-byte what the pty spike did.
+**Nothing abeam intercepts is a key Claude can act on.** Every abeam binding
+below was checked against the inventory below and is a verified no-op in Claude
+today. Typing at Claude is byte-for-byte what the pty spike did.
 
-## Forge's bindings
+## abeam's bindings
 
-`crates/forge/src/keys.rs` is the single table. Globals work at any focus.
+`crates/abeam/src/keys.rs` is the single table. Globals work at any focus.
 
 | Key | Action |
 | --- | --- |
@@ -125,7 +125,7 @@ deleteWordBefore.
   retired. Exiting the app when the user meant to open an artifact is the worst
   possible failure for a binding nobody chose. Replaced by `Alt+Q`.
 - **No F-key is bound anywhere, in any context.** That is why `F1` is help and
-  `F12` is the literal-next alias. The audit covered the *bare* keys, so forge
+  `F12` is the literal-next alias. The audit covered the *bare* keys, so abeam
   claims only those: `Ctrl+F12` and `Shift+F1` are keys nobody has checked, and
   they go to Claude. Swallowing `Ctrl+F12` would have been worse than a dead
   key — it arms literal-next with nothing on screen to say so, and the *next*
@@ -133,7 +133,7 @@ deleteWordBefore.
 - **Alt is only partly claimed**: `v m p o t w b f d y`, Up, Down, Backspace.
   Everything else under Alt is free, and Claude's prompt editor
   `preventDefault()`s then *discards* unmatched Alt keys — so those keystrokes
-  are dead weight there today and forge loses nothing by claiming them.
+  are dead weight there today and abeam loses nothing by claiming them.
 - **`Alt+F` is not free**, which is why the file view is `Alt+E` for "explorer".
   An audit reading only the documented keymap would have shipped that collision.
   Same trap for `Alt+B`, `Alt+D`, `Alt+Y`.
@@ -146,16 +146,16 @@ PageUp/PageDown (Claude's Scroll context).
 
 - Claude's keybindings are user-configurable (`~/.claude/keybindings.json`) and
   Anthropic ships new ones regularly. The Alt namespace is free *today*, not
-  forever. `Ctrl+\` literal-next is the pressure-release valve, and forge's own
+  forever. `Ctrl+\` literal-next is the pressure-release valve, and abeam's own
   bindings should become configurable before 1.0.
 - **`Alt+J` — watch this one.** Claude has a live `app:toggleTerminal` action
   with a Global handler and **no default key**, so its footer falls back to
   printing the literal `meta + j` (and fires a `tengu_keybinding_fallback_used`
-  event each time it does). Nothing is bound, so forge's invariant holds and
+  event each time it does). Nothing is bound, so abeam's invariant holds and
   `Alt+J` still scrolls the right pane — but **Claude's own UI is already
   telling the user that key toggles a terminal**, and Anthropic is one line from
   making that true. This is the first case of a Claude action whose *intended*
-  key collides with a forge binding, and it is exactly the scenario the "free
+  key collides with an abeam binding, and it is exactly the scenario the "free
   today, not forever" caveat above was written for. If it lands, `Alt+↑`/`Alt+↓`
   are not available either (`app:diffFileList`), so the replacement is an F-key.
 - **`Alt+M` is conditionally `chat:cycleMode`.** The Chat block binds a computed
@@ -166,18 +166,18 @@ PageUp/PageDown (Claude's Scroll context).
   out.
 - **`Ctrl+\` is in Claude's own reserved-key table** as `severity: "error"`,
   reason "Terminal quit signal (SIGQUIT)". Harmless on Windows — there is no
-  SIGQUIT, and forge intercepts the key before the pty — but on a Unix port that
+  SIGQUIT, and abeam intercepts the key before the pty — but on a Unix port that
   binding would signal the process group. `F12` is the alias that already covers
   it, and that is why it exists.
 - `Ctrl+Shift+B` (toggleBrief) and `Ctrl+Shift+C` (selection:copy) are
   **unrepresentable in legacy terminal encoding** — no byte sequence
   distinguishes them from `Ctrl+B` / `Ctrl+C`. Those two Claude features are
-  simply unavailable inside forge until the Kitty keyboard protocol is
-  implemented. Not caused by forge, but users will report it as a forge bug.
+  simply unavailable inside abeam until the Kitty keyboard protocol is
+  implemented. Not caused by abeam, but users will report it as an abeam bug.
 - Claude's hold-to-talk voice binds `space` in Chat and needs **key release**
-  events to know when you let go. Forge drops releases (load-bearing — see
-  `docs/conpty-findings.md`) and advertises no protocol that reports them.
-  Push-to-talk will not work inside forge.
+  events to know when you let go. In abeam those releases are dropped
+  (load-bearing — see `docs/conpty-findings.md`), and nothing it advertises
+  reports them. Push-to-talk will not work inside abeam.
 - ~~`ctrl_byte` in `input.rs` has no arm for `-`~~ — **fixed** during pane
   integration. `Ctrl+-` now encodes to `0x1f` alongside `_` and `/`, so Claude's
   declared `"ctrl+-": "chat:undo"` reaches it. Pinned by

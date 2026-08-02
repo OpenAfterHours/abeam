@@ -2,9 +2,9 @@
 //!
 //! # The invariant
 //!
-//! **Forge intercepts nothing Claude can act on.** Every binding below was
-//! checked against Claude Code's own keymap and is a verified no-op there. See
-//! `docs/keymap.md` for the inventory that check was made against.
+//! **Nothing abeam intercepts is a key Claude can act on.** Every binding below
+//! was checked against Claude Code's own keymap and is a verified no-op there.
+//! See `docs/keymap.md` for the inventory that check was made against.
 //!
 //! The short version of why the namespace is `Alt`:
 //!
@@ -48,7 +48,7 @@ pub enum Action {
     /// Send the *next* keystroke to Claude verbatim, bypassing everything here.
     ///
     /// The pressure-release valve. If a future Claude release binds `Alt+G`,
-    /// this still reaches it, so forge can never permanently shadow anything.
+    /// this still reaches it, so abeam can never permanently shadow anything.
     LiteralNext,
 }
 
@@ -59,7 +59,7 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // The audit that cleared the F-keys cleared the *bare* F-keys. A modified
-    // one is a key forge knows nothing about, so it belongs to Claude — and
+    // one is a key abeam knows nothing about, so it belongs to Claude — and
     // swallowing Ctrl+F12 would arm literal-next invisibly, which then eats the
     // following keystroke as well. One press, two keys misrouted.
     let bare = key.modifiers.is_empty();
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn plain_typing_is_never_a_global() {
-        // Anything forge claims here is a keystroke Claude never sees.
+        // Anything abeam claims here is a keystroke Claude never sees.
         for c in "abcdefghijklmnopqrstuvwxyz0123456789 /?.".chars() {
             assert_eq!(global(&k(KeyCode::Char(c), KeyModifiers::NONE)), None);
             assert_eq!(global(&k(KeyCode::Char(c), KeyModifiers::SHIFT)), None);
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn the_forge_namespace_resolves() {
+    fn the_abeam_namespace_resolves() {
         assert_eq!(
             global(&k(KeyCode::Char('g'), KeyModifiers::ALT)),
             Some(Action::ShowGit)
@@ -247,7 +247,7 @@ mod tests {
                 assert_eq!(
                     global(&k(KeyCode::F(n), mods)),
                     None,
-                    "F{n} with {mods:?} is not forge's"
+                    "F{n} with {mods:?} is not abeam's"
                 );
             }
         }

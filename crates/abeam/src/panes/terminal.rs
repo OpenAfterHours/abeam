@@ -1,11 +1,11 @@
 //! The Claude pane: a `PtySession` rendered through tui-term.
 //!
-//! Almost everything hard about hosting a pty lives in `forge-pty`. What is
+//! Almost everything hard about hosting a pty lives in `abeam-pty`. What is
 //! left here is the part that needs to know it is a pane.
 
+use abeam_pty::{ExitStatus, PtyConfig, PtySession};
 use anyhow::Result;
 use crossterm::event::{KeyEvent, MouseEvent};
-use forge_pty::{ExitStatus, PtyConfig, PtySession};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use tui_term::widget::PseudoTerminal;
@@ -22,7 +22,7 @@ impl TerminalPane {
     /// A child and a size, for the tests that want nothing else.
     ///
     /// `main` used this until it acquired a working directory it had to pass —
-    /// forge now stands in `%SystemRoot%`, so a pty that is not told where to
+    /// abeam now stands in `%SystemRoot%`, so a pty that is not told where to
     /// start starts there. Test-only rather than merely unused, because a
     /// constructor that silently accepts the process's own directory is exactly
     /// what should no longer be reachable from the program.
@@ -98,10 +98,10 @@ impl TerminalPane {
     /// The hosted program's last screen, as plain rows with the trailing blank
     /// ones dropped.
     ///
-    /// Printed to the primary buffer once forge has left the alternate screen.
+    /// Printed to the primary buffer once abeam has left the alternate screen.
     /// Without it, `/exit` takes the whole session with it: everything Claude
-    /// drew lived on forge's alternate screen and goes when that does, which is
-    /// a thing the plain terminal forge replaces does not do.
+    /// drew lived on abeam's alternate screen and goes when that does, which is
+    /// a thing the plain terminal abeam replaces does not do.
     ///
     /// `rows()` rather than `contents()` — the latter rejoins wrapped rows into
     /// logical lines and tells you nothing about layout
@@ -202,7 +202,7 @@ impl Pane for TerminalPane {
     }
 
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
-        // Coordinates are already pane-relative; forge-pty stays out of the
+        // Coordinates are already pane-relative; abeam-pty stays out of the
         // question of where the pane is, and gates on what Claude enabled.
         Ok(self.session.send_mouse(ev, ev.column, ev.row)?.into())
     }

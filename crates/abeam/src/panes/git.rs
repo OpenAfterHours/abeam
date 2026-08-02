@@ -140,7 +140,7 @@ impl GitPane {
     ///
     /// Absolute, and resolved against the repository top level rather than
     /// `self.root`: porcelain paths are relative to the worktree root, so
-    /// joining them onto the directory forge happens to have been started in is
+    /// joining them onto the directory abeam happens to have been started in is
     /// right only at the top of the tree. The worker asks git once and every
     /// report carries the answer.
     pub fn take_open_request(&mut self) -> Option<PathBuf> {
@@ -254,7 +254,7 @@ fn report_rows(report: &Report, root: &Path, rows: &mut Vec<Row>, picks: &mut Ve
         Report::Pending => rows.push(Row::note("reading the repository…", dim())),
         Report::NoGit => {
             rows.push(Row::note("git is not on PATH", err()));
-            rows.push(Row::note("install it, or start forge from a", dim()));
+            rows.push(Row::note("install it, or start abeam from a", dim()));
             rows.push(Row::note("shell that can see it", dim()));
         }
         Report::NotRepo => {
@@ -772,7 +772,7 @@ fn spawn_worker(root: PathBuf) -> (Sender<()>, Receiver<Report>) {
     // thread, and there is deliberately no join: the thread ends when the pane
     // drops its sender.
     let _ = std::thread::Builder::new()
-        .name("forge-git".into())
+        .name("abeam-git".into())
         .spawn(move || {
             // Asked once, on the first refresh rather than at construction, so
             // that `GitPane::new` still returns without waiting on a
@@ -867,9 +867,9 @@ fn run(root: &Path, args: &[&str]) -> std::result::Result<String, Report> {
         .args(args)
         .current_dir(root)
         // `git status` refreshes the index and takes `.git/index.lock` to write
-        // it back. Forge polls every couple of seconds; Claude runs real git
-        // commands. Without this they collide, and the command that fails is
-        // *Claude's*.
+        // it back. Here abeam polls every couple of seconds; Claude runs real
+        // git commands. Without this they collide, and the command that fails
+        // is *Claude's*.
         .env("GIT_OPTIONAL_LOCKS", "0")
         // Nothing here may ever prompt. A worker blocked on a credential
         // question would take every future refresh down with it, silently.
@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn ignored_entries_are_parsed_but_do_not_count_as_dirty() {
-        let st = parse_status(&z(&["! target/debug/forge.exe", "? real.rs"]));
+        let st = parse_status(&z(&["! target/debug/abeam.exe", "? real.rs"]));
         assert_eq!(st.entries.len(), 2);
         assert_eq!(st.dirty(), 1);
         assert_eq!(st.untracked().count(), 1);
@@ -1435,13 +1435,13 @@ mod tests {
             "# branch.head workspace-restructure",
             "# branch.upstream origin/workspace-restructure",
             "# branch.ab +3 -0",
-            "1 M. N... 100644 100644 100644 1111 2222 crates/forge/src/app.rs",
-            "1 .M N... 100644 100644 100644 3333 3333 crates/forge/src/panes/git.rs",
+            "1 M. N... 100644 100644 100644 1111 2222 crates/abeam/src/app.rs",
+            "1 .M N... 100644 100644 100644 3333 3333 crates/abeam/src/panes/git.rs",
             "1 A. N... 000000 100644 100644 0000 4444 docs/keymap.md",
             "2 R. N... 100644 100644 100644 5555 6666 R100 docs/conpty-findings.md",
             "spike-pty/README.md",
             "u UU N... 100644 100644 100644 100644 7777 8888 9999 Cargo.lock",
-            "? crates/forge/src/panes/viewer notes.md",
+            "? crates/abeam/src/panes/viewer notes.md",
             "! target/",
         ]));
 
@@ -1534,7 +1534,7 @@ mod tests {
 
     #[test]
     fn a_rename_source_is_shortened_to_two_components() {
-        assert_eq!(short_path("crates/forge/src/panes/git.rs"), "panes/git.rs");
+        assert_eq!(short_path("crates/abeam/src/panes/git.rs"), "panes/git.rs");
         assert_eq!(short_path("docs/keymap.md"), "docs/keymap.md");
         assert_eq!(short_path("README.md"), "README.md");
     }

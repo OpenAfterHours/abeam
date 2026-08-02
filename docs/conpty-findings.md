@@ -11,7 +11,7 @@ The question the spike answered:
 
 **Verdict: go.** Claude renders and behaves correctly hosted in a pane we draw
 ourselves. Confirmed by automated tests and by the author running a real Claude
-session on 2026-08-01. Everything else in forge — git pane, markdown viewer,
+session on 2026-08-01. Everything else in abeam — git pane, markdown viewer,
 file watcher, packaging — is ordinary work with no comparable unknown in it.
 
 ## The finding that nearly sank it
@@ -30,14 +30,14 @@ then completes in under half a second.
 
 Three consequences, all still in the code:
 
-- `DsrScanner` in `crates/forge-pty/src/input.rs` watches the output stream for
+- `DsrScanner` in `crates/abeam-pty/src/input.rs` watches the output stream for
   the query, carrying bytes across read boundaries so a split sequence still
   matches.
 - The pty **writer is shared** between callers and the reader thread, because
   the reader is what has to answer. This is why `PtySession` holds an
   `Arc<Mutex<..>>` writer and exposes no accessor to it.
 - `conpty_stalls_until_the_dsr_query_is_answered` in
-  `crates/forge-pty/tests/conpty.rs` pins the behaviour both ways. If the
+  `crates/abeam-pty/tests/conpty.rs` pins the behaviour both ways. If the
   ignore-DSR arm ever starts passing, Windows has changed and the handling can
   be removed.
 
@@ -79,16 +79,16 @@ Any refactor must keep all five. There are tests pinning every one of them.
   exactly the same way: a stall with a tiny byte count. Check `dsr_replies` and
   `bytes_read` first.
 - **`EnableMouseCapture` disables the host terminal's native text selection.**
-  Copying out of forge needs Shift+drag, and which terminals honour that varies.
+  Copying out of abeam needs Shift+drag, and which terminals honour that varies.
 
 ## Reading the diagnostics
 
 `PtyStats` and the screen's mode flags exist so that the failure modes above are
 visible instead of mysterious. Two places put them on screen: **`F2` inside
-forge**, which is the one that matters because these failures are not
+abeam**, which is the one that matters because these failures are not
 reproducible on demand and you want the instrument while the thing is going
-wrong; and `cargo run -p forge-pty --example host`, which is the same view
-without forge around it.
+wrong; and `cargo run -p abeam-pty --example host`, which is the same view
+without abeam around it.
 
 | Field | Why it matters |
 | --- | --- |
@@ -113,10 +113,10 @@ not match the rect.
 
 All confirmed passing on 2026-08-01, **against `examples/host.rs`**. Kept as the
 manual regression checklist, because they have no automated equivalent — they
-need a human at a terminal. Run either `forge` or
-`cargo run -p forge-pty --example host`.
+need a human at a terminal. Run either `abeam` or
+`cargo run -p abeam-pty --example host`.
 
-They have not been re-run against `forge` itself since the git and files panes
+They have not been re-run against `abeam` itself since the git and files panes
 landed. The pty layer underneath is unchanged and its tests still pass, so a
 failure now would be in the shell — most likely in key routing, since that is
 the only part of the path the panes added anything to.

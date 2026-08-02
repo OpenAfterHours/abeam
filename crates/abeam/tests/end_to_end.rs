@@ -1,4 +1,4 @@
-//! Forge, hosted in a pty, driven by keystrokes.
+//! The abeam binary, hosted in a pty, driven by keystrokes.
 //!
 //! Every other test in this repository builds a pane or an `App` in-process and
 //! asks what it did. That is most of the value and none of the last mile: it
@@ -8,28 +8,28 @@
 //! is *legible* in a 46-column pane. Those are exactly the failures a user meets
 //! first and a unit test never sees.
 //!
-//! So this suite does to forge what forge does to Claude: spawns it in a
-//! ConPTY through `forge-pty`, types at it, and reads the screen that comes
+//! So this suite does to abeam what abeam does to Claude: spawns it in a
+//! ConPTY through `abeam-pty`, types at it, and reads the screen that comes
 //! back. The library being used to test the binary is not a shortcut — it is
 //! the same code path the product runs on, which is why a bug in it fails here
 //! too rather than hiding.
 //!
 //! The children are chosen for determinism, not realism: `cmd.exe` on both
 //! sides, because `pwsh` prints a banner whose text varies by version and takes
-//! a second to do it, and because the assertions are about forge rather than
+//! a second to do it, and because the assertions are about abeam rather than
 //! about a shell.
 //!
 //! **These tests are slow by the standards of this repository** — a few seconds
 //! each, against milliseconds everywhere else — because they wait on real
 //! process startup. They earn it by being the only tests that would notice
-//! forge failing to start at all.
+//! abeam failing to start at all.
 
 #![cfg(windows)]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use forge_pty::{PtyConfig, PtySession};
+use abeam_pty::{PtyConfig, PtySession};
 
 /// Long enough for a cold `cmd.exe` on a loaded machine, short enough that a
 /// hang is a test failure rather than a coffee break. Every wait here is
@@ -45,7 +45,7 @@ struct Dir(PathBuf);
 impl Dir {
     fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "forge-e2e-{name}-{}-{:?}",
+            "abeam-e2e-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -72,23 +72,23 @@ impl Drop for Dir {
     }
 }
 
-/// Start forge itself, hosting `cmd.exe`, in a pane-sized pty.
+/// Start abeam itself, hosting `cmd.exe`, in a pane-sized pty.
 ///
 /// 120x40 is the smallest window that still splits — below `MIN_SPLIT_COLS` the
 /// right pane collapses and every assertion here would be about a pane that was
 /// never drawn.
-fn forge(dir: &Dir) -> PtySession {
+fn abeam(dir: &Dir) -> PtySession {
     PtySession::spawn(
-        PtyConfig::new(env!("CARGO_BIN_EXE_forge"))
+        PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
             .arg("cmd.exe")
             .cwd(&dir.0)
             // The command view would otherwise pick `pwsh`, whose banner and
             // startup time vary by machine. This is the seam that makes it
             // testable, and it is a user-facing setting rather than a test hook.
-            .env("FORGE_SHELL", "cmd.exe")
+            .env("ABEAM_SHELL", "cmd.exe")
             .size(40, 120),
     )
-    .expect("spawn forge in a pty")
+    .expect("spawn abeam in a pty")
 }
 
 /// Everything currently on screen, wrapped rows rejoined.
@@ -117,14 +117,14 @@ fn wait_for(session: &PtySession, needle: &str) -> String {
     }
 }
 
-/// Type at forge, as bytes on the pty exactly as a terminal would send them.
+/// Type at abeam, as bytes on the pty exactly as a terminal would send them.
 ///
-/// The pause is not superstition: forge drains every pending event before
+/// The pause is not superstition: abeam drains every pending event before
 /// drawing a frame, so keys sent in one burst can be handled before the frame
 /// that would spawn the pane they were aimed at. A person cannot type faster
 /// than a frame; a test can.
 fn send(session: &PtySession, bytes: &[u8]) {
-    session.write(bytes).expect("write to forge's pty");
+    session.write(bytes).expect("write to abeam's pty");
     std::thread::sleep(Duration::from_millis(250));
 }
 
@@ -137,10 +137,10 @@ fn alt(c: char) -> Vec<u8> {
 fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
     let dir = Dir::new("shell");
     dir.write("notes.md", "# notes\n");
-    let session = forge(&dir);
+    let session = abeam(&dir);
 
-    // The git view is what forge opens on, so its border is the proof that
-    // forge started, sized itself and drew — before any key is sent.
+    // The git view is what abeam opens on, so its border is the proof that
+    // abeam started, sized itself and drew — before any key is sent.
     wait_for(&session, "git");
 
     send(&session, &alt('s'));
@@ -154,11 +154,11 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
     send(&session, b"set /a 123*456\r");
     let text = wait_for(&session, "56088");
 
-    // ...and it ran in the directory forge was pointed at, which is the whole
+    // ...and it ran in the directory abeam was pointed at, which is the whole
     // point of the pane being here rather than in another window.
     assert!(
-        text.contains("forge-e2e-shell"),
-        "the shell's prompt should name forge's root; got:\n{text}"
+        text.contains("abeam-e2e-shell"),
+        "the shell's prompt should name abeam's root; got:\n{text}"
     );
 
     // Claude is still live, so the first Alt+Q asks and the second answers.
@@ -176,7 +176,7 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
 /// Windows resolves a bare program name in `CreateProcessW` against the calling
 /// process's current directory before it consults `PATH`, and portable-pty
 /// hands the bare name straight through when its own `PATH` walk finds nothing.
-/// Forge runs with the repository as its directory, which is the one directory
+/// The directory abeam runs with is the repository, which is the one directory
 /// in the whole question that somebody else gets to write to — so `Alt+S`
 /// falling back through a list of shells was one `git clone` away from
 /// executing a file out of the repo, in a pty, with the user's full token.
@@ -197,13 +197,13 @@ fn a_shell_planted_in_the_repository_is_not_what_alt_s_runs() {
     std::fs::copy(&system32, dir.0.join(planted)).expect("plant a shell in the repository");
 
     let session = PtySession::spawn(
-        PtyConfig::new(env!("CARGO_BIN_EXE_forge"))
+        PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
             .arg("cmd.exe")
             .cwd(&dir.0)
-            .env("FORGE_SHELL", planted)
+            .env("ABEAM_SHELL", planted)
             .size(40, 120),
     )
-    .expect("spawn forge in a pty");
+    .expect("spawn abeam in a pty");
 
     wait_for(&session, "git");
     send(&session, &alt('s'));
@@ -223,15 +223,15 @@ fn a_shell_planted_in_the_repository_is_not_what_alt_s_runs() {
 #[test]
 fn the_second_alt_e_opens_a_file_list_that_can_be_walked_to_a_file() {
     let dir = Dir::new("files");
-    dir.write("notes.md", "# notes\n\nthe document forge opens on.\n");
+    dir.write("notes.md", "# notes\n\nthe document abeam opens on.\n");
     dir.mkdir("subdir");
     dir.write("subdir/target-file.md", "# found me\n");
-    let session = forge(&dir);
+    let session = abeam(&dir);
 
     wait_for(&session, "git");
 
     // First press shows the viewer, which has already opened the newest
-    // markdown under the root without being asked — the behaviour forge exists
+    // markdown under the root without being asked — the behaviour abeam exists
     // for. Which file that is depends on mtimes this test does not control, so
     // what is asserted is the rendering: the heading arrives styled, not as its
     // source, which is true of either document here.

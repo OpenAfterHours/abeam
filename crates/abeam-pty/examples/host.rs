@@ -6,19 +6,20 @@
 //!              alt-screen / mouse mode / bracketed paste light up as you use
 //!              Claude, the emulation layer is keeping up.
 //!
-//! This is not forge — forge's right pane is git and files. This is the manual
+//! This is not abeam — abeam's right pane is git and files. This is the manual
 //! regression harness for the six pass criteria in `docs/conpty-findings.md`,
 //! which have no automated equivalent, and it doubles as the crate's worked
 //! example. If it stops compiling, the public API has lost something.
 //!
-//! Usage:  cargo run -p forge-pty --example host
-//!         cargo run -p forge-pty --example host -- powershell
+//! Usage:  cargo run -p abeam-pty --example host
+//!         cargo run -p abeam-pty --example host -- powershell
 //!
 //! Alt+Q detaches and exits.
 
 use std::io::Stdout;
 use std::time::Duration;
 
+use abeam_pty::{ExitStatus, PtyConfig, PtySession};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -28,7 +29,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use forge_pty::{ExitStatus, PtyConfig, PtySession};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -47,7 +47,7 @@ fn split(area: Rect) -> (Rect, Rect) {
 ///
 /// One function, used for sizing the pty *and* for the mouse hit test. Two
 /// calculations that have to agree is exactly where "off-by-one here is what
-/// makes hosted apps wrap strangely" comes from — forge stashes the rect its
+/// makes hosted apps wrap strangely" comes from — abeam stashes the rect its
 /// last frame drew for the same reason.
 fn host_area(full: Rect) -> Rect {
     let (left, _) = split(full);
