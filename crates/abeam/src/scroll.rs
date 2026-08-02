@@ -94,13 +94,13 @@ impl Scroll {
 
     /// `None` for a key this vocabulary has no opinion about, so the pane can
     /// go on to match its own — `Tab`, `Enter`, `r` — and so `Esc` and `q` fall
-    /// through to the shell as "give focus back to Claude".
+    /// through to the shell as "give focus back to the agent".
     pub fn key(&mut self, key: KeyEvent) -> Option<Handled> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         Some(match key.code {
             KeyCode::Char('d') if ctrl => self.by(self.half() as isize),
             KeyCode::Char('u') if ctrl => self.by(-(self.half() as isize)),
-            // Ctrl+letter is Claude's everywhere else in the program; inside a
+            // Ctrl+letter is the agent's everywhere else in the program; inside a
             // focused pane only the two above mean anything, and the rest must
             // not be swallowed by the plain-letter arms below.
             KeyCode::Char(_) if ctrl => return None,

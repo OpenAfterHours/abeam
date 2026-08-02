@@ -2,9 +2,22 @@
 //!
 //! # The invariant
 //!
-//! **Nothing abeam intercepts is a key Claude can act on.** Every binding below
-//! was checked against Claude Code's own keymap and is a verified no-op there.
-//! See `docs/keymap.md` for the inventory that check was made against.
+//! **Nothing abeam intercepts is a key any hosted agent can act on.** "Any" is
+//! doing the work: a binding is safe only if it is a no-op in *every* agent
+//! abeam can host, so gaining an agent can retire a key that was safe while
+//! there was only one. It has already retired one, and this file is where that
+//! shows. Every binding below was checked against Claude Code's own keymap, read
+//! out of its binary, and against GitHub Copilot CLI's, read from GitHub's
+//! published tables and from Ink's source. See `docs/keymap.md` for both
+//! inventories, and for how much weaker the second one is than the first.
+//!
+//! Weaker in one way that belongs here rather than only there, because this is
+//! the file that claims the keys: `Alt+G`, `Alt+S`, `Alt+J`, `Alt+K`,
+//! `Alt+PageUp` and `Alt+PageDown` each shadow a key Copilot binds in its bare
+//! form somewhere, and Ink hands a handler the bare form together with a `meta`
+//! flag the handler is free to ignore — so for those six the invariant is
+//! unrefuted rather than verified, and only a strings audit of the Copilot
+//! binary can settle it.
 //!
 //! The short version of why the namespace is `Alt`:
 //!
@@ -21,6 +34,41 @@
 //! absent from Claude's declared keybinding table. That is why the file view is
 //! `Alt+E` for "explorer". An audit that reads only the documented keymap would
 //! have shipped that collision.
+//!
+//! # Why `Alt` stopped being enough
+//!
+//! All of that still holds, and none of it is enough on its own any more. Alt
+//! was a good namespace because Claude leaves most of it alone — which is a
+//! fact about Claude, not a fact about terminals, and a second agent is under no
+//! obligation to agree. Copilot CLI does not agree: GitHub's own command
+//! reference declares **`Alt+←` / `Alt+→` as "move the cursor by a word"** on
+//! Windows and Linux, and has done since 0.0.400. Those were abeam's focus keys.
+//! Inside abeam a Copilot user would have had no word-motion at all —
+//! `Ctrl+B`/`Ctrl+F` move one character, `Ctrl+W` deletes a word backwards, and
+//! nothing else *moves* by a word — so abeam gave them up.
+//!
+//! It gave them up for every agent, not for Copilot. A per-agent table was
+//! considered and rejected: a key that means one thing in front of one agent and
+//! another in front of the next is a key nobody can learn, and the F1 overlay
+//! would have to be right about which agent it is describing. The invariant is
+//! about what abeam *intercepts*, and abeam should intercept the same set
+//! whoever is listening.
+//!
+//! The replacement is `F4`/`F5`, and it is an F-key rather than two more Alt
+//! letters because F-keys are the only namespace abeam has that is
+//! *structurally* safe in both agents rather than merely unclaimed in both:
+//!
+//! - Claude binds no function key in any context, in the 2.1.220 binary.
+//! - Copilot CLI is an Ink application, and `useInput` — the hook an Ink app
+//!   reads keys through — hands its handler a `Key` record with no field for a
+//!   function key at all, while `f1`–`f12` sit in Ink's `nonAlphanumericKeys` so
+//!   the `input` string is blanked as well. Every bare F-key therefore arrives
+//!   as `("", all-flags-false)`, indistinguishable from every other F-key and
+//!   from nothing having happened. An Ink app cannot bind one even if it wants
+//!   to.
+//!
+//! That is a stronger claim than "we could not find it documented", which is
+//! precisely the evidence that would have cleared `Alt+F` in Claude.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -37,7 +85,7 @@ pub enum Action {
     FocusLeft,
     FocusRight,
     /// Scroll the right pane *without focusing it* — glancing at git or at the
-    /// markdown Claude just wrote is a read, and a read should not cost a focus
+    /// markdown the agent just wrote is a read, and a read should not cost a focus
     /// round-trip. Carries the bare key the pane would have seen had it been
     /// focused, so there is one scroll vocabulary rather than two.
     ScrollRight(KeyCode),
@@ -52,10 +100,14 @@ pub enum Action {
     /// `Alt+E` first to change how it looks would defeat the point. It affects
     /// no other view; see `panes::viewer::theme`.
     ToggleReaderTheme,
-    /// Send the *next* keystroke to Claude verbatim, bypassing everything here.
+    /// Send the *next* keystroke to the agent verbatim, bypassing everything
+    /// here.
     ///
-    /// The pressure-release valve. If a future Claude release binds `Alt+G`,
-    /// this still reaches it, so abeam can never permanently shadow anything.
+    /// The pressure-release valve. If a future release of either agent binds
+    /// `Alt+G`, this still reaches it, so abeam can never permanently shadow
+    /// anything. It is what made `Alt+←` survivable for as long as it did, and
+    /// what a third agent's collisions will be met with on the day they are
+    /// found rather than on the day they are fixed.
     LiteralNext,
 }
 
@@ -66,7 +118,7 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // The audit that cleared the F-keys cleared the *bare* F-keys. A modified
-    // one is a key abeam knows nothing about, so it belongs to Claude — and
+    // one is a key abeam knows nothing about, so it belongs to the agent — and
     // swallowing Ctrl+F12 would arm literal-next invisibly, which then eats the
     // following keystroke as well. One press, two keys misrouted.
     let bare = key.modifiers.is_empty();
@@ -90,6 +142,17 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // readline bindings its prompt editor handles without declaring them.
         // No F-key is bound by Claude in any context.
         KeyCode::F(3) if bare => Some(Action::ToggleReaderTheme),
+        // Two direct keys rather than one toggle, for the reason the view keys
+        // are two direct keys: a toggle needs you to know the current state
+        // before you press it, which fails exactly when you are glancing rather
+        // than looking. Focus is glanced at the same way a view is.
+        //
+        // These were `Alt+←`/`Alt+→` until abeam gained a second agent. GitHub
+        // declares that pair as word-motion in Copilot CLI's command reference,
+        // so it is the agent's key and not abeam's; the module doc has the
+        // argument, and `the_agents_alt_bindings_are_left_alone` pins it.
+        KeyCode::F(4) if bare => Some(Action::FocusLeft),
+        KeyCode::F(5) if bare => Some(Action::FocusRight),
 
         _ if !alt => None,
 
@@ -106,10 +169,10 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
 
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('z') | KeyCode::Char('Z') => Some(Action::ToggleZoom),
-
-        KeyCode::Left => Some(Action::FocusLeft),
-        KeyCode::Right => Some(Action::FocusRight),
-
+        // There is no arm here for `Alt+←` or `Alt+→`, and the gap is the
+        // point: they moved focus until Copilot CLI turned out to declare them
+        // as word-motion. They fall through to the agent now, like every other
+        // key abeam does not claim, and focus is `F4`/`F5` above.
         KeyCode::Char('k') | KeyCode::Char('K') => Some(Action::ScrollRight(KeyCode::Up)),
         KeyCode::Char('j') | KeyCode::Char('J') => Some(Action::ScrollRight(KeyCode::Down)),
         KeyCode::PageUp => Some(Action::ScrollRight(KeyCode::PageUp)),
@@ -124,15 +187,18 @@ pub const HELP: &[(&str, &str)] = &[
     ("Alt+G", "right pane: git"),
     ("Alt+E", "right pane: files (again for the file list)"),
     ("Alt+S", "right pane: a shell, focused (again to leave)"),
-    ("Alt+Left / Alt+Right", "move focus"),
+    ("F4 / F5", "move focus left / right"),
     ("Alt+J / Alt+K", "scroll right pane, without focusing it"),
     ("Alt+PgDn / Alt+PgUp", "page right pane, without focusing it"),
     ("Alt+Z", "zoom: hide / show the right pane"),
-    ("Alt+Q", "quit (press twice while Claude is running)"),
+    // "while a child is live", not "while the agent is running": `app::act`
+    // quits outright only when the agent has exited *and* no shell is live, so
+    // a dead agent with a shell still in the right pane asks twice as well.
+    ("Alt+Q", "quit (press twice while a child is live)"),
     ("F1", "this help"),
     ("F2", "pty diagnostics, and back"),
     ("F3", "file reader: light / dark page"),
-    ("Ctrl+\\ or F12", "send the next key to Claude verbatim"),
+    ("Ctrl+\\ or F12", "send the next key to the agent verbatim"),
     ("", ""),
     ("j / k, arrows", "right pane, when focused: scroll a line"),
     ("space / b, PgDn / PgUp", "scroll a page"),
@@ -148,7 +214,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("/", "file list: find a file anywhere under the root"),
     ("Backspace or -", "file list: up a directory"),
     ("r", "refresh"),
-    ("Esc or q", "back to Claude (the shell keeps them)"),
+    ("Esc or q", "back to the agent (the shell keeps them)"),
 ];
 
 #[cfg(test)]
@@ -195,7 +261,10 @@ mod tests {
     }
 
     #[test]
-    fn claudes_alt_bindings_are_left_alone() {
+    fn the_agents_alt_bindings_are_left_alone() {
+        // Plural, since abeam gained a second agent: Alt is claimed by both of
+        // them, in different places, and abeam has to clear both.
+
         // `b f d y v m p o t w` and Alt+arrows-up/down are Claude's, several of
         // them undeclared readline bindings in its prompt editor.
         for c in "bfdyvmpotw".chars() {
@@ -208,6 +277,21 @@ mod tests {
         assert_eq!(global(&k(KeyCode::Up, KeyModifiers::ALT)), None);
         assert_eq!(global(&k(KeyCode::Down, KeyModifiers::ALT)), None);
         assert_eq!(global(&k(KeyCode::Backspace, KeyModifiers::ALT)), None);
+
+        // And the left and right arrows are Copilot's, which is the one place a
+        // second agent cost abeam a key it already had. GitHub's command
+        // reference declares them as "move the cursor by a word" on Windows and
+        // Linux and has since 0.0.400, and inside abeam they are a Copilot
+        // user's only way to move by a word at all. Reclaiming them for focus
+        // would leave that user with none, so this is the assertion a future
+        // edit has to argue with rather than a line it can quietly delete.
+        for (code, arrow) in [(KeyCode::Left, '←'), (KeyCode::Right, '→')] {
+            assert_eq!(
+                global(&k(code, KeyModifiers::ALT)),
+                None,
+                "Alt+{arrow} is Copilot's word-motion; abeam's focus keys are F4 and F5"
+            );
+        }
     }
 
     #[test]
@@ -229,10 +313,6 @@ mod tests {
             Some(Action::Quit)
         );
         assert_eq!(
-            global(&k(KeyCode::Right, KeyModifiers::ALT)),
-            Some(Action::FocusRight)
-        );
-        assert_eq!(
             global(&k(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
             Some(Action::LiteralNext)
         );
@@ -248,20 +328,34 @@ mod tests {
             global(&k(KeyCode::F(3), KeyModifiers::NONE)),
             Some(Action::ToggleReaderTheme)
         );
+        assert_eq!(
+            global(&k(KeyCode::F(4), KeyModifiers::NONE)),
+            Some(Action::FocusLeft)
+        );
+        assert_eq!(
+            global(&k(KeyCode::F(5), KeyModifiers::NONE)),
+            Some(Action::FocusRight)
+        );
     }
 
     #[test]
-    fn a_modified_f_key_belongs_to_claude() {
-        // The keymap audit cleared the bare F-keys. Ctrl+F12 is not one of
-        // them, and swallowing it would arm literal-next with nothing on screen
-        // to say so — the *next* key would then be forwarded raw as well.
+    fn a_modified_f_key_belongs_to_the_agent() {
+        // Not "to Claude" any more: the bare F-keys are cleared in both agents,
+        // and by different arguments — absent from Claude's binary, and beyond
+        // what Ink's `useInput` can even describe to a Copilot handler. Neither
+        // argument was ever made about a *modified* F-key, so those stay the
+        // agent's, whichever agent it is.
+        //
+        // Ctrl+F12 is the one that shows what the cost of guessing would be:
+        // swallowing it would arm literal-next with nothing on screen to say so,
+        // and the *next* key would then be forwarded raw as well.
         for mods in [
             KeyModifiers::CONTROL,
             KeyModifiers::SHIFT,
             KeyModifiers::ALT,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ] {
-            for n in [1u8, 2, 3, 12] {
+            for n in [1u8, 2, 3, 4, 5, 12] {
                 assert_eq!(
                     global(&k(KeyCode::F(n), mods)),
                     None,
@@ -281,7 +375,7 @@ mod tests {
         }
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
         for expected in [
-            "Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2", "F3",
+            "Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4", "F5",
         ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),

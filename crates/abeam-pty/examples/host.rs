@@ -4,7 +4,7 @@
 //! Right pane = live diagnostics about what the hosted program is asking the
 //!              terminal to do. That right pane is the actual instrument: if
 //!              alt-screen / mouse mode / bracketed paste light up as you use
-//!              Claude, the emulation layer is keeping up.
+//!              the hosted program, the emulation layer is keeping up.
 //!
 //! This is not abeam — abeam's right pane is git and files. This is the manual
 //! regression harness for the six pass criteria in `docs/conpty-findings.md`,

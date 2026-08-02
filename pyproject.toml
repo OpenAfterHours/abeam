@@ -13,7 +13,12 @@ build-backend = "maturin"
 
 [project]
 name = "abeam"
-description = "One window for a Claude Code session: Claude hosted in a pty pane, with git, a file viewer and a shell beside it."
+# This is the storefront copy, and it is read before the README rather than
+# after it — so the Copilot caveat belongs here too, not only in the README's
+# "Not done, and known". Claude Code is what abeam is used with daily; Copilot
+# CLI is supported and has never been run. Saying so costs a clause and buys the
+# reader the thing they would otherwise find out by installing it.
+description = "One window for an AI coding session on Windows: your agent hosted in a pty pane, with git, a file viewer and a shell beside it. Built on Claude Code; GitHub Copilot CLI is supported but not yet exercised."
 readme = "README.md"
 requires-python = ">=3.9"
 # PEP 639: an SPDX expression rather than the old free-text table or a
@@ -25,7 +30,17 @@ license-files = ["LICENSE"]
 # and the wheel, and the release workflow refuses to run if the tag disagrees
 # with it.
 dynamic = ["version"]
-keywords = ["claude", "claude-code", "terminal", "tui", "multiplexer", "conpty"]
+keywords = [
+    "claude",
+    "claude-code",
+    "copilot",
+    "github-copilot",
+    "coding-agent",
+    "terminal",
+    "tui",
+    "multiplexer",
+    "conpty",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

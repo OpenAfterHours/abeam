@@ -1,7 +1,7 @@
 //! The pty instrument, kept because it earned its place.
 //!
 //! Every field here was, at some point during the spike, the difference between
-//! "Claude doesn't work" and a diagnosis. The one to look at first is **DSR
+//! "the agent doesn't work" and a diagnosis. The one to look at first is **DSR
 //! answered**: ConPTY opens a session by asking where the cursor is and blocks
 //! until it is told, so a zero there — shown red — is not a statistic, it is an
 //! imminent hang. `bytes_read` frozen while the child is alive means the reader
@@ -214,7 +214,7 @@ fn rows(d: &Diagnostics, f: Option<FrameStats>, width: usize) -> Vec<Line<'stati
         lines.push(row("frames", Span::raw(f.drawn.to_string())));
         // Idle is the common case and reports zero, which is the truth and not
         // a fault: a loop with nothing to draw draws nothing. The number to
-        // read is what it climbs to while Claude is producing output.
+        // read is what it climbs to while the agent is producing output.
         lines.push(row("fps (last 1s)", Span::raw(format!("{:.0}", f.fps))));
         lines.push(row("last frame", Span::raw(format!("{:.2} ms", f.last_ms))));
         // The one worth watching. An average would hide the single slow frame

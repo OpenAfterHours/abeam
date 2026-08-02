@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Block;
 
 /// Below this, a 40% right pane is too narrow to be worth anything while the
-/// remaining 60% is actively bad for Claude. Collapsing is the right
+/// remaining 60% is actively bad for the agent. Collapsing is the right
 /// degradation; squeezing is not.
 pub const MIN_SPLIT_COLS: u16 = 60;
 
@@ -64,7 +64,7 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_window_collapses_instead_of_squeezing_claude() {
+    fn a_narrow_window_collapses_instead_of_squeezing_the_agent() {
         let s = split(Rect::new(0, 0, MIN_SPLIT_COLS - 1, 24), false);
         assert!(s.right.is_none());
         assert_eq!(s.left.width, MIN_SPLIT_COLS - 1);

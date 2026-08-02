@@ -39,7 +39,7 @@ const MIN_COL: usize = 8;
 const FLOOR_COL: usize = 4;
 
 pub fn options() -> Options {
-    // Everything here is something Claude actually writes: tables in design
+    // Everything here is something an agent actually writes: tables in design
     // docs, task lists in plans, `> [!NOTE]` alerts, YAML front matter. Left
     // off: smart punctuation, which silently rewrites the author's text.
     Options::ENABLE_TABLES

@@ -205,7 +205,7 @@ fn the_view_into_the_scrollback_goes_where_it_is_put_and_says_whether_it_moved()
 
     assert_eq!(session.scrollback(), 0, "a session starts on the live screen");
     // `false` is not a failure, it is the answer a pane needs: a key that moved
-    // nothing must not cost a frame, and a frame here redraws Claude as well.
+    // nothing must not cost a frame, and a frame here redraws the agent as well.
     assert!(!session.scroll_by(-1), "already at the bottom");
 
     assert!(session.scroll_by(4));

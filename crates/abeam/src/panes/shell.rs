@@ -2,7 +2,7 @@
 //!
 //! What it is for is the round trip that otherwise costs a second window:
 //! `git branch`, `uv run ruff format`, `cargo test` — run in the directory
-//! abeam was pointed at, next to the Claude session that is about to be told
+//! abeam was pointed at, next to the agent session that is about to be told
 //! what they printed. `Alt+S` out, type, `Alt+S` home.
 //!
 //! What it deliberately is not is a multiplexer. There is one child, started
@@ -18,8 +18,8 @@
 //!
 //! Git, files and diagnostics are read-only, which is what lets an unbound
 //! keystroke in them be harmless. This one hosts a live child and takes every
-//! key it is given, `Esc` and `q` included: those cannot mean "back to Claude"
-//! while something inside the pane is listening for them.
+//! key it is given, `Esc` and `q` included: those cannot mean "back to the
+//! agent" while something inside the pane is listening for them.
 //!
 //! Which is why nothing here is a fact about the *type*. The app decides where
 //! `Esc` goes from what [`Pane::handle_key`] returned, so a live child claims
@@ -28,7 +28,7 @@
 //! [`Pane::takes_input`], which is likewise a question about this instant. The
 //! single frame on which that answer is stale is the first: the border is drawn
 //! before `render`, and `render` is what spawns, so the frame that starts the
-//! shell still advertises `esc→claude` — for the few milliseconds until the new
+//! shell still advertises `esc→agent` — for the few milliseconds until the new
 //! session's first output asks for another one.
 //!
 //! ## The contract
@@ -39,8 +39,8 @@
 //!   `Alt+S` must never have paid for a shell process.
 //! - **Restartable.** A child that exits leaves the pane saying so, with
 //!   `Enter` to start another. While it is dead the pane must *not* claim every
-//!   key — `Esc` and `q` fall through so the way back to Claude is the one the
-//!   rest of the app taught.
+//!   key — `Esc` and `q` fall through so the way back to the agent is the one
+//!   the rest of the app taught.
 //! - **Sized from the rect it was drawn into**, through
 //!   [`Pane::on_resize`], which the app calls after every frame.
 //! - **`tick` must not block.** `try_wait`, never `wait`
@@ -48,7 +48,6 @@
 
 use std::path::{Path, PathBuf};
 
-use abeam_pty::PtyConfig;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -56,6 +55,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
+use crate::launch;
 use crate::pane::{Handled, Pane};
 use crate::panes::TerminalPane;
 use crate::text::{self, dim, err};
@@ -158,25 +158,39 @@ impl ShellPane {
         for candidate in &self.candidates {
             // Resolved to an absolute path first, and the pty is never given
             // anything else. A bare name reaching `CreateProcessW` is a
-            // vulnerability rather than a convenience — see [`resolve`].
-            let exe = match resolve(&candidate.program) {
-                Ok(exe) => exe,
+            // vulnerability rather than a convenience — see [`crate::launch`].
+            //
+            // The same resolver the left pane uses, script routing included,
+            // rather than a stricter one for this pane. `ABEAM_SHELL` pointing
+            // at a `.cmd` wrapper — a login script, a `nu.cmd` — is the same
+            // wish as `abeam claude` on an npm install, and two implementations
+            // of that wish would be two places for it to be got wrong. What is
+            // special about this pane is the *list* of shells and where they
+            // live, which is `SHELLS` and `known_home` and stays here.
+            let launch = match launch::resolve_preferring(
+                &candidate.program,
+                &candidate.args,
+                known_home(&candidate.program),
+            ) {
+                Ok(launch) => launch,
                 Err(reason) => {
                     why = reason;
                     continue;
                 }
             };
-            let cfg = PtyConfig::new(exe.to_string_lossy())
-                .args(candidate.args.iter().cloned())
+            let cfg = launch
+                .config()
                 .cwd(&self.root)
                 .size(at.height.max(1), at.width.max(1));
             match TerminalPane::spawn_with(cfg) {
                 // Named after what started, not after what was asked for. With
                 // a resolution step in front those can differ, and the border
-                // has one job: to say which program is taking the typing.
+                // has one job: to say which program is taking the typing. The
+                // *target* rather than the program, so a routed `nu.cmd` is
+                // still "nu" and not "cmd".
                 Ok(term) => {
                     return State::Hosted {
-                        name: name_of(&exe),
+                        name: name_of(&launch.target),
                         term,
                     };
                 }
@@ -349,8 +363,8 @@ impl Pane for ShellPane {
         }
 
         // Nothing to type into. `Esc` and `q` must fall through from here: the
-        // shell reads an unhandled one as "back to Claude", and that is the way
-        // out the other three views taught.
+        // shell reads an unhandled one as "back to the agent", and that is the
+        // way out the other three views taught.
         if key.code == KeyCode::Enter {
             // ...but not before a frame has said how big this pane is. `App`
             // drains every pending event before drawing, so `Alt+S` and `Enter`
@@ -404,9 +418,9 @@ impl Pane for ShellPane {
     /// would be one more place for the two to disagree.
     fn exit_hint(&self) -> &'static str {
         if self.is_live() {
-            " · alt+s→claude"
+            " · alt+s→agent"
         } else {
-            " · esc→claude"
+            " · esc→agent"
         }
     }
 
@@ -435,10 +449,11 @@ impl Pane for ShellPane {
             // Swallowed, like every other call into this child — and this is
             // the one that used not to be. `App::draw` propagates what comes
             // back here, so a `ResizePseudoConsole` refusing in *this* pane
-            // ended the Claude session in the other one and skipped the
+            // ended the agent session in the other one and skipped the
             // transcript abeam prints on the way out. The left pane
-            // propagating is right, because if Claude's pty cannot be resized
-            // abeam is over; this pane is exactly where that stops being true.
+            // propagating is right, because if the agent's pty cannot be
+            // resized abeam is over; this pane is exactly where that stops
+            // being true.
             let _ = term.on_resize(inner);
         }
         // A child that has exited is deliberately not resized. Its last screen
@@ -473,84 +488,10 @@ fn args_for(program: &str) -> &'static [&'static str] {
 }
 
 // --- finding a shell ------------------------------------------------------
-
-/// The extensions `CreateProcessW` will start on its own.
-///
-/// Everything else `PATHEXT` lists — `.cmd`, `.bat`, `.ps1`, `.js` — needs an
-/// interpreter named in front of it, and there is no flag that makes the API
-/// supply one. A shell named as one of those is a spawn that fails with "%1 is
-/// not a valid Win32 application" and no hint as to why, so it is turned away
-/// here with a sentence instead.
-const IMAGES: &[&str] = &["exe", "com"];
-
-/// `PATHEXT`'s default, for the rare environment that does not set it. The
-/// whole list, not an opinion about it: what abeam can *start* is [`IMAGES`],
-/// and the two questions are answered separately on purpose.
-const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
-
-/// Turn the name of a shell into an absolute path to something Windows can
-/// start, or into the sentence explaining why there is not one.
-///
-/// This exists because handing a **bare name** to `CreateProcessW` is a
-/// vulnerability rather than a convenience. portable-pty searches `PATH` for
-/// one and, when nothing matches, passes the name straight through as
-/// `lpApplicationName` — at which point Windows resolves it against the
-/// *calling process's* current directory before it looks anywhere else.
-/// `PtyConfig::cwd` has no bearing on that; the directory in question is the
-/// one abeam itself is standing in, which is the repository. So a repository
-/// containing a file called `pwsh.exe` would have run it, with the user's full
-/// token, on the first `Alt+S` — on any machine without PowerShell 7, which is
-/// precisely the machine the [`SHELLS`] fallback exists for. `main` now stands
-/// in `%SystemRoot%` as well; this is the half of the fix that does not depend
-/// on it, and either alone is sufficient.
-///
-/// Two narrower holes close with it. `std::env::split_paths` yields an *empty*
-/// path for the `;;` or the trailing `;` that a `PATH` accumulates, and joining
-/// a name onto that produces a relative path whose existence check tests the
-/// current directory again — reachable even on a machine that has all three
-/// shells. And an extensionless file is only taken once every `PATHEXT` match
-/// has been tried, because an npm install puts `claude`, `claude.cmd` and
-/// `claude.ps1` in one directory and the first of those is a POSIX shell
-/// script.
-fn resolve(program: &str) -> Result<PathBuf, String> {
-    let named = Path::new(program);
-
-    let found = if named.is_absolute() {
-        // Probed rather than trusted: an `ABEAM_SHELL` pointing at something
-        // that has since been uninstalled should arrive here as "not found"
-        // rather than as whatever `CreateProcessW` makes of it.
-        probe(named.parent().unwrap_or(named), &file_name_of(named))
-    } else if named.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
-        // A relative path names a place, and the place it would name is
-        // relative to the repository on screen — the one directory in this
-        // whole question that somebody else gets to write to.
-        return Err(format!(
-            "`{program}` is a relative path, and abeam will not resolve one \
-             here: it would be resolved against the repository on screen. \
-             Give an absolute path, or a bare name to look up on PATH."
-        ));
-    } else {
-        known_home(program)
-            .filter(|home| home.is_file())
-            .or_else(|| walk_path(program))
-    };
-
-    let Some(found) = found else {
-        return Err(format!("`{program}` was not found on PATH."));
-    };
-    if !found
-        .extension()
-        .is_some_and(|e| IMAGES.iter().any(|image| e.eq_ignore_ascii_case(image)))
-    {
-        return Err(format!(
-            "`{}` is a script rather than a program. Windows starts only .exe \
-             and .com directly; a .cmd or a .ps1 needs a shell named in front \
-             of it, and abeam has no way to know which one you meant.",
-            found.display()
-        ));
-    }
-    Ok(found)
-}
+//
+// The search itself is `crate::launch`, shared with the program `main` hosts.
+// What is left here is the part that is knowledge about *shells* rather than
+// about launching: which ones to try, and where Windows keeps them.
 
 /// Where Windows keeps the shells in [`SHELLS`], consulted before `PATH`.
 ///
@@ -581,56 +522,6 @@ fn known_home(program: &str) -> Option<PathBuf> {
     }
 }
 
-/// Look `name` up on `PATH`, and answer only with absolute paths.
-fn walk_path(name: &str) -> Option<PathBuf> {
-    walk(&std::env::var_os("PATH")?, name)
-}
-
-/// The search itself, over a `PATH` handed in rather than read.
-///
-/// Split out so that the entries this refuses to look in can be pinned by a
-/// test without a test reaching for the process's environment or its current
-/// directory — both of which are shared by every other test running beside it.
-fn walk(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
-    std::env::split_paths(path)
-        // Drops both the empty entry a `;;` leaves behind and any genuinely
-        // relative one. Joining a name onto either gives a *relative* path, and
-        // checking whether that exists asks about the current directory — which
-        // is the repository, and the whole thing this module exists to stop.
-        .filter(|dir| dir.is_absolute())
-        .find_map(|dir| probe(&dir, name))
-}
-
-/// `name` inside `dir`, with whatever extension makes it startable.
-fn probe(dir: &Path, name: &str) -> Option<PathBuf> {
-    // `PATHEXT` matches before the bare file, deliberately, and this is the one
-    // place the order matters: an npm install of Claude Code leaves `claude`,
-    // `claude.cmd` and `claude.ps1` side by side, and the extensionless one is
-    // a POSIX shell script. Taking it first — which is what portable-pty's own
-    // search does — is a program that cannot start.
-    pathext()
-        .iter()
-        .map(|ext| dir.join(format!("{name}{ext}")))
-        .chain(std::iter::once(dir.join(name)))
-        .find(|file| file.is_file())
-}
-
-/// `PATHEXT` spelled in lower case.
-///
-/// Windows sets it in capitals and matches file names without regard to case,
-/// so the only thing the choice affects is the path abeam then *shows* — in the
-/// message about a script it will not start, and in the pty diagnostics.
-/// `claude.cmd` is what a reader has on disk; `claude.CMD` is a second thing to
-/// wonder about.
-fn pathext() -> Vec<String> {
-    std::env::var("PATHEXT")
-        .unwrap_or_else(|_| DEFAULT_PATHEXT.to_string())
-        .split(';')
-        .filter(|ext| ext.starts_with('.'))
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
 /// `C:\…\pwsh.exe` is what gets started; `pwsh` is what the border says.
 fn name_of(path: &Path) -> String {
     path.file_stem()
@@ -640,12 +531,6 @@ fn name_of(path: &Path) -> String {
 
 fn stem_of(program: &str) -> String {
     name_of(Path::new(program)).to_ascii_lowercase()
-}
-
-fn file_name_of(path: &Path) -> String {
-    path.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 /// What the pane says when nothing would start.
@@ -857,8 +742,8 @@ mod tests {
         wait_for_exit(&mut dead);
         assert!(!dead.takes_input());
         assert!(!dead.is_live(), "nothing left for abeam to wait for");
-        // ...so the app can read them as "give focus back to Claude", which is
-        // the only route out of a pane that is no longer hosting anything.
+        // ...so the app can read them as "give focus back to the agent", which
+        // is the only route out of a pane that is no longer hosting anything.
         for code in [KeyCode::Esc, KeyCode::Char('q')] {
             assert_eq!(dead.handle_key(key(code)).unwrap(), Handled::No);
         }
@@ -923,7 +808,7 @@ mod tests {
         assert_eq!(pane.handle_paste("git status\r").unwrap(), Handled::Yes);
         pane.handle_mouse(&wheel(MouseEventKind::ScrollUp)).unwrap();
 
-        // And the one that used to be able to end the Claude session in the
+        // And the one that used to be able to end the agent session in the
         // *other* pane: `App::draw` propagates what this returns.
         pane.on_resize(Rect::new(0, 0, 20, 5)).unwrap();
         wait_for_exit(&mut pane);
@@ -933,9 +818,9 @@ mod tests {
     #[test]
     fn the_exit_is_news_exactly_once() {
         // The frame this asks for is the only thing that puts "exited · enter
-        // restarts" in the border. Reported forever, it would redraw Claude's
-        // whole screen on every idle loop; reported never, the title would
-        // still say `shell · cmd` over a dead pane until something else
+        // restarts" in the border. Reported forever, it would redraw the
+        // agent's whole screen on every idle loop; reported never, the title
+        // would still say `shell · cmd` over a dead pane until something else
         // happened to want a frame.
         let dir = TempDir::new("shell-news");
         let mut pane = pane(&dir, "cmd.exe", &["/c", "exit"]);
@@ -1163,108 +1048,52 @@ mod tests {
         assert!(screen.contains("not found on PATH"), "got: {screen}");
     }
 
-    #[test]
-    fn a_shell_is_never_taken_from_the_directory_abeam_is_looking_at() {
-        // The bug this whole resolution step exists for. portable-pty hands a
-        // bare name it could not find on PATH to `CreateProcessW` unchanged,
-        // and Windows resolves that against the *calling process's* current
-        // directory — so a repository containing `pwsh.exe` used to be what ran
-        // on the first Alt+S, on every machine without PowerShell 7.
-        //
-        // Demonstrated against a `PATH` handed in rather than by standing in
-        // the planted directory: the current directory belongs to the whole
-        // test binary, and two hundred other tests are running beside this one.
-        // What has to be true is that no entry which could name the current
-        // directory is ever looked in, and these are all of them.
-        let dir = TempDir::new("shell-planted");
-        dir.write("abeam-planted-shell.exe", b"MZ not really a program");
-        let planted = "abeam-planted-shell.exe";
-
-        for hostile in [";;", ";", ".", ".;", r".\tools", "..", ""] {
-            assert_eq!(
-                walk(std::ffi::OsStr::new(hostile), planted),
-                None,
-                "PATH {hostile:?} was searched, and it names the current directory"
-            );
-        }
-
-        // ...and the planted file is genuinely there, so the `None`s above are
-        // the filter doing its job rather than the file being absent.
-        assert_eq!(
-            walk(dir.path().as_os_str(), planted),
-            Some(dir.path().join(planted)),
-            "an absolute PATH entry is still searched"
-        );
-
-        // The end of the same story: nothing on PATH, so nothing is started —
-        // where portable-pty would have passed the bare name through.
-        assert!(resolve(planted).is_err());
-    }
-
-    #[test]
-    fn a_relative_path_is_refused_rather_than_resolved() {
-        // `ABEAM_SHELL=.\tools\sh.exe` would be resolved against the repository
-        // on screen, which is the one directory in this question somebody else
-        // gets to write to. Refusing says so; resolving would not.
-        let refused = resolve(r".\tools\sh.exe").expect_err("a relative path is not a shell");
-        assert!(refused.contains("relative"), "got: {refused}");
-        assert!(refused.contains("absolute"), "the way out has to be named");
-    }
-
-    #[test]
-    fn a_script_is_refused_with_the_reason_rather_than_a_win32_error() {
-        // `CreateProcessW` cannot start a .cmd or a .ps1 at all, and says so as
-        // "%1 is not a valid Win32 application", which names neither the file
-        // nor the problem.
-        let dir = TempDir::new("shell-script");
-        let script = dir.write("wrapper.cmd", b"@echo off\r\n");
-        let refused =
-            resolve(&script.to_string_lossy()).expect_err("a batch file is not a shell");
-        assert!(refused.contains("script"), "got: {refused}");
-        assert!(refused.contains("wrapper.cmd"), "got: {refused}");
-    }
+    // The search that answers these lives in `crate::launch` and is tested
+    // there, including the hole a bare name opens. What is asserted here is the
+    // half this pane still owns: the table of where Windows keeps its shells,
+    // and what the border says once one has started.
 
     #[test]
     fn the_shells_windows_ships_resolve_to_the_ones_windows_shipped() {
         // Not "resolve to something": to the copy under %SystemRoot%. `cmd.exe`
         // taken from PATH is `cmd.exe` taken from whatever put itself at the
-        // front of PATH.
-        let system32 = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
-            .join("System32");
-        assert_eq!(resolve("cmd.exe").unwrap(), system32.join("cmd.exe"));
+        // front of PATH. `known_home` is the one thing the shared resolver is
+        // told rather than works out, and this is why it exists.
+        let system32 =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
+        let found = |name: &str| {
+            launch::resolve_preferring(name, &[], known_home(name))
+                .expect(name)
+                .program
+        };
+        assert_eq!(found("cmd.exe"), system32.join("cmd.exe"));
         assert_eq!(
-            resolve("powershell.exe").unwrap(),
+            found("powershell.exe"),
             system32
                 .join("WindowsPowerShell")
                 .join("v1.0")
                 .join("powershell.exe")
         );
         // ...and whatever comes back is absolute, always, which is the property
-        // the whole module is for.
-        assert!(resolve("cmd.exe").unwrap().is_absolute());
+        // the whole search is for.
+        assert!(found("cmd.exe").is_absolute());
     }
 
     #[test]
-    fn an_extensionless_script_never_wins_over_an_executable_beside_it() {
-        // An npm install of Claude Code drops `claude`, `claude.cmd` and
-        // `claude.ps1` in one directory, and the extensionless one is a POSIX
-        // shell script `CreateProcessW` cannot run. portable-pty's own search
-        // checks the exact name first and takes it.
-        let dir = TempDir::new("shell-pathext");
-        dir.write("abeam-probe", b"#!/bin/sh\n");
-        dir.write("abeam-probe.exe", b"MZ");
-        assert_eq!(
-            probe(dir.path(), "abeam-probe"),
-            Some(dir.path().join("abeam-probe.exe"))
-        );
+    fn a_shell_that_is_a_cmd_wrapper_starts_and_the_border_names_the_wrapper() {
+        // `ABEAM_SHELL=…\nu.cmd` is the same wish as `abeam claude` on an npm
+        // install, so this pane routes scripts too rather than holding a
+        // stricter contract of its own. What is specific to the pane is the
+        // border: it has to name what the person chose, because the
+        // interpreter is a detail of starting it and naming *that* would make
+        // every wrapper on the machine look like the same shell.
+        let dir = TempDir::new("shell-wrapper");
+        let script = dir.write("abeam-wrapper.cmd", b"@echo off\r\ncmd.exe\r\n");
+        let named = script.to_string_lossy().into_owned();
+        let mut pane = pane(&dir, &named, &[]);
+        draw(&mut pane, 40, 8);
 
-        // With no executable beside it, the script is still what is there —
-        // `resolve` is what turns that into a sentence rather than a spawn.
-        let only = TempDir::new("shell-pathext-only");
-        only.write("abeam-probe", b"#!/bin/sh\n");
-        assert_eq!(
-            probe(only.path(), "abeam-probe"),
-            Some(only.path().join("abeam-probe"))
-        );
+        assert!(pane.is_live(), "the wrapper did not start: {}", pane.title());
+        assert_eq!(pane.title(), "shell · abeam-wrapper");
     }
 }

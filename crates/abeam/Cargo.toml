@@ -1,6 +1,9 @@
 [package]
 name = "abeam"
-description = "A terminal multiplexer for a Claude Code workflow: Claude in one pane, git, files and a shell in the other."
+description = "A Windows terminal multiplexer for an AI coding workflow: the agent in one pane, git, files and a shell in the other. Hosts Claude Code and GitHub Copilot CLI."
+# Five is crates.io's limit, so this is a choice rather than a list: what abeam
+# is, what it is built on, and the two agents somebody would search for by name.
+keywords = ["terminal", "tui", "conpty", "claude-code", "copilot"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -64,7 +64,7 @@ Any refactor must keep all five. There are tests pinning every one of them.
    its own bindings *before* calling `encode_key` — the app shell does — needs
    its own release filter, or every command fires twice.
 4. **Mouse reports are gated on what the hosted app actually enabled.** Sending
-   unrequested ones dumps escape sequences into Claude's prompt.
+   unrequested ones dumps escape sequences into the agent's prompt.
 5. **`Screen::contents()` rejoins wrapped rows** into logical lines, so it tells
    you nothing about layout. Use `Screen::rows()` for anything positional. This
    one is not structurally enforceable — it is vt100's API, not ours.
@@ -92,10 +92,10 @@ without abeam around it.
 
 | Field | Why it matters |
 | --- | --- |
-| `alt screen` | Should flip to `on` once Claude's UI starts. |
+| `alt screen` | Should flip to `on` once the agent's UI starts. |
 | `app cursor` | DECCKM. When `on`, arrows must be sent as `ESC O A`. |
-| `bracketed paste` | When `on`, pasted text is wrapped so Claude can tell paste from typing. |
-| `mouse mode` / `encoding` | Whether Claude wants mouse reports, and in which dialect. We stay silent unless asked. |
+| `bracketed paste` | When `on`, pasted text is wrapped so the agent can tell paste from typing. |
+| `mouse mode` / `encoding` | Whether the agent wants mouse reports, and in which dialect. We stay silent unless asked. |
 | `dsr_replies` | Non-zero within the first moment. **Zero means an imminent hang.** |
 | `pty size (set)` / `parser size` | Compare them with the *inner* area of the bordered pane — not with each other. See below. |
 | `bytes_read` | Should climb steadily. Frozen = the reader thread died. |

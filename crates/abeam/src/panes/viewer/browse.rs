@@ -4,11 +4,11 @@
 //! view or the startup walk hands it. This is the one part of the pane a
 //! person drives, and driving it has to be *cheap* and *stable*.
 //!
-//! Cheap, because `render` runs on every keystroke Claude receives. Reading a
+//! Cheap, because `render` runs on every keystroke the agent receives. Reading a
 //! directory is the only work here that touches the disk, and it happens when
 //! the reader moves or asks — never from `render`, and never for more than
 //! [`MAX_ENTRIES`] rows. Both bounds matter: this runs on the thread that
-//! pumps Claude's pty, so a `read_dir` per frame would put a syscall behind
+//! pumps the agent's pty, so a `read_dir` per frame would put a syscall behind
 //! every character typed at the agent next door, and an uncapped one would put
 //! a fifty-thousand-entry sort there.
 //!
@@ -57,9 +57,9 @@ use crate::watch::in_noise;
 ///
 /// `files.rs` caps its walk for the same reason, and this one needs it more:
 /// that walk is on a worker thread, while this runs on the thread that pumps
-/// Claude's pty and draws its frames. `Enter` on a vendored directory with
+/// the agent's pty and draws its frames. `Enter` on a vendored directory with
 /// fifty thousand entries in it would otherwise materialise fifty thousand
-/// rows and sort them, between one of Claude's keystrokes and the next.
+/// rows and sort them, between one of the agent's keystrokes and the next.
 ///
 /// Two thousand is far more than anyone scrolls — the find exists precisely so
 /// that nobody has to — and is a fraction of a millisecond to sort. Past it the
@@ -83,8 +83,8 @@ const RELOAD_COOLDOWN: Duration = Duration::from_millis(250);
 ///
 /// `Ignored` maps to `Handled::No`, and that mapping is load-bearing: a key
 /// that changed nothing must not cost a frame, and a frame here re-renders
-/// Claude's whole screen. It is also how `Esc` with no find open reaches the
-/// shell as "back to Claude" while `Esc` inside a find does not.
+/// the agent's whole screen. It is also how `Esc` with no find open reaches
+/// the shell as "back to the agent" while `Esc` inside a find does not.
 pub enum Outcome {
     Ignored,
     Moved,
@@ -356,7 +356,7 @@ impl Browser {
     }
 
     /// A pasted path, which only a find has anywhere to put. Pasting something
-    /// copied out of Claude's transcript is one of the likelier ways a
+    /// copied out of the agent's transcript is one of the likelier ways a
     /// particular file gets looked up.
     pub fn paste(&mut self, text: &str) -> Outcome {
         if self.find.is_none() {
@@ -395,7 +395,7 @@ impl Browser {
         match key.code {
             KeyCode::Char('d') if ctrl => self.step(half),
             KeyCode::Char('u') if ctrl => self.step(-half),
-            // Ctrl+letter is Claude's everywhere else in the program, so the
+            // Ctrl+letter is the agent's everywhere else in the program, so the
             // rest must not fall into the plain-letter arms below.
             KeyCode::Char(_) if ctrl => Outcome::Ignored,
 
@@ -424,7 +424,7 @@ impl Browser {
             KeyCode::Char('r') => self.refresh(),
 
             // Esc and q are not ours. The shell reads an unhandled one as
-            // "give focus back to Claude", which is the way out of here.
+            // "give focus back to the agent", which is the way out of here.
             _ => Outcome::Ignored,
         }
     }
@@ -441,7 +441,7 @@ impl Browser {
 
         match key.code {
             // Cancels the find and stays in the list. Only an Esc with nothing
-            // open falls through to the shell as "back to Claude" — being
+            // open falls through to the shell as "back to the agent" — being
             // thrown out of the pane by the key that means "never mind" is the
             // single most annoying thing a filter box can do.
             KeyCode::Esc => {
@@ -665,7 +665,7 @@ impl Browser {
         let to = to.min(n - 1);
         if to == self.cursor() {
             // Nothing moved, so nothing was acted on. Reporting otherwise
-            // spends a frame — Claude's whole screen included — on a key that
+            // spends a frame — the agent's whole screen included — on a key that
             // could not do anything.
             return Outcome::Ignored;
         }
@@ -1186,7 +1186,7 @@ mod tests {
     #[test]
     fn a_directory_too_big_to_list_is_cut_short_and_says_so() {
         // The cap is what keeps `Enter` on a vendored directory from sorting
-        // fifty thousand rows on the thread that pumps Claude's pty.
+        // fifty thousand rows on the thread that pumps the agent's pty.
         let dir = tree("browse-cap", &["a.md", "b.md", "c.md", "d.md"]);
         let (entries, cut) = list(dir.path(), dir.path(), 2);
         assert_eq!(entries.len(), 2);
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn a_key_that_moves_nothing_says_it_did_nothing() {
-        // A frame here re-renders Claude's whole screen. `j` at the bottom of a
+        // A frame here re-renders the agent's whole screen. `j` at the bottom of a
         // list is not worth one.
         let dir = tree("browse-ends", &["a.md", "b.md"]);
         let mut b = browser(&dir, &[]);
@@ -1439,7 +1439,7 @@ mod tests {
 
     #[test]
     fn a_listing_read_once_is_not_read_again_per_frame() {
-        // `render` runs on every keystroke Claude receives, so the listing is
+        // `render` runs on every keystroke the agent receives, so the listing is
         // cached. Drawn for real, because a `render` that called `list()` every
         // frame would satisfy any assertion that never drew one.
         let dir = tree("browse-cache", &["a.md"]);
@@ -1625,7 +1625,7 @@ mod tests {
     #[test]
     fn esc_cancels_the_find_and_stays_in_the_list() {
         // Only an Esc with nothing open falls through to the shell as "back to
-        // Claude". Being thrown out of the pane by the key that means "never
+        // the agent". Being thrown out of the pane by the key that means "never
         // mind" is the worst thing a filter box can do.
         let dir = tree("find-esc", &["a.md", "b.md"]);
         let mut b = browser(&dir, &["a.md", "b.md"]);
@@ -1650,7 +1650,7 @@ mod tests {
         let dir = tree("find-q", &["a.md"]);
         let mut b = browser(&dir, &["quick.md", "slow.md"]);
         // In the list it is nobody's: the shell reads an unhandled one as
-        // "give focus back to Claude".
+        // "give focus back to the agent".
         assert!(ignored(b.key(key(KeyCode::Char('q')))));
 
         b.key(key(KeyCode::Char('/')));

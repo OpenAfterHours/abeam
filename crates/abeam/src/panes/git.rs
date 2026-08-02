@@ -1,7 +1,7 @@
 //! The git view: a read-only observer of the working tree.
 //!
 //! This replaces the second terminal window the user kept open purely to watch
-//! git while Claude worked. It stages nothing, commits nothing, and runs no
+//! git while the agent worked. It stages nothing, commits nothing, and runs no
 //! command that can change the repository — every `git` invocation below is a
 //! read, and that is a property worth preserving: the pane refreshes itself on
 //! a timer, so anything it can do, it does unasked.
@@ -15,7 +15,7 @@
 //!
 //! **Nothing git-shaped happens on the UI thread.** `git status` on a cold,
 //! large repository can take a second, and a second spent here is a second of
-//! Claude's keystrokes going nowhere. A worker thread owns every subprocess;
+//! the agent's keystrokes going nowhere. A worker thread owns every subprocess;
 //! `tick` only ever does a `try_recv`.
 //!
 //! **The refresh timer is measured from the last *result*, not on a fixed
@@ -399,7 +399,7 @@ impl Pane for GitPane {
             KeyCode::Enter => self.open = self.openable_path().map(str::to_owned),
             KeyCode::Char('r') => self.request_refresh(),
             // Esc and q fall through: the shell reads an unhandled one as
-            // "give focus back to Claude".
+            // "give focus back to the agent".
             _ => return Ok(Handled::No),
         }
         Ok(Handled::Yes)
@@ -780,7 +780,7 @@ fn spawn_worker(root: PathBuf) -> (Sender<()>, Receiver<Report>) {
             // where nothing will ever be opened.
             let toplevel = toplevel(&root);
             // The log only changes when HEAD moves, so it is cached against the
-            // oid. In the common case — Claude editing files — a whole refresh
+            // oid. In the common case — the agent editing files — a whole refresh
             // is one `git status`.
             let mut log_cache: Option<(String, Vec<Commit>)> = None;
             while req_rx.recv().is_ok() {
@@ -867,9 +867,9 @@ fn run(root: &Path, args: &[&str]) -> std::result::Result<String, Report> {
         .args(args)
         .current_dir(root)
         // `git status` refreshes the index and takes `.git/index.lock` to write
-        // it back. Here abeam polls every couple of seconds; Claude runs real
+        // it back. Here abeam polls every couple of seconds; the agent runs real
         // git commands. Without this they collide, and the command that fails
-        // is *Claude's*.
+        // is the *agent's*.
         .env("GIT_OPTIONAL_LOCKS", "0")
         // Nothing here may ever prompt. A worker blocked on a credential
         // question would take every future refresh down with it, silently.

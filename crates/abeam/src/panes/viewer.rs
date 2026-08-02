@@ -43,7 +43,7 @@
 //!   runs on its own thread and reports through a channel `tick` polls,
 //! - the watcher is the shell's, on `notify`'s thread behind a debouncer,
 //! - layout — parse, highlight, wrap — happens once per `(file, width)` pair
-//!   and is cached, because `render` runs on every keystroke Claude receives,
+//!   and is cached, because `render` runs on every keystroke the agent sees,
 //! - the file list's own directory read is the one gitignore walk that happens
 //!   *on this thread*. It is cached between keys, never done from `render`, and
 //!   bounded by `browse::MAX_ENTRIES`: one directory is a bounded amount of
@@ -255,7 +255,7 @@ impl ViewerPane {
         // and show within one pass of its loop.
         self.pending = None;
         // Re-showing the file already on screen is a reload, and a reload must
-        // not throw away the reader's place. Claude rewriting a document
+        // not throw away the reader's place. An agent rewriting a document
         // someone is halfway through is the common case, not the rare one.
         if self.path() != Some(path.as_path()) {
             self.scroll.to(0);
@@ -392,7 +392,7 @@ impl ViewerPane {
             // The list has re-read its own directory; the find index is the
             // pane's, and only a walk can refresh it. The walk is worth
             // starting whether or not the directory turned out to have changed
-            // — but a frame is not, and a frame here re-renders Claude.
+            // — but a frame is not, and a frame here re-renders the agent.
             browse::Outcome::Refreshed { changed } => {
                 self.rescan();
                 changed.into()
@@ -479,7 +479,7 @@ impl ViewerPane {
     fn step(&mut self, forward: bool) -> Handled {
         if self.recent.is_empty() {
             // Nothing to step to, so nothing was acted on. Reporting `Yes` here
-            // spent a whole frame — Claude's screen included — on a key that
+            // spent a whole frame — the agent's screen included — on a key that
             // did nothing.
             return Handled::No;
         }
@@ -668,7 +668,7 @@ impl Pane for ViewerPane {
             }
 
             // Esc and q are not ours. The shell reads an unhandled one as
-            // "give focus back to Claude", which is the way out of here.
+            // "give focus back to the agent", which is the way out of here.
             _ => Handled::No,
         };
         Ok(handled)
@@ -699,25 +699,25 @@ impl Pane for ViewerPane {
     /// Only while a query is being typed. Everything else this pane does is a
     /// read; in the find box `j` is a letter, and both things the shell asks
     /// this for — where a paste goes, and whether leaving hands focus back to
-    /// Claude — turn on exactly that.
+    /// the agent — turn on exactly that.
     fn takes_input(&self) -> bool {
         self.finding()
     }
 
     /// `Esc` closes the find and leaves you in the list, which is one press
-    /// short of Claude. A border promising `esc→claude` there would be naming
+    /// short of the agent. A border promising `esc→agent` there would be naming
     /// a key that does something else.
     fn exit_hint(&self) -> &'static str {
         if self.finding() {
             " · esc→list"
         } else {
-            " · esc→claude"
+            " · esc→agent"
         }
     }
 
     /// A pasted path goes into the find box and nowhere else. It is the one
     /// place in a read-only pane with somewhere to put text, and pasting a path
-    /// out of Claude's transcript is a likely way to reach a particular file.
+    /// out of the agent's transcript is a likely way to reach a given file.
     fn handle_paste(&mut self, text: &str) -> Result<Handled> {
         if !matches!(self.mode, Mode::Browse) {
             return Ok(Handled::No);
@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn tab_with_nothing_to_walk_says_it_did_nothing() {
         // A repository with no markdown in it, or a scan that has not answered
-        // yet. Reporting `Yes` here spent a frame — Claude's whole screen
+        // yet. Reporting `Yes` here spent a frame — the agent's whole screen
         // redrawn — on a key that could not move.
         let dir = TempDir::new("view-tab-empty");
         let mut pane = quiet(dir.path());
@@ -1285,10 +1285,10 @@ mod tests {
 
     #[test]
     fn a_file_chosen_in_the_list_is_not_replaced_by_one_the_watcher_queued() {
-        // Claude writes something while a directory is being walked, so a file
-        // is pending; the reader picks a different one and presses Enter. The
-        // very next frame used to swap in the queued file, so what arrived on
-        // screen was never the file that was chosen. The same shape reaches
+        // The agent writes something while a directory is being walked, so a
+        // file is pending; the reader picks a different one and presses Enter.
+        // The very next frame used to swap in the queued file, so what arrived
+        // on screen was never the file that was chosen. The same shape reaches
         // `Enter` in the git view and `Tab`, because the shell can queue and
         // show within one pass of its loop.
         let dir = TempDir::new("view-browse-supersede");
@@ -1341,25 +1341,25 @@ mod tests {
         dir.write("a.md", b"# a\n");
         let mut pane = quiet(dir.path());
         assert!(!pane.takes_input());
-        assert_eq!(pane.exit_hint(), " · esc→claude");
+        assert_eq!(pane.exit_hint(), " · esc→agent");
 
         pane.toggle_browse();
         assert!(!pane.takes_input(), "the list is still only read");
-        assert_eq!(pane.exit_hint(), " · esc→claude");
+        assert_eq!(pane.exit_hint(), " · esc→agent");
 
         pane.handle_key(key(KeyCode::Char('/'))).unwrap();
         assert!(pane.takes_input(), "a query is typing");
         assert_eq!(
             pane.exit_hint(),
             " · esc→list",
-            "Esc closes the find; Claude is one press further than that"
+            "Esc closes the find; the agent is one press further than that"
         );
 
         // Leaving the list ends the query, so the two answers cannot drift out
         // of step with what Esc would do.
         pane.toggle_browse();
         assert!(!pane.takes_input());
-        assert_eq!(pane.exit_hint(), " · esc→claude");
+        assert_eq!(pane.exit_hint(), " · esc→agent");
     }
 
     #[test]
@@ -1466,7 +1466,7 @@ mod tests {
     #[test]
     fn a_source_file_has_no_second_form_to_toggle_to() {
         // `Handled::No` rather than a no-op that claims to have acted: a frame
-        // here re-renders Claude's whole screen.
+        // here re-renders the agent's whole screen.
         let dir = TempDir::new("view-raw-rs");
         let path = dir.write("main.rs", b"fn main() {}\n");
         let mut pane = quiet(dir.path());

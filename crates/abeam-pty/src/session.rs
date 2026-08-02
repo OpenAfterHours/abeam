@@ -17,17 +17,26 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::input;
 
-/// Errors are an enum rather than `anyhow::Error` so a caller can render
-/// "claude is not installed" differently from an I/O failure. `anyhow` cannot
-/// be eliminated — portable-pty's own API returns it — so it appears only as a
+/// Errors are an enum rather than `anyhow::Error` so a caller can render "the
+/// agent is not installed" differently from an I/O failure. `anyhow` cannot be
+/// eliminated — portable-pty's own API returns it — so it appears only as a
 /// `#[source]`.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
     #[error("failed to open a pty")]
     Open(#[source] anyhow::Error),
-    #[error("failed to spawn `{program}`")]
+    /// `name` is [`PtyConfig::title`] when the caller supplied one and
+    /// [`PtyConfig::program`] otherwise, and it is named for the job rather
+    /// than for where it comes from. An npm shim is spawned as
+    /// `C:\Windows\System32\cmd.exe`, so reporting the program would say
+    /// "failed to spawn `C:\Windows\System32\cmd.exe`" about a file nobody
+    /// asked for and about an installation that is not the one at fault —
+    /// which is the exact confusion `title` was added to prevent, in the enum
+    /// whose whole reason for existing is that a caller can tell "not
+    /// installed" from "the pty broke".
+    #[error("failed to spawn `{name}`")]
     Spawn {
-        program: String,
+        name: String,
         #[source]
         source: anyhow::Error,
     },
@@ -47,6 +56,26 @@ pub enum PtyError {
 #[derive(Debug, Clone)]
 pub struct PtyConfig {
     pub program: String,
+    /// What a host should *call* this session, when that is not the program it
+    /// starts. `None` means the program, which is right until something in
+    /// front of the pty resolves names: `claude` reaching here as
+    /// `C:\Users\…\AppData\Roaming\npm\claude.cmd` is the same session, and an
+    /// npm shim reaching here as `cmd.exe` is not even the same word.
+    ///
+    /// Deliberately not derived from `program` — a host that wanted the file
+    /// name could take it, and the cases where the two differ are exactly the
+    /// cases where only the caller knows what was meant.
+    ///
+    /// A carrier, and the only field here that is one. Every other field is
+    /// consumed by [`PtySession::spawn`] and changes what the child is or how
+    /// it starts; this one changes nothing about the session. The crate stores
+    /// it, reads it in exactly one place — [`PtyError::Spawn`], which has to
+    /// name something the caller recognises — and otherwise hands it straight
+    /// back for the caller to put on a border.
+    ///
+    /// Which means `abeam-pty` has no test for it: there is no behaviour here
+    /// to assert, so what coverage exists is in the host that renders it.
+    pub title: Option<String>,
     pub args: Vec<String>,
     /// `None` means the current working directory at spawn time.
     pub cwd: Option<PathBuf>,
@@ -62,6 +91,7 @@ impl PtyConfig {
     pub fn new(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
+            title: None,
             args: Vec::new(),
             cwd: None,
             env: vec![
@@ -72,6 +102,11 @@ impl PtyConfig {
             cols: 80,
             scrollback: 5000,
         }
+    }
+
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
     }
 
     pub fn arg(mut self, a: impl Into<String>) -> Self {
@@ -223,7 +258,10 @@ impl PtySession {
             .slave
             .spawn_command(cmd)
             .map_err(|source| PtyError::Spawn {
-                program: cfg.program.clone(),
+                // The title if there is one: what failed to start, from the
+                // caller's side, is `claude` — `cmd.exe` is how abeam was
+                // spelling it.
+                name: cfg.title.clone().unwrap_or_else(|| cfg.program.clone()),
                 source,
             })?;
         // Closes the write end on unix, where that is what lets the reader see
@@ -306,9 +344,9 @@ impl PtySession {
     /// This exists because polling sets a floor on latency that has nothing to
     /// do with how fast anything actually is: a loop that asks every 10 ms
     /// renders a keystroke 5 ms late on average however quick the renderer is,
-    /// and — worse for the look of it — quantises Claude's output onto a grid
-    /// it has no relationship with, so frames land unevenly. Uneven frames read
-    /// as jitter at any rate.
+    /// and — worse for the look of it — quantises the agent's output onto a
+    /// grid it has no relationship with, so frames land unevenly. Uneven frames
+    /// read as jitter at any rate.
     ///
     /// `notify` runs **on the reader thread, holding nothing**, so it must not
     /// block and must not touch the session. Ring a doorbell and return; the
@@ -362,7 +400,7 @@ impl PtySession {
     /// Reports whether the view moved rather than leaving the caller to ask
     /// again, for the same reason: the answer is only true at the instant the
     /// lock was held. The caller is a pane deciding whether to spend a frame,
-    /// and a frame re-renders Claude's whole screen.
+    /// and a frame re-renders the agent's whole screen.
     fn move_view(&self, to: impl FnOnce(usize) -> usize) -> bool {
         let mut parser = self.shared.parser.lock().unwrap();
         let screen = parser.screen_mut();
@@ -482,8 +520,8 @@ impl PtySession {
 }
 
 impl Drop for PtySession {
-    /// A dropped session must not leave a Claude process running — nor, since
-    /// the command view landed, the `cargo build` a hosted shell started.
+    /// A dropped session must not leave the agent's process running — nor,
+    /// since the command view landed, the `cargo build` a hosted shell started.
     ///
     /// The order is load-bearing. The child is terminated, then the job closed,
     /// which takes with it every descendant `TerminateProcess` cannot reach;

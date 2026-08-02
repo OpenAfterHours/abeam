@@ -1,4 +1,9 @@
-//! The Claude pane: a `PtySession` rendered through tui-term.
+//! A pane with a live child in it: a `PtySession` rendered through tui-term.
+//!
+//! Not "the agent pane", though that is what it began as. `panes::shell` hosts
+//! one of these too, so every fact here has to be true of the agent on the left
+//! *and* of whatever somebody typed into the command view on the right — which
+//! is why nothing below names either of them.
 //!
 //! Almost everything hard about hosting a pty lives in `abeam-pty`. What is
 //! left here is the part that needs to know it is a pane.
@@ -38,7 +43,12 @@ impl TerminalPane {
     /// A pane from a config the caller has already built — a working directory,
     /// extra environment, a different scrollback. The way in.
     pub fn spawn_with(cfg: PtyConfig) -> Result<Self> {
-        let title = cfg.program.clone();
+        // The program only when nobody said otherwise. Once something in front
+        // of the pty resolves names, `cfg.program` is an absolute path — or,
+        // for a script routed through an interpreter, `cmd.exe` — and a border
+        // reading `C:\Users\…\npm\claude.cmd` or `cmd` is worse than useless in
+        // 46 columns. See [`PtyConfig::title`].
+        let title = cfg.title.clone().unwrap_or_else(|| cfg.program.clone());
         Ok(Self {
             session: PtySession::spawn(cfg)?,
             title,
@@ -67,9 +77,9 @@ impl TerminalPane {
         self.exit_status().is_some()
     }
 
-    /// Lets the app loop be told when Claude has produced something, instead of
-    /// asking on a timer. See [`PtySession::wake_on_output`] — the closure runs
-    /// on the reader thread and must only ring a doorbell.
+    /// Lets the app loop be told when the child has produced something, instead
+    /// of asking on a timer. See [`PtySession::wake_on_output`] — the closure
+    /// runs on the reader thread and must only ring a doorbell.
     pub fn wake_on_output(&self, notify: impl Fn() + Send + Sync + 'static) {
         self.session.wake_on_output(notify);
     }
@@ -90,7 +100,7 @@ impl TerminalPane {
 
     /// Move it, clamped to the history that exists. True if the view actually
     /// moved: a pane that redraws for a key that changed nothing is spending a
-    /// frame, and a frame re-renders Claude's whole screen.
+    /// frame, and a frame re-renders the agent's whole screen.
     pub fn set_scrollback(&self, rows: usize) -> bool {
         self.session.set_scrollback(rows)
     }
@@ -106,9 +116,9 @@ impl TerminalPane {
     /// ones dropped.
     ///
     /// Printed to the primary buffer once abeam has left the alternate screen.
-    /// Without it, `/exit` takes the whole session with it: everything Claude
-    /// drew lived on abeam's alternate screen and goes when that does, which is
-    /// a thing the plain terminal abeam replaces does not do.
+    /// Without it, `/exit` takes the whole session with it: everything the
+    /// agent drew lived on abeam's alternate screen and goes when that does,
+    /// which is a thing the plain terminal abeam replaces does not do.
     ///
     /// `rows()` rather than `contents()` — the latter rejoins wrapped rows into
     /// logical lines and tells you nothing about layout
@@ -202,7 +212,8 @@ impl Pane for TerminalPane {
     }
 
     /// The hosted app gets everything the shell did not claim, so this always
-    /// reports `Yes` — an unbound key inside Claude is still Claude's business.
+    /// reports `Yes` — an unbound key inside the child is still the child's
+    /// business.
     fn handle_key(&mut self, key: KeyEvent) -> Result<Handled> {
         self.session.send_key(key)?;
         Ok(Handled::Yes)
@@ -210,7 +221,7 @@ impl Pane for TerminalPane {
 
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
         // Coordinates are already pane-relative; abeam-pty stays out of the
-        // question of where the pane is, and gates on what Claude enabled.
+        // question of where the pane is, and gates on what the child enabled.
         Ok(self.session.send_mouse(ev, ev.column, ev.row)?.into())
     }
 
@@ -222,7 +233,7 @@ impl Pane for TerminalPane {
     /// Pane-relative `(col, row)` of the text cursor, or `None` to hide it.
     ///
     /// The strongest focus signal available: if the cursor is not blinking in
-    /// Claude's prompt, your keys are not going to Claude.
+    /// the agent's prompt, your keys are not going to the agent.
     fn cursor(&self) -> Option<(u16, u16)> {
         let screen = self.session.screen();
         if screen.hide_cursor() {
@@ -244,5 +255,34 @@ impl Pane for TerminalPane {
     fn handle_paste(&mut self, text: &str) -> Result<Handled> {
         self.session.send_paste(text)?;
         Ok(Handled::Yes)
+    }
+}
+
+/// Windows-only: both of these start a real child in a real pty.
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_border_says_the_name_it_was_given_rather_than_the_path_that_was_started() {
+        // The regression this exists to stop. `main` resolves what it was asked
+        // for into an absolute path before the pty sees it, and a script goes
+        // further still and is started by naming `cmd.exe` in front of it — so
+        // the two obvious things a border could show are a path nobody typed
+        // and the name of an interpreter nobody chose. In 46 columns, clipped
+        // from the right, an absolute path is a border that says `C:\Users\p`.
+        let windows = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+        let resolved = windows.join("System32").join("cmd.exe");
+        let cfg = PtyConfig::new(resolved.to_string_lossy())
+            .args(["/c".to_string(), "exit".to_string()])
+            .size(10, 40);
+
+        let named = TerminalPane::spawn_with(cfg.clone().title("claude")).unwrap();
+        assert_eq!(named.title(), "claude");
+
+        // Unset is the old behaviour exactly, which is what lets every caller
+        // that does not care go on not caring.
+        let bare = TerminalPane::spawn_with(cfg).unwrap();
+        assert_eq!(bare.title(), resolved.to_string_lossy());
     }
 }

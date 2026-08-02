@@ -1,21 +1,53 @@
 # Keymap, and the collision audit behind it
 
-> Provenance: extracted from `C:/Users/philm/.local/bin/claude.exe` — **Claude
-> Code 2.1.220**, 265,720,480 bytes, mtime 2026-07-25 — by the design pass on
-> 2026-08-01 and re-checked on 2026-08-01 when the command view added `Alt+S`.
-> Written down because it was expensive to obtain and will silently rot
-> otherwise. The version and size are recorded as well as the date: a date alone
-> cannot tell a re-install of the same build from a silent update.
+> Provenance, for the Claude sections: extracted from
+> `C:/Users/philm/.local/bin/claude.exe` — **Claude Code 2.1.220**, 265,720,480
+> bytes, mtime 2026-07-25 — by the design pass on 2026-08-01 and re-checked on
+> 2026-08-01 when the command view added `Alt+S`. Written down because it was
+> expensive to obtain and will silently rot otherwise. The version and size are
+> recorded as well as the date: a date alone cannot tell a re-install of the
+> same build from a silent update.
 >
 > `~/.claude/keybindings.json` does not exist on this machine, so nothing here
 > is overridden by user configuration. If it ever does, this whole document is
 > describing defaults the user may not be using.
+>
+> The GitHub Copilot CLI sections at the foot of this document carry their own
+> provenance, and it is weaker. The two are not interchangeable and are kept
+> apart for that reason.
 
 ## The invariant
 
-**Nothing abeam intercepts is a key Claude can act on.** Every abeam binding
-below was checked against the inventory below and is a verified no-op in Claude
-today. Typing at Claude is byte-for-byte what the pty spike did.
+**Nothing abeam intercepts may be a key any supported agent can act on.** The
+plural is the whole difficulty: a binding is safe only if it is a no-op in
+*every* agent abeam can host, so gaining an agent can retire a key that was
+safe when there was one. It has already retired one.
+
+Every abeam binding below was checked against the Claude inventory below and is
+a verified no-op in Claude today. Against Copilot CLI the same check has been
+made from documentation and source rather than from the binary, it is honestly
+weaker, and it found one collision: `Alt+Left` and `Alt+Right`, which GitHub
+declares as word-motion in its own command reference. **abeam gave them up.**
+Focus movement is `F4` and `F5`, and the arrows go to the agent.
+
+That removed the one breach this audit knew about, and yielding a key verifies
+nothing else, so be exact about what the invariant is worth in each agent. In
+Claude it is **verified**: the inventory came out of the installed binary,
+which is the only reason it caught `Alt+F`. In Copilot it is **unrefuted**,
+which is a weaker thing entirely — six of abeam's bindings, `Alt+G`, `Alt+S`,
+`Alt+J`, `Alt+K`, `Alt+PageUp` and `Alt+PageDown`, each shadow a key Copilot
+binds in its bare form somewhere, and Ink hands a handler the bare form
+together with a `meta` flag the handler is free to ignore. Nothing a user can
+reach is lost either way, because the bare keys still pass through; what is
+unproven is the strict form, that an intercepted key is one the agent could not
+have acted on. The change made that "unproven for one agent" instead of "known
+broken for one agent", and not "verified for both". Only the Copilot binary can
+settle the six; "Known gaps, against Copilot" at the foot of this document says
+so again, and the README's disclosure bullet is the third place. The evidence
+for the collision, and the reasoning about which side should yield, are under
+"The collision, and how it was settled" below.
+
+Typing at the agent is byte-for-byte what the pty spike did.
 
 ## abeam's bindings
 
@@ -26,7 +58,7 @@ today. Typing at Claude is byte-for-byte what the pty spike did.
 | `Alt+G` | right pane → git view (focus unchanged) |
 | `Alt+E` | right pane → files / markdown view (focus unchanged) |
 | `Alt+S` | right pane → a shell, **and focus it**; again to hand focus back |
-| `Alt+Right` / `Alt+Left` | move focus right / left |
+| `F4` / `F5` | move focus left / right |
 | `Alt+J` / `Alt+K` | scroll right pane one line — **without focusing it** |
 | `Alt+PageDown` / `Alt+PageUp` | scroll right pane one page — without focusing it |
 | `Alt+Z` | zoom: hide / show the right pane |
@@ -34,7 +66,7 @@ today. Typing at Claude is byte-for-byte what the pty spike did.
 | `F1` | key help overlay |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page (no other view changes) |
-| `Ctrl+\` or `F12` | literal-next: send the following key to Claude verbatim |
+| `Ctrl+\` or `F12` | literal-next: send the following key to the agent verbatim |
 
 `Alt+E` pressed while the files view is already showing opens the file list, so
 it is never a key that does nothing. It used to reload the open file; reload is
@@ -68,18 +100,36 @@ than a key the viewer handles, so it works while Claude has focus — the reader
 is a pane you glance at, and having to enter it before you could change how it
 looks would defeat the point.
 
-Right pane, only when focused. Plain keys, because Claude never sees them.
-Deliberately the same vocabulary as Claude's own transcript view, so there is
-one scroll language in the application:
+`F4` and `F5` are the odd pair in this table: the only binding that was *taken
+away* from abeam rather than chosen for it. Focus moved on `Alt+←`/`Alt+→` until
+the Copilot audit below found GitHub declaring that pair as word-motion, at
+which point they stopped being abeam's to bind. Two direct keys rather than one
+toggle, for the reason the view keys are two direct keys — a toggle needs you to
+know the current state before you press it, which fails exactly when you are
+glancing rather than looking, and focus is glanced at the same way a view is.
+Function keys rather than two more Alt letters because F-keys, alone in this
+table, do not rest on an audit having been exhaustive: Claude binds none in any
+context, and an Ink application *cannot* bind one. See "Why Ink settles the
+function keys and unsettles the letters" below.
+
+Right pane, only when focused. Plain keys, because the agent never sees them.
+The vocabulary was taken from Claude's own transcript view, deliberately, so
+that there is one scroll language in the application. Copilot's diff mode
+shares most of it and differs in two places that are worth naming rather than
+glossing: `space` pages nothing there, and `b` toggles the diff rather than
+paging back. Neither difference reaches inside abeam, where these keys are the
+pane's, but "one scroll language serves both" is a near-miss and not an
+identity.
 
 `j`/`k`, arrows — line · `space`/`b`, PgDn/PgUp — page · `Ctrl+D`/`Ctrl+U` —
 half page · `g`/`G`, Home/End — ends · `Tab`/`Shift+Tab` — next/prev item ·
-`Enter` — open · `r` — refresh · `Esc`/`q` — back to Claude.
+`Enter` — open · `r` — refresh · `Esc`/`q` — back to the agent, which is what
+the border says.
 
 The files view adds `t` — rendered markdown or its source — and, in the file
 list, `/` to find a file anywhere under the root and `Backspace` or `-` to climb
 a directory. None of these collides with the vocabulary above, and none can
-reach Claude: the right pane has to be focused for any of them to be seen.
+reach the agent: the right pane has to be focused for any of them to be seen.
 
 Two of them are claimed *conditionally*, which is the thing to keep straight.
 While a find is open the query eats every printable key, so `j`, `k`, `g`, `G`,
@@ -133,8 +183,9 @@ deleteWordBefore.
 - **`Ctrl+]` — the pty spike's detach key — is `app:openArtifact`.** It is
   retired. Exiting the app when the user meant to open an artifact is the worst
   possible failure for a binding nobody chose. Replaced by `Alt+Q`.
-- **No F-key is bound anywhere, in any context.** That is why `F1` is help and
-  `F12` is the literal-next alias. The audit covered the *bare* keys, so abeam
+- **No F-key is bound anywhere, in any context.** That is why `F1` is help,
+  `F2` and `F3` are the instrument and the reader's page, `F4`/`F5` are focus,
+  and `F12` is the literal-next alias. The audit covered the *bare* keys, so abeam
   claims only those: `Ctrl+F12` and `Shift+F1` are keys nobody has checked, and
   they go to Claude. Swallowing `Ctrl+F12` would have been worse than a dead
   key — it arms literal-next with nothing on screen to say so, and the *next*
@@ -151,7 +202,7 @@ Excluded for other reasons: `Alt+Space` (Windows system menu), `Alt+Enter`
 (Windows Terminal fullscreen), `Ctrl+Alt+*` (AltGr on non-US layouts), bare
 PageUp/PageDown (Claude's Scroll context).
 
-## Known gaps
+## Known gaps, against Claude
 
 - Claude's keybindings are user-configurable (`~/.claude/keybindings.json`) and
   Anthropic ships new ones regularly. The Alt namespace is free *today*, not
@@ -166,7 +217,10 @@ PageUp/PageDown (Claude's Scroll context).
   making that true. This is the first case of a Claude action whose *intended*
   key collides with an abeam binding, and it is exactly the scenario the "free
   today, not forever" caveat above was written for. If it lands, `Alt+↑`/`Alt+↓`
-  are not available either (`app:diffFileList`), so the replacement is an F-key.
+  are not available either (`app:diffFileList`), so the replacement is an F-key
+  — a move this project has since made in earnest, for `Alt+←`/`Alt+→`, and on
+  better evidence than a footer hint. The F-keys are the reserve, and the
+  Copilot section below is why there is no other.
 - **`Alt+M` is conditionally `chat:cycleMode`.** The Chat block binds a computed
   key: `shift+tab` normally, but `meta+m` on Windows when the runtime is outside
   a version range checked at startup. `m` is in the presumed-taken set already,
@@ -195,3 +249,293 @@ PageUp/PageDown (Claude's Scroll context).
   verified free. They are classic readline word-case commands and the audit
   found the prompt editor's readline switch is only partly declared. Nothing
   binds them today; nothing should, without re-reading that switch.
+
+## GitHub Copilot CLI's bindings, as of the audited release
+
+> Provenance: **documentation and source, not a binary.** GitHub Copilot CLI
+> **1.0.77** — the version published to npm as `@github/copilot`, registry
+> mtime 2026-08-01, changelog entry dated 2026-07-30 — audited on 2026-08-02
+> from GitHub's published shortcut tables
+> (`docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference`,
+> whose source lives at `github/docs`), the whole of `changelog.md` in
+> `github/copilot-cli` (2025-09-26 through 2026-07-30, about 150 releases), that
+> repository's issue tracker, and the source of Ink, the React-for-terminals
+> renderer GitHub has said in print that Copilot CLI is built on. This is the
+> standalone interactive `copilot`, not the retired `gh copilot suggest` and
+> `explain` extension, which had no interactive keymap at all.
+>
+> **It is weaker evidence than the Claude section above, and the difference is
+> not a formality.** The Claude inventory was extracted from the installed
+> binary, which is the only reason it caught `Alt+F`, a binding Anthropic's own
+> keymap does not declare. Nothing below can catch Copilot's equivalent, because
+> nothing below reads Copilot's code. One undeclared Copilot binding has already
+> surfaced by accident — `Alt+D`, announced in a changelog entry and absent from
+> every published table — which is direct evidence that the tables are
+> incomplete in exactly the way Claude's were.
+>
+> `copilot` is **not installed on this machine** and was not installed to write
+> this. It is not on `PATH`; Node here is v20.14.0 with npm 10.9.3, below the
+> Node 22 the npm route wants; and `pwsh` is absent, so Copilot's documented
+> Windows prerequisite of PowerShell v6 or higher is unmet. Nothing was
+> installed, and no strings audit was faked to stand in for one.
+
+**Prompt and global:** `esc` cancel · `ctrl+c` cancel / clear input · `ctrl+d`
+shutdown · `ctrl+g` external editor · `ctrl+l` clearScreen · `ctrl+enter` or
+`ctrl+q` queue a message · `ctrl+r` history:search · `ctrl+s` stash and pop the
+prompt · `ctrl+v` paste as attachment · `ctrl+z` suspend (Unix) · `shift+tab`
+cycle standard / plan / autopilot · **`alt+enter`** newline on Windows and
+Linux (`shift+enter` or `option+enter` on Mac) · the `@ # ! $ ?` prompt
+prefixes, `?` being quick help on an empty prompt
+
+**`ctrl+x` prefix:** `ctrl+x /` slash command · `ctrl+x e` and `ctrl+x ctrl+e`
+editor · `ctrl+x b` background · `ctrl+x o` open the last link · `ctrl+x x`
+close session · `ctrl+x h` hide the sidebar
+
+**Editing:** `ctrl+a`/`ctrl+e` line ends · `ctrl+b`/`ctrl+f` by character ·
+`ctrl+h` delete back · `ctrl+k`/`ctrl+u` kill to end / start · `ctrl+w` delete
+word back · home/end, `ctrl+home`/`ctrl+end` · **`alt+left`/`alt+right` move by
+word** on Windows and Linux (`option` on Mac) · up/down history · `tab` or
+`ctrl+y` accept completion
+
+**Timeline:** `ctrl+f` search · `ctrl+o` expand recent · `ctrl+e` expand all ·
+`ctrl+t` reasoning · pageup/pagedown.
+**Diff mode:** `j`/`k` and arrows · `h`/`l` file · `g`/`G`, home/end ·
+pageup/pagedown · `ctrl+u`/`ctrl+d` half page · `c` comment · `s` summary ·
+`b` diff toggle · `w` whitespace · `r` refresh · `enter` submit · `esc` or
+`ctrl+c` exit. **Session picker:** arrows · `enter` · `s` sort · `tab`
+local/remote · `d` delete · `esc` close.
+
+**Undeclared** — absent from every published table, found only by reading the
+changelog: **`alt+d`** delete the word in front of the cursor (1.0.25,
+2026-04-13) · **`meta+v`** image paste alongside `ctrl+v` on all platforms
+(1.0.30, 2026-04-16) · `alt+backspace` registers as backspace rather than
+delete (0.0.417, 2026-02-25) · hold `alt` while scrolling for line-at-a-time
+(1.0.69, 2026-07-07). The declared `alt+left`/`alt+right` arrived earlier still,
+as "better support for UNIX keyboard bindings (Ctrl+A/E/W/U/K, Alt+arrows)"
+(0.0.400, 2026-01-30).
+
+## What that means for Copilot
+
+Three verdicts are used below, and the middle one is the honest one.
+**Collision** means GitHub documents the key as doing something. **No-op**
+means three independent lines agree it does nothing and one of them is
+structural — Copilot could not bind the key even if it wanted to. **Probable
+no-op** means nothing was found, and nothing found is not the same as nothing
+there: it is precisely the evidence that would have missed `Alt+F` in Claude.
+
+The audit found exactly one collision. Its two rows are kept as they were found
+and then marked settled, rather than deleted now that abeam no longer binds
+those keys: the finding is the most valuable thing in this document, and a table
+that only lists keys abeam still holds cannot explain why focus is on an F-key.
+
+| Key | Verdict | Why |
+| --- | --- | --- |
+| `Alt+Left` | **collision — abeam yielded** | Declared: "move the cursor by a word", Windows and Linux, in the navigation table. It was abeam's focus-left until this audit; it is the agent's now, and focus-left is `F4`. |
+| `Alt+Right` | **collision — abeam yielded** | The same binding, the other direction. Focus-right is `F5`. |
+| `Alt+G` | probable no-op | Absent from the tables and the changelog. Bare `g` jumps to the first line in diff mode; see the meta-blind caveat below. |
+| `Alt+E` | probable no-op | Absent everywhere, and no bare `e` is bound in any view. The cleanest of the letters. |
+| `Alt+S` | probable no-op | Absent everywhere. Bare `s` is comments-summary in diff mode and cycle-sort in the session picker; meta-blind caveat. |
+| `Alt+Q` | probable no-op | Absent everywhere. `Ctrl+Q` queues a message, which is a different key and one abeam does not take. |
+| `Alt+Z` | probable no-op | Absent everywhere. `Ctrl+Z` suspends on Unix; not claimed. |
+| `Alt+J` | probable no-op | Absent everywhere. Bare `j` moves down in diff mode; meta-blind caveat, and 1.0.71 fixed this exact class of leak elsewhere. |
+| `Alt+K` | probable no-op | As `Alt+J`, with bare `k`. |
+| `Alt+PageUp` | probable no-op | Absent everywhere. Bare PageUp scrolls the timeline and pages the diff, and Ink reports `Alt+PageUp` as PageUp with `meta` set. |
+| `Alt+PageDown` | probable no-op | As `Alt+PageUp`. |
+| `F1` | no-op | Absent from the tables, absent from the changelog, and an Ink `useInput` handler cannot tell one function key from another or from nothing at all. |
+| `F2` | no-op | As `F1`. |
+| `F3` | no-op | As `F1`. |
+| `F4` | no-op | As `F1`, and now load-bearing: this is the argument focus movement rests on. |
+| `F5` | no-op | As `F4`. |
+| `F12` | no-op | As `F1`. |
+| `Ctrl+\` | no-op | Absent from the tables and the changelog, and in legacy encoding it is a byte Ink's parser matches no branch of. |
+
+`Esc` and `Shift+Tab` are Copilot's — cancel, and cycling standard / plan /
+autopilot — and abeam claims neither. `keys.rs` returns `None` for a bare `Esc`
+and for `Shift+Tab` in either spelling, `BackTab` or `Tab`+SHIFT, because all of
+them fall past the `!alt` guard. `plain_typing_is_never_a_global` pins the bare
+`Esc` and `Tab` halves of that; the modified spelling of `Shift+Tab` is pinned
+by nothing and is safe by the same structural argument as every other
+unmentioned key. The right pane's own `Esc` and `q` are reachable only when that
+pane has focus, so Copilot never loses them.
+
+`Alt+Enter` is Copilot's newline on Windows, and abeam already excluded it for a
+different reason (Windows Terminal fullscreen). Inside abeam that exclusion
+becomes load-bearing rather than incidental: Copilot's other newline,
+`Shift+Enter`, needs the Kitty keyboard protocol, which abeam does not
+implement, so `Alt+Enter` is the *only* way to get a newline into a Copilot
+prompt hosted here.
+
+### Why Ink settles the function keys and unsettles the letters
+
+Copilot CLI is an Ink application, and that is not a trivia point: it fixes what
+Copilot is *able* to bind, and two of Ink's limits do most of the work here.
+
+The first is that Ink cannot see which function key was pressed. Its
+`parseKeypress` does recognise them — `\x1bOP` becomes the name `f1`,
+`\x1b[24~` becomes `f12`, which is exactly what `abeam-pty` sends. But
+`useInput`, the hook an Ink app handles keys with, exposes a fixed record with
+fields for the arrows, PageUp/PageDown, Home/End, Return, Escape, Tab,
+Backspace, Delete and the modifiers, and **no field for a function key at all**;
+and because `f1` through `f12` are in Ink's `nonAlphanumericKeys`, the `input`
+string is blanked as well. Every bare function key therefore arrives at every
+handler as an empty string with every flag false — indistinguishable from any
+other function key, and from nothing having happened. An Ink app cannot bind a
+bare function key through `useInput`. That agrees with the two documentary
+lines: no function key appears in any published Copilot shortcut table, and none
+appears anywhere in the changelog across about 150 releases.
+
+That argument used to carry `F1`, `F2`, `F3` and `F12` — help, an instrument, a
+page colour and an alias for a key that already had one. It now also carries
+focus movement, which after the view keys is the binding a user reaches for
+most. Being *structural* rather than evidential is exactly why it was safe to
+put focus there instead of on a fourth Alt letter: a letter would have been
+cleared by the same kind of search that cleared `Alt+F` in Claude, and `Alt+F`
+was bound.
+
+`Ctrl+\` fails the same way and for a related reason. In legacy encoding it is
+the single byte `0x1c`, and Ink's parser only turns a lone byte into
+`ctrl`+letter for `0x01` through `0x1a`; `0x1c` falls past every branch, leaving
+a nameless character with `ctrl`, `meta` and `shift` all false. Under the Kitty
+keyboard protocol it would be distinguishable, but inside abeam the pty is a
+legacy vt100, so the legacy branch is the one that runs. This is the same
+argument the existing note about `Ctrl+Shift+B` makes, pointed the other way:
+what a legacy terminal cannot express, the hosted program cannot bind.
+
+The second limit cuts against abeam, and it is the one to keep in mind. Ink
+parses `Alt`+letter with `/^(?:\x1b)([a-zA-Z0-9])$/`, setting the name to the
+letter and `meta` to true, and `useInput` then hands the handler the sequence
+with the escape prefix stripped. **`Alt+J` reaches an Ink handler as
+`input === "j"` with `key.meta === true`** — so a handler written
+`if (input === "j")`, which never tests `key.meta`, fires on `Alt+J` as readily
+as on `j`. Copilot has shipped fixes for precisely this: 1.0.71 (2026-07-16)
+records that "modified vim keys (Ctrl+K, uppercase J/K) no longer move the
+selection in tool-permission prompts". Every bare-letter binding in Copilot's
+diff mode and session picker is therefore a *possible* Alt binding, decided by a
+handler this audit cannot read.
+
+That matters less than it first looks, and it is worth being exact about why.
+abeam intercepts `Alt+J`; Copilot's own way to move down a diff is bare `j`,
+which abeam never touches, so nothing a user can reach is shadowed. What is not
+true is the strict form of the invariant — that the intercepted key is one the
+agent could not have acted on — and this document should not pretend otherwise.
+Those six are *unverified*, though, not known broken. The one key pair this
+audit knew to be broken was `Alt+←`/`Alt+→`, and abeam no longer binds it.
+
+### The collision, and how it was settled
+
+**`Alt+Left` and `Alt+Right` were a collision, and a declared one.** GitHub's
+navigation table binds them to moving the cursor by a word on Windows and Linux,
+and the changelog has carried them since 0.0.400 (2026-01-30). They were abeam's
+focus-movement keys. Inside abeam a Copilot user would have had no word-left or
+word-right in the prompt at all: `Ctrl+B` and `Ctrl+F` move by a single
+character, `Ctrl+W` deletes a word backwards and the undeclared `Alt+D` deletes
+one forwards, but nothing else *moves* by a word. No argument about Ink rescues
+this one — it is spelt out in the vendor's own reference, in the same table as
+the bindings abeam relies on being complete.
+
+**abeam yielded.** Focus is `F4` and `F5`; `Alt+←` and `Alt+→` fall through to
+the agent like any other key abeam does not claim. Three things about that are
+worth writing down, because the next collision will need them.
+
+*One table, every agent.* Making the arrows mean focus in front of Claude and
+word-motion in front of Copilot was considered and rejected. A key that means
+different things depending on what is hosted is a key nobody can learn, and it
+turns the `F1` overlay from a statement of fact into a claim about which agent
+is running. The invariant is about what abeam *intercepts*; abeam should
+intercept the same set whoever is listening.
+
+*abeam yielded rather than the agent, because the two losses are not
+comparable.* The agent's prompt is where the user is actually typing, the
+collision is in the middle of that, and there is no second way to move by a word
+once those keys are gone. abeam's focus movement can be spelt however abeam
+likes, and it is not even the only way to move focus — a mouse click and `Esc`
+from the right pane both do it.
+
+*The replacement is a function key rather than another Alt letter*, and that is
+the part that generalises. Every "probable no-op" in the table above could be
+wrong in the way `Alt+F` was wrong in Claude. `F4` and `F5` cannot be wrong that
+way: an Ink `useInput` handler is not handed enough information to tell one
+function key from another, or from nothing at all. When a letter and an F-key
+are both apparently free, they are not equally free.
+
+The rows above are kept rather than tidied away because this is the finding the
+whole audit paid for: **a vendor's declared binding moved one of abeam's keys**,
+and it was found by reading GitHub's own reference rather than by a user
+reporting that word-motion was broken. The version and date are recorded
+(0.0.400, 2026-01-30) so that the next person to ask why focus is on an F-key
+gets the evidence and not just the conclusion.
+
+### What would upgrade this evidence
+
+Two steps, in this order, and neither has been taken.
+
+**Install `copilot` and audit the binary.** On this machine that means clearing
+the prerequisites first — Node 22 or newer for `npm install -g @github/copilot`,
+or `winget install GitHub.Copilot`, which sidesteps npm entirely, plus
+PowerShell 6 or higher for the documented Windows path. Note that the npm
+package is a 13 KB loader (`npm-loader.js`) that fetches a platform binary, so
+the artefact a strings audit must run against is that downloaded binary and not
+anything npm unpacks. Then repeat the Claude method: search the extracted
+strings for the declared shortcut tables, and then — the part that actually
+earns the confidence — for the *undeclared* comparisons, `meta` or `alt` tested
+against a single letter, in the prompt editor and in each modal view. Record the
+version, the byte size and the mtime, as the Claude provenance above does.
+
+**Then probe both ends of the wire.** `crates/abeam/examples/keyprobe.rs`, run
+as `cargo run -p abeam --example keyprobe`, puts the terminal into raw mode and
+prints, for every event crossterm reports, the `KeyCode`, the modifier set and
+the event kind; it flags any `Char` carrying ALT as one abeam would treat as an
+Alt binding, and flags a lone `Esc` as the sign that this terminal sends Alt as
+an escape prefix rather than as a modifier. Three presses of `Esc` exit. It
+answers the half of the question a strings audit cannot: what this Windows
+console actually delivers for each of the sixteen keys abeam still binds, which
+is not the same question as what Copilot would do with them. So run it first in
+the terminal abeam is launched from, to confirm every one of the sixteen arrives
+as abeam expects; then host `copilot` inside abeam and send each key through to
+it with literal-next (`Ctrl+\` or `F12`, then the key), in the prompt, in `/diff`
+and in the session picker, watching for any response. A key that is dead in all
+three views is as close to proof as this project gets without reading GitHub's
+code.
+
+`Alt+←` and `Alt+→` want probing too, and in the opposite direction: they are no
+longer abeam's, so what has to be confirmed is that they *arrive* — that a word
+really does move in a Copilot prompt hosted here. There is a specific thing to
+watch. `abeam-pty` encodes them as the xterm modified-arrow form, `\x1b[1;3D`
+and `\x1b[1;3C` (`input::cursor_key`), rather than as an `Esc` prefix in front
+of a bare arrow, and only Copilot's parser can say whether it reads that form as
+`left` with `meta` set. Yielding a key is worth nothing if the key then fails to
+work, and no test in this repository can tell:
+`the_agents_alt_bindings_are_left_alone` pins that abeam does not claim them,
+which is the whole of what abeam controls.
+
+## Known gaps, against Copilot
+
+- **Everything above is documentation-derived.** It is the kind of audit that
+  would have cleared `Alt+F` in Claude, and `Alt+F` was bound. Treat every
+  "probable no-op" as unproven, not as safe.
+- **The meta-blind handler risk is unquantified.** `Alt+G`, `Alt+S`, `Alt+J`,
+  `Alt+K`, `Alt+PageUp` and `Alt+PageDown` all shadow a key Copilot binds in its
+  bare form somewhere, and Ink hands a handler the bare form plus a `meta` flag
+  it is free to ignore. Nothing a user can reach is lost either way — the bare
+  keys still pass through — but the strict invariant is unverified for those
+  six, and only the binary can settle it.
+- **Copilot's keybindings are not user-configurable**, which is the mirror image
+  of the Claude gap rather than an absence of one. Issue #2259 asks for a
+  `~/.copilot/keybindings.json` and is open, so today the table is the table for
+  every user; but GitHub ships roughly weekly and has changed key bindings
+  repeatedly, including adding `Alt+D` mid-life. This inventory rots faster than
+  the Claude one, not slower.
+- **The Ink version is unverifiable.** The reasoning above reads Ink's current
+  source; Copilot ships a bundled binary whose npm manifest declares one
+  unrelated dependency, so neither the Ink version it vendors nor any local
+  patch to `useInput` can be checked from here.
+- **Windows Alt handling is unsettled in Copilot itself.** Issues #1999 and
+  #2424 report AltGr combinations being swallowed on German layouts, so users on
+  those layouts already have Alt trouble that abeam neither causes nor can fix,
+  and that abeam will nevertheless be blamed for.
+- **The Kitty keyboard protocol is the shared assumption.** Copilot uses it when
+  the terminal offers it, and several of its behaviours — `Shift+Enter` for
+  newline, extended key reporting — exist only on that path. abeam does not
+  implement it, so inside abeam Copilot falls back to legacy encoding. That is
+  what makes the `Ctrl+\` and function-key reasoning above apply; it would need
+  re-checking the day abeam gains Kitty support.

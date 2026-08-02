@@ -6,7 +6,7 @@
 //! the newest document instead of sitting empty until something changes.
 //!
 //! One walk answers two questions. `Tab` wants markdown in recency order,
-//! because Claude touches source files constantly and a *recency* list that
+//! because the agent touches source files constantly and a *recency* list that
 //! follows every one of them is a list nobody can read. The find in `browse`
 //! wants the opposite — every file there is, so that "view any file" is true —
 //! and it wants them by name rather than by age. Both fall out of the same

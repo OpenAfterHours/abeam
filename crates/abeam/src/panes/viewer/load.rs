@@ -12,7 +12,7 @@ use std::io::{self, Read};
 use std::path::Path;
 
 /// Read at most this much. A viewer that faithfully loads a 200 MB file is a
-/// viewer that hangs the Claude pane, and nobody reads the two-millionth line
+/// viewer that hangs the agent's pane, and nobody reads the two-millionth line
 /// of anything.
 ///
 /// This is the only bound on how long the frame that opens a document can take,

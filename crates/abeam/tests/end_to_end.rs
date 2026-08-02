@@ -8,7 +8,7 @@
 //! is *legible* in a 46-column pane. Those are exactly the failures a user meets
 //! first and a unit test never sees.
 //!
-//! So this suite does to abeam what abeam does to Claude: spawns it in a
+//! So this suite does to abeam what abeam does to an agent: spawns it in a
 //! ConPTY through `abeam-pty`, types at it, and reads the screen that comes
 //! back. The library being used to test the binary is not a shortcut — it is
 //! the same code path the product runs on, which is why a bug in it fails here
@@ -161,7 +161,8 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
         "the shell's prompt should name abeam's root; got:\n{text}"
     );
 
-    // Claude is still live, so the first Alt+Q asks and the second answers.
+    // Both children are live — the one in the left pane and the shell in the
+    // right — so the first Alt+Q asks and the second answers.
     send(&session, &alt('q'));
     assert!(
         screen(&session).contains("again to quit"),
@@ -247,7 +248,7 @@ fn the_second_alt_e_opens_a_file_list_that_can_be_walked_to_a_file() {
     // real answer to "view any file": focus, `/`, type, Enter. Nothing has
     // opened `target-file.md`, no watcher has mentioned it, and it is not in
     // the directory the list started in.
-    send(&session, &[0x1b, b'[', b'1', b';', b'3', b'C']); // Alt+Right
+    send(&session, b"\x1b[15~"); // F5, the focus-right key
     send(&session, b"/");
     send(&session, b"target");
     send(&session, b"\r");

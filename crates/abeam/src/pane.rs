@@ -15,7 +15,7 @@ use ratatui::layout::Rect;
 /// Doubles as the redraw signal, and genuinely: the shell draws a frame only
 /// for events something came of, so `j` at the bottom of a document costs
 /// nothing at all. A pane that reports `Yes` for a key that changed nothing is
-/// spending a frame — including re-rendering Claude's whole screen — on it.
+/// spending a frame — including re-rendering the agent's whole screen — on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handled {
     Yes,
@@ -108,7 +108,7 @@ pub trait Pane {
     ///
     /// Two things read it, and both are about what the *user* should be told or
     /// handed next — never about how an event is dispatched. Leaving such a
-    /// pane for one that does not take typing hands focus back to Claude, so
+    /// pane for one that does not take typing hands focus back to the agent, so
     /// `Alt+G` means the same thing from everywhere. And a pane that takes
     /// typing has somewhere for a paste to go.
     ///
@@ -124,16 +124,25 @@ pub trait Pane {
     ///
     /// Not derivable from [`takes_input`](Pane::takes_input), which is why it
     /// is asked separately: there are three answers, not two. A read-only view
-    /// gives focus back to Claude on `Esc`. A shell keeps `Esc` for its child,
-    /// so the way out is `Alt+S`. A view with a filter box open takes `Esc`
-    /// itself and gives you back the list — one press short of Claude, and a
-    /// border that said `esc→claude` there would be naming a key that does
+    /// gives focus back to the agent on `Esc`. A shell keeps `Esc` for its
+    /// child, so the way out is `Alt+S`. A view with a filter box open takes
+    /// `Esc` itself and gives you back the list — one press short of the agent,
+    /// and a border that said `esc→agent` there would be naming a key that does
     /// something else.
+    ///
+    /// It says `agent` rather than the name of whatever is actually hosted, and
+    /// that is a decision rather than a shortcut. Naming it would mean threading
+    /// the hosted program's name through this signature and every pane that
+    /// implements it, to earn a word the *left* border is already showing: the
+    /// destination of `Esc` is the pane on the other side of the divider, and
+    /// that pane is titled with the real program name. A hint that repeated it
+    /// would cost four implementations and a lifetime parameter, to say
+    /// `claude` twice on one screen.
     ///
     /// The border is the only place this is written down, so it has to be true
     /// in every state the pane can be in, including the ones it passes through.
     fn exit_hint(&self) -> &'static str {
-        " · esc→claude"
+        " · esc→agent"
     }
 
     /// Pane-relative `(col, row)` of a text cursor, or `None` for no cursor.

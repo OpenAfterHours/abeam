@@ -2,14 +2,13 @@
 //!
 //! Two rules run through all of it.
 //!
-//! **Typing goes to Claude.** It is over 95% of keystrokes, so it is the state
-//! the app lives in and the one it must never leave by accident. Nothing moves
-//! focus implicitly — not the file watcher, not a view switch, not a git
-//! refresh. Only `Alt+Left`/`Alt+Right`, a mouse click, or `Esc` from the right
-//! pane.
+//! **Typing goes to the agent.** It is over 95% of keystrokes, so it is the
+//! state the app lives in and the one it must never leave by accident. Nothing
+//! moves focus implicitly — not the file watcher, not a view switch, not a git
+//! refresh. Only `F4`/`F5`, a mouse click, or `Esc` from the right pane.
 //!
 //! **Reading the right pane costs nothing.** Switching views and scrolling both
-//! work while Claude still has focus. Focus is needed only to drive a
+//! work while the agent still has focus. Focus is needed only to drive a
 //! selection. A two-pane multiplexer that makes you switch modes to *look* at
 //! something has already lost.
 //!
@@ -56,7 +55,7 @@ const TICK: Duration = Duration::from_millis(10);
 
 /// The shortest gap between two frames, start to start.
 ///
-/// A floor, not a target. Claude can produce output far faster than any screen
+/// A floor, not a target. An agent produces output far faster than any screen
 /// can show it, and drawing every time it does spends the whole budget on
 /// frames nobody sees while the console write queue backs up — which is what
 /// jitter *is*. Holding frames to an even cadence and always drawing the
@@ -73,8 +72,8 @@ enum Wake {
     /// The console had something to say. Carried rather than re-read, because
     /// the thread that reads them is the only one that may.
     Input(Event),
-    /// Claude produced output. No payload — the news is the pty's sticky dirty
-    /// flag, and this only says "go and look".
+    /// The agent produced output. No payload — the news is the pty's sticky
+    /// dirty flag, and this only says "go and look".
     Output,
 }
 
@@ -210,13 +209,13 @@ pub struct App {
     /// Quitting kills a live session, so it asks twice. One bit rather than a
     /// modal dialog: any other key cancels it, which is the whole interaction.
     pending_quit: bool,
-    /// Claude's exit, and the screen it left behind, held until abeam is
+    /// The agent's exit, and the screen it left behind, held until abeam is
     /// actually willing to go. Normally that is immediately; with a command
     /// still running in the shell view it is when the user says so.
-    claude_exit: Option<(ExitStatus, Vec<String>)>,
+    agent_exit: Option<(ExitStatus, Vec<String>)>,
     /// Whichever pane owned the last mouse press keeps drag and motion events
     /// even once the pointer leaves it. Without this, dragging a selection in
-    /// Claude and crossing the divider silently retargets mid-gesture.
+    /// the agent and crossing the divider silently retargets mid-gesture.
     mouse_owner: Option<Focus>,
     /// Stashed by the last frame. Panes are sized from exactly the rects that
     /// were drawn, so the two can never disagree.
@@ -254,7 +253,7 @@ impl App {
             help: false,
             literal_next: false,
             pending_quit: false,
-            claude_exit: None,
+            agent_exit: None,
             mouse_owner: None,
             left_inner: Rect::ZERO,
             right_inner: None,
@@ -269,10 +268,10 @@ impl App {
     /// draw more often than a screen can show. Those are two halves of one
     /// idea: the old loop blocked 10 ms on the console before it would so much
     /// as look at the pty, which put a 10 ms floor under a renderer measured at
-    /// 0.75 ms and quantised Claude's output onto a grid unrelated to it. Now
-    /// both sources of news arrive on one channel — the console from a thread
-    /// that may block on it, Claude from the pty reader — and [`MIN_FRAME`] is
-    /// the only thing deciding when a frame goes out.
+    /// 0.75 ms and quantised the agent's output onto a grid unrelated to it.
+    /// Now both sources of news arrive on one channel — the console from a
+    /// thread that may block on it, the agent from the pty reader — and
+    /// [`MIN_FRAME`] is the only thing deciding when a frame goes out.
     pub fn run(mut self, terminal: &mut Tui) -> Result<Outcome> {
         // Bounded, because it is a doorbell and not a queue. Input uses the
         // blocking `send` — a keystroke may never be dropped — while output
@@ -334,7 +333,7 @@ impl App {
             }
 
             // Everything below happens only when a frame could actually go out.
-            // Under a flood, Claude rings this loop far more often than 125
+            // Under a flood, the agent rings this loop far more often than 125
             // times a second, and running the periodic work on every one of
             // those wakes would put a `try_wait`, three channel polls and a
             // watcher drain on the hot path of its output — to learn things
@@ -343,7 +342,7 @@ impl App {
                 continue;
             }
 
-            if self.claude_exit.is_none()
+            if self.agent_exit.is_none()
                 && let Some(status) = self.left.poll_exit()?
             {
                 // try_wait can report an exit while the last of the output is
@@ -351,18 +350,18 @@ impl App {
                 // it drained into — that is what makes the wait worth 50 ms.
                 std::thread::sleep(Duration::from_millis(50));
                 let screen = self.left.last_screen();
-                self.claude_exit = Some((status, screen));
+                self.agent_exit = Some((status, screen));
                 // The left title now says the session has ended, and on the
                 // path where abeam stays up that is the only thing announcing
                 // it.
                 redraw = true;
             }
 
-            // Claude leaving normally ends abeam with it — that is what abeam
-            // is. The exception is an open shell session: leaving kills it, and
-            // killing someone's `cargo build` because the *other* pane finished
-            // is not a decision this program gets to make on its own. So it
-            // waits, says so in the title, and Alt+Q is the answer.
+            // The agent leaving normally ends abeam with it — that is what
+            // abeam is. The exception is an open shell session: leaving kills
+            // it, and killing someone's `cargo build` because the *other* pane
+            // finished is not a decision this program gets to make on its own.
+            // So it waits, says so in the title, and Alt+Q is the answer.
             //
             // "Open", not "busy", and the difference is worth knowing: ConPTY
             // cannot be asked whether a command is running, so a shell sitting
@@ -370,7 +369,7 @@ impl App {
             // that pressing Alt+S once, early, changes how the session ends —
             // which is why the title names the shell rather than just saying
             // abeam is still here.
-            if self.claude_exit.is_some() && !self.shell.is_live() {
+            if self.agent_exit.is_some() && !self.shell.is_live() {
                 return Ok(self.finish());
             }
 
@@ -394,7 +393,7 @@ impl App {
     /// What differs is whose news earns a redraw. For the three read-only views
     /// news is rare and cheap. The shell's is neither: a `cargo build` running
     /// behind the git view makes that pane dirty on almost every pass of this
-    /// loop, and honouring it would re-render Claude's entire screen at the
+    /// loop, and honouring it would re-render the agent's entire screen at the
     /// poll rate to show nobody anything. Its output only counts while it is
     /// the view on screen — and switching back to it redraws on the keystroke
     /// that switches, so nothing is missed.
@@ -412,12 +411,12 @@ impl App {
 
     /// What to report on the way out.
     ///
-    /// `Alt+Q` after Claude has already gone is still Claude's exit — it is the
+    /// `Alt+Q` after the agent has gone is still the agent's exit — it is the
     /// same session ending, delayed by however long the shell was busy — and
     /// reporting it as a detach would throw away both the transcript `main`
     /// prints and the status code anything scripting abeam reads.
     fn finish(&mut self) -> Outcome {
-        match self.claude_exit.take() {
+        match self.agent_exit.take() {
             Some((status, screen)) => Outcome::Exited { status, screen },
             None => Outcome::Detached,
         }
@@ -510,12 +509,12 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Flow> {
         if std::mem::take(&mut self.literal_next) {
-            // To whichever pane has focus, not to Claude. The hatch exists so
-            // abeam can never permanently shadow a binding of the program you
+            // To whichever pane has focus, not to the agent. The hatch exists
+            // so abeam can never permanently shadow a binding of the program you
             // are typing at, and once the right pane can host a shell that is
-            // two programs. Sending it left regardless would deliver a keystroke
-            // into Claude while the user is looking at the shell they aimed it
-            // at, invisibly.
+            // two programs. Sending it left regardless would deliver a
+            // keystroke into the agent while the user is looking at the shell
+            // they aimed it at, invisibly.
             match self.focus {
                 Focus::Left => self.left.handle_key(key)?,
                 Focus::Right => self.right_pane().handle_key(key)?,
@@ -547,12 +546,12 @@ impl App {
                 // user is done with it — and `Handled` is the whole of that
                 // question. A live shell claims both keys by returning `Yes`
                 // and never reaches here; a shell whose child has exited
-                // declines them and lands back on Claude, which is the way out
-                // the other three views taught. A second predicate asking the
-                // pane's *type* whether it takes typing would have to be kept
-                // in sync with what its `handle_key` actually did, and would be
-                // wrong for exactly the states that matter: a dead child, and a
-                // read-only pane with a filter box open.
+                // declines them and lands back on the agent, which is the way
+                // out the other three views taught. A second predicate asking
+                // the pane's *type* whether it takes typing would have to be
+                // kept in sync with what its `handle_key` actually did, and
+                // would be wrong for exactly the states that matter: a dead
+                // child, and a read-only pane with a filter box open.
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.focus = Focus::Left;
                     return Ok(Flow::redraw());
@@ -571,8 +570,8 @@ impl App {
         match action {
             Action::Quit => {
                 // Straight out when nothing would be killed by leaving. A shell
-                // still running a command counts, even once Claude has gone —
-                // that is the whole reason abeam is still on screen.
+                // still running a command counts, even once the agent has
+                // gone — that is the whole reason abeam is still on screen.
                 if confirming || (self.left.has_exited() && !self.shell.is_live()) {
                     return Ok(Flow::Quit);
                 }
@@ -754,7 +753,7 @@ impl App {
         let left_focused = self.focus == Focus::Left;
         let left_title = if self.pending_quit {
             format!(" {} · Alt+Q again to quit ", self.left.title())
-        } else if self.claude_exit.is_some() {
+        } else if self.agent_exit.is_some() {
             // This is abeam outliving the session it exists for, which happens
             // only because a shell is open. Naming it matters: without that
             // word the window looks stuck, and the one thing the user needs to
@@ -784,9 +783,10 @@ impl App {
             self.right_pane().render(f, inner);
         }
 
-        // The real cursor sits in whichever focused pane has one — Claude, or
-        // the shell view. It is the strongest focus signal there is, because it
-        // is what a typist is already looking at, and it costs no screen space.
+        // The real cursor sits in whichever focused pane has one — the agent,
+        // or the shell view. It is the strongest focus signal there is,
+        // because it is what a typist is already looking at, and it costs no
+        // screen space.
         // The read-only views have nothing to point at and say so by returning
         // `None`, which is also what hides it while they are up.
         let (rect, at) = match self.focus {
@@ -815,7 +815,7 @@ impl App {
     /// The right pane's border text.
     ///
     /// Hints live in the border, not a status bar: rows are the scarcest
-    /// resource in a two-pane TUI and Claude's UI is hungry for them.
+    /// resource in a two-pane TUI and an agent's UI is hungry for them.
     ///
     /// The unread mark goes *first* because titles are clipped from the right.
     /// A git title with a branch name and a change count already fills a 46
@@ -862,11 +862,11 @@ impl App {
             self.last_workspace_view = view;
         }
         // Leaving a pane you were typing into for one you cannot type into
-        // hands focus back to Claude. Without this, `Alt+G` means two different
-        // things depending on where you were: "show git, keep typing at Claude"
-        // from the left, and "show git and you are now driving it" from the
-        // shell — where the next thing typed would be read as scroll keys. One
-        // keystroke, one meaning, from everywhere.
+        // hands focus back to the agent. Without this, `Alt+G` means two
+        // different things depending on where you were: "show git, keep typing
+        // at the agent" from the left, and "show git and you are now driving
+        // it" from the shell — where the next thing typed would be read as
+        // scroll keys. One keystroke, one meaning, from everywhere.
         if was_typing && !self.right_pane().takes_input() {
             self.focus = Focus::Left;
         }
@@ -1185,11 +1185,11 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_running_behind_another_view_does_not_redraw_claude() {
+    fn a_shell_running_behind_another_view_does_not_redraw_the_agent() {
         // The expensive mistake this app can make: a build running in the
         // command view while you read git, asking for a frame every time it
-        // prints a line. A frame re-renders Claude's whole screen, so that is
-        // Claude's typing latency spent on a pane nobody is looking at.
+        // prints a line. A frame re-renders the agent's whole screen, so that
+        // is the agent's typing latency spent on a pane nobody is looking at.
         let mut app = app();
         // `cmd` rather than whatever `ABEAM_SHELL` or the candidate search
         // would pick: this test is about the shell's bookkeeping, and `pwsh`
@@ -1311,7 +1311,7 @@ mod tests {
 
     #[test]
     fn the_watcher_never_moves_focus_or_switches_the_view() {
-        // The rule the whole design rests on: typing goes to Claude, and
+        // The rule the whole design rests on: typing goes to the agent, and
         // nothing that happens in the background may quietly change that.
         let mut app = app();
         app.viewer.follow(PathBuf::from("whatever.md"));
@@ -1323,19 +1323,20 @@ mod tests {
     }
 
     #[test]
-    fn esc_in_the_right_pane_gives_focus_back_and_esc_in_claude_does_not() {
+    fn esc_in_the_right_pane_gives_focus_back_and_esc_in_the_agent_does_not() {
         let mut app = app();
         // Focus only moves if there is a right pane to move to, which the last
         // drawn frame is what decides.
         screen(&mut app, 120, 24);
-        app.handle_key(alt(KeyCode::Right)).unwrap();
+        app.handle_key(key(KeyCode::F(5))).unwrap();
         assert_eq!(app.focus, Focus::Right);
 
         app.handle_key(key(KeyCode::Esc)).unwrap();
         assert_eq!(app.focus, Focus::Left);
 
-        // ...and now Esc is Claude's, as it must be: it is how you leave a
-        // Claude prompt, and abeam stealing it would be unusable.
+        // ...and now Esc is the agent's, as it must be: it is how you leave a
+        // prompt in both the agents abeam knows, and abeam stealing it would be
+        // unusable.
         app.handle_key(key(KeyCode::Esc)).unwrap();
         assert_eq!(app.focus, Focus::Left);
     }
@@ -1364,10 +1365,10 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_window_gives_the_whole_screen_to_claude() {
+    fn a_narrow_window_gives_the_whole_screen_to_the_agent() {
         let mut app = app();
         screen(&mut app, 120, 24);
-        app.handle_key(alt(KeyCode::Right)).unwrap();
+        app.handle_key(key(KeyCode::F(5))).unwrap();
         assert_eq!(app.focus, Focus::Right);
 
         // The right pane vanishes below `MIN_SPLIT_COLS`, and focus cannot be
@@ -1401,9 +1402,9 @@ mod tests {
     }
 
     #[test]
-    fn the_next_key_after_the_escape_hatch_reaches_claude_verbatim() {
-        // It must never be possible for abeam to permanently shadow a Claude
-        // binding.
+    fn the_next_key_after_the_escape_hatch_reaches_the_agent_verbatim() {
+        // It must never be possible for abeam to permanently shadow a binding
+        // of the program it is hosting, whichever one that is.
         let mut app = app();
         app.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL))
             .unwrap();
@@ -1446,7 +1447,7 @@ mod tests {
             alt(KeyCode::Char('g')),
             alt(KeyCode::Char('e')),
             alt(KeyCode::Char('z')),
-            alt(KeyCode::Right),
+            key(KeyCode::F(5)),
             key(KeyCode::F(2)),
         ] {
             app.handle_key(key(KeyCode::F(1))).unwrap();
@@ -1465,8 +1466,8 @@ mod tests {
     #[test]
     fn a_frame_is_drawn_for_events_that_changed_something_and_not_for_others() {
         // `Handled` is the redraw signal, and the loop acts on it: a frame
-        // re-renders Claude's whole screen, so a key a pane declined must not
-        // cost one. Release events matter most — Windows sends one for every
+        // re-renders the agent's whole screen, so a key a pane declined must
+        // not cost one. Release events matter most — Windows sends one for every
         // keystroke, so treating them as news doubles the frame rate of typing.
         let mut app = app();
         let redraws = |flow: Flow| matches!(flow, Flow::Continue { redraw: true });
@@ -1480,7 +1481,7 @@ mod tests {
 
         // Focused on the git view with nothing to scroll, `j` changes nothing.
         screen(&mut app, 120, 24);
-        app.handle_key(alt(KeyCode::Right)).unwrap();
+        app.handle_key(key(KeyCode::F(5))).unwrap();
         assert_eq!(app.focus, Focus::Right);
         assert!(!redraws(app.handle_event(Event::Key(key(KeyCode::Char('j')))).unwrap()));
     }
