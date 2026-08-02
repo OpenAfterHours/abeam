@@ -3,9 +3,9 @@
 One window for a Claude Code session.
 
 Claude runs in the left pane — hosted in a pty, parsed, and drawn by forge, not
-passed through to your terminal. The right pane shows either the state of the
-git worktree or the document Claude just wrote. A file watcher drives both, so
-neither has to be asked.
+passed through to your terminal. The right pane shows the state of the git
+worktree, the document Claude just wrote, or a shell to run things in. A file
+watcher drives the first two, so neither has to be asked.
 
 It replaces a three-window setup: Claude in one terminal, git in another, and an
 editor open purely to read the markdown Claude produced.
@@ -66,7 +66,8 @@ to Claude untouched.
 | Key | |
 | --- | --- |
 | `Alt+G` | right pane → git |
-| `Alt+E` | right pane → files / markdown (again to reload) |
+| `Alt+E` | right pane → files / markdown (again for the file list) |
+| `Alt+S` | right pane → a shell, **and focus it** (again to hand focus back) |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `Alt+Left` / `Alt+Right` | move focus |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
@@ -77,13 +78,20 @@ to Claude untouched.
 | `Ctrl+\` or `F12` | send the *next* key to Claude verbatim |
 
 Reading the right pane costs nothing: switching views and scrolling both work
-while Claude still has focus. You only need focus to drive a selection.
+while Claude still has focus. You only need focus to drive a selection — or to
+type, which is what `Alt+S` is for and the only reason a view key moves focus.
 
 Once the right pane *is* focused, plain keys work, deliberately the same
 vocabulary as Claude's own transcript view: `j`/`k` and arrows for a line,
 `space`/`b` and PgDn/PgUp for a page, `Ctrl+D`/`Ctrl+U` for a half page, `g`/`G`
 and Home/End for the ends, `Tab`/`Shift+Tab` for the selection, `Enter` to open,
-`r` to refresh. `Esc` or `q` hands focus back to Claude.
+`r` to refresh. `t` swaps rendered markdown for its source; in the file list,
+`/` finds a file anywhere under the root and `Backspace` goes up a directory.
+`Esc` or `q` hands focus back to Claude.
+
+The shell view is the exception, and it has to be: `Esc` and `q` belong to
+whatever is running in it. `Alt+S` or `Alt+←` is the way out, and its border
+says so rather than leaving you to find out.
 
 `Ctrl+\` exists so forge can never permanently shadow a Claude binding. If a
 future Claude release binds `Alt+G`, `Ctrl+\` then `Alt+G` still reaches it.
@@ -102,14 +110,44 @@ one in, and a deletion is a path git has just finished saying is gone. Enter
 does nothing on those, rather than trading the view you are reading for a
 viewer saying "no such file".
 
-**files** — read-only markdown and source. Markdown is rendered, not shown as
-source: headings, lists, tables, quotes, GFM alerts, footnotes, and
-syntax-highlighted fenced code. Source files get highlighting and a line-number
-gutter. Everything is pre-wrapped to the pane's exact width and scrolled by
-physical row, so jump-to-end lands where you asked. On startup it opens the
-newest markdown under the root; after that it follows what gets written. If
-something arrives while the git view is showing it waits, and the border says
-`◆ Alt+E` rather than switching under you.
+**files** — read-only markdown and source, and a way to reach any of it.
+Markdown is rendered, not shown as source: headings, lists, tables, quotes, GFM
+alerts, footnotes, and syntax-highlighted fenced code. `t` swaps that for the
+source it was rendered from, highlighted and numbered like any other file, and
+back. Source files get highlighting and a line-number gutter. Everything is
+pre-wrapped to the pane's exact width and scrolled by physical row, so
+jump-to-end lands where you asked. On startup it opens the newest markdown under
+the root; after that it follows what gets written. If something arrives while
+another view is showing it waits, and the border says `◆ Alt+E` rather than
+switching under you.
+
+A second `Alt+E` opens the **file list**: a gitignore-aware directory browser
+starting wherever the open file lives. `Enter` descends or opens, `Backspace`
+climbs — and lands on the directory you just left, so walking back up is a place
+rather than a reset. `/` finds a file by name anywhere under the root, matched
+as a subsequence over its path and ranked so a hit in the file name beats one in
+a directory name; `Esc` cancels the find and stays put, because being thrown out
+of the pane by the key that means "never mind" is the worst thing a filter box
+can do. The list is the second half of the never-switch-under-you rule: a
+document arriving from the watcher waits while you are walking a tree, exactly
+as it waits behind the git view.
+
+**shell** — `Alt+S`, and the reason it is here rather than in another window:
+`git branch`, `uv run ruff format`, `cargo test`, run in the directory forge was
+pointed at, next to the session that is about to be told what they printed. It
+is a real pty — `pwsh`, falling back to `powershell` then `cmd`, or whatever
+`FORGE_SHELL` names — started the first time the view is drawn and never before,
+so a session that never asks for one never pays for it. `Alt+J`/`Alt+K` scroll
+its history without focusing it, which is why they are not the arrow keys the
+shell would read as history. A child that exits leaves its last screen up with
+`Enter` to start another, and while it is dead `Esc` means what it means
+everywhere else.
+
+Forge will not close out from under it, either: Claude exiting holds the door
+rather than killing whatever is running, and says `shell open · Alt+Q to quit`
+in the left title. That is "open", not "busy" — ConPTY cannot be asked whether a
+command is running, so a shell sitting at a prompt holds the door exactly as a
+build does. Type `exit` in it, or `Alt+Q` twice.
 
 **pty diagnostics** (`F2`) — what the emulation layer is doing: alt-screen,
 application cursor, bracketed paste, mouse mode, byte counts, resize count, and
@@ -131,6 +169,7 @@ resize.
 ```
 crates/forge-pty/    the pty host layer: ConPTY session, input encoding, DSR
 crates/forge/        the binary: shell, layout, focus, panes
+crates/forge/tests/end_to_end.rs   forge itself, hosted in a pty and typed at
 docs/conpty-findings.md   what the spike learned. Read before touching the pty.
 docs/keymap.md            the keybinding collision audit
 ```
@@ -154,22 +193,60 @@ cargo clippy --workspace --all-targets
 Working, and used. Not finished.
 
 **Done.** The pty host layer, proven by a spike that ran a real Claude session
-against it on 2026-08-01. Both right-hand views. The watcher driving both.
+against it on 2026-08-01. All three right-hand views, the file list and the find
+under it, the rendered/source toggle, and the watcher driving what it should.
 Focus, zoom, help, the diagnostics view, and the literal-next escape hatch.
-168 tests, `clippy --all-targets` clean.
+248 tests, `clippy --all-targets` clean.
 
 **Verified how.** The whole path — pty → parser → pane, git worker → real `git`
 → rendered rows, watcher → both panes, Enter in git → open in files — is
-covered by tests that spawn a real ConPTY child and draw real frames, plus a
-smoke run of the binary hosting `cmd.exe`. What that does *not* cover is a
-human at a terminal: the six pass criteria in `docs/conpty-findings.md`
-(rendering, one character per keystroke, editing keys, live resize, paste,
-`/exit`) were confirmed against the spike's host, and have not been re-run
-against `forge` itself since the panes landed. Do that before trusting it with
-real work.
+covered by tests that spawn a real ConPTY child and draw real frames.
+
+On top of that, `crates/forge/tests/end_to_end.rs` does to forge what forge does
+to Claude: it spawns **the built binary** in a ConPTY, types at it as bytes, and
+reads the screen that comes back. That is what proves the parts no in-process
+test can reach — that forge starts at all, that raw mode and the alternate
+screen survive being someone else's child, that `Alt+S` written as `ESC s`
+becomes the binding it should, and that a command typed into the shell view runs
+in the right directory and puts its answer on screen. Three paths are pinned that
+way today: type a command in the shell and read its output; reach a file nothing
+pointed the pane at, by `Alt+E` `Alt+E` `/`; and a copy of a real shell planted
+in the repository under the name forge is about to look for, which forge must
+refuse to run. That last one is a test about an attack rather than a feature —
+Windows resolves a bare program name against the *calling* process's directory
+before it consults `PATH`, so a `pwsh.exe` committed to a cloned repo was one
+keystroke from executing. Forge now stands in `%SystemRoot%` for the whole
+session and hands its pty absolute paths only.
+
+What none of it covers is a human at a terminal. The six pass criteria in
+`docs/conpty-findings.md` (rendering, one character per keystroke, editing keys,
+live resize, paste, `/exit`) were confirmed against the spike's host and have
+not been re-run against `forge` itself since the panes landed. Do that before
+trusting it with real work.
 
 **Not done, and known.**
 
+- **The shell view has never been driven by a human.** A test types `set /a
+  123*456` into the real binary and reads `56088` back off the screen, which is
+  more than a smoke test and still less than use: the six pass criteria above
+  were confirmed against Claude in the *left* pane, and a shell in a
+  46-column right pane is not the same thing. Expect the first real `cargo test`
+  run in there to find something about width, wrapping or the scrollback that no
+  test thought to ask about.
+- **`Alt+J` is on borrowed time.** Claude has a live `app:toggleTerminal` action
+  with no default key, and its footer already prints `meta + j` as a fallback —
+  so Claude's own UI advertises a key forge has claimed. Nothing is bound today
+  and the invariant holds; the day it is bound, forge has to move.
+  `docs/keymap.md` carries the details.
+- **An npm-installed `claude` cannot be hosted.** `npm i -g` puts three files in
+  `%APPDATA%\npm`: `claude` (a POSIX shell script, no extension), `claude.cmd`
+  and `claude.ps1`. Windows starts only `.exe` and `.com` directly, so plain
+  `forge` fails at startup for those users — and the two obvious fixes are both
+  wrong: preferring the `.cmd` does not help, because `CreateProcessW` cannot
+  run that either, and going through `cmd.exe /c` hands forge's own argv to a
+  command-line re-parser that treats `&`, `|` and `^` as syntax. The native
+  installer (`claude.exe`) is unaffected. Fixing it properly is a decision about
+  how forge launches its main program, not a patch.
 - **Windows only.** Not a portability bug so much as an absence of work: nothing
   outside `forge-pty` is platform-specific, but nothing has been tried.
 - **No configuration.** Keybindings, the split ratio and the refresh interval are

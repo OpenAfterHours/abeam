@@ -11,6 +11,14 @@ portable-pty.workspace = true
 thiserror.workspace = true
 vt100.workspace = true
 
+# Job objects, for `src/job.rs`: a killed shell has to take its `cargo build`
+# with it. Not a new crate in the tree — portable-pty already depends on winapi
+# 0.3 and enables six of its modules; this asks for three more, so what changes
+# is how much of winapi compiles, not what is compiled.
+[target."cfg(windows)".dependencies.winapi]
+version = "0.3"
+features = ["handleapi", "jobapi2", "winnt"]
+
 # examples/host.rs only. The library itself stays renderer-agnostic so that a
 # consumer using something other than ratatui pays nothing for the demo.
 [dev-dependencies]

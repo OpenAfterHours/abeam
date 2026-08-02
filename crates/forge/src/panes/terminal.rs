@@ -19,15 +19,29 @@ pub struct TerminalPane {
 }
 
 impl TerminalPane {
+    /// A child and a size, for the tests that want nothing else.
+    ///
+    /// `main` used this until it acquired a working directory it had to pass —
+    /// forge now stands in `%SystemRoot%`, so a pty that is not told where to
+    /// start starts there. Test-only rather than merely unused, because a
+    /// constructor that silently accepts the process's own directory is exactly
+    /// what should no longer be reachable from the program.
+    #[cfg(test)]
     pub fn spawn(program: &str, args: &[String], rows: u16, cols: u16) -> Result<Self> {
-        let session = PtySession::spawn(
+        Self::spawn_with(
             PtyConfig::new(program)
                 .args(args.iter().cloned())
                 .size(rows, cols),
-        )?;
+        )
+    }
+
+    /// A pane from a config the caller has already built — a working directory,
+    /// extra environment, a different scrollback. The way in.
+    pub fn spawn_with(cfg: PtyConfig) -> Result<Self> {
+        let title = cfg.program.clone();
         Ok(Self {
-            session,
-            title: program.to_string(),
+            session: PtySession::spawn(cfg)?,
+            title,
             exited: None,
         })
     }
@@ -42,8 +56,43 @@ impl TerminalPane {
         Ok(self.exited.clone())
     }
 
+    /// What [`poll_exit`](Self::poll_exit) last saw, without asking the OS for
+    /// a fresh answer. A title is built on `&self` during a frame, and a frame
+    /// is not the place to make a syscall.
+    pub fn exit_status(&self) -> Option<&ExitStatus> {
+        self.exited.as_ref()
+    }
+
     pub fn has_exited(&self) -> bool {
-        self.exited.is_some()
+        self.exit_status().is_some()
+    }
+
+    // --- scrollback ------------------------------------------------------
+    //
+    // Two forwards rather than an accessor for the session. The session is
+    // private and stays private — it holds a writer shared with its reader
+    // thread and hands it to nobody — and moving the view through what has
+    // scrolled off is the only thing a pane hosting one needs from it that the
+    // `Pane` trait does not already cover.
+
+    /// How far back through the rows that have scrolled off the view is, in
+    /// rows. `0` is the live screen.
+    pub fn scrollback(&self) -> usize {
+        self.session.scrollback()
+    }
+
+    /// Move it, clamped to the history that exists. True if the view actually
+    /// moved: a pane that redraws for a key that changed nothing is spending a
+    /// frame, and a frame re-renders Claude's whole screen.
+    pub fn set_scrollback(&self, rows: usize) -> bool {
+        self.session.set_scrollback(rows)
+    }
+
+    /// The same, relative to where the view already is. Not assembled from the
+    /// two above by the caller, because the reader thread moves this offset
+    /// too — see [`PtySession::scroll_by`].
+    pub fn scroll_by(&self, delta: isize) -> bool {
+        self.session.scroll_by(delta)
     }
 
     /// The hosted program's last screen, as plain rows with the trailing blank
@@ -68,35 +117,6 @@ impl TerminalPane {
             rows.pop();
         }
         rows
-    }
-
-    /// Everything below here is the terminal pane's alone, and is reached
-    /// concretely rather than through `dyn Pane`. See the `Pane` trait.
-    pub fn handle_paste(&mut self, text: &str) -> Result<()> {
-        self.session.send_paste(text)?;
-        Ok(())
-    }
-
-    /// The only call into the pty's resize in the whole program. It is a no-op
-    /// when the size has not changed, which is what lets the app call it
-    /// unconditionally after every frame.
-    pub fn on_resize(&mut self, inner: Rect) -> Result<()> {
-        self.session.resize(inner.height, inner.width)?;
-        Ok(())
-    }
-
-    /// Pane-relative `(col, row)` of the text cursor, or `None` to hide it.
-    ///
-    /// The strongest focus signal available: if the cursor is not blinking in
-    /// Claude's prompt, your keys are not going to Claude.
-    pub fn cursor(&self) -> Option<(u16, u16)> {
-        let screen = self.session.screen();
-        if screen.hide_cursor() {
-            return None;
-        }
-        // vt100 reports (row, col); ratatui wants (x, y).
-        let (row, col) = screen.cursor_position();
-        Some((col, row))
     }
 
     /// A copy of everything the diagnostics view shows, taken on the frame that
@@ -185,5 +205,37 @@ impl Pane for TerminalPane {
         // Coordinates are already pane-relative; forge-pty stays out of the
         // question of where the pane is, and gates on what Claude enabled.
         Ok(self.session.send_mouse(ev, ev.column, ev.row)?.into())
+    }
+
+    /// Everything typed goes into the child, `Esc` and `q` included.
+    fn takes_input(&self) -> bool {
+        true
+    }
+
+    /// Pane-relative `(col, row)` of the text cursor, or `None` to hide it.
+    ///
+    /// The strongest focus signal available: if the cursor is not blinking in
+    /// Claude's prompt, your keys are not going to Claude.
+    fn cursor(&self) -> Option<(u16, u16)> {
+        let screen = self.session.screen();
+        if screen.hide_cursor() {
+            return None;
+        }
+        // vt100 reports (row, col); ratatui wants (x, y).
+        let (row, col) = screen.cursor_position();
+        Some((col, row))
+    }
+
+    /// The only call into this pty's resize in the whole program. It is a no-op
+    /// when the size has not changed, which is what lets the app call it
+    /// unconditionally after every frame.
+    fn on_resize(&mut self, inner: Rect) -> Result<()> {
+        self.session.resize(inner.height, inner.width)?;
+        Ok(())
+    }
+
+    fn handle_paste(&mut self, text: &str) -> Result<Handled> {
+        self.session.send_paste(text)?;
+        Ok(Handled::Yes)
     }
 }

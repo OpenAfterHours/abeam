@@ -23,7 +23,10 @@ mod watch;
 #[cfg(test)]
 mod testutil;
 
+use std::path::Path;
+
 use anyhow::Result;
+use forge_pty::PtyConfig;
 
 use crate::app::{App, Outcome};
 use crate::panes::TerminalPane;
@@ -36,6 +39,30 @@ fn main() -> Result<()> {
     };
 
     let root = std::env::current_dir()?;
+
+    // `forge ./tools/agent.exe` named a place, and meant it relative to where
+    // forge was run — which is about to stop being this process's directory.
+    // Resolved here, while it still means that.
+    let program = match Path::new(&program) {
+        p if p.is_relative() && p.parent().is_some_and(|d| !d.as_os_str().is_empty()) => {
+            root.join(p).to_string_lossy().into_owned()
+        }
+        _ => program,
+    };
+
+    // Then stand somewhere nobody else can write to, for the rest of the
+    // session. Every program forge starts, it starts by name, and Windows
+    // resolves a bare name in `CreateProcessW` against *this* process's current
+    // directory before it consults `PATH` — so with forge sitting in a
+    // repository, a file called `claude.exe` or `pwsh.exe` committed to that
+    // repository is what runs, with the user's full token. It costs nothing
+    // because every pty forge opens is given an explicit working directory, and
+    // it covers the panes as well as this line. A failure leaves us exactly
+    // where the program stood before, which is why it is not fatal.
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        let _ = std::env::set_current_dir(system_root);
+    }
+
     let mut terminal = term::setup()?;
 
     let result = (|| -> Result<Outcome> {
@@ -46,11 +73,15 @@ fn main() -> Result<()> {
         // making it reflow immediately.
         let inner = layout::inner(layout::split(full, false).left);
 
-        let left = TerminalPane::spawn(
-            &program,
-            &program_args,
-            inner.height.max(1),
-            inner.width.max(1),
+        let left = TerminalPane::spawn_with(
+            PtyConfig::new(&program)
+                .args(program_args.iter().cloned())
+                // Explicit, and it has to be: `PtySession::spawn` falls back to
+                // the process's own directory, and after the line above that is
+                // `%SystemRoot%`. Claude belongs in the repository it was
+                // opened on.
+                .cwd(&root)
+                .size(inner.height.max(1), inner.width.max(1)),
         )?;
         App::new(left, root).run(&mut terminal)
     })();

@@ -24,6 +24,8 @@
 //! See `examples/host.rs` for a complete ratatui host in ~130 lines.
 
 pub mod input;
+#[cfg(windows)]
+mod job;
 mod session;
 
 pub use session::{PtyConfig, PtyError, PtySession, PtyStats, ScreenGuard};

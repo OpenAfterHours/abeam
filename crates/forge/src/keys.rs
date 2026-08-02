@@ -29,6 +29,11 @@ pub enum Action {
     Quit,
     ShowGit,
     ShowViewer,
+    /// Show the command view *and* focus it — the one binding that moves focus,
+    /// because a command line you cannot type into is a picture of one. Pressed
+    /// again while it already has focus, it hands focus back, so the round trip
+    /// to run `git branch` is one key out and the same key home.
+    ShowShell,
     FocusLeft,
     FocusRight,
     /// Scroll the right pane *without focusing it* — glancing at git or at the
@@ -80,6 +85,11 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // are glancing rather than looking.
         KeyCode::Char('g') | KeyCode::Char('G') => Some(Action::ShowGit),
         KeyCode::Char('e') | KeyCode::Char('E') => Some(Action::ShowViewer),
+        // `s` for shell. Not in Claude's declared table, and not one of the
+        // four letters its undeclared readline switch handles (`b f d y`) —
+        // held to the same standard as `g` and `e`, and re-checked against the
+        // installed binary when the command view landed. See docs/keymap.md.
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ShowShell),
 
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('z') | KeyCode::Char('Z') => Some(Action::ToggleZoom),
@@ -99,7 +109,8 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
 /// Rendered by the F1 overlay. Kept next to the table so the two cannot drift.
 pub const HELP: &[(&str, &str)] = &[
     ("Alt+G", "right pane: git"),
-    ("Alt+E", "right pane: files (again to reload)"),
+    ("Alt+E", "right pane: files (again for the file list)"),
+    ("Alt+S", "right pane: a shell, focused (again to leave)"),
     ("Alt+Left / Alt+Right", "move focus"),
     ("Alt+J / Alt+K", "scroll right pane, without focusing it"),
     ("Alt+PgDn / Alt+PgUp", "page right pane, without focusing it"),
@@ -111,11 +122,19 @@ pub const HELP: &[(&str, &str)] = &[
     ("", ""),
     ("j / k, arrows", "right pane, when focused: scroll a line"),
     ("space / b, PgDn / PgUp", "scroll a page"),
+    // Claimed by `crate::scroll` in every pane, and missing from this table
+    // until the command view's scrollback made the omission load-bearing: a
+    // pane reasoning about "the keys the overlay promises" was reading a
+    // shorter list than the one the code implements.
+    ("Ctrl+D / Ctrl+U", "scroll a half page"),
     ("g / G, Home / End", "jump to top / bottom"),
     ("Tab / Shift+Tab", "next / previous item"),
-    ("Enter", "git: open the file · files: reload"),
+    ("Enter", "git: open the file · list: open · doc: reload"),
+    ("t", "files: rendered markdown / its source"),
+    ("/", "file list: find a file anywhere under the root"),
+    ("Backspace or -", "file list: up a directory"),
     ("r", "refresh"),
-    ("Esc or q", "back to Claude"),
+    ("Esc or q", "back to Claude (the shell keeps them)"),
 ];
 
 #[cfg(test)]
@@ -188,6 +207,10 @@ mod tests {
             Some(Action::ShowViewer)
         );
         assert_eq!(
+            global(&k(KeyCode::Char('s'), KeyModifiers::ALT)),
+            Some(Action::ShowShell)
+        );
+        assert_eq!(
             global(&k(KeyCode::Char('q'), KeyModifiers::ALT)),
             Some(Action::Quit)
         );
@@ -239,7 +262,7 @@ mod tests {
             assert_eq!(k.is_empty(), what.is_empty(), "half-empty help row: {k:?}");
         }
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
-        for expected in ["Alt+G", "Alt+E", "Alt+Q", "Alt+Z", "F1", "F2"] {
+        for expected in ["Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2"] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),
                 "{expected} is bound but not in the F1 overlay"

@@ -41,14 +41,16 @@ pub enum Focus {
     Right,
 }
 
-/// What the shell needs from a right-hand view.
+/// What the shell needs from a view.
 ///
-/// Deliberately only that. The terminal pane is reached concretely — it is a
-/// field, never a `dyn Pane` — so anything only it can do is an inherent method
-/// on it rather than a trait method three views would have to read and dismiss:
-/// pasting, resizing the pty, and owning the cursor are all its alone, and
-/// "only the terminal pane resizes the pty" is then a fact about the types
-/// rather than a comment asking to be believed.
+/// The last four methods used to be inherent on `TerminalPane`, on the argument
+/// that only it hosted a pty and a trait method three read-only views ignore is
+/// a trait method that lies. That argument expired when the shell view landed:
+/// there are now two panes with a live child in them, one of them reached only
+/// as `&mut dyn Pane`, and the questions "where is your cursor", "what size were
+/// you drawn at" and "do you take typing" are the shell's to ask of whichever
+/// pane is on screen. They default to the read-only answer, so a pane that has
+/// no child still says nothing about one.
 pub trait Pane {
     /// Shown in the border. Owned: every caller ends up with a `String`
     /// anyway, and the git pane rebuilds its title from live state on every
@@ -76,6 +78,93 @@ pub trait Pane {
     /// must not try to work it out.
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
         let _ = ev;
+        Ok(Handled::No)
+    }
+
+    /// A glance binding — `Alt+J`/`Alt+K`/`Alt+PgDn`/`Alt+PgUp` — arriving as
+    /// the bare key the pane would have seen had it been focused.
+    ///
+    /// In a read-only view `Down` and `Alt+J` mean the same thing, so the
+    /// default is ordinary key handling and one implementation serves both.
+    /// Where typing goes *into* the pane the two are opposites: a bare `Down`
+    /// belongs to whatever is hosted there — shell history, a filter box — and
+    /// only this path is the user asking to move the pane itself. So the
+    /// default declines rather than forwarding, and a pane that can scroll
+    /// while taking input says how. Getting this wrong is not a dead key: it is
+    /// a glance at the command view silently walking its history.
+    fn scroll_key(&mut self, key: KeyEvent) -> Result<Handled> {
+        if self.takes_input() {
+            Ok(Handled::No)
+        } else {
+            self.handle_key(key)
+        }
+    }
+
+    /// Does typing go *into* this pane, right now?
+    ///
+    /// A question about this instant, not about the type: a shell whose child
+    /// has exited takes nothing, and a read-only view with a filter box open
+    /// takes everything until the box closes.
+    ///
+    /// Two things read it, and both are about what the *user* should be told or
+    /// handed next — never about how an event is dispatched. Leaving such a
+    /// pane for one that does not take typing hands focus back to Claude, so
+    /// `Alt+G` means the same thing from everywhere. And a pane that takes
+    /// typing has somewhere for a paste to go.
+    ///
+    /// Dispatch is [`Handled`]'s job. A pane that wants a key says so by
+    /// claiming it, and no second predicate is consulted — one that could
+    /// disagree with what `handle_key` actually did would be wrong for exactly
+    /// the states above.
+    fn takes_input(&self) -> bool {
+        false
+    }
+
+    /// What the border promises as the way out, while this pane has focus.
+    ///
+    /// Not derivable from [`takes_input`](Pane::takes_input), which is why it
+    /// is asked separately: there are three answers, not two. A read-only view
+    /// gives focus back to Claude on `Esc`. A shell keeps `Esc` for its child,
+    /// so the way out is `Alt+S`. A view with a filter box open takes `Esc`
+    /// itself and gives you back the list — one press short of Claude, and a
+    /// border that said `esc→claude` there would be naming a key that does
+    /// something else.
+    ///
+    /// The border is the only place this is written down, so it has to be true
+    /// in every state the pane can be in, including the ones it passes through.
+    fn exit_hint(&self) -> &'static str {
+        " · esc→claude"
+    }
+
+    /// Pane-relative `(col, row)` of a text cursor, or `None` for no cursor.
+    ///
+    /// Drawn only while the pane has focus. It is the strongest focus signal
+    /// there is, because it is what a typist is already looking at.
+    fn cursor(&self) -> Option<(u16, u16)> {
+        None
+    }
+
+    /// The rect this pane was just drawn into, handed back after the frame.
+    ///
+    /// Only a pane with a pty behind it has anything to do here, and for those
+    /// it is the *only* honest moment to resize: the size that was drawn and
+    /// the size the child is told are then one number rather than two that can
+    /// drift. Called every frame, so an implementation must be a no-op when
+    /// nothing changed.
+    fn on_resize(&mut self, inner: Rect) -> Result<()> {
+        let _ = inner;
+        Ok(())
+    }
+
+    /// A bracketed paste, offered to whichever pane has focus.
+    ///
+    /// Offered unconditionally, and declined by returning `No` — the same
+    /// mechanism as every other event, rather than the shell deciding from
+    /// [`takes_input`](Pane::takes_input) who deserves one. That leaves room for
+    /// a read-only pane with a filter box in it, which wants a pasted path and
+    /// still wants `Esc` to mean what it means there.
+    fn handle_paste(&mut self, text: &str) -> Result<Handled> {
+        let _ = text;
         Ok(Handled::No)
     }
 }

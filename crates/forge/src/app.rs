@@ -28,6 +28,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use forge_pty::ExitStatus;
+
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -38,7 +39,7 @@ use ratatui::{Frame, Terminal};
 use crate::keys::{self, Action};
 use crate::layout as forge_layout;
 use crate::pane::{Focus, Pane};
-use crate::panes::{DiagPane, GitPane, RightView, TerminalPane, ViewerPane};
+use crate::panes::{DiagPane, GitPane, RightView, ShellPane, TerminalPane, ViewerPane};
 use crate::watch::Watch;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -77,9 +78,10 @@ pub struct App {
     left: TerminalPane,
     git: GitPane,
     viewer: ViewerPane,
+    shell: ShellPane,
     diag: DiagPane,
     right_view: RightView,
-    /// What F2 puts back. Only ever `Git` or `Viewer`.
+    /// What F2 puts back. Never `Diag`.
     last_workspace_view: RightView,
     /// One watcher for the whole app; the shell splits its output between the
     /// two panes that care. `None` if the platform would not watch, in which
@@ -93,6 +95,10 @@ pub struct App {
     /// Quitting kills a live session, so it asks twice. One bit rather than a
     /// modal dialog: any other key cancels it, which is the whole interaction.
     pending_quit: bool,
+    /// Claude's exit, and the screen it left behind, held until forge is
+    /// actually willing to go. Normally that is immediately; with a command
+    /// still running in the shell view it is when the user says so.
+    claude_exit: Option<(ExitStatus, Vec<String>)>,
     /// Whichever pane owned the last mouse press keeps drag and motion events
     /// even once the pointer leaves it. Without this, dragging a selection in
     /// Claude and crossing the divider silently retargets mid-gesture.
@@ -101,6 +107,10 @@ pub struct App {
     /// were drawn, so the two can never disagree.
     left_inner: Rect,
     right_inner: Option<Rect>,
+    /// The whole window, as of the last frame. Kept because the split is a pure
+    /// function of it: a key can ask whether there *would* be a right pane
+    /// without waiting for a frame to find out.
+    area: Rect,
 }
 
 impl App {
@@ -113,8 +123,11 @@ impl App {
 
         Self {
             left,
-            git: GitPane::new(root),
+            git: GitPane::new(root.clone()),
             viewer,
+            // No child yet. It is spawned by the first frame that draws it, so
+            // a session that never asks for a command line never pays for one.
+            shell: ShellPane::new(root, std::env::var("FORGE_SHELL").ok()),
             diag: DiagPane::new(),
             right_view: RightView::Git,
             last_workspace_view: RightView::Git,
@@ -124,9 +137,11 @@ impl App {
             help: false,
             literal_next: false,
             pending_quit: false,
+            claude_exit: None,
             mouse_owner: None,
             left_inner: Rect::ZERO,
             right_inner: None,
+            area: Rect::ZERO,
         }
     }
 
@@ -134,16 +149,38 @@ impl App {
         self.draw(terminal)?;
 
         loop {
-            if let Some(status) = self.left.poll_exit()? {
+            let mut redraw = false;
+
+            if self.claude_exit.is_none()
+                && let Some(status) = self.left.poll_exit()?
+            {
                 // try_wait can report an exit while the last of the output is
                 // still in flight. Let the reader drain, then take the screen
                 // it drained into — that is what makes the wait worth 50 ms.
                 std::thread::sleep(Duration::from_millis(50));
                 let screen = self.left.last_screen();
-                return Ok(Outcome::Exited { status, screen });
+                self.claude_exit = Some((status, screen));
+                // The left title now says the session has ended, and on the
+                // path where forge stays up that is the only thing announcing
+                // it.
+                redraw = true;
             }
 
-            let mut redraw = false;
+            // Claude leaving normally ends forge with it — that is what forge
+            // is. The exception is an open shell session: leaving kills it, and
+            // killing someone's `cargo build` because the *other* pane finished
+            // is not a decision this program gets to make on its own. So it
+            // waits, says so in the title, and Alt+Q is the answer.
+            //
+            // "Open", not "busy", and the difference is worth knowing: ConPTY
+            // cannot be asked whether a command is running, so a shell sitting
+            // at a prompt holds the door exactly as a build does. The cost is
+            // that pressing Alt+S once, early, changes how the session ends —
+            // which is why the title names the shell rather than just saying
+            // forge is still here.
+            if self.claude_exit.is_some() && !self.shell.is_live() {
+                return Ok(self.finish());
+            }
 
             if event::poll(Duration::from_millis(10))? {
                 // Drain everything pending before drawing. Windows floods
@@ -151,7 +188,7 @@ impl App {
                 // flakiest operation in the stack; one batch is one resize.
                 loop {
                     match self.handle_event(event::read()?)? {
-                        Flow::Quit => return Ok(Outcome::Detached),
+                        Flow::Quit => return Ok(self.finish()),
                         Flow::Continue { redraw: wanted } => redraw |= wanted,
                     }
                     if !event::poll(Duration::ZERO)? {
@@ -160,16 +197,51 @@ impl App {
                 }
             }
 
-            // Every pane ticks whether or not it is visible: the watcher has to
-            // notice new markdown while the git view is showing.
-            redraw |= self.left.tick();
-            redraw |= self.git.tick();
-            redraw |= self.viewer.tick();
+            redraw |= self.tick_panes();
             redraw |= self.pump();
 
             if redraw {
                 self.draw(terminal)?;
             }
+        }
+    }
+
+    /// Every pane's periodic work, and the one place that decides whether any
+    /// of it was worth a frame.
+    ///
+    /// All of them tick whether or not they are visible: the watcher has to
+    /// notice new markdown while the git view is showing, and a child has to be
+    /// able to exit behind one.
+    ///
+    /// What differs is whose news earns a redraw. For the three read-only views
+    /// news is rare and cheap. The shell's is neither: a `cargo build` running
+    /// behind the git view makes that pane dirty on almost every pass of this
+    /// loop, and honouring it would re-render Claude's entire screen at the
+    /// poll rate to show nobody anything. Its output only counts while it is
+    /// the view on screen — and switching back to it redraws on the keystroke
+    /// that switches, so nothing is missed.
+    fn tick_panes(&mut self) -> bool {
+        let mut redraw = false;
+        redraw |= self.left.tick();
+        redraw |= self.git.tick();
+        redraw |= self.viewer.tick();
+
+        let shell_dirty = self.shell.tick();
+        redraw |= shell_dirty && self.right_view == RightView::Shell;
+
+        redraw
+    }
+
+    /// What to report on the way out.
+    ///
+    /// `Alt+Q` after Claude has already gone is still Claude's exit — it is the
+    /// same session ending, delayed by however long the shell was busy — and
+    /// reporting it as a detach would throw away both the transcript `main`
+    /// prints and the status code anything scripting forge reads.
+    fn finish(&mut self) -> Outcome {
+        match self.claude_exit.take() {
+            Some((status, screen)) => Outcome::Exited { status, screen },
+            None => Outcome::Detached,
         }
     }
 
@@ -229,12 +301,22 @@ impl App {
                 self.handle_key(key)
             }
             Event::Paste(text) => {
-                // Only the terminal pane takes a paste; the right-hand views
-                // are read-only and have nowhere to put one.
-                if self.focus == Focus::Left {
-                    self.left.handle_paste(&text)?;
-                }
-                Ok(Flow::redraw())
+                // Offered to the focused pane unconditionally. The read-only
+                // views decline by returning `No` — which is the same mechanism
+                // every other event uses, and it leaves room for a pane that
+                // takes a paste into a filter box without claiming to be a
+                // terminal.
+                let handled = match self.focus {
+                    Focus::Left => self.left.handle_paste(&text)?,
+                    Focus::Right => self.right_pane().handle_paste(&text)?,
+                };
+                // A paste is a keystroke as far as the confirmation is
+                // concerned: "any other key cancels it" has to include the ones
+                // that do not arrive as keys, or Alt+Q, paste, Alt+Q quits.
+                self.pending_quit = false;
+                Ok(Flow::Continue {
+                    redraw: handled.is_yes(),
+                })
             }
             Event::Mouse(me) => {
                 self.handle_mouse(me)?;
@@ -250,7 +332,16 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Flow> {
         if std::mem::take(&mut self.literal_next) {
-            self.left.handle_key(key)?;
+            // To whichever pane has focus, not to Claude. The hatch exists so
+            // forge can never permanently shadow a binding of the program you
+            // are typing at, and once the right pane can host a shell that is
+            // two programs. Sending it left regardless would deliver a keystroke
+            // into Claude while the user is looking at the shell they aimed it
+            // at, invisibly.
+            match self.focus {
+                Focus::Left => self.left.handle_key(key)?,
+                Focus::Right => self.right_pane().handle_key(key)?,
+            };
             return Ok(Flow::redraw());
         }
 
@@ -275,7 +366,15 @@ impl App {
                     return Ok(Flow::redraw());
                 }
                 // A right pane that does not want Esc or q is telling us the
-                // user is done with it.
+                // user is done with it — and `Handled` is the whole of that
+                // question. A live shell claims both keys by returning `Yes`
+                // and never reaches here; a shell whose child has exited
+                // declines them and lands back on Claude, which is the way out
+                // the other three views taught. A second predicate asking the
+                // pane's *type* whether it takes typing would have to be kept
+                // in sync with what its `handle_key` actually did, and would be
+                // wrong for exactly the states that matter: a dead child, and a
+                // read-only pane with a filter box open.
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.focus = Focus::Left;
                     return Ok(Flow::redraw());
@@ -293,7 +392,10 @@ impl App {
     fn act(&mut self, action: Action, confirming: bool, was_helping: bool) -> Result<Flow> {
         match action {
             Action::Quit => {
-                if confirming || self.left.has_exited() {
+                // Straight out when nothing would be killed by leaving. A shell
+                // still running a command counts, even once Claude has gone —
+                // that is the whole reason forge is still on screen.
+                if confirming || (self.left.has_exited() && !self.shell.is_live()) {
                     return Ok(Flow::Quit);
                 }
                 self.pending_quit = true;
@@ -303,13 +405,38 @@ impl App {
             Action::ShowGit => self.set_right_view(RightView::Git),
             Action::ShowViewer => {
                 // Pressing it again while the viewer is already up would
-                // otherwise be a key that does nothing. Re-reading the open
-                // file is the obvious thing it should mean, and it is what `r`
-                // does from inside the pane.
+                // otherwise be a key that does nothing. It used to reload;
+                // reload is what `r` does from inside the pane and what the
+                // watcher does unasked, so the second press is now the way to
+                // the file list — the fastest route to a file nothing has
+                // pointed the pane at.
                 if self.right_view == RightView::Viewer {
-                    self.viewer.reload();
+                    self.viewer.toggle_browse();
                 }
                 self.set_right_view(RightView::Viewer);
+            }
+            Action::ShowShell => {
+                // The one action that moves focus, because a command line you
+                // have to press a second key to type into is not a command
+                // line. Pressed again from inside, it is the way home — so the
+                // whole round trip for `git branch` is Alt+S, type, Alt+S.
+                if self.right_view == RightView::Shell && self.focus == Focus::Right {
+                    self.focus = Focus::Left;
+                } else {
+                    self.set_right_view(RightView::Shell);
+                    // Asked of the layout rather than of the last frame.
+                    // `right_inner` is a frame behind, and on exactly this key
+                    // it is behind in the way that matters: `set_right_view`
+                    // has just un-zoomed, so the pane that is about to exist
+                    // does not exist yet. Taking focus optimistically and
+                    // letting the frame correct it is not good enough either —
+                    // the loop drains every pending event before drawing, so
+                    // `Alt+S` followed by a typed command in the same batch
+                    // would route those keys at a pane that will never appear.
+                    if forge_layout::split(self.area, self.zoom).right.is_some() {
+                        self.focus = Focus::Right;
+                    }
+                }
             }
             Action::ToggleDiag => {
                 let target = if self.right_view == RightView::Diag {
@@ -330,9 +457,11 @@ impl App {
             }
             Action::ScrollRight(code) => {
                 // Delivered as the bare key the pane would have seen had it
-                // been focused, so panes implement one scroll vocabulary.
+                // been focused, so panes implement one scroll vocabulary — but
+                // through `scroll_key`, so a pane with a child in it can tell
+                // this apart from the same key typed at the child.
                 let key = KeyEvent::new(code, KeyModifiers::NONE);
-                self.right_pane().handle_key(key)?;
+                self.right_pane().scroll_key(key)?;
             }
             Action::ToggleZoom => {
                 self.zoom = !self.zoom;
@@ -367,6 +496,9 @@ impl App {
             // scrolling the right pane is that it does not disturb typing.
             self.focus = target;
             self.mouse_owner = Some(target);
+            // And a click cancels a pending quit, for the same reason any other
+            // key does: the user has moved on to something else.
+            self.pending_quit = false;
         }
 
         match target {
@@ -396,14 +528,18 @@ impl App {
         // Sized from the rect that was just drawn, unconditionally, once per
         // frame. `on_resize` is a no-op when nothing changed, which is what
         // makes calling it every frame the cheap option rather than the
-        // careless one. Only the terminal pane has one: the right-hand views
+        // careless one. The views without a pty behind them ignore it and
         // learn their size inside `render`, from the same rect.
         let left_inner = self.left_inner;
         self.left.on_resize(left_inner)?;
+        if let Some(right) = self.right_inner {
+            self.right_pane().on_resize(right)?;
+        }
         Ok(())
     }
 
     fn ui(&mut self, f: &mut Frame) {
+        self.area = f.area();
         let split = forge_layout::split(f.area(), self.zoom);
         self.left_inner = forge_layout::inner(split.left);
         self.right_inner = split.right.map(forge_layout::inner);
@@ -416,6 +552,12 @@ impl App {
         let left_focused = self.focus == Focus::Left;
         let left_title = if self.pending_quit {
             format!(" {} · Alt+Q again to quit ", self.left.title())
+        } else if self.claude_exit.is_some() {
+            // Forge has outlived the session it exists for, which happens only
+            // because a shell is open. Naming it matters: without that word the
+            // window looks stuck, and the one thing the user needs to know is
+            // that something of theirs is still alive in the other pane.
+            format!(" {} · shell open · Alt+Q to quit ", self.left.title())
         } else {
             format!(" {} ", self.left.title())
         };
@@ -436,13 +578,19 @@ impl App {
             self.right_pane().render(f, inner);
         }
 
-        // The real cursor sits only in the terminal pane, and only when it has
-        // focus. It is the strongest focus signal there is, because it is what
-        // a typist is already looking at, and it costs no screen space. The
-        // right-hand views are read-only: there is nothing there to point at.
-        let rect = self.left_inner;
-        if self.focus == Focus::Left
-            && let Some((col, row)) = self.left.cursor()
+        // The real cursor sits in whichever focused pane has one — Claude, or
+        // the shell view. It is the strongest focus signal there is, because it
+        // is what a typist is already looking at, and it costs no screen space.
+        // The read-only views have nothing to point at and say so by returning
+        // `None`, which is also what hides it while they are up.
+        let (rect, at) = match self.focus {
+            Focus::Left => (self.left_inner, self.left.cursor()),
+            Focus::Right => match self.right_inner {
+                Some(r) => (r, self.right_pane_ref().cursor()),
+                None => (Rect::ZERO, None),
+            },
+        };
+        if let Some((col, row)) = at
             && rect.width > 0
             && rect.height > 0
         {
@@ -481,8 +629,12 @@ impl App {
 
         spans.push(Span::raw(self.right_pane_ref().title()));
         if focused {
+            // Asked of the pane rather than decided here. The way out differs
+            // per view and, in two of them, per state — a shell keeps `Esc` for
+            // its child until that child exits, and a filter box keeps it until
+            // the box closes. The shell cannot know any of that.
             spans.push(Span::styled(
-                " · esc→claude",
+                self.right_pane_ref().exit_hint(),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -498,9 +650,19 @@ impl App {
         // is a dead key while zoomed, which is a worse surprise than the pane
         // reappearing — that at least is visible and one keystroke to undo.
         self.zoom = false;
+        let was_typing = self.focus == Focus::Right && self.right_pane().takes_input();
         self.right_view = view;
         if view != RightView::Diag {
             self.last_workspace_view = view;
+        }
+        // Leaving a pane you were typing into for one you cannot type into
+        // hands focus back to Claude. Without this, `Alt+G` means two different
+        // things depending on where you were: "show git, keep typing at Claude"
+        // from the left, and "show git and you are now driving it" from the
+        // shell — where the next thing typed would be read as scroll keys. One
+        // keystroke, one meaning, from everywhere.
+        if was_typing && !self.right_pane().takes_input() {
+            self.focus = Focus::Left;
         }
     }
 
@@ -508,6 +670,7 @@ impl App {
         match self.right_view {
             RightView::Git => &mut self.git,
             RightView::Viewer => &mut self.viewer,
+            RightView::Shell => &mut self.shell,
             RightView::Diag => &mut self.diag,
         }
     }
@@ -516,6 +679,7 @@ impl App {
         match self.right_view {
             RightView::Git => &self.git,
             RightView::Viewer => &self.viewer,
+            RightView::Shell => &self.shell,
             RightView::Diag => &self.diag,
         }
     }
@@ -687,6 +851,128 @@ mod tests {
         app.handle_key(key(KeyCode::F(2))).unwrap();
         app.handle_key(key(KeyCode::F(2))).unwrap();
         assert_eq!(app.right_view, RightView::Git);
+    }
+
+    /// The command view is deliberately never *drawn* in these tests. Drawing
+    /// it spawns a real shell — that is the contract, spawn on first draw — and
+    /// what is under test here is the shell's routing, not the pane's child.
+    #[test]
+    fn the_command_view_takes_focus_and_the_same_key_hands_it_back() {
+        let mut app = app();
+        screen(&mut app, 120, 24);
+        assert_eq!(app.focus, Focus::Left);
+
+        // The one view key that moves focus. A command line you have to press a
+        // second key to type into is not a command line.
+        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        assert_eq!(app.right_view, RightView::Shell);
+        assert_eq!(app.focus, Focus::Right);
+
+        // ...and pressing it again is the way home, so the whole round trip for
+        // `git branch` is Alt+S, type, Alt+S.
+        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        assert_eq!(app.focus, Focus::Left);
+        assert_eq!(
+            app.right_view,
+            RightView::Shell,
+            "leaving is a focus move, not a view switch — what you ran is still there"
+        );
+
+        // From any other view it selects rather than toggles. Otherwise the
+        // press that brings the view up would be the press that leaves it.
+        app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        assert_eq!(app.right_view, RightView::Shell);
+        assert_eq!(app.focus, Focus::Right);
+    }
+
+    #[test]
+    fn focus_taken_before_the_pane_is_drawn_is_corrected_by_the_frame() {
+        // Alt+S takes focus optimistically, because the pane it un-zooms has
+        // not been drawn yet and `right_inner` still says there is nowhere to
+        // go. That is only safe because the next frame is the authority.
+        let mut app = app();
+        screen(&mut app, 120, 24);
+        app.handle_key(alt(KeyCode::Char('z'))).unwrap();
+        screen(&mut app, 120, 24);
+        assert!(app.right_inner.is_none(), "zoom hides the right pane");
+
+        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        assert!(!app.zoom, "asking for a view is asking to see it");
+        assert_eq!(app.focus, Focus::Right);
+
+        // ...and a window too narrow to draw a right pane at all takes it back,
+        // rather than leaving focus pointing at something that is not there.
+        screen(&mut app, 40, 24);
+        assert_eq!(app.focus, Focus::Left);
+    }
+
+    #[test]
+    fn a_shell_running_behind_another_view_does_not_redraw_claude() {
+        // The expensive mistake this app can make: a build running in the
+        // command view while you read git, asking for a frame every time it
+        // prints a line. A frame re-renders Claude's whole screen, so that is
+        // Claude's typing latency spent on a pane nobody is looking at.
+        let mut app = app();
+        // `cmd` rather than whatever `FORGE_SHELL` or the candidate search
+        // would pick: this test is about the shell's bookkeeping, and `pwsh`
+        // costs a second of startup to prove the same thing.
+        app.app.shell = ShellPane::new(app.dir.path().to_path_buf(), Some("cmd.exe".into()));
+
+        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        screen(&mut app, 120, 24); // the frame that spawns it
+
+        // Wait for the banner, so the pane is known to have produced output at
+        // all — otherwise the assertion below passes for the wrong reason.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !app.tick_panes() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.shell.is_live(), "the shell should be up by now");
+
+        // Now hide it, and keep it printing. Asked repeatedly rather than once
+        // because the other panes have opening news of their own — the startup
+        // walk, the first git report — and under a loaded `cargo test` there is
+        // no window this test can pick that is guaranteed to be quiet. What
+        // *is* guaranteed: if a hidden shell's output counted, every one of
+        // these would be true, because every one of them follows fresh output.
+        app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        let mut quiet = false;
+        for _ in 0..8 {
+            app.shell
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            quiet |= !app.tick_panes();
+        }
+        assert!(quiet, "a hidden shell's output must not cost a frame");
+
+        // ...and the same output does earn one when it is the view on screen,
+        // or the pane would be frozen rather than merely quiet.
+        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        app.shell
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut asked = false;
+        while !asked && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            asked = app.tick_panes();
+        }
+        assert!(asked, "a visible shell's output must ask for a frame");
+    }
+
+    #[test]
+    fn the_instrument_comes_back_to_the_command_view_too() {
+        // `last_workspace_view` records any view but the instrument itself, so
+        // F2 out of diagnostics can never land back on diagnostics — and can
+        // land on the shell, which is a place you leave a command running.
+        let mut app = app();
+        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        app.handle_key(key(KeyCode::F(2))).unwrap();
+        assert_eq!(app.right_view, RightView::Diag);
+        app.handle_key(key(KeyCode::F(2))).unwrap();
+        assert_eq!(app.right_view, RightView::Shell);
     }
 
     #[test]

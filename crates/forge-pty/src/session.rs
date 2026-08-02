@@ -160,6 +160,12 @@ pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     writer: SharedWriter,
     shared: Arc<Shared>,
+    /// Holds the child *and its descendants*, so that dropping this session
+    /// does not leave the `cargo build` it started running. `None` if the
+    /// operating system would not give us one, which leaves the session working
+    /// exactly as it did before job objects existed here. See [`crate::job`].
+    #[cfg(windows)]
+    job: Option<crate::job::Job>,
 }
 
 impl PtySession {
@@ -193,9 +199,28 @@ impl PtySession {
                 program: cfg.program.clone(),
                 source,
             })?;
-        // Dropping the slave handle is what lets the reader see EOF when the
-        // child exits. Without this the read thread hangs forever on Windows.
+        // Closes the write end on unix, where that is what lets the reader see
+        // EOF. On Windows it drops a refcount and does nothing else —
+        // `ConPtySlavePty` and `ConPtyMasterPty` share one `Arc<Mutex<Inner>>`,
+        // and EOF arrives from `ClosePseudoConsole` when the *master* goes.
+        // Correct on both; do not read it as the reason the reader thread ever
+        // finishes on the platform these tests actually run on.
         drop(pair.slave);
+
+        // Before anything can be written to the child, and before any error
+        // path can drop it: the sooner this happens the smaller the window in
+        // which a grandchild is born outside the job.
+        #[cfg(windows)]
+        let job = {
+            let job = crate::job::Job::kill_on_close();
+            if let (Some(job), Some(handle)) = (&job, child.as_raw_handle()) {
+                // Best effort. A refusal here — an ancient Windows, a job we
+                // are already in that forbids nesting — costs us the
+                // grandchildren and nothing else.
+                job.adopt(handle);
+            }
+            job
+        };
 
         let master = pair.master;
         let shared = Arc::new(Shared {
@@ -220,6 +245,8 @@ impl PtySession {
             child,
             writer,
             shared,
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -243,6 +270,59 @@ impl PtySession {
     /// without polling the screen contents.
     pub fn take_dirty(&self) -> bool {
         self.shared.dirty.swap(false, Ordering::Relaxed)
+    }
+
+    // --- scrollback ------------------------------------------------------
+
+    /// How far back through the rows that have scrolled off the view is, in
+    /// rows. `0` is the live screen.
+    pub fn scrollback(&self) -> usize {
+        self.with_screen(vt100::Screen::scrollback)
+    }
+
+    /// Move that view to an absolute distance from the live screen, clamped to
+    /// the history that actually exists — [`PtyConfig::scrollback`] is a
+    /// ceiling, not a promise, and a fresh session has nothing behind it.
+    pub fn set_scrollback(&self, rows: usize) -> bool {
+        self.move_view(|_| rows)
+    }
+
+    /// Move it *relatively*: positive is backwards, into the history.
+    ///
+    /// The relative form exists because a caller cannot safely assemble it out
+    /// of the other two. Between reading [`scrollback`](Self::scrollback) and
+    /// calling [`set_scrollback`](Self::set_scrollback) the reader thread can
+    /// take this lock, push rows, and advance the same offset itself — it does
+    /// that on purpose, so that someone who has scrolled back stays where they
+    /// are looking while output flows. A `PgUp` timed into that window would
+    /// compute its destination from a base that had already moved.
+    pub fn scroll_by(&self, delta: isize) -> bool {
+        self.move_view(|at| {
+            if delta < 0 {
+                at.saturating_sub(delta.unsigned_abs())
+            } else {
+                at.saturating_add(delta as usize)
+            }
+        })
+    }
+
+    /// The one place the offset is written, so that every move is a
+    /// read-modify-write under a single lock.
+    ///
+    /// Reports whether the view moved rather than leaving the caller to ask
+    /// again, for the same reason: the answer is only true at the instant the
+    /// lock was held. The caller is a pane deciding whether to spend a frame,
+    /// and a frame re-renders Claude's whole screen.
+    fn move_view(&self, to: impl FnOnce(usize) -> usize) -> bool {
+        let mut parser = self.shared.parser.lock().unwrap();
+        let screen = parser.screen_mut();
+        let before = screen.scrollback();
+        screen.set_scrollback(to(before));
+        let moved = screen.scrollback() != before;
+        if moved {
+            self.shared.dirty.store(true, Ordering::Relaxed);
+        }
+        moved
     }
 
     // --- input -----------------------------------------------------------
@@ -352,12 +432,20 @@ impl PtySession {
 }
 
 impl Drop for PtySession {
-    /// A dropped session must not leave a Claude process running.
+    /// A dropped session must not leave a Claude process running — nor, since
+    /// the command view landed, the `cargo build` a hosted shell started.
+    ///
+    /// The order is load-bearing. The child is terminated, then the job closed,
+    /// which takes with it every descendant `TerminateProcess` cannot reach;
+    /// only then does `master` drop, and `ClosePseudoConsole` can block while
+    /// clients are still attached, so by then there must be none.
     ///
     /// The reader thread is deliberately *not* joined. It has no reliable EOF
     /// to return from and joining it hangs the process — let it die with us.
     fn drop(&mut self) {
         let _ = self.child.kill();
+        #[cfg(windows)]
+        drop(self.job.take());
     }
 }
 

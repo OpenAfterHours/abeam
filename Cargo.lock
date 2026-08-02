@@ -532,6 +532,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tui-term",
  "vt100",
+ "winapi",
 ]
 
 [[package]]
