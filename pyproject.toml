@@ -16,6 +16,11 @@ name = "abeam"
 description = "One window for a Claude Code session: Claude hosted in a pty pane, with git, a file viewer and a shell beside it."
 readme = "README.md"
 requires-python = ">=3.9"
+# PEP 639: an SPDX expression rather than the old free-text table or a
+# `License ::` classifier, both of which that PEP deprecated. maturin emits
+# Metadata-Version 2.4, which is the one that understands it.
+license = "MIT"
+license-files = ["LICENSE"]
 # From `[workspace.package] version` in Cargo.toml. One version for the crate
 # and the wheel, and the release workflow refuses to run if the tag disagrees
 # with it.

@@ -1,8 +1,10 @@
 [package]
 name = "abeam"
-description = "A terminal multiplexer for a Claude Code workflow: Claude in one pane, git and files in the other."
+description = "A terminal multiplexer for a Claude Code workflow: Claude in one pane, git, files and a shell in the other."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true

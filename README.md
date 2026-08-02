@@ -328,3 +328,7 @@ everything, mouse reports must be gated on what the hosted app enabled, and
 `Screen::contents()` tells you nothing about layout.
 
 There are tests pinning all five. Read the document first.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
