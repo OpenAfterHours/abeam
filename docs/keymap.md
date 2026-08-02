@@ -12,6 +12,13 @@
 > is overridden by user configuration. If it ever does, this whole document is
 > describing defaults the user may not be using.
 >
+> The binary audited is a **Windows** build, and now that abeam runs on Linux
+> that is worth saying out loud rather than leaving to be inferred from the
+> path. Where Claude's own bindings are platform-conditional the inventory below
+> says so — `alt+v` for image paste, the computed `meta+m` — but a Linux build
+> has not been extracted, so "the table says so" is only as complete as one
+> platform's binary made it.
+>
 > The GitHub Copilot CLI sections at the foot of this document carry their own
 > provenance, and it is weaker. The two are not interchangeable and are kept
 > apart for that reason.
@@ -151,6 +158,16 @@ do the selected one now. None of these collides with the vocabulary above, and
 none can reach the agent: the right pane has to be focused for any of them to
 be seen.
 
+Inside the queue's composer, `Enter` commits the item and `Ctrl+Enter` or
+`Alt+Enter` puts a newline in it instead — and the first of that pair is a
+Windows fact rather than a binding. Telling `Ctrl+Enter` from a bare `Enter`
+requires the Kitty keyboard protocol, which abeam does not ask for (`term::setup`
+enables raw mode, the alternate screen, mouse capture and bracketed paste, and
+nothing else), so on most Unix terminals that arm is unreachable and what is
+left is `Alt+Enter` — itself subject to the probe below — and pasting. Asking
+for Kitty would fix it and is not a queue decision: it changes how *every* key
+in this document arrives.
+
 Arming is `a` and not `space`, which was the first implementation and was
 wrong: `space` pages, in every pane, and the table above promises it by name. A
 key that pages in three panes and toggles a mode in the fourth is a key nobody
@@ -225,9 +242,16 @@ deleteWordBefore.
   An audit reading only the documented keymap would have shipped that collision.
   Same trap for `Alt+B`, `Alt+D`, `Alt+Y`.
 
-Excluded for other reasons: `Alt+Space` (Windows system menu), `Alt+Enter`
-(Windows Terminal fullscreen), `Ctrl+Alt+*` (AltGr on non-US layouts), bare
-PageUp/PageDown (Claude's Scroll context).
+Excluded for other reasons: `Alt+Space` (the Windows system menu, and the window
+menu in most Linux desktops), `Alt+Enter` (Windows Terminal fullscreen — and on
+Linux, Copilot's own newline, which is the stronger reason of the two and is
+argued below), `Ctrl+Alt+*` (AltGr on non-US Windows layouts, where AltGr *is*
+Ctrl+Alt; on Linux AltGr is a modifier of its own and the combination is instead
+what desktop environments take for switching workspaces), bare PageUp/PageDown
+(Claude's Scroll context). Every one of them stays excluded on both platforms.
+Only the reasons differ, which is worth noticing rather than smoothing over: an
+exclusion that survives a change of platform for a *different* reason is one
+nobody should reopen on the grounds that the original reason has gone.
 
 ## Known gaps, against Claude
 
@@ -255,10 +279,19 @@ PageUp/PageDown (Claude's Scroll context).
   a grep for the literal, and this table can only be trusted for the ones spelt
   out.
 - **`Ctrl+\` is in Claude's own reserved-key table** as `severity: "error"`,
-  reason "Terminal quit signal (SIGQUIT)". Harmless on Windows — there is no
-  SIGQUIT, and abeam intercepts the key before the pty — but on a Unix port that
-  binding would signal the process group. `F12` is the alias that already covers
-  it, and that is why it exists.
+  reason "Terminal quit signal (SIGQUIT)". This entry used to end "on a Unix
+  port that binding would signal the process group". The Unix port has arrived,
+  so here is what is actually true rather than what was feared. abeam's own
+  terminal is in raw mode, and raw mode clears `ISIG`, so `Ctrl+\` does not
+  signal abeam; and abeam matches the key in `keys.rs` before anything is
+  written to the pty, so it does not reach the agent either. The one live route
+  is literal-next aimed at the key itself — `Ctrl+\` then `Ctrl+\` — which
+  writes `0x1c` into the child's pty, where a program that has *not* put that
+  pty into raw mode gets `SIGQUIT` for its foreground process group instead of a
+  keystroke. Both agents put their terminal into raw mode, so both ought to read
+  it as an ordinary byte; neither has been tried. `F12` is the alias that
+  sidesteps all of it, and this is now a better half of why it exists than the
+  AltGr layouts it was written for.
 - `Ctrl+Shift+B` (toggleBrief) and `Ctrl+Shift+C` (selection:copy) are
   **unrepresentable in legacy terminal encoding** — no byte sequence
   distinguishes them from `Ctrl+B` / `Ctrl+C`. Those two Claude features are
@@ -385,12 +418,15 @@ by nothing and is safe by the same structural argument as every other
 unmentioned key. The right pane's own `Esc` and `q` are reachable only when that
 pane has focus, so Copilot never loses them.
 
-`Alt+Enter` is Copilot's newline on Windows, and abeam already excluded it for a
-different reason (Windows Terminal fullscreen). Inside abeam that exclusion
-becomes load-bearing rather than incidental: Copilot's other newline,
-`Shift+Enter`, needs the Kitty keyboard protocol, which abeam does not
-implement, so `Alt+Enter` is the *only* way to get a newline into a Copilot
-prompt hosted here.
+`Alt+Enter` is Copilot's newline on Windows and Linux both, and abeam already
+excluded it for a reason belonging to only one of those (Windows Terminal
+fullscreen). Inside abeam that exclusion becomes load-bearing rather than
+incidental, on either platform: Copilot's other newline, `Shift+Enter`, needs
+the Kitty keyboard protocol, which abeam does not implement, so `Alt+Enter` is
+the *only* way to get a newline into a Copilot prompt hosted here. On Linux that
+also means the key has to *arrive* — an exclusion is worth nothing if the
+terminal or the desktop eats the key on its way in — which is the keyprobe's
+question and not this document's.
 
 ### Why Ink settles the function keys and unsettles the letters
 
@@ -514,15 +550,20 @@ prints, for every event crossterm reports, the `KeyCode`, the modifier set and
 the event kind; it flags any `Char` carrying ALT as one abeam would treat as an
 Alt binding, and flags a lone `Esc` as the sign that this terminal sends Alt as
 an escape prefix rather than as a modifier. Three presses of `Esc` exit. It
-answers the half of the question a strings audit cannot: what this Windows
-console actually delivers for each of the sixteen keys abeam still binds, which
-is not the same question as what Copilot would do with them. So run it first in
-the terminal abeam is launched from, to confirm every one of the sixteen arrives
-as abeam expects; then host `copilot` inside abeam and send each key through to
-it with literal-next (`Ctrl+\` or `F12`, then the key), in the prompt, in `/diff`
-and in the session picker, watching for any response. A key that is dead in all
-three views is as close to proof as this project gets without reading GitHub's
-code.
+answers the half of the question a strings audit cannot: what *this* terminal
+actually delivers for each of the sixteen keys abeam still binds, which is not
+the same question as what Copilot would do with them. **It has been run
+against Windows consoles only**, and on Linux it is the more urgent of these two
+probes rather than the lesser: whether an `Alt` combination arrives as a
+modifier, as an `Esc` prefix, or not at all because the window manager took it
+first is a question about that terminal and that desktop, and nothing found by
+reading an agent's source answers it. So run it first in the terminal abeam is
+launched from, on the platform you are on, to confirm every one of the sixteen
+arrives as abeam expects; then host `copilot` inside abeam and send each key
+through to it with literal-next (`Ctrl+\` or `F12`, then the key), in the
+prompt, in `/diff` and in the session picker, watching for any response. A key
+that is dead in all three views is as close to proof as this project gets
+without reading GitHub's code.
 
 `Alt+←` and `Alt+→` want probing too, and in the opposite direction: they are no
 longer abeam's, so what has to be confirmed is that they *arrive* — that a word
@@ -559,7 +600,18 @@ which is the whole of what abeam controls.
 - **Windows Alt handling is unsettled in Copilot itself.** Issues #1999 and
   #2424 report AltGr combinations being swallowed on German layouts, so users on
   those layouts already have Alt trouble that abeam neither causes nor can fix,
-  and that abeam will nevertheless be blamed for.
+  and that abeam will nevertheless be blamed for. Both reports are about
+  Windows, where AltGr *is* Ctrl+Alt; the Linux equivalent has not been looked
+  for, and not looked for is not the same as not there.
+- **`Ctrl+Z` has stopped being an inert line in the inventory.** Copilot's
+  prompt list carries `ctrl+z` suspend, marked *(Unix)*, and until this port
+  that annotation meant "not here". abeam does not claim the key — it encodes to
+  `0x1a` and goes to the agent like any other byte, and abeam's own terminal is
+  in raw mode so nothing suspends abeam — but what the agent does next is the
+  agent's, and untested. abeam is not a job-control shell and has no `fg`, so an
+  agent that stops itself in response stops with nothing on the abeam side able
+  to continue it; `Alt+Q` is the way out. Claude's audited inventory has no
+  `ctrl+z` at all.
 - **The Kitty keyboard protocol is the shared assumption.** Copilot uses it when
   the terminal offers it, and several of its behaviours — `Shift+Enter` for
   newline, extended key reporting — exist only on that path. abeam does not

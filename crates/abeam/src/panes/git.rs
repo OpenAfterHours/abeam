@@ -477,11 +477,19 @@ impl Row {
     /// git — the view the user is reading — to say "not a regular file" or "no
     /// such file", and leaves them there. That is a worse answer than Enter
     /// doing nothing.
+    ///
+    /// A trailing `/` and only a `/`, because every path in this module came
+    /// out of `git … -z` and git spells a separator `/` on every platform it
+    /// runs on — it is not the operating system's path syntax, it is git's.
+    /// Accepting `\` as well would therefore never match anything extra on
+    /// Windows, and on Unix would be wrong: a backslash is an ordinary byte in
+    /// a file name there, so `awkward\name` is a file this would refuse to
+    /// open on the grounds that it is a directory.
     fn openable(&self) -> Option<&str> {
         match self {
             Row::File {
                 path, gone: false, ..
-            } if !path.ends_with(['/', '\\']) => Some(path),
+            } if !path.ends_with('/') => Some(path),
             _ => None,
         }
     }
@@ -1219,9 +1227,13 @@ fn short_oid(oid: &str) -> &str {
 
 /// Just the last two components of a path — used for the *source* of a rename,
 /// where the destination is already spelled out in full next to it.
+///
+/// `/` only, for the reason [`Row::openable`] gives: these paths are git's
+/// spelling rather than the platform's, and on Unix a `\` is a byte in a name
+/// and not a separator to cut at.
 fn short_path(path: &str) -> &str {
-    match path.rsplit_once(['/', '\\']) {
-        Some((head, tail)) => match head.rsplit_once(['/', '\\']) {
+    match path.rsplit_once('/') {
+        Some((head, tail)) => match head.rsplit_once('/') {
             Some((_, mid)) => &path[path.len() - tail.len() - mid.len() - 1..],
             None => path,
         },
@@ -1537,6 +1549,26 @@ mod tests {
         assert_eq!(short_path("crates/abeam/src/panes/git.rs"), "panes/git.rs");
         assert_eq!(short_path("docs/keymap.md"), "docs/keymap.md");
         assert_eq!(short_path("README.md"), "README.md");
+    }
+
+    #[test]
+    fn a_backslash_in_a_path_is_a_character_in_a_name_and_never_a_separator() {
+        // Asserted on both platforms because the rule is git's, not the
+        // operating system's: everything this module parses came out of
+        // `git … -z`, and git spells a separator `/` wherever it runs. So `\`
+        // can only ever be a byte somebody put in a file name — legal on Unix,
+        // impossible on Windows — and cutting at one would shorten a path to
+        // something that names nothing.
+        assert_eq!(short_path(r"x/od\d/na\me.rs"), r"od\d/na\me.rs");
+
+        // The same fact, on the other side of it, and driven through the
+        // parser rather than by hand so that what is under test is a row git
+        // could really produce. A trailing `/` is how `-unormal` collapses an
+        // untracked tree into one row, and that row has nothing to open; a
+        // trailing `\` is the last character of a file name, and that row has.
+        let (listed, openable) = selectable(&z(&[r"? awkward\", "? notes/"]));
+        assert_eq!(listed, [r"awkward\", "notes/"]);
+        assert_eq!(openable, [r"awkward\"]);
     }
 
     #[test]

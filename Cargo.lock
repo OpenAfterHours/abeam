@@ -4,12 +4,13 @@ version = 4
 
 [[package]]
 name = "abeam"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "abeam-pty",
  "anyhow",
  "crossterm",
  "ignore",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "pulldown-cmark",
@@ -23,10 +24,11 @@ dependencies = [
 
 [[package]]
 name = "abeam-pty"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crossterm",
+ "libc",
  "portable-pty",
  "ratatui",
  "thiserror 2.0.19",

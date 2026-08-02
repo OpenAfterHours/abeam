@@ -1,6 +1,6 @@
 [package]
 name = "abeam-pty"
-description = "Host a child process in a pty and render it, correctly, on Windows ConPTY."
+description = "Host a child process in a pty and render it, correctly, on ConPTY or a Unix pty."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,13 +13,21 @@ portable-pty.workspace = true
 thiserror.workspace = true
 vt100.workspace = true
 
-# Job objects, for `src/job.rs`: a killed shell has to take its `cargo build`
-# with it. Not a new crate in the tree — portable-pty already depends on winapi
-# 0.3 and enables six of its modules; this asks for three more, so what changes
-# is how much of winapi compiles, not what is compiled.
+# Job objects, for `src/tree/windows.rs`: a killed shell has to take its
+# `cargo build` with it. Not a new crate in the tree — portable-pty already
+# depends on winapi 0.3 and enables six of its modules; this asks for three
+# more, so what changes is how much of winapi compiles, not what is compiled.
 [target."cfg(windows)".dependencies.winapi]
 version = "0.3"
 features = ["handleapi", "jobapi2", "winnt"]
+
+# `killpg`, for `src/tree/unix.rs`: the same requirement, answered with a
+# process group. Even less of an addition than winapi is — portable-pty depends
+# on libc unconditionally and libc has no features to ask for, so this changes
+# nothing about what compiles. It is here so that a file that calls libc says
+# so in the manifest rather than inheriting the name from a dependency.
+[target."cfg(unix)".dependencies]
+libc = "0.2"
 
 # examples/host.rs only. The library itself stays renderer-agnostic so that a
 # consumer using something other than ratatui pays nothing for the demo.

@@ -1,10 +1,16 @@
 //! A child process hosted in a pty, its output parsed into a `vt100` screen.
 //!
-//! The awkward parts of this file are not accidents. ConPTY opens a session by
-//! asking the host where the cursor is and blocks until it is answered, which
-//! forces the writer to be shared with the reader thread; and there is no
-//! reliable EOF on the master, which forces `try_wait` polling and a reader
-//! thread that is never joined. See `docs/conpty-findings.md`.
+//! The awkward parts of this file are not accidents, and they are ConPTY's.
+//! ConPTY opens a session by asking the host where the cursor is and blocks
+//! until it is answered, which forces the writer to be shared with the reader
+//! thread; and there is no reliable EOF on its master, which forces `try_wait`
+//! polling and a reader thread that is never joined. See
+//! `docs/conpty-findings.md`.
+//!
+//! A Unix pty does neither of those things, and none of it is written twice.
+//! Answering a query nobody asked costs nothing, and polling a child that could
+//! have been waited on costs a poll — one shape that is right on both platforms
+//! is worth more here than a `cfg` for each.
 
 use std::io::{self, Read, Write};
 use std::ops::Deref;
@@ -16,6 +22,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::input;
+use crate::tree::Tree;
 
 /// Errors are an enum rather than `anyhow::Error` so a caller can render "the
 /// agent is not installed" differently from an I/O failure. `anyhow` cannot be
@@ -214,7 +221,7 @@ impl Deref for ScreenGuard<'_> {
 ///
 /// Everything that could be misused is private: there is no accessor handing
 /// out the writer (the reader thread needs it to answer DSR), there is no
-/// `wait()` (under ConPTY it never returns), and there is no `kill()` — a
+/// `wait()` (see [`try_wait`](Self::try_wait)), and there is no `kill()` — a
 /// dropped session kills its child, and a second way to do it is a second way
 /// to do it while something else is still reading.
 pub struct PtySession {
@@ -224,10 +231,10 @@ pub struct PtySession {
     shared: Arc<Shared>,
     /// Holds the child *and its descendants*, so that dropping this session
     /// does not leave the `cargo build` it started running. `None` if the
-    /// operating system would not give us one, which leaves the session working
-    /// exactly as it did before job objects existed here. See [`crate::job`].
-    #[cfg(windows)]
-    job: Option<crate::job::Job>,
+    /// platform would not give us one, which leaves the session working exactly
+    /// as it did before [`crate::tree`] existed. A job object on Windows and a
+    /// process group on Unix; the same three lines of session either way.
+    tree: Option<Tree>,
 }
 
 impl PtySession {
@@ -273,19 +280,12 @@ impl PtySession {
         drop(pair.slave);
 
         // Before anything can be written to the child, and before any error
-        // path can drop it: the sooner this happens the smaller the window in
-        // which a grandchild is born outside the job.
-        #[cfg(windows)]
-        let job = {
-            let job = crate::job::Job::kill_on_close();
-            if let (Some(job), Some(handle)) = (&job, child.as_raw_handle()) {
-                // Best effort. A refusal here — an ancient Windows, a job we
-                // are already in that forbids nesting — costs us the
-                // grandchildren and nothing else.
-                job.adopt(handle);
-            }
-            job
-        };
+        // path can drop it: on Windows the sooner this happens the smaller the
+        // window in which a grandchild is born outside the job. Unix has no
+        // such window — the child made its own group before it exec'd — and the
+        // call is still made here, because one order that is right on both
+        // beats two that are each right on one.
+        let tree = Tree::holding(&*child);
 
         let master = pair.master;
         let shared = Arc::new(Shared {
@@ -311,8 +311,7 @@ impl PtySession {
             child,
             writer,
             shared,
-            #[cfg(windows)]
-            job,
+            tree,
         })
     }
 
@@ -501,9 +500,15 @@ impl PtySession {
         Ok((s.rows, s.cols))
     }
 
-    /// Non-blocking. There is deliberately no `wait()`: under ConPTY it never
-    /// returns. Output may still be in flight when this yields `Some`, so give
-    /// the reader a moment before drawing the final frame.
+    /// Non-blocking. There is deliberately no `wait()`, and the rule holds on
+    /// both platforms out of two different strengths of reason: under ConPTY
+    /// `wait()` never returns at all, and on a Unix pty it returns perfectly
+    /// well — having stopped the caller's draw loop until the agent exits. The
+    /// Windows failure is the one that taught it; the Unix one is the one that
+    /// would get called a design decision.
+    ///
+    /// Output may still be in flight when this yields `Some`, so give the
+    /// reader a moment before drawing the final frame.
     pub fn try_wait(&mut self) -> Result<Option<portable_pty::ExitStatus>, PtyError> {
         Ok(self.child.try_wait()?)
     }
@@ -538,17 +543,48 @@ impl Drop for PtySession {
     /// A dropped session must not leave the agent's process running — nor,
     /// since the command view landed, the `cargo build` a hosted shell started.
     ///
-    /// The order is load-bearing. The child is terminated, then the job closed,
-    /// which takes with it every descendant `TerminateProcess` cannot reach;
-    /// only then does `master` drop, and `ClosePseudoConsole` can block while
-    /// clients are still attached, so by then there must be none.
+    /// The order is load-bearing on both platforms, and not for the same
+    /// reason on either.
+    ///
+    /// The child is killed first. On Windows that is `TerminateProcess` and it
+    /// reaches one process; on Unix portable-pty sends `SIGHUP` first and only
+    /// escalates if the child is still there, which is worth having in that
+    /// order — `SIGHUP` is what an interactive shell answers by hanging up its
+    /// own jobs, and those live in process groups `crate::tree` cannot reach.
+    /// It also means this line can spend up to 200 ms inside portable-pty
+    /// waiting for a live child to take the hint. That is the only blocking
+    /// thing in this function, it is not ours to remove, and it is why
+    /// `crate::tree` does not put a grace period of its own on top of it.
+    ///
+    /// One thing that first step is *not* on Unix, and the port turned it into
+    /// this quietly: over there `Child::kill` is `libc::kill(pid, SIGHUP)` on a
+    /// bare pid — portable-pty 0.9.0, `src/lib.rs`, `impl ChildKiller for
+    /// std::process::Child` — sent without asking whether this process has
+    /// already reaped that pid, and [`try_wait`](Self::try_wait) is called every
+    /// frame by the host, so by the time this runs it usually has. On Windows
+    /// the same call is `TerminateProcess` on an `OwnedHandle`, and a handle
+    /// names one process for as long as it is open: it cannot come to mean
+    /// somebody else's. So this line carries exactly the pid-reuse exposure
+    /// `crate::tree`'s Unix half documents at length, on the same number and in
+    /// the same window, and it is no more fixable from here than that one is —
+    /// the fix for both is a `pidfd`, taken at spawn time, in portable-pty.
+    ///
+    /// Then the tree closes, taking with it every descendant that one signal or
+    /// one `TerminateProcess` does not: the job object's members on Windows, the
+    /// child's process group on Unix.
+    ///
+    /// Only then does `master` drop. `ClosePseudoConsole` can block while
+    /// clients are still attached, so by then there must be none; and closing
+    /// the master is what triggers the kernel's own hangup on Unix, which is to
+    /// say it is what starts emptying the group the line above wants full. Both
+    /// of the first two steps therefore happen *here*, in the body, rather than
+    /// by field order — `master` is declared first and would otherwise go first.
     ///
     /// The reader thread is deliberately *not* joined. It has no reliable EOF
     /// to return from and joining it hangs the process — let it die with us.
     fn drop(&mut self) {
         let _ = self.child.kill();
-        #[cfg(windows)]
-        drop(self.job.take());
+        drop(self.tree.take());
     }
 }
 

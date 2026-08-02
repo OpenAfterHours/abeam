@@ -18,7 +18,12 @@ name = "abeam"
 # "Not done, and known". Claude Code is what abeam is used with daily; Copilot
 # CLI is supported and has never been run. Saying so costs a clause and buys the
 # reader the thing they would otherwise find out by installing it.
-description = "One window for an AI coding session on Windows: your agent hosted in a pty pane, with git, a file viewer and a shell beside it. Built on Claude Code; GitHub Copilot CLI is supported but not yet exercised."
+#
+# Naming the two platforms is not padding either. Every wheel here is
+# platform-tagged, so for anyone on a third one the install fails in the
+# resolver with a sentence about platform tags, and this line is the last place
+# before that where they could have read which platforms there are.
+description = "One window for an AI coding session on Windows or Linux: your agent hosted in a pty pane, with git, a file viewer and a shell beside it. Built on Claude Code; GitHub Copilot CLI is supported but not yet exercised."
 readme = "README.md"
 requires-python = ">=3.9"
 # PEP 639: an SPDX expression rather than the old free-text table or a
@@ -39,13 +44,19 @@ keywords = [
     "terminal",
     "tui",
     "multiplexer",
+    "pty",
     "conpty",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
+    # Two operating systems listed rather than `OS Independent`, which would be
+    # a claim about the source and not about what PyPI is serving: every wheel
+    # is a platform-tagged binary, and these two lines are the list of platforms
+    # one exists for. They come off again if a wheel ever stops being built.
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
     "Topic :: Software Development",
     "Topic :: Terminals :: Terminal Emulators/X Terminals",

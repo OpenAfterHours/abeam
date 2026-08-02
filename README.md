@@ -31,10 +31,10 @@ not, and "Not done, and known" says exactly why and what that leaves unproven.
 ```
 
 That title is the name you chose and never the path it resolved to, which is
-why an npm-installed agent started by way of `cmd.exe` still says its own name
-rather than the interpreter's. `abeam copilot` should therefore draw `┌ copilot
-─…` in the same place — "should" because that follows from the code and from a
-test of the naming, and nobody has watched it happen.
+why an npm-installed agent started on Windows by way of `cmd.exe` says its own
+name rather than the interpreter's. `abeam copilot` should therefore draw
+`┌ copilot ─…` in the same place — "should" because that follows from the code
+and from a test of the naming, and nobody has watched it happen.
 
 ## Why this rather than wezterm + lazygit + glow
 
@@ -57,41 +57,80 @@ uv tool install abeam     # or keep it on PATH
 ```
 
 There is no Python in abeam. PyPI is the delivery van: the wheel's whole payload
-is a compiled Windows binary, so `uvx` fetches a few hundred kilobytes and runs
-it — no Rust toolchain, no build step, and nothing to compile on your machine.
+is a compiled binary, so `uvx` fetches a few hundred kilobytes and runs it — no
+Rust toolchain, no build step, and nothing to compile on your machine. Two
+wheels are published, `win_amd64` and x86-64 `manylinux`; the section after next
+says what that list leaves out, and what it does not prove about the half of it
+that is new.
 
 ## Requirements
 
-- **Windows, x86-64.** Everything works because of specific ConPTY behaviour,
-  and the pty test suites are `#![cfg(windows)]`. The code is not portable
-  today, and on another platform the tests pass by saying nothing. Only x86-64
-  wheels are published: ARM Windows would cross-compile in one line and would be
-  a binary nobody has ever run, so `uvx` reporting no matching wheel is the more
-  honest answer until someone can test it.
+- **Windows or Linux, x86-64**, which is not the same sentence as "tested on
+  both" — see **Platforms**.
 - `git` on `PATH`, for the git pane. Its absence is reported in the pane, not
   fatal.
 - **An agent to host**, which abeam does not install for you — see below for
   what each one wants.
-- Rust 1.95+ and the MSVC toolchain — **only to build from source**. Plain
-  `cargo build`, no vcvars wrapper.
+- Rust 1.95+ — **only to build from source**. On Windows that means the MSVC
+  toolchain and plain `cargo build`, with no vcvars wrapper; on Linux it means
+  whatever your distribution calls a C toolchain, because that is what supplies
+  the linker. Neither build looks for a system library.
+
+## Platforms
+
+**Windows x86-64 and Linux x86-64 are what ships, and the two are not equally
+proven.**
+
+abeam was Windows-only by construction until this version — `uvx abeam` on Linux
+found no wheel because there was none to find — and the fix was a real port
+rather than a build flag. `crates/abeam/src/launch/` is one shared question —
+where a program may be found — in front of two answers to what may then be
+started; `crates/abeam-pty/src/tree/` is one type whose `Drop` is a kill, with a
+job object behind it on Windows and a process group on Unix; the shell pane's
+candidate list is per-platform; and four places were folding case or reading `\`
+as a path separator, which is right on Windows and a correctness bug anywhere
+else. CI builds, tests and lints both targets on
+every push, which is the only reason the second one is a claim at all: a suite
+that names a platform is only ever run by that platform, and a `cfg` that
+excludes one is invisible from the other.
+
+**Nobody has driven abeam on Linux by hand.** That is the sentence to read
+before installing it there. The six manual pass criteria in
+`docs/conpty-findings.md` — renders, one character per keystroke, editing keys,
+live resize, paste, `/exit` — have been confirmed on Windows only. They
+generalise to a Unix pty without a word changing, which is why re-running them
+there is the right acceptance gate rather than a second checklist, and nobody
+has run them. Two further things are worse on Linux than on Windows and both are
+about killing children rather than starting them; "Not done, and known" says
+what they are.
+
+**macOS and both ARM targets do not ship.** The Unix half compiles for macOS and
+would probably work, and `aarch64-pc-windows-msvc` and
+`aarch64-unknown-linux-gnu` are one more matrix entry each. None of the three
+has ever been built or run by anyone on this project, and `uvx` picks a wheel
+automatically — so shipping one would mean the first person to find out it does
+not work is a user. That is the rule that already kept ARM Windows out, applied
+unchanged: `uvx` reporting no matching wheel is one line, true and immediately
+actionable. Add each target when someone can run it.
 
 ## Running it
 
 ```
 abeam                  # the default agent, in the current directory
 abeam copilot          # GitHub Copilot CLI
-abeam powershell       # anything else on PATH
+abeam bash             # anything else on PATH
 abeam claude --resume  # everything after the name belongs to the agent
 ```
 
 The first word that is not a flag is the whole of the selection. If it names an
 agent abeam knows — `claude` or `copilot`, matched without regard to case —
 abeam looks that agent's executables up on `PATH`; anything else is a program
-name and means exactly what `abeam powershell` has always meant. `ABEAM_AGENT`
-names the default for a shell where you always want the same one, and it is read
-on precisely those terms: an agent name, or any program. An empty value counts
-as unset, because PowerShell leaves one behind and `'' was not found on PATH`
-names nothing anyone can act on.
+name and means exactly what `abeam bash` or `abeam powershell` has always meant.
+`ABEAM_AGENT` names the default for a shell where you always want the same one,
+and it is read on precisely those terms: an agent name, or any program. An empty
+value counts as unset, because PowerShell leaves one behind — and so does a
+profile that exports a variable it then fails to fill — and `'' was not found on
+PATH` names nothing anyone can act on.
 
 **abeam parses its own flags only up to that first non-flag word**, and it has
 two of them: `-h`/`--help` and `-V`/`--version`. Everything from the selector
@@ -122,14 +161,16 @@ starting, and nothing else on that screen would say so.
 
 What each agent wants:
 
-- **Claude Code** — the native installer, which writes `claude.exe`, or `npm i
-  -g @anthropic-ai/claude-code`, which writes a `claude.cmd` shim. Both are
-  hostable; the shim was not until recently, and the story is under "Not done,
-  and known".
-- **GitHub Copilot CLI** — `winget install GitHub.Copilot`, or run `gh copilot`
-  once to fetch it. There is an npm package too, `@github/copilot`, but it wants
-  Node 22 or newer, which is the reason `gh copilot` is worth naming: it is the
-  route that works where the other two do not.
+- **Claude Code** — the native installer, or `npm i -g
+  @anthropic-ai/claude-code`. On Windows those write `claude.exe` and a
+  `claude.cmd` shim respectively; both are hostable, the shim was not until
+  recently, and the story is under "Not done, and known". On Linux both write
+  one extensionless file with a `#!` line on it, which abeam starts directly and
+  which has no story.
+- **GitHub Copilot CLI** — `winget install GitHub.Copilot` on Windows, `npm i -g
+  @github/copilot` on Linux, or `gh copilot` once on either to fetch it. The npm
+  package wants Node 22 or newer, which is the reason `gh copilot` is worth
+  naming: it is the route that works where the other two do not.
 
 The current directory is both the child's working directory and the root that
 the git pane and the watcher use.
@@ -235,27 +276,36 @@ as it waits behind the git view.
 **shell** — `Alt+S`, and the reason it is here rather than in another window:
 `git branch`, `uv run ruff format`, `cargo test`, run in the directory abeam was
 pointed at, next to the session that is about to be told what they printed. It
-is a real pty — `pwsh`, falling back to `powershell` then `cmd`, or whatever
-`ABEAM_SHELL` names — started the first time the view is drawn and never before,
-so a session that never asks for one never pays for it. `Alt+J`/`Alt+K` scroll
-its history without focusing it, which is why they are not the arrow keys the
-shell would read as history. A child that exits leaves its last screen up with
+is a real pty — on Windows `pwsh`, falling back to `powershell` then `cmd`; on
+Linux `$SHELL` when it is set to anything, then `bash`, then `sh`; or whatever
+`ABEAM_SHELL` names, which replaces the list rather than heading it, because a
+program you typed is a choice and falling back from it would hide the typo —
+started the first time the view is drawn and never before, so a session that
+never asks for one never pays for it. `Alt+J`/`Alt+K` scroll its history without
+focusing it, which is why they are not the arrow keys the shell would read as
+history. A child that exits leaves its last screen up with
 `Enter` to start another, and while it is dead `Esc` means what it means
 everywhere else.
 
 Nor will abeam close out from under it: the agent exiting holds the door rather
 than killing whatever is running, and says `shell open · Alt+Q to quit` in the
 left title. That is "open", not "busy" — ConPTY cannot be asked whether a
-command is running, so a shell sitting at a prompt holds the door exactly as a
-build does. Type `exit` in it, or `Alt+Q` twice.
+command is running at all, and on Unix the question has an answer abeam does not
+go and get (`tcgetpgrp` on the master says which process group holds the
+terminal in the foreground) — so on both a shell sitting at a prompt holds the
+door exactly as a build does. Type `exit` in it, or `Alt+Q` twice.
 
 **pty diagnostics** (`F2`) — what the emulation layer is doing: alt-screen,
 application cursor, bracketed paste, mouse mode, byte counts, resize count, and
 the pty and parser sizes side by side, to be compared with the pane you can see
-rather than with each other. **DSR answered** is the one that matters:
-ConPTY blocks until its opening cursor query is answered, so a red zero there
-means the session is hung rather than slow. `docs/conpty-findings.md` explains
-each field and why it is on screen.
+rather than with each other. **DSR answered** is the one that matters on
+Windows: ConPTY blocks until its opening cursor query is answered, so a red zero
+there means the session is hung rather than slow. Nothing opens a Unix pty with
+a cursor query, so there the counter reads zero for the whole of a healthy
+session and the pane neither reddens it nor says anything beside it — a
+permanent alarm would cost this view the only thing it has, which is that a red
+row means something. `docs/conpty-findings.md` explains each field and why it is
+on screen.
 
 It also reports the frame clock — frames drawn, the rate over the last second,
 and the **worst** single frame in it rather than an average, because a stutter
@@ -292,15 +342,17 @@ sequence ignores it.
 60/40 split, and below 60 columns the right pane collapses entirely rather than
 squeezing the agent into 36. The pty is sized from exactly the rect that was
 drawn, once per frame, which is also what coalesces a window drag into a single
-ConPTY resize.
+pty resize.
 
 ## Repository
 
 ```
-crates/abeam-pty/    the pty host layer: ConPTY session, input encoding, DSR
+crates/abeam-pty/    the pty host layer: sessions, input encoding, DSR
+crates/abeam-pty/src/tree/         killing a child's children, per platform
 crates/abeam/        the binary: shell, layout, focus, panes
 crates/abeam/src/agent.rs          the agents abeam knows, and how one is chosen
-crates/abeam/src/launch.rs         what may be handed to CreateProcessW
+crates/abeam/src/launch/           where a program may be found, and what may
+                                   then be started: one shared half, two others
 crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
 docs/conpty-findings.md   what the spike learned. Read before touching the pty.
 docs/keymap.md            the keybinding collision audit
@@ -316,11 +368,14 @@ Tag it and push the tag:
 git tag v0.0.1 && git push origin v0.0.1
 ```
 
-`release.yml` builds the wheel on Windows and uploads it to PyPI through
-**trusted publishing** — an OIDC exchange between GitHub and PyPI, so there is
-no API token in this repository to leak or rotate. PyPI is configured to trust
-one repository, one workflow file and one environment (`pypi`); renaming any of
-the three breaks the publish, deliberately.
+`release.yml` builds two wheels — `win_amd64` on a Windows runner, and the
+x86-64 `manylinux` one inside a manylinux container on a Linux runner, because
+the container is what fixes the wheel's glibc floor at something old rather than
+at whatever the runner image happened to ship this month — and uploads both to
+PyPI through **trusted publishing** — an OIDC exchange between GitHub and PyPI,
+so there is no API token in this repository to leak or rotate. PyPI is
+configured to trust one repository, one workflow file and one environment
+(`pypi`); renaming any of the three breaks the publish, deliberately.
 
 The version lives in `[workspace.package]` in `Cargo.toml` and nowhere else. The
 workflow refuses to run if the tag disagrees with it, because a release where
@@ -348,15 +403,42 @@ Working, and used. Not finished.
 against it on 2026-08-01. All three right-hand views, the file list and the find
 under it, the rendered/source toggle, and the watcher driving what it should.
 Focus, zoom, help, the diagnostics view, and the literal-next escape hatch.
-Agent selection and the launcher underneath it. 299 tests, and
-`clippy --all-targets` clean.
+Agent selection and the launcher underneath it. The Unix port, in the sense that
+the whole workspace builds, tests and lints clean for both
+`x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see "Platforms" for
+the sense in which it is not done. 379 tests on Windows, and
+`clippy --all-targets` clean on both.
+
+Two of those changed Windows behaviour on the way past, and both are worth
+seeing before you upgrade rather than after.
+
+**An earlier `PATH` entry holding something abeam cannot start no longer hides
+the program behind it.** A `claude.ps1` with no `.cmd` beside it, or the
+extensionless npm shim on its own, used to end the search where it sat and
+produce the error about *that* file — with a perfectly good `claude.exe` one
+`PATH` entry further along. The walk now takes two passes, the first for a file
+this platform can actually start and the second only to name something in the
+error if nothing can be, and it is the same code on both platforms because the
+question is the same one. It arrived as a Unix change: there a directory holds
+one candidate, so the preference `PATHEXT` expresses inside a directory on
+Windows had to be lifted to the walk. It has a test of its own on this platform,
+`a_file_windows_cannot_start_does_not_shadow_the_program_further_along_path`,
+because without one the whole two-pass could be deleted and every Windows test
+would still pass.
+
+**`launch/unix.rs` asks the kernel whether *this process* may execute the file**
+— `access(X_OK)` — rather than reading the mode bits, which answer "may
+anybody". A `--x------` owned by somebody else passed the old check and then
+failed at the spawn with a raw `EACCES`; it is now refused by abeam, with
+abeam's own sentence.
 
 **Verified how.** The whole path — pty → parser → pane, git worker → real `git`
 → rendered rows, watcher → both panes, Enter in git → open in files — is
-covered by tests that spawn a real ConPTY child and draw real frames.
+covered by tests that spawn a real pty child and draw real frames, on both
+platforms.
 
 On top of that, `crates/abeam/tests/end_to_end.rs` does to abeam what abeam does
-to an agent: it spawns **the built binary** in a ConPTY, types at it as bytes,
+to an agent: it spawns **the built binary** in a pty, types at it as bytes,
 and reads the screen that comes back. That is what proves the parts no in-process
 test can reach — that abeam starts at all, that raw mode and the alternate
 screen survive being someone else's child, that `Alt+S` written as `ESC s`
@@ -365,17 +447,45 @@ in the right directory and puts its answer on screen. Three paths are pinned tha
 way today: type a command in the shell and read its output; reach a file nothing
 pointed the pane at, by `Alt+E` `Alt+E` `/`; and a copy of a real shell planted
 in the repository under the name abeam is about to look for, which abeam must
-refuse to run. That last one is a test about an attack rather than a feature —
-Windows resolves a bare program name against the *calling* process's directory
-before it consults `PATH`, so a `pwsh.exe` committed to a cloned repo was one
-keystroke from executing. For the whole session abeam now stands in
-`%SystemRoot%` and hands its pty absolute paths only.
+refuse to run. That last one is a test about an attack rather than a feature, and
+the two platforms arrive at it down different roads, which is worth stating twice
+rather than generalising once. Windows resolves a bare program name against the
+*calling* process's directory before it consults `PATH`, so a `pwsh.exe`
+committed to a cloned repo was one keystroke from executing and nothing the user
+did was wrong. `execvp` has no rule of that kind, and hands the same hole back
+through `PATH` instead: a `.`, a `..`, any relative entry, and the empty string
+that a leading, trailing or doubled `:` leaves behind all name the directory the
+process is standing in, which under abeam is the repository on screen — the one
+directory in the whole question somebody else gets to write to. `PATH=:$PATH` is
+one typo, and an empty entry is what a shell profile appending to an unset `PATH`
+produces on its own, so it is not an exotic road. On both, the answer is the same
+one thing: the `PATH` walk drops every entry that is not absolute, and nothing
+leaves `launch` that is not an absolute path.
+
+**The second line of defence is not symmetric, and this document used to imply
+it was.** abeam stands in `%SystemRoot%` on Windows and in `/` on Unix for the
+whole session, and only the first of those buys anything against this hazard. On
+Windows it is real: `CreateProcessW` consults the calling process's directory
+before `PATH`, so where abeam is standing is part of the answer, and standing in
+`%SystemRoot%` is what makes it a harmless one. On Unix it buys nothing, because
+abeam never reaches `execvp`'s own `PATH` walk holding this process's directory —
+every spawn goes through `portable_pty::CommandBuilder::search_path`, which
+resolves a bare name against `PtyConfig.cwd`, and every pty abeam opens is given
+the repository on screen as its `cwd`. So a future call site that built a
+`PtyConfig` with a bare name would resolve it against the repository however far
+this process had walked from it, and `launch::resolve` returning absolute paths
+is the whole of what stands behind that. The residual value is smaller again than
+`/` suggests: `uvx abeam` inside a container commonly runs as root, where `/` is
+writable like anywhere else. The chdir stays on both because it costs nothing and
+still covers anything that does consult the process's own directory — but a Linux
+reader should not read it as a spare defence they have.
 
 What none of it covers is a human at a terminal. The six pass criteria in
 `docs/conpty-findings.md` (rendering, one character per keystroke, editing keys,
 live resize, paste, `/exit`) were confirmed against the spike's host and have
-not been re-run against `abeam` itself since the panes landed. Do that before
-trusting it with real work.
+not been re-run against `abeam` itself since the panes landed — and have never
+been run on Linux at all, against anything. Do that before trusting it with real
+work, on either platform.
 
 **Not done, and known.**
 
@@ -432,17 +542,20 @@ trusting it with real work.
   and the invariant holds; the day it is bound, abeam has to move.
   `docs/keymap.md` carries the details.
 - **An npm-installed agent is hosted now, and this README used to say it could
-  not be.** `npm i -g` puts three files in `%APPDATA%\npm`: `claude` (a POSIX
-  shell script, no extension), `claude.cmd` and `claude.ps1`. Windows starts
+  not be.** All of what follows is about Windows, and a Linux reader can stop at
+  the end of this sentence: the same install there is one file that already
+  runs, and the paragraph after this one says why that is the whole of it. `npm
+  i -g` puts three files in `%APPDATA%\npm`: `claude` (a POSIX shell script, no
+  extension), `claude.cmd` and `claude.ps1`. Windows starts
   `.exe` and `.com` and nothing else, so plain `abeam` did fail at startup for
   those users. The entry that said so also called `cmd.exe /c` one of "two
   obvious fixes [that] are both wrong", on the grounds that it hands abeam's own
   argv to a command-line re-parser treating `&`, `|` and `^` as syntax. That
   half was itself wrong, and deleting it quietly would be the worse correction.
-  `crates/abeam/src/launch.rs` routes a `.cmd` or a `.bat` by naming `cmd.exe`
-  in front of it, and going through the re-parser is safe *because* of the
-  argument quoting rather than despite it: the command line is built the way
-  Rust's own `make_bat_command_line` builds one — the fix for CVE-2024-24576,
+  `crates/abeam/src/launch/windows.rs` routes a `.cmd` or a `.bat` by naming
+  `cmd.exe` in front of it, and going through the re-parser is safe *because*
+  of the argument quoting rather than despite it: the command line is built the
+  way Rust's own `make_bat_command_line` builds one — the fix for CVE-2024-24576,
   "BatBadBut" — quoting eagerly rather than trying to enumerate `cmd`'s syntax
   and coming up one character short, doubling an embedded quote as `""` because
   that is the one spelling both `cmd` and every CRT since Visual C++ 2008 read,
@@ -474,8 +587,103 @@ trusting it with real work.
   normally reached — npm writes a `.cmd` beside both, `PATHEXT` is probed ahead
   of the bare file name, and `.PS1` is not on `PATHEXT` at all — so arriving at
   either message means the sibling that would have worked is missing.
-- **Windows only.** Not a portability bug so much as an absence of work: nothing
-  outside `abeam-pty` is platform-specific, but nothing has been tried.
+
+  **On Linux the whole of that inverts, and `launch/unix.rs` is three
+  functions.** The same `npm i -g` writes one file, extensionless, with
+  `#!/usr/bin/env node` on its first line and the execute bit set — the very
+  shape Windows cannot start at all — and the *kernel* reads that line: `execve`
+  finds the interpreter, rewrites the argument vector and starts it before any
+  of abeam's code would have had a chance to. So there is nothing to route, and
+  because there is nothing to route there is no second parser between abeam and
+  the child: nothing to quote against, no character that has to be refused
+  because it cannot be escaped, and no command-line length belonging to a shell
+  that is not running. What the platform does ask is one question — whether the
+  file may be executed at all — and a file that may not gets its own sentence
+  naming `chmod +x`, rather than the search's "was not found on PATH", which
+  would be a lie about a file the user can see with `ls`. Putting `sh -c` in
+  front of things is the obvious improvement to a module that short, and it is
+  refused for the reason the paragraph above exists: it would invent on Linux,
+  deliberately, the entire problem `windows.rs` spends four hundred lines
+  solving, in exchange for nothing.
+- **Nobody has driven abeam on Linux by hand.** CI compiles it, lints it and
+  runs the suite there on every push; the six pass criteria above have been
+  confirmed on Windows only. "Platforms" says this where somebody deciding
+  whether to install it will read it, which is the more important of the two
+  places.
+- **On Linux, killing abeam itself leaves the process tree behind.** A Windows
+  job object dies with its last handle and the handle goes when the process
+  does, so even `taskkill /f` takes the hosted shell's `cargo build` with it. A
+  process group is nobody's handle: `SIGKILL` to abeam runs no destructor, and
+  what is left is the kernel's own `SIGHUP` to the foreground process group when
+  the pty master closes. That reaches a shell sitting at a prompt. It does not
+  reach a build that ignores it. Quit with `Alt+Q`, which is the path that runs
+  the destructor.
+- **A second, narrower hole in the same place.** `killpg` signals the group the
+  child leads, and job control gives every job an interactive shell starts a
+  group of its own — so a `cargo build &` backgrounded under `bash` in the shell
+  view is outside it even when abeam exits normally. What covers the foreground
+  case is the `SIGHUP` that goes first, which a job-control shell answers by
+  hanging up its own jobs. `sh -c`, direct spawns and non-interactive shells are
+  fully covered. Windows has no equivalent gap: everything the child starts
+  joins the job with it.
+- **On Unix, abeam signals a bare pid in two places, and a pid comes round
+  again.** `tree::unix`'s `killpg` and `PtySession::drop`'s `child.kill()` both
+  take the number portable-pty handed back at spawn, and abeam's own `try_wait`
+  — called every frame — has usually already reaped it, which is what releases
+  the number to be handed out again. Windows has neither problem: a job object
+  and a process handle each name one process for as long as they are open, and
+  cannot come to mean somebody else's. What makes this reachable rather than
+  academic is that abeam deliberately outlives the hosted agent for as long as a
+  shell pane is open — so the window is however long the user leaves that pane
+  up, and it is the pane people run builds in, spawning thousands of pids
+  against a default `pid_max` of 32768. To be wrong the group has to have emptied
+  *and* the pid space to have wrapped inside that window. Nobody has hit it, a
+  distribution that has raised `pid_max` into the millions puts it back out of
+  reach, and nothing in this repository can close it: the number is the only
+  handle Unix hands back. The fix is a `pidfd` taken at spawn time, it is
+  Linux-only, and it belongs in portable-pty. `crates/abeam-pty/src/tree/unix.rs`
+  is the long version and is worth reading before anyone tries to fix it here.
+- **A marked-executable file with no `#!` line runs on glibc and not on musl.**
+  This is libc's doing rather than the kernel's — the kernel refuses the file
+  with `ENOEXEC`, and glibc's `execvp` then retries it against `/bin/sh`, in
+  `__execvpe`'s `maybe_script_execute`. musl declines to implement that retry at
+  all, as a long-standing upstream decision. So on a musl system the same file is
+  an `Exec format error`, and what the user sees is portable-pty's raw spawn
+  failure rather than one of abeam's own sentences. It has no bearing on either
+  wheel today, because the Linux wheel is `manylinux` and Alpine would find no
+  matching wheel at all; it becomes live the day a `musllinux` wheel is published
+  or somebody builds from source there. `launch/unix.rs` records it because that
+  is where the next person will look.
+- **A dispatched background task does not survive closing the terminal window on
+  Windows.** A task sent off to run beside the session — rather than typed into
+  it — is now detached into a session of its own on Linux, with `setsid` in the
+  child between `fork` and `exec`, so a `kill %1`, a shell hangup or a dropped
+  ssh leaves it running. Windows has no counterpart yet: the child inherits
+  abeam's console, and closing the window delivers `CTRL_CLOSE_EVENT` to
+  everything attached to that console and kills it after the usual grace period.
+  Raw mode does not suppress that — it clears `ENABLE_PROCESSED_INPUT`, which
+  suppresses `CTRL_C_EVENT` and nothing else. The fix is a `DETACHED_PROCESS`
+  creation flag, giving the child no console at all, and specifically *not*
+  `CREATE_NEW_PROCESS_GROUP`, because a console control event reaches every
+  process attached to the console whatever group it is in. That is a feature with
+  its own questions rather than a line to add, so for now the two platforms
+  differ and this says which way.
+- **`Ctrl+Enter` is unreachable on most Unix terminals.** Telling it from a bare
+  `Enter` needs the Kitty keyboard protocol, and abeam asks for raw mode, the
+  alternate screen, mouse capture and bracketed paste and nothing else. The one
+  place abeam distinguishes the two is the composer in the queue view, where
+  `Ctrl+Enter` puts a newline in the item being written instead of committing
+  it; on Linux that binding is mostly dead and a multi-line item has to be
+  pasted. `Alt+Enter` does the same job and probably does arrive there — which
+  is exactly the next bullet's point.
+- **The `Alt` table is unverified on Linux.** Every key in it was checked against
+  what a Windows console delivers, and `crates/abeam/examples/keyprobe.rs` exists
+  to answer precisely that question and has been run against Windows consoles
+  only. Whether an `Alt` combination arrives as a modifier, as an `Esc` prefix,
+  or not at all because the desktop took it first is a question about that
+  terminal and that desktop, and no amount of reading an agent's source answers
+  it. Run the probe in the terminal you launch abeam from before assuming the
+  table holds; `docs/keymap.md` has the procedure.
 - **Almost no configuration**, and the "almost" is two environment variables.
   Keybindings, the split ratio and both drawing intervals are constants in the
   source. `ABEAM_AGENT` names the agent — or the program — to host when the
@@ -488,9 +696,13 @@ trusting it with real work.
 - **A scrolling pane is a full repaint.** ratatui diffs by cell and has no notion
   of a scroll region, so when the agent's output scrolls, every row has changed
   and the whole pane is rewritten — about 10 KB of escape sequences, measured
-  at a 118×45 pane. Windows Terminal keeps up with that comfortably; it is
-  still the structural ceiling on how cheap a frame can get, and the thing to
-  attack next if the F2 worst-frame figure ever says the renderer is the limit.
+  at a 118×45 pane on Windows Terminal, which keeps up with it comfortably.
+  There is no Linux counterpart to that second half and this bullet does not
+  claim one: the byte count is the renderer's and does not change, but what a
+  terminal does with 10 KB many times a second is the terminal's business and no
+  Linux terminal has been measured. Either way it is the structural ceiling on
+  how cheap a frame can get, and the thing to attack next if the F2 worst-frame
+  figure ever says the renderer is the limit.
 - **No diff view.** The git pane shows *which* files changed and by how many
   lines, not what changed in them.
 - **The first source file with code in it costs a visible hitch** of 100–200 ms,
@@ -515,6 +727,28 @@ trusting it with real work.
   and starts dark — there is nowhere to persist it until there is a config file.
 - **UTF-16 files are reported as binary.** The sniff is a NUL byte in the first
   8 KiB, which is what git does.
+- **A path that is not UTF-8 breaks `launch`'s chain of custody.**
+  `PtyConfig::program` is a `String`, so a `PathBuf` that `launch` probed,
+  checked and found absolute is converted lossily on the way into the pty — and
+  a `PATH` entry that is not valid UTF-8 can therefore hand the spawn a path
+  that was never the one probed. What it produces in practice is a confusing
+  "does not exist" rather than anything worse, because a lossy rendering names a
+  *different* file rather than a hostile one. The fix is an `OsString` on that
+  field, and it is worth doing precisely because the module's whole value is
+  that nothing leaves it unchecked.
+- **A non-UTF-8 command-line argument aborts abeam before anything runs.**
+  `std::env::args()` panics on one. That is unreachable on Windows and entirely
+  reachable on Unix, where an argument is bytes; `args_os` is the fix.
+- **The reader's title and the find list spell the same path differently on
+  Windows.** The file index rewrites `\` to `/` so that typing `src/panes` finds
+  something; the reader's own label does not, so a title can read
+  `src\panes\git.rs` where the list beside it read `src/panes/git.rs`. It is
+  cosmetic, it predates the port, and it is Windows-only — on Unix both are the
+  walk's own `/`, and rewriting there would be a bug rather than a tidy-up.
+- **A Claude session record is matched by a case-insensitive `.json`.** Right on
+  Windows, wrong on Unix, where `46256.JSON` is a different file that would be
+  read as a record anyway. Nothing writes that spelling, so it is listed for
+  completeness rather than because anyone has met it.
 - **Two Claude features are unreachable inside abeam**, and both will be reported
   as abeam bugs: `Ctrl+Shift+B` and `Ctrl+Shift+C` are indistinguishable from
   `Ctrl+B` / `Ctrl+C` in legacy terminal encoding, and hold-to-talk voice needs
@@ -522,17 +756,18 @@ trusting it with real work.
   (`docs/conpty-findings.md`, constraint 3).
 - **`EnableMouseCapture` disables your terminal's native text selection.**
   Copying out of abeam needs Shift+drag, and which terminals honour that varies.
-- **A routed script agent sees an abeam variable in its environment.** The
-  command line `cmd.exe` is asked to run travels in `%ABEAM_LAUNCH%` rather
-  than on the wire, for the quoting reason above, and `cmd` is handed it as an
-  environment variable — so an npm-installed agent, and every process it goes
-  on to spawn, can read a variable abeam set, containing the full path abeam
-  resolved and the arguments it was given. Nothing is known to care, and it is
-  occasionally the fastest way to see what abeam actually ran; it is listed
-  here because a program's environment is not abeam's to write in silently, and
-  because an agent that reports its own environment somewhere would report this
-  too. Only a routed `.cmd` or `.bat` is affected — a native `claude.exe` is
-  started directly and gets no such variable.
+- **A routed script agent sees an abeam variable in its environment, on
+  Windows.** The command line `cmd.exe` is asked to run travels in
+  `%ABEAM_LAUNCH%` rather than on the wire, for the quoting reason above, and
+  `cmd` is handed it as an environment variable — so an npm-installed agent, and
+  every process it goes on to spawn, can read a variable abeam set, containing
+  the full path abeam resolved and the arguments it was given. Nothing is known
+  to care, and it is occasionally the fastest way to see what abeam actually
+  ran; it is listed here because a program's environment is not abeam's to write
+  in silently, and because an agent that reports its own environment somewhere
+  would report this too. Only a routed `.cmd` or `.bat` is affected — a native
+  `claude.exe` is started directly and gets no such variable, and on Linux
+  nothing is ever routed, so nothing is ever set.
 - **The `Alt` keys abeam claims are free** — verified against one audited Claude
   build (2026-07-25), and merely not refuted by Copilot's published tables,
   which is one claim resting on two quite different strengths of evidence. The
@@ -552,7 +787,10 @@ up and are not. The shortest version: ConPTY hangs forever if you do not answer
 its opening `ESC [ 6 n`, `wait()` never returns so only `try_wait()` is safe,
 Windows sends a Release event for every key and forwarding it double-types
 everything, mouse reports must be gated on what the hosted app enabled, and
-`Screen::contents()` tells you nothing about layout.
+`Screen::contents()` tells you nothing about layout. Three of those five are
+facts about Windows rather than about ptys, which matters now that there is a
+Unix build; the document marks which, and none of the three stops being a rule
+the code has to keep.
 
 There are tests pinning all five. Read the document first.
 

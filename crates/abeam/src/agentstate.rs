@@ -1,6 +1,6 @@
-//! What abeam can learn about the agent it is hosting, without asking it.
+﻿//! What abeam can learn about the agent it is hosting, without asking it.
 //!
-//! The queue's whole difficulty is one question — *has the agent finished?* —
+//! The queue's whole difficulty is one question â€” *has the agent finished?* â€”
 //! and the honest answers available from a pty are all bad. Output quiescence
 //! cannot tell a finished turn from one waiting on a permission prompt, and a
 //! prompt typed into that dialog is answered by its first character. Screen
@@ -10,21 +10,21 @@
 //! session under `~/.claude/sessions/<pid>.json`, rewritten as state changes:
 //!
 //! ```json
-//! {"pid":46256,"sessionId":"…","cwd":"C:\\…\\forge","version":"2.1.220",
+//! {"pid":46256,"sessionId":"â€¦","cwd":"C:\\â€¦\\forge","version":"2.1.220",
 //!  "peerProtocol":1,"kind":"interactive","name":"forge-c5","status":"busy",
 //!  "statusUpdatedAt":1785683809246}
 //! ```
 //!
 //! `status` is one of `idle`, `busy`, `waiting` and `shell` on an interactive
 //! session, which is the kind abeam hosts. That is the signal, it is exact, and
-//! it is in a *file* — which is what makes it cheap enough to re-read that
+//! it is in a *file* â€” which is what makes it cheap enough to re-read that
 //! abeam simply re-reads it, on the loop that is already running to draw the
 //! agent's screen.
 //!
 //! A watcher was the obvious alternative and it was declined. `crate::watch`
 //! runs one recursive watch of the repository root and argues for exactly one,
 //! because a second doubles the OS-level event traffic for the same
-//! information. This directory is not in the root at all — it is under the
+//! information. This directory is not in the root at all â€” it is under the
 //! user's profile, and it changes whenever *any* Claude on the machine changes
 //! status, nearly all of them nothing to do with this window. A second watcher,
 //! outside the repository, to save re-reading one small file a few times a
@@ -32,8 +32,8 @@
 //!
 //! `status` is exact about interactive sessions and about nothing else, and the
 //! difference is worth stating rather than leaving to be discovered. The same
-//! directory holds records for background agents — `claude -p --bg`, whose
-//! records spell `kind` as `"bg"` — and those carry a `status` too, often with
+//! directory holds records for background agents â€” `claude -p --bg`, whose
+//! records spell `kind` as `"bg"` â€” and those carry a `status` too, often with
 //! no `state` beside it. The `state` vocabulary (`working`, `blocked`,
 //! `failed`) is mostly a *roster* shape: `claude agents --json` is where an
 //! entry with a `state` and no `status` turns up. [`Session::readiness`] is
@@ -45,7 +45,7 @@
 //! interface and would work. It was not chosen because it asks somebody to
 //! edit their settings before a feature in front of them works at all. Reading
 //! a file that is already there asks nothing, adds nothing to the child's
-//! argument list — `crate::agent` promises that and a test pins it — and
+//! argument list â€” `crate::agent` promises that and a test pins it â€” and
 //! degrades to [`Readiness::Unknown`] rather than to a wrong answer.
 //!
 //! ## What is not promised
@@ -55,7 +55,7 @@
 //! every field is optional, an unreadable or unfamiliar record is
 //! [`Readiness::Unknown`], and `Unknown` means the queue falls back to the
 //! manual drain rather than guessing. A probe that guesses is worse than one
-//! that admits it does not know — the failure it would cause is a prompt typed
+//! that admits it does not know â€” the failure it would cause is a prompt typed
 //! into a busy agent.
 //!
 //! ## Why the record being current is the whole of the design
@@ -64,7 +64,7 @@
 //! while a permission dialog is up. That is the answer to the question this
 //! file opens with: a pty cannot tell a finished turn from a dialog, and the
 //! record can. The design is therefore sound *exactly as far as the record
-//! being read is current* — which makes everything that keeps it current
+//! being read is current* â€” which makes everything that keeps it current
 //! load-bearing, and makes anything that could hand back a record which is not
 //! the most serious kind of bug there is here. A stale one, a neighbour's, a
 //! half-written one read as though it were whole: each of those is a `status`
@@ -93,7 +93,7 @@ use crate::text::clip;
 /// refused outright and reported as [`Readiness::Unknown`], because a
 /// `peerProtocol` that is present and unfamiliar is Claude saying, in the field
 /// that exists to say it, that this record means something abeam has not been
-/// taught — and reading that hopefully is how a `status` which has come to mean
+/// taught â€” and reading that hopefully is how a `status` which has come to mean
 /// something else gets read as `idle`.
 ///
 /// A record that carries *no* `peerProtocol` is read on its other merits, and
@@ -128,7 +128,7 @@ impl Readiness {
 /// What kind of session a record describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A session somebody is typing at — including the one abeam hosts.
+    /// A session somebody is typing at â€” including the one abeam hosts.
     Interactive,
     /// A `claude -p --bg` agent.
     Background,
@@ -151,7 +151,7 @@ pub struct Session {
     /// its `serde` spelling from a JSON sample, which is exactly the guesswork
     /// this module exists to have done once. They are asserted by
     /// `the_record_claude_writes_for_a_live_session_parses_field_for_field`, so
-    /// they are covered even while they are unconsumed — which is the whole of
+    /// they are covered even while they are unconsumed â€” which is the whole of
     /// what `dead_code` is objecting to here.
     #[allow(
         dead_code,
@@ -160,7 +160,7 @@ pub struct Session {
     pub pid: Option<u32>,
     /// The short id `claude agents` uses; absent on interactive sessions.
     pub id: Option<String>,
-    /// The full session id — what `claude --resume` would want, on the day
+    /// The full session id â€” what `claude --resume` would want, on the day
     /// anything offers to reopen a dispatched task.
     #[allow(
         dead_code,
@@ -169,14 +169,14 @@ pub struct Session {
     pub session_id: Option<String>,
     pub cwd: Option<PathBuf>,
     pub kind: Kind,
-    /// `busy` / `shell` / `idle` / `waiting` — see [`Session::readiness`] for
+    /// `busy` / `shell` / `idle` / `waiting` â€” see [`Session::readiness`] for
     /// what each of them means and where the list was read from.
     ///
     /// Not one half of a partition with [`state`](Self::state), which is what
     /// these two look like and what the real records disprove twice over. A
     /// background agent's *roster* entry can carry `"status":"busy"` and
-    /// `"state":"working"` at once — and a `pid` and an `id` at once with them
-    /// — while a background agent's *record file* carries a `status` and often
+    /// `"state":"working"` at once â€” and a `pid` and an `id` at once with them
+    /// â€” while a background agent's *record file* carries a `status` and often
     /// no `state` at all. So a record may have either field, both, or neither,
     /// and [`Session::readiness`] has to say which wins. It reads this one
     /// first, because the session abeam hosts is interactive and this is the
@@ -199,9 +199,9 @@ impl Session {
     /// This session's readiness, from whichever of `status` and `state` it
     /// carries. Anything unrecognised is [`Readiness::Unknown`].
     ///
-    /// `status` is read first where a record has both — a background agent's
+    /// `status` is read first where a record has both â€” a background agent's
     /// roster entry carries `"status":"busy"` and `"state":"working"` together
-    /// — because `status` is the field the interactive record is written with,
+    /// â€” because `status` is the field the interactive record is written with,
     /// and an interactive session is what abeam hosts.
     ///
     /// ## The whole of Claude's vocabulary, and where it came from
@@ -209,7 +209,7 @@ impl Session {
     /// `status` is one of **`busy`, `shell`, `idle`, `waiting`**, and `state`
     /// is one of **`working`, `blocked`, `failed`**. Neither list is
     /// documented anywhere: they were read out of the shipped binary at version
-    /// 2.1.220, which is why they are written down here — knowledge that
+    /// 2.1.220, which is why they are written down here â€” knowledge that
     /// expensive rots silently, and the next reader deserves to find it beside
     /// the code that acts on it rather than to go and get it again. Assume it
     /// is a version behind and treat the catch-all as the real contract.
@@ -217,8 +217,8 @@ impl Session {
     /// Two of the four are the interesting ones, and both are `Unknown`:
     ///
     /// **`waiting` is the permission dialog.** It is the finding that
-    /// vindicates this module. The nightmare in the header — a queued prompt
-    /// arriving at a dialog and being answered by its first character — cannot
+    /// vindicates this module. The nightmare in the header â€” a queued prompt
+    /// arriving at a dialog and being answered by its first character â€” cannot
     /// happen through a record that says `waiting`, because `waiting` is not
     /// `idle` and abeam only ever sends on `idle`. That is exactly what a pty
     /// could not tell us, and it is the reason a file is read at all.
@@ -227,7 +227,7 @@ impl Session {
     /// so `Busy` would be a lie, but what is in front of the keyboard is a
     /// shell: a prompt sent then goes to `bash`, not to Claude. `Unknown` is
     /// therefore the right answer rather than a shrug, and it is the one place
-    /// where `Unknown` costs a reader something — the queue stops draining and
+    /// where `Unknown` costs a reader something â€” the queue stops draining and
     /// cannot say why, because [`Readiness`] has three variants and no room for
     /// "not now, and here is the reason". Worth a fourth variant on the day
     /// anything wants to explain itself.
@@ -239,9 +239,11 @@ impl Session {
     /// `Idle`, and the queue falls back to its manual drain, which is the right
     /// place for a decision somebody is already standing in front of.
     pub fn readiness(&self) -> Readiness {
-        // Case-insensitively, like every other name abeam matches on this
-        // platform, and without lowercasing a copy of a word it is only
-        // comparing.
+        // Case-insensitively, because what is being matched is Claude's own
+        // vocabulary in a record it wrote and not a name on a filesystem â€”
+        // where whether case folds is the platform's business and
+        // [`spelling`]'s, and on Unix the answer is that it does not. And
+        // without lowercasing a copy of a word it is only comparing.
         match self.status.as_deref() {
             Some(word) if word.eq_ignore_ascii_case("idle") => Readiness::Idle,
             Some(word) if word.eq_ignore_ascii_case("busy") => Readiness::Busy,
@@ -249,7 +251,7 @@ impl Session {
             // though all three answers are the same word. What the catch-all
             // says is "abeam has never heard of this"; what these two say is
             // "abeam knows exactly what this is, and it is still not a
-            // permission to type" — and only one of those survives Claude
+            // permission to type" â€” and only one of those survives Claude
             // adding a fifth status.
             Some(word) if word.eq_ignore_ascii_case("waiting") => Readiness::Unknown,
             Some(word) if word.eq_ignore_ascii_case("shell") => Readiness::Unknown,
@@ -273,17 +275,46 @@ impl Session {
 pub fn sessions_dir() -> Option<PathBuf> {
     sessions_dir_from(
         std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-        // `USERPROFILE` first because it is the variable Windows itself sets
-        // and the one Claude's own path is built from. `HOME` is behind it
-        // rather than absent because a machine can have both — git-bash and
-        // MSYS set `HOME`, sometimes to a POSIX-shaped path that names nothing
-        // a Windows program ever wrote to — so it is the fallback for the
-        // machine that has only that one, not a second opinion about a machine
-        // that has both.
-        std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(PathBuf::from),
+        home(),
     )
+}
+
+/// The profile directory `.claude` sits in, from the variable this platform's
+/// Claude built its own path out of.
+///
+/// Two functions rather than one list of variables, because the same list read
+/// in the same order is right on one platform and wrong on the other, and the
+/// wrong answer is not a missing directory â€” it is a *different* directory,
+/// which is how abeam ends up reading somebody's session records from
+/// somewhere they were never written.
+///
+/// On Windows `USERPROFILE` is the variable the system sets and the one Claude
+/// is installed under. `HOME` is behind it rather than absent because a machine
+/// can have both: git-bash and MSYS set `HOME`, sometimes to a POSIX-shaped
+/// path that names nothing a Windows program ever wrote to. So it is the
+/// fallback for the machine that has only that one, not a second opinion about
+/// a machine that has both.
+#[cfg(windows)]
+fn home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// `HOME` and nothing else, which is `USERPROFILE` dropped rather than demoted.
+///
+/// A Linux process can have a `USERPROFILE` in its environment and it never
+/// means anything good: WSL's interop exports the Windows environment into
+/// Linux shells in some configurations, so the variable arrives naming
+/// `C:\Users\someone` â€” a string with no meaning to this kernel â€” or its
+/// `/mnt/c` spelling, which is a real directory that no Linux Claude has ever
+/// written a session record into. Behind `HOME` it would be harmless and
+/// unreachable; in front of it, on exactly the machines where it is set, it
+/// would beat the only variable that is right. A fallback that cannot be
+/// correct is not a fallback, so there is one variable here.
+#[cfg(unix)]
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// The directory itself, over the two variables handed in rather than read.
@@ -291,21 +322,58 @@ pub fn sessions_dir() -> Option<PathBuf> {
 /// Split out for the reason `crate::launch::interpreter_from` is: the process
 /// environment belongs to the whole test binary, and a test that set
 /// `CLAUDE_CONFIG_DIR` to prove it is honoured would be setting it for the two
-/// hundred tests running beside it — several of which spawn children that
+/// hundred tests running beside it â€” several of which spawn children that
 /// inherit it.
 fn sessions_dir_from(config: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
-    // A blank variable counts as unset, which is `crate::agent`'s rule for
-    // `ABEAM_AGENT` and is here for a sharper version of the same reason:
-    // PowerShell leaves `$env:CLAUDE_CONFIG_DIR = ""` behind when somebody
-    // clears it, and joining `sessions` onto nothing names a *relative*
-    // directory — which is looked for inside the repository on screen.
-    let dir = match config.filter(|dir| !dir.as_os_str().is_empty()) {
-        Some(config) => config.join("sessions"),
-        None => home?.join(".claude").join("sessions"),
-    };
+    let dir = sessions_path_from(config, home)?;
     // `is_dir` rather than `exists`: what the caller does next is a `read_dir`,
     // and a file of that name is not somewhere to read records from.
     dir.is_dir().then_some(dir)
+}
+
+/// Which directory those two variables name, before anything asks whether it is
+/// there.
+///
+/// Split from the check above so that the rule below can be tested at all.
+/// Whether the directory exists is a fact about the machine running the suite,
+/// and the failure this rule prevents is invisible through it: a *relative*
+/// path is only ever found on a machine that happens to have one beside the
+/// test binary. The path is the whole of the decision, so the path is what the
+/// test asserts.
+fn sessions_path_from(config: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    // Absolute or not at all â€” both variables, for one reason, and the rule is
+    // absoluteness rather than mere blankness because blank is only the loudest
+    // way of being relative.
+    //
+    // What a relative one costs: joining onto it leaves a relative directory,
+    // so the `is_dir` above stops being a question about anybody's profile and
+    // becomes one about wherever this process is standing, which `main` has
+    // deliberately moved to `%SystemRoot%` or `/`. A `/.claude/sessions`
+    // belonging to somebody else would then become the search space for the
+    // record that decides whether a queued prompt may be typed â€” which is the
+    // one decision in this module that must never be made about the wrong
+    // agent.
+    //
+    // Both shapes really do arrive. PowerShell leaves
+    // `$env:CLAUDE_CONFIG_DIR = ""` behind when somebody clears it; a container
+    // or a service unit can export an empty `HOME`, which on Unix is the only
+    // variable there is; and a `CLAUDE_CONFIG_DIR=.claude` typed relative to a
+    // repository is an ordinary enough mistake to make. That last one is worth
+    // refusing rather than following even though it names something: Claude
+    // resolves it against *its* working directory, which is the repository, and
+    // abeam would resolve the same string against `/`. Two different
+    // directories from one variable is not a case to guess in, and the safe
+    // guess is to have no directory at all â€” `Readiness::Unknown` costs a
+    // keystroke, and the other answer costs somebody's prompt going to the
+    // wrong session.
+    //
+    // The same rule, and for the same reason, as `crate::launch::find`'s
+    // refusal of a relative program path.
+    let dir = match config.filter(|dir| dir.is_absolute()) {
+        Some(config) => config.join("sessions"),
+        None => home.filter(|dir| dir.is_absolute())?.join(".claude").join("sessions"),
+    };
+    Some(dir)
 }
 
 /// The readiness probe abeam holds for the whole session.
@@ -321,13 +389,13 @@ pub struct Probe {
     /// The file the search settled on, so that the search runs about once per
     /// session instead of once per frame.
     ///
-    /// A path and nothing else — deliberately not a `Session`, and that is what
+    /// A path and nothing else â€” deliberately not a `Session`, and that is what
     /// makes it a cache that cannot go stale. What is remembered is *where to
     /// look*, which is a fact about the machine and changes about never; what
     /// is read is the file, every time, and it is checked against
     /// [`Probe::is_mine`] every time. A remembered path that has stopped being
-    /// ours — the file gone, a pid handed to a Claude in another repository, a
-    /// dispatched background agent written over it — is thrown away and the
+    /// ours â€” the file gone, a pid handed to a Claude in another repository, a
+    /// dispatched background agent written over it â€” is thrown away and the
     /// search runs again. So the memory can be wrong for exactly one read, and
     /// that read is the one that notices.
     found: Option<PathBuf>,
@@ -337,11 +405,14 @@ impl Probe {
     /// `pid` is the child abeam spawned, when it knows it.
     ///
     /// It is not always the right pid, and that is the reason for the fallback
-    /// below: with a native install abeam starts `claude.exe` and holds its
-    /// pid, but an npm install is a `claude.cmd` routed through `cmd.exe`
+    /// below: on Windows a native install has abeam start `claude.exe` and hold
+    /// its pid, but an npm install is a `claude.cmd` routed through `cmd.exe`
     /// (`crate::launch`), so the pid abeam holds is the interpreter's and the
-    /// record is written by its child. `spawned_at` is milliseconds since the
-    /// epoch, taken as close to the spawn as the caller can manage.
+    /// record is written by its child. Nothing is routed anywhere on Unix â€” the
+    /// kernel runs a `#!` script itself â€” so the pid is the agent's own there,
+    /// and the fallback is what covers a machine that has put a wrapper script
+    /// in the way. `spawned_at` is milliseconds since the epoch, taken as close
+    /// to the spawn as the caller can manage.
     pub fn new(root: PathBuf, pid: Option<u32>, spawned_at: u64) -> Self {
         Self {
             dir: sessions_dir(),
@@ -359,7 +430,7 @@ impl Probe {
     /// anything that holds a `Probe` can only ever observe
     /// [`Readiness::Unknown`], which is the one answer that is indistinguishable
     /// from the feature being deleted. `#[cfg(test)]` and `pub` for the same
-    /// reason `GitPane::stub_open_request` is — reachable from any test in the
+    /// reason `GitPane::stub_open_request` is â€” reachable from any test in the
     /// crate, and not part of what abeam ships.
     #[cfg(test)]
     pub fn over(dir: PathBuf, root: PathBuf, pid: Option<u32>, spawned_at: u64) -> Self {
@@ -376,21 +447,22 @@ impl Probe {
     /// `(kind, cwd, started_at)` where it does not.
     ///
     /// Those three are checked on the pid path too. The pid is a shortcut past
-    /// the *search*, not past the evidence — Windows hands the same number out
-    /// again, and the file it names may be a dead session's.
+    /// the *search*, not past the evidence â€” every operating system abeam runs
+    /// on hands the same number out again eventually, and the file it names may
+    /// be a dead session's.
     ///
     /// The fallback must not match a *different* interactive session in the
-    /// same directory — there are usually several — so it takes the one whose
+    /// same directory â€” there are usually several â€” so it takes the one whose
     /// `startedAt` is nearest to, and not before, abeam's own spawn.
     ///
     /// **What this costs, and why it takes `&mut self`.** In the steady state,
-    /// one `read_to_string` of one small file — on both installs. Getting there
-    /// is what the `&mut` is for: the first call runs the search, which on an
-    /// npm install (where the pid abeam holds is `cmd.exe`'s) is a `read_dir`
-    /// plus a read and a parse of every `*.json` in a directory that grows with
-    /// every session the user has ever started. Paying that on the loop that
-    /// draws the agent's screen, several times a second, for the whole session,
-    /// is the thing [`Probe::found`] exists to stop.
+    /// one `read_to_string` of one small file â€” on both installs. Getting there
+    /// is what the `&mut` is for: the first call runs the search, which on a
+    /// Windows npm install (where the pid abeam holds is `cmd.exe`'s) is a
+    /// `read_dir` plus a read and a parse of every `*.json` in a directory that
+    /// grows with every session the user has ever started. Paying that on the
+    /// loop that draws the agent's screen, several times a second, for the
+    /// whole session, is the thing [`Probe::found`] exists to stop.
     ///
     /// It is not a cache of the answer. The file is read on every call and
     /// checked on every call; what is remembered is only which file to read.
@@ -403,7 +475,7 @@ impl Probe {
         // written is *our* file, mid-rewrite, so there is nothing to look for
         // and nowhere better to look. The answer is `Unknown` for that poll and
         // the next one reads a whole file. A record that has *gone*, or that
-        // has stopped being ours, is a different matter — the memory is wrong,
+        // has stopped being ours, is a different matter â€” the memory is wrong,
         // so it is dropped and the search runs again below.
         match self.found.as_deref().map(record) {
             Some(Record::Read(session)) if self.is_mine(&session) => return Some(session),
@@ -422,27 +494,29 @@ impl Probe {
         Some(session)
     }
 
-    /// Where the record is, when nothing is remembered — and the record, since
+    /// Where the record is, when nothing is remembered â€” and the record, since
     /// finding it means reading it.
     fn search(&self) -> Option<(PathBuf, Session)> {
         let dir = self.dir.as_deref()?;
 
         // The pid first, because when it is the right pid it is the only answer
         // here that cannot be confused by a second window on the same
-        // repository — and with a native install it is the right pid.
+        // repository â€” and with a native install it is the right pid.
         //
         // It is checked against the other three facts all the same, and that is
-        // not belt and braces. Windows recycles pids: a Claude that died
+        // not belt and braces. Pids are reused on both platforms â€” Windows
+        // hands a number back out as soon as it is free, and a Linux counter
+        // wraps round at `pid_max` and does the same â€” so a Claude that died
         // without tidying up leaves its record behind, and the number naming it
-        // eventually names something else — abeam's own child, on a machine
-        // that has been up a while. The file would then be a dead session's,
+        // eventually names something else: abeam's own child, on a machine that
+        // has been up a while. The file would then be a dead session's,
         // its `status` frozen at whatever it last was, and a frozen `idle` is
         // not a stale reading. It is a queued prompt typed into a mid-turn
         // agent, on every item, for the whole session.
         //
         // So: our repository (`is_here`), an interactive session rather than a
-        // dispatched `claude -p --bg` — which runs with our `cwd` and so passes
-        // that check on its own — and started no earlier than abeam did, which
+        // dispatched `claude -p --bg` â€” which runs with our `cwd` and so passes
+        // that check on its own â€” and started no earlier than abeam did, which
         // is the only one of the three that can tell a stale record in *this*
         // repository from the live one. That last check is what covers the
         // window between the spawn and Claude writing its own record over the
@@ -451,7 +525,7 @@ impl Probe {
         // A record that fails any of them falls through to the search below
         // rather than to `Unknown`, and that is where the clock skew between
         // abeam's stamp and Claude's is handled. `procStart` is the field that
-        // would settle the whole question outright — see [`Wire`] for why it is
+        // would settle the whole question outright â€” see [`Wire`] for why it is
         // not here.
         if let Some(pid) = self.pid {
             let path = dir.join(format!("{pid}.json"));
@@ -459,7 +533,7 @@ impl Probe {
                 Record::Read(session) if self.is_mine(&session) => return Some((path, session)),
                 // A file that is *there* and did not parse is not permission to
                 // go looking for a different one. Our own record is exactly the
-                // one that goes unreadable — Claude rewrites it in place, so a
+                // one that goes unreadable â€” Claude rewrites it in place, so a
                 // read can land mid-write, and a `peerProtocol` bump makes ours
                 // unreadable while an older session's in the same repository
                 // stays readable. Falling through would then answer with that
@@ -473,7 +547,7 @@ impl Probe {
 
         // And when the pid is not the answer: everything in the directory,
         // narrowed to what could be the session on screen. `kind` and `cwd` are
-        // cheap and rule out most of it — a background agent is never what
+        // cheap and rule out most of it â€” a background agent is never what
         // abeam hosts, and a session in another repository is somebody else's
         // window.
         let mut unreadable = false;
@@ -507,7 +581,7 @@ impl Probe {
             return None;
         }
 
-        // Of the candidates, the earliest start at or after abeam's own — the
+        // Of the candidates, the earliest start at or after abeam's own â€” the
         // session abeam caused. One that started earlier was already running
         // when abeam began, and one that started later is a window somebody
         // opened afterwards.
@@ -518,7 +592,7 @@ impl Probe {
             // ...and when nothing is at or after it, the newest there is.
             // abeam's stamp comes from `SystemTime::now` on this side of the
             // spawn and Claude's from its own clock a moment later, so a few
-            // milliseconds either way is ordinary — and an exact-or-later rule
+            // milliseconds either way is ordinary â€” and an exact-or-later rule
             // that found nothing would leave the queue permanently `Unknown`
             // over a rounding difference. A record with no `startedAt` at all
             // sorts below every record that has one, so it wins only when it is
@@ -547,13 +621,14 @@ impl Probe {
     /// Everything a record has to be before this probe will answer with it.
     ///
     /// Asked by the pid shortcut, which is taking a record on the strength of a
-    /// number Windows hands out again, and asked of the remembered path on
-    /// every single read, which is what keeps that memory honest.
+    /// number the operating system will hand out again, and asked of the
+    /// remembered path on every single read, which is what keeps that memory
+    /// honest.
     ///
     /// It cannot catch everything, and the gap is worth naming: a record that
     /// is replaced by a *later* interactive session in the same repository
     /// passes all three checks, because all three are true of it. Nothing short
-    /// of `procStart` separates those two — see [`Wire`] — and the search has
+    /// of `procStart` separates those two â€” see [`Wire`] â€” and the search has
     /// the same blind spot, so the memory is no worse than the thing it stands
     /// in for.
     fn is_mine(&self, session: &Session) -> bool {
@@ -575,7 +650,7 @@ impl Probe {
 
 /// Every session Claude currently knows about, live and finished.
 ///
-/// **Blocking** — it starts a process. Call it from a worker thread, never
+/// **Blocking** â€” it starts a process. Call it from a worker thread, never
 /// from `Pane::tick` (`crate::pane`, and `docs/conpty-findings.md`
 /// constraint 2).
 ///
@@ -594,13 +669,16 @@ pub fn roster(root: &Path) -> Result<Vec<Session>> {
         .map(|arg| (*arg).to_string())
         .collect();
 
-    // Never `Command::new("claude")`. A bare name reaching `CreateProcessW` is
-    // resolved against *this* process's current directory before Windows
-    // consults `PATH`, so a `claude.exe` committed to the repository on screen
-    // would be what ran, with the user's full token. `crate::launch` is the
-    // module that exists to stop that, and it is also what turns an npm
-    // `claude.cmd` — which `CreateProcessW` cannot start at all — into
-    // something that runs.
+    // Never `Command::new("claude")`. On Windows a bare name reaching
+    // `CreateProcessW` is resolved against *this* process's current directory
+    // before `PATH` is consulted, so a `claude.exe` committed to the repository
+    // on screen would be what ran, with the user's full token. `crate::launch`
+    // is the module that exists to stop that, and it is also what turns an npm
+    // `claude.cmd` â€” which `CreateProcessW` cannot start at all â€” into
+    // something that runs. Neither hazard exists on Unix, where `execvp` reads
+    // `PATH` and nothing else, but the resolution goes through the same module
+    // there: one code path that is right everywhere beats two, one of which is
+    // only ever exercised by half the machines.
     //
     // Resolved *with* these arguments rather than with none, which is what
     // [`crate::launch::Launch::args`] documents: for a routed `.cmd` the
@@ -617,7 +695,7 @@ pub fn roster(root: &Path) -> Result<Vec<Session>> {
 ///
 /// Split out for the reason `crate::launch::interpreter_from` and
 /// `crate::agent::resolve_within` are, and for a sharper version of it: the
-/// rule below — *a non-zero exit is forgiven when the output still parses* — is
+/// rule below â€” *a non-zero exit is forgiven when the output still parses* â€” is
 /// an argument about a program that may not be on the machine at all, so
 /// against the real `claude` it is either untestable or untested depending on
 /// who runs the suite. Handed a `Launch`, it can be proved against a `.cmd`
@@ -657,10 +735,10 @@ fn ask(launch: &Launch, root: &Path) -> Result<Vec<Session>> {
 pub fn parse_roster(json: &str) -> Result<Vec<Session>> {
     // Through `Value` rather than straight into `Vec<Wire>`, so that one entry
     // abeam cannot read does not cost the reader the other four. That is not
-    // hypothetical: the roster is already three shapes today — a background
+    // hypothetical: the roster is already three shapes today â€” a background
     // agent carries `id` and `state` and may have no `pid` or `status` at all,
     // an interactive one carries `status` and no `state`, and a background
-    // agent that is running carries both — and it is the list of every agent on
+    // agent that is running carries both â€” and it is the list of every agent on
     // the machine, so the oddest one is somebody else's.
     let entries: Vec<serde_json::Value> = serde_json::from_str(json)
         .context("`claude agents --json` did not print an array of sessions")?;
@@ -687,13 +765,13 @@ pub fn parse_session(json: &str) -> Option<Session> {
 /// an edit here and nothing anywhere else.
 ///
 /// Every field is optional, and none of them is `#[serde(deny_unknown_fields)]`
-/// — a record that has grown a field abeam has never heard of is still a
+/// â€” a record that has grown a field abeam has never heard of is still a
 /// record. `procStart`, `version`, `entrypoint`, `nameSource`, `updatedAt` and
 /// `statusUpdatedAt` are all in the real record and none of them is read below.
 ///
 /// One of those six is worth naming, so that the next person does not have to
-/// rediscover it. `procStart` — `"procStart":"639212808652473350"`, an 18-digit
-/// process-start stamp, delivered as a *string* rather than a number — is the
+/// rediscover it. `procStart` â€” `"procStart":"639212808652473350"`, an 18-digit
+/// process-start stamp, delivered as a *string* rather than a number â€” is the
 /// canonical Windows answer to pid recycling: a pid identifies a process only
 /// alongside the time it started, which is why `Probe::session` has to check a
 /// `cwd` instead. It is absent from this struct because abeam cannot use it
@@ -712,7 +790,7 @@ struct Wire {
     status: Option<String>,
     state: Option<String>,
     started_at: Option<u64>,
-    /// The one field this module refuses a record over — see
+    /// The one field this module refuses a record over â€” see
     /// [`Wire::into_session`].
     peer_protocol: Option<u64>,
 }
@@ -722,13 +800,13 @@ impl Wire {
     /// abeam may read.
     ///
     /// Lenient about an absent `peerProtocol` and strict about a mismatched
-    /// one, which is not the same rule twice — [`PEER_PROTOCOL`] is where that
+    /// one, which is not the same rule twice â€” [`PEER_PROTOCOL`] is where that
     /// asymmetry is argued, and the real roster is the evidence for it.
     ///
     /// ## Why a record that names no session is not a record
     ///
     /// `{}` is valid JSON and every field on it is optional, so without the
-    /// second check it would parse — into a session with no pid, no id and no
+    /// second check it would parse â€” into a session with no pid, no id and no
     /// status. That is a row in the roster describing nothing and a
     /// probe answering about nobody, which is worse than an empty list in both
     /// places. All three names are accepted because the roster's own entries
@@ -749,7 +827,7 @@ impl Wire {
             kind: kind_of(self.kind.as_deref()),
             status: self.status,
             // Kept as the strings they arrived as. `status` and `state` are
-            // Claude's vocabulary and it is longer than abeam's — mapping them
+            // Claude's vocabulary and it is longer than abeam's â€” mapping them
             // to an enum here would mean throwing away the word before anything
             // has had a chance to show it.
             state: self.state,
@@ -763,8 +841,8 @@ impl Wire {
 /// site is one that eventually disagrees with itself.
 ///
 /// **A background agent is `"bg"` on disk and `"background"` in the roster.**
-/// The record file gets the raw word — the vocabulary is `interactive`, `bg`,
-/// `daemon` and `daemon-worker` — and `claude agents --json` renames it on the
+/// The record file gets the raw word â€” the vocabulary is `interactive`, `bg`,
+/// `daemon` and `daemon-worker` â€” and `claude agents --json` renames it on the
 /// way out. Both spellings therefore have to be here, and only one of them is
 /// ever written to a file: matching `"background"` alone made [`Kind`] a thing
 /// only the roster could produce, so every record file on the machine came back
@@ -789,7 +867,7 @@ fn kind_of(word: Option<&str>) -> Kind {
 /// Three answers rather than two, because the two failures are not the same
 /// failure and reading them alike is a bug this module has already had. A file
 /// that is not there says nothing about the session abeam hosts. A file that is
-/// there and cannot be read says there is a session abeam cannot see — and it
+/// there and cannot be read says there is a session abeam cannot see â€” and it
 /// is very likely *ours*, because ours is the one being rewritten while we read
 /// it and the one a `peerProtocol` bump would refuse first.
 enum Record {
@@ -803,7 +881,7 @@ enum Record {
 /// One record file.
 ///
 /// A failure is ordinary rather than exceptional here: Claude rewrites the
-/// record in place — `readFile` then `writeFile`, with no temp-and-rename — so
+/// record in place â€” `readFile` then `writeFile`, with no temp-and-rename â€” so
 /// a read landing mid-write sees half of it, and that is likeliest at exactly
 /// the moment the status is changing. Either failure becomes
 /// [`Readiness::Unknown`], the queue waits, and the next poll reads a whole
@@ -822,7 +900,7 @@ fn record(path: &Path) -> Record {
 ///
 /// `<pid>.json`, and nothing else counts. The question being asked is "could
 /// this unreadable file have been ours", and the file name is the only part of
-/// it left to ask — the contents are what failed. Anything Claude drops in this
+/// it left to ask â€” the contents are what failed. Anything Claude drops in this
 /// directory that is not named for a process is not a session record, and its
 /// being unreadable says nothing about the session on screen.
 fn is_named_for_a_pid(path: &Path) -> bool {
@@ -831,30 +909,76 @@ fn is_named_for_a_pid(path: &Path) -> bool {
         .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Whether two paths name the same directory, as far as comparing two strings
+/// Whether two paths name the same directory, as far as comparing two spellings
 /// can tell.
 ///
-/// Case-insensitively and with the separators normalised, because the two sides
-/// arrive by different routes — abeam's from `std::env::current_dir`, Claude's
-/// from whatever its own process was handed — so `C:\Users\me\forge`,
-/// `c:\users\me\forge` and `C:/Users/me/forge/` are one directory spelled three
-/// ways, and this is Windows, where all three are the same directory.
+/// The two sides arrive by different routes â€” abeam's from
+/// `std::env::current_dir`, Claude's from whatever its own process was handed â€”
+/// so they agree about the directory and not always about how to write it down.
+/// Which of those disagreements is still the same *place* is a fact about the
+/// filesystem underneath, and that is [`spelling`]'s question rather than this
+/// one's.
 ///
-/// Two strings rather than `fs::canonicalize`, on purpose: canonicalising
-/// touches the disk, answers with a `\\?\` path that then has to be undone, and
-/// would run once per file in the directory every time the queue asks whether
-/// it may send.
+/// Comparing spellings rather than `fs::canonicalize`, on purpose:
+/// canonicalising touches the disk, answers on Windows with a `\\?\` path that
+/// then has to be undone, and would run once per file in the directory every
+/// time the queue asks whether it may send.
 fn same_dir(a: &Path, b: &Path) -> bool {
     spelling(a) == spelling(b)
 }
 
-fn spelling(path: &Path) -> String {
+/// The one form of a path this module compares, for the platform it was built
+/// for.
+///
+/// There is no rule that is right on both, and the reason to insist on that
+/// rather than pick the more forgiving one is that the two mistakes cost
+/// different amounts. Windows folds case, reads `/` and `\` as one separator,
+/// and calls `C:\` and `C:` the same place; a comparison there that did none of
+/// those would refuse a record that is genuinely ours, and the queue would
+/// drain by hand for no reason anybody could see. Unix does none of the three.
+/// `/home/phil/Work` and `/home/phil/work` are two directories, `\` is
+/// an ordinary byte in a file name rather than a separator, and a rule that
+/// folded either of those would be declaring two different places equal â€” in
+/// the one function that decides whether a queued prompt may be typed into an
+/// agent. That mistake sends somebody's prompt to a session in another
+/// checkout, and it is not one they would see happen.
+///
+/// macOS is the awkward middle: its kernel distinguishes case and its default
+/// volume does not. It takes the strict reading with the rest of Unix, because
+/// being strict costs a queue that drains by hand and being loose costs the
+/// paragraph above.
+#[cfg(windows)]
+fn spelling(path: &Path) -> Vec<u8> {
     path.to_string_lossy()
         .replace('/', "\\")
         // A trailing separator is a spelling and not a place. `C:\` and `C:`
         // both come out as `C:`, which is the same directory either way.
         .trim_end_matches('\\')
         .to_ascii_lowercase()
+        .into_bytes()
+}
+
+#[cfg(unix)]
+fn spelling(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Bytes rather than `to_string_lossy`, because a Unix path is bytes and not
+    // text: two different names that are not UTF-8 both come back from a lossy
+    // conversion as the same run of replacement characters, and this is the
+    // comparison where calling two different directories equal is the answer
+    // that costs something.
+    let bytes = path.as_os_str().as_bytes();
+    // One trailing slash, and never the last one. `/home/me/forge/` and
+    // `/home/me/forge` are one directory, so the first is a spelling rather
+    // than a reason to refuse a record â€” but `trim_end_matches` would take `/`
+    // itself down to the empty string, which is also what a record carrying an
+    // empty `cwd` comes out as. The root would then be equal to a record that
+    // names nowhere, in the function that decides whether a prompt may be
+    // typed, and a Claude running at `/` is not a hypothetical in a container.
+    match bytes {
+        [head @ .., b'/'] if !head.is_empty() => head.to_vec(),
+        _ => bytes.to_vec(),
+    }
 }
 
 /// What abeam says when there is no Claude to ask.
@@ -869,7 +993,7 @@ fn cannot_run(why: &str) -> String {
     format!("abeam could not run `claude agents --json --all`: {why}")
 }
 
-/// The one line of a child's standard error worth putting in a message —
+/// The one line of a child's standard error worth putting in a message â€”
 /// `panes::git` holds its own git failures to the same standard.
 fn first_line(text: &str) -> String {
     let line = text
@@ -885,19 +1009,27 @@ fn first_line(text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Nothing here starts Claude, and that is a rule rather than an accident. A
-/// machine without Claude on it — a build server, a laptop with Copilot — would
+/// machine without Claude on it â€” a build server, a laptop with Copilot â€” would
 /// either fail the suite or skip the test silently, and a test suite that
 /// spawns agents is not a test suite. So the parsing is tested on strings,
 /// exactly as `panes::git` tests git's output without running git, and the two
 /// fixtures below are real output captured from a real Claude rather than
 /// invented.
 ///
-/// One test does start a process, and it starts a four-line `.cmd` shim that
-/// this file wrote itself. It is the only way to ask what [`ask`] does with a
-/// child that prints an answer and then exits non-zero, which is a rule with an
+/// One test does start a process, and it starts a four-line script that this
+/// file wrote itself. It is the only way to ask what [`ask`] does with a child
+/// that prints an answer and then exits non-zero, which is a rule with an
 /// argument behind it and was until now the one such rule here with no test
 /// under it. `crate::launch` and `crate::dispatch` prove their own claims about
 /// spawning the same way.
+///
+/// The fixtures below are in two shapes, and which is which is worth keeping
+/// straight. `RECORD` and `ROSTER` are captured output, so their Windows paths
+/// stay Windows paths on every platform â€” what they prove is that a string in
+/// the JSON reaches [`Session`] unaltered, and that is a fact about the parser.
+/// [`ROOT`] and [`ELSEWHERE`] are *places*, compared by [`same_dir`] under a
+/// rule that differs by platform, so they are spelled for the platform running
+/// the test.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,7 +1053,32 @@ mod tests {
       {"pid":46256,"cwd":"C:\\Users\\philm\\PycharmProjects\\forge","kind":"interactive","startedAt":1785680468453,"sessionId":"9c634f25-b81f-4254-874b-e076c7116283","name":"forge-c5","status":"busy"}
     ]"#;
 
+    /// The `cwd` inside [`RECORD`], spelled as that record spells it.
+    ///
+    /// A Windows path on every platform, because it is being compared with what
+    /// came out of the parser rather than with a directory: the fixture is
+    /// bytes captured from a real Claude, and a test that quietly rewrote them
+    /// for the machine it is running on would no longer be checking that they
+    /// survive the trip.
+    const RECORD_CWD: &str = r"C:\Users\philm\PycharmProjects\forge";
+
+    /// The repository on screen, and another one beside it to be mistaken for
+    /// it â€” both as this platform writes a path.
+    ///
+    /// Every test that plants a record puts one of these in its `cwd`, and what
+    /// they are for is [`same_dir`], whose rule is not the same rule on the two
+    /// platforms. A Windows path planted on Linux would go through the
+    /// case-sensitive comparison and pass, which is the shape of a test that
+    /// runs everywhere and tests one thing in one place.
+    #[cfg(windows)]
     const ROOT: &str = r"C:\Users\philm\PycharmProjects\forge";
+    #[cfg(windows)]
+    const ELSEWHERE: &str = r"C:\Users\philm\PycharmProjects\rwa_calculator";
+    #[cfg(unix)]
+    const ROOT: &str = "/home/philm/PycharmProjects/forge";
+    #[cfg(unix)]
+    const ELSEWHERE: &str = "/home/philm/PycharmProjects/rwa_calculator";
+
     /// The real record's `startedAt`, which every planted record below is
     /// placed around.
     const STARTED: u64 = 1_785_680_468_453;
@@ -970,7 +1127,7 @@ mod tests {
             session.session_id.as_deref(),
             Some("9c634f25-b81f-4254-874b-e076c7116283")
         );
-        assert_eq!(session.cwd.as_deref(), Some(Path::new(ROOT)));
+        assert_eq!(session.cwd.as_deref(), Some(Path::new(RECORD_CWD)));
         assert_eq!(session.kind, Kind::Interactive);
         assert_eq!(session.status.as_deref(), Some("busy"));
         assert_eq!(session.started_at, Some(STARTED));
@@ -1010,7 +1167,7 @@ mod tests {
         assert_eq!(interactive.state, None);
         assert_eq!(interactive.readiness(), Readiness::Idle);
 
-        // And a running background agent, which carries both — the case that
+        // And a running background agent, which carries both â€” the case that
         // decides which of the two fields is read first.
         let working = &roster[3];
         assert_eq!(working.pid, Some(45960));
@@ -1034,7 +1191,9 @@ mod tests {
         assert_eq!(readiness(r#","status":"busy""#), Readiness::Busy);
         assert_eq!(readiness(r#","state":"working""#), Readiness::Busy);
 
-        // Case-insensitively, like every other name abeam matches here.
+        // Case-insensitively, because this is Claude's vocabulary in a record
+        // rather than a path: [`spelling`] is the comparison in this module
+        // that case matters to, and on Unix it is strict on purpose.
         assert_eq!(readiness(r#","status":"IDLE""#), Readiness::Idle);
         assert_eq!(readiness(r#","status":"Busy""#), Readiness::Busy);
         assert_eq!(readiness(r#","state":"Working""#), Readiness::Busy);
@@ -1042,7 +1201,7 @@ mod tests {
         // The other two of Claude's four statuses, both `Unknown` and both for
         // a reason rather than by falling off the end of the list.
         //
-        // `waiting` is the permission dialog — the state the module header's
+        // `waiting` is the permission dialog â€” the state the module header's
         // nightmare is about, and the proof that reading this file rather than
         // watching the pty is what makes the nightmare impossible: a queued
         // prompt is only ever sent on `idle`.
@@ -1084,7 +1243,7 @@ mod tests {
     fn a_blocked_background_session_is_never_reported_as_idle() {
         // The failure this whole module exists to prevent, in one assertion. A
         // blocked agent has stopped and gone quiet, so every heuristic short of
-        // asking — output quiescence above all — reads it as finished. What it
+        // asking â€” output quiescence above all â€” reads it as finished. What it
         // is actually doing is waiting for a person to answer a permission
         // prompt, and the first character of a queued prompt answers that
         // prompt instead of arriving as a prompt. `failed` is here for the same
@@ -1203,8 +1362,9 @@ mod tests {
 
         // The shortcut is a shortcut past the search and not past the checks.
         // A pid naming a record that started before this abeam did is a pid
-        // Windows handed out twice, so it is not taken — and the search behind
-        // it answers instead, with the session that did start when we did.
+        // that has been handed out twice, so it is not taken â€” and the search
+        // behind it answers instead, with the session that did start when we
+        // did.
         assert_eq!(
             probe(&dir, Some(11292), STARTED - 12)
                 .session()
@@ -1216,22 +1376,16 @@ mod tests {
 
     #[test]
     fn a_dead_sessions_record_is_never_read_as_the_agent_on_screen() {
-        // Windows recycles pids. A Claude that died without tidying up leaves
-        // its record behind, and the number naming it eventually names
-        // something else — abeam's own child, on a machine that has been up a
-        // while. Matched on the pid alone, that file would be read as the
-        // session on screen for the rest of the run, with its `status` frozen
-        // at whatever it last was. A frozen `idle` is not a stale reading: it
-        // is a queued prompt typed into a mid-turn agent, on every item, and it
-        // would never come right.
+        // Pids are handed out again on both platforms. A Claude that died
+        // without tidying up leaves its record behind, and the number naming it
+        // eventually names something else â€” abeam's own child, on a machine
+        // that has been up a while. Matched on the pid alone, that file would
+        // be read as the session on screen for the rest of the run, with its
+        // `status` frozen at whatever it last was. A frozen `idle` is not a
+        // stale reading: it is a queued prompt typed into a mid-turn agent, on
+        // every item, and it would never come right.
         let dir = TempDir::new("agentstate-recycled");
-        plant(
-            &dir,
-            46256,
-            r"C:\Users\philm\PycharmProjects\rwa_calculator",
-            STARTED - 900_000,
-            "idle",
-        );
+        plant(&dir, 46256, ELSEWHERE, STARTED - 900_000, "idle");
 
         let mut ours = probe(&dir, Some(46256), STARTED - 12);
         assert!(
@@ -1253,7 +1407,7 @@ mod tests {
         );
 
         // A record with no `cwd` in it has nothing to check, and an unchecked
-        // record is the one this is here to refuse — by either branch.
+        // record is the one this is here to refuse â€” by either branch.
         let bare = TempDir::new("agentstate-recycled-bare");
         bare.write(
             "46256.json",
@@ -1269,9 +1423,9 @@ mod tests {
     fn a_dispatched_background_agent_is_not_the_session_on_screen() {
         // `crate::dispatch` starts `claude -p --bg` with `current_dir(root)`,
         // so its record carries abeam's own `cwd` and the cwd guard says
-        // nothing about it at all. It is `"kind":"bg"` on disk — the roster's
+        // nothing about it at all. It is `"kind":"bg"` on disk â€” the roster's
         // `"background"` is a rename that happens on the way out of `claude
-        // agents --json` — so a `kind` check that only knew the roster's
+        // agents --json` â€” so a `kind` check that only knew the roster's
         // spelling would have let every dispatched agent through.
         let dir = TempDir::new("agentstate-bg");
         dir.write(
@@ -1283,7 +1437,7 @@ mod tests {
             .as_bytes(),
         );
 
-        // By pid — the branch that used to check only the `cwd` — and by the
+        // By pid â€” the branch that used to check only the `cwd` â€” and by the
         // search behind it, with nothing else in the directory to find.
         assert!(probe(&dir, Some(46256), STARTED - 12).session().is_none());
         assert!(probe(&dir, None, STARTED - 12).session().is_none());
@@ -1295,7 +1449,7 @@ mod tests {
         assert_eq!(kind_of(Some("BG")), Kind::Background);
         assert_eq!(kind_of(Some("interactive")), Kind::Interactive);
         // A daemon is not an agent taking anybody's typing, so it is not
-        // something abeam could be hosting — `Other` keeps it out of the search
+        // something abeam could be hosting â€” `Other` keeps it out of the search
         // without pretending to know what it is.
         assert_eq!(kind_of(Some("daemon")), Kind::Other);
         assert_eq!(kind_of(Some("daemon-worker")), Kind::Other);
@@ -1306,7 +1460,7 @@ mod tests {
     fn a_record_that_is_there_and_will_not_parse_is_never_answered_for_by_a_neighbour() {
         // The whole point of refusing a record is to fail safe, and until this
         // test the refusal did the opposite. Claude rewrites `<pid>.json` in
-        // place — `readFile` then `writeFile`, no temp-and-rename — so a read
+        // place â€” `readFile` then `writeFile`, no temp-and-rename â€” so a read
         // can land mid-write, and a future `peerProtocol` bump would make *our*
         // record unreadable while an older session's in the same repository
         // stayed readable. Either way the search behind the shortcut then
@@ -1327,7 +1481,7 @@ mod tests {
         );
         assert_eq!(ours.readiness(), Readiness::Unknown);
 
-        // And with no usable pid — the npm case — the search cannot say which
+        // And with no usable pid â€” the npm case â€” the search cannot say which
         // record is ours, so an unreadable one might be, and it will not guess.
         let mut blind = probe(&dir, None, STARTED - 12);
         assert!(blind.session().is_none());
@@ -1354,7 +1508,7 @@ mod tests {
         // The judgement is on the file name, because the contents are the part
         // that failed. This directory is named by pid; something else Claude
         // leaves here is not a record, and its being unreadable says nothing
-        // about ours — so it must not take the queue down with it.
+        // about ours â€” so it must not take the queue down with it.
         let alongside = TempDir::new("agentstate-not-a-record");
         plant(&alongside, 46256, ROOT, STARTED, "busy");
         alongside.write("index.json", b"{ not a record, and not named for one");
@@ -1374,7 +1528,8 @@ mod tests {
     #[test]
     fn a_pid_that_names_no_record_falls_back_to_the_earliest_session_started_at_or_after_the_spawn()
     {
-        // The npm case: `claude.cmd` is routed through `cmd.exe`, so the pid
+        // The Windows npm case, and any machine with a wrapper script in front
+        // of the agent: `claude.cmd` is routed through `cmd.exe`, so the pid
         // abeam holds is the interpreter's and the record is written by its
         // child under a pid abeam never saw. There are three interactive
         // sessions on this repository and only one of them is the one abeam
@@ -1390,7 +1545,7 @@ mod tests {
         plant(&dir, 46256, ROOT, STARTED, "busy"); // ours
         plant(&dir, 47001, ROOT, STARTED + 60_000, "idle"); // opened later
         // A dispatched `claude -p --bg`, started between abeam's spawn and
-        // Claude's — so it is precisely what the earliest-at-or-after rule
+        // Claude's â€” so it is precisely what the earliest-at-or-after rule
         // would take if `kind` were not checked, and it runs with abeam's own
         // `cwd`, which is what makes the cwd guard useless against it. On disk
         // its `kind` is `"bg"`; `"background"` is the roster's spelling and is
@@ -1432,16 +1587,10 @@ mod tests {
     #[test]
     fn a_session_in_another_repository_is_never_matched_by_the_fallback() {
         // Somebody else's window, with a perfect timestamp. Matching it would
-        // report readiness for an agent on the other side of the machine — and
+        // report readiness for an agent on the other side of the machine â€” and
         // "idle" from it is a prompt typed into the agent on screen.
         let dir = TempDir::new("agentstate-elsewhere");
-        plant(
-            &dir,
-            11292,
-            r"C:\Users\philm\PycharmProjects\rwa_calculator",
-            STARTED,
-            "idle",
-        );
+        plant(&dir, 11292, ELSEWHERE, STARTED, "idle");
         assert!(probe(&dir, None, STARTED - 12).session().is_none());
         assert_eq!(
             probe(&dir, None, STARTED - 12).readiness(),
@@ -1457,37 +1606,85 @@ mod tests {
         );
     }
 
+    /// Every way the two sides might have written [`ROOT`] down, each with
+    /// whether this platform's filesystem calls it the same directory.
+    ///
+    /// A table per platform rather than a test per platform, because the rule
+    /// being tested is one rule â€” a record is ours if its `cwd` is this
+    /// repository â€” and all that changes underneath it is which spellings are
+    /// that repository. Windows folds case, reads either separator, and does
+    /// not mind a trailing one. Unix folds nothing: the trailing slash is the
+    /// only one of the three that is a spelling there, and the other two name
+    /// other places.
+    #[cfg(windows)]
+    fn spellings() -> Vec<(String, bool)> {
+        vec![
+            (ROOT.to_string(), true),
+            (ROOT.to_ascii_lowercase(), true),
+            (ROOT.to_ascii_uppercase(), true),
+            (ROOT.replace('\\', "/"), true),
+            (format!("{ROOT}\\"), true),
+            (format!("{}/", ROOT.replace('\\', "/")), true),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn spellings() -> Vec<(String, bool)> {
+        vec![
+            (ROOT.to_string(), true),
+            (format!("{ROOT}/"), true),
+            // Two directories, and this filesystem will happily hold both â€”
+            // which is what the capital letters in [`ROOT`] are there for, and
+            // why changing them would take these two assertions with them.
+            (ROOT.to_ascii_lowercase(), false),
+            (ROOT.to_ascii_uppercase(), false),
+            // Not a separator here. `\` is an ordinary byte in a file name, so
+            // this names one file with a very odd name and not a path at all.
+            (ROOT.replace('/', "\\"), false),
+        ]
+    }
+
     #[test]
-    fn a_cwd_is_matched_however_the_two_sides_spelled_it() {
+    fn a_cwd_is_matched_exactly_as_far_as_this_filesystem_would_match_it() {
         // abeam's `root` comes from `std::env::current_dir` and Claude's `cwd`
         // from whatever its own process was handed, so the two agree about the
-        // directory and not always about how to write it down. On Windows all
-        // of these are one place.
-        let spellings = [
-            ROOT.to_string(),
-            ROOT.to_ascii_lowercase(),
-            ROOT.to_ascii_uppercase(),
-            ROOT.replace('\\', "/"),
-            format!("{ROOT}\\"),
-            format!("{}/", ROOT.replace('\\', "/")),
-        ];
-        for spelling in &spellings {
+        // directory and not always about how to write it down.
+        //
+        // Which of those disagreements is still the same place is the whole of
+        // what [`spelling`] decides, and the answer is different on the two
+        // platforms. This test is written to invert with it, and that is
+        // deliberate: a version of it that merely passed on both â€” the Windows
+        // spellings, asserted to match everywhere â€” would have been testing
+        // nothing. It would go green against a `spelling` that lowercased a
+        // Linux path, which is the bug where a queued prompt is typed into the
+        // session in `/home/phil/work` because the one on screen is
+        // `/home/phil/Work`.
+        for (spelling, is_ours) in spellings() {
             let dir = TempDir::new("agentstate-cwd");
-            plant(&dir, 46256, spelling, STARTED, "idle");
+            plant(&dir, 46256, &spelling, STARTED, "idle");
+            let expected = if is_ours {
+                Readiness::Idle
+            } else {
+                Readiness::Unknown
+            };
             assert_eq!(
                 probe(&dir, None, STARTED - 12).readiness(),
-                Readiness::Idle,
-                "`{spelling}` was not read as the repository on screen"
+                expected,
+                "`{spelling}` should {}be the repository on screen",
+                if is_ours { "" } else { "not " }
             );
         }
 
         // It is still a comparison of directories and not of prefixes, in both
         // directions: a sibling whose name merely begins with the same
         // characters is a different place, and so is a directory inside this
-        // one — a Claude started in `crates/` is not the session on screen.
+        // one â€” a Claude started in `crates/` is not the session on screen.
+        // Joined rather than concatenated, so that the separator is this
+        // platform's without a `cfg` for it.
+        let inside = Path::new(ROOT).join("crates");
         let dir = TempDir::new("agentstate-cwd-near");
         plant(&dir, 46256, &format!("{ROOT}-old"), STARTED, "idle");
-        plant(&dir, 46257, &format!(r"{ROOT}\crates"), STARTED, "idle");
+        plant(&dir, 46257, &inside.to_string_lossy(), STARTED, "idle");
         assert!(probe(&dir, None, STARTED - 12).session().is_none());
     }
 
@@ -1533,11 +1730,11 @@ mod tests {
 
     #[test]
     fn the_record_is_found_once_and_read_from_then_on() {
-        // What the `&mut self` buys. On an npm install the pid abeam holds is
-        // `cmd.exe`'s, so every call used to be a `read_dir` plus a parse of
-        // every file in a directory that grows with every session the user has
-        // ever started — several times a second, on the loop that draws the
-        // agent's screen.
+        // What the `&mut self` buys. On a Windows npm install the pid abeam
+        // holds is `cmd.exe`'s, so every call used to be a `read_dir` plus a
+        // parse of every file in a directory that grows with every session the
+        // user has ever started â€” several times a second, on the loop that
+        // draws the agent's screen.
         let dir = TempDir::new("agentstate-memo");
         plant(&dir, 46256, ROOT, STARTED, "busy");
         let mut warm = probe(&dir, None, STARTED - 12);
@@ -1578,19 +1775,19 @@ mod tests {
         // The memory is a path, and it is re-validated on every read: what
         // makes that necessary is that a pid outlives the process it named. A
         // file that is no longer ours has to send the search out again rather
-        // than be answered from memory — otherwise the memoisation would
+        // than be answered from memory â€” otherwise the memoisation would
         // reintroduce, one indirection later, the exact stale-record bug the
         // `is_mine` guard was added to close.
         //
         // Three ways a remembered record stops being ours, and all three are
-        // things `is_mine` can see. The fourth — the same pid recycled onto a
-        // *later* interactive session in this same repository — passes all
+        // things `is_mine` can see. The fourth â€” the same pid recycled onto a
+        // *later* interactive session in this same repository â€” passes all
         // three checks and is invisible without `procStart`. The search has the
         // same blind spot, so the memory is no worse than what it stands in
         // for, and saying so is more use than pretending otherwise.
         let elsewhere = format!(
             r#"{{"pid":46256,"sessionId":"s","cwd":{},"startedAt":{STARTED},"kind":"interactive","status":"idle"}}"#,
-            serde_json::to_string(r"C:\Users\philm\PycharmProjects\rwa_calculator").unwrap()
+            serde_json::to_string(ELSEWHERE).unwrap()
         );
         let dispatched = format!(
             r#"{{"pid":46256,"sessionId":"s","cwd":{},"startedAt":{STARTED},"kind":"bg","status":"idle"}}"#,
@@ -1616,7 +1813,7 @@ mod tests {
             // rewritten by whatever got it, while the session abeam actually
             // hosts turns up under a pid abeam never saw. Answered from memory,
             // the probe reports the stranger; re-validated, it goes and finds
-            // ours — and *which file the answer came from* is the only thing
+            // ours â€” and *which file the answer came from* is the only thing
             // that tells those two apart, so that is what is asserted.
             dir.write("46256.json", replacement.as_bytes());
             plant(&dir, 51000, ROOT, STARTED, "idle");
@@ -1637,7 +1834,7 @@ mod tests {
 
         // The third replacement above is the one that would *not* have failed
         // this way. A record that predates the spawn is refused by `is_mine`,
-        // so the memory is dropped — but the search behind it takes the newest
+        // so the memory is dropped â€” but the search behind it takes the newest
         // record in this repository when nothing started at or after the spawn,
         // and with one file in the directory that is the same record again.
         // That is the clock-skew rule doing exactly what it is for, and it is
@@ -1654,7 +1851,7 @@ mod tests {
     #[test]
     fn a_search_that_finds_nothing_is_not_remembered_as_nothing() {
         // Claude takes a second or two to write its first record, and abeam
-        // asks several times a second — so the first several answers are always
+        // asks several times a second â€” so the first several answers are always
         // "there is no record". Remembering that would make an agent that
         // starts slowly `Unknown` for the whole session, which is a feature
         // that silently does not work.
@@ -1693,7 +1890,7 @@ mod tests {
         assert_eq!(nowhere.readiness(), Readiness::Unknown);
 
         // An empty directory is the same answer, and so is one that has gone
-        // between construction and the frame that asks — a probe is held for
+        // between construction and the frame that asks â€” a probe is held for
         // the whole session and the disk is not.
         let dir = TempDir::new("agentstate-empty");
         let mut empty = probe(&dir, Some(46256), STARTED);
@@ -1729,11 +1926,52 @@ mod tests {
 
         // A blank variable counts as unset. PowerShell leaves one behind when
         // somebody clears it, and joining `sessions` onto nothing names a
-        // relative directory — one that would be looked for inside the
-        // repository on screen.
+        // relative directory â€” one that would be looked for wherever this
+        // process happens to be standing.
         assert_eq!(
             sessions_dir_from(Some(PathBuf::new()), dot_claude.clone()),
             Some(under_home)
+        );
+
+        // And the same of the other variable, which is the half that had no
+        // assertion under it. Asked of the path rather than of the answer,
+        // because the answer goes through `is_dir` and that is a question about
+        // the machine running the suite: a blank home names `.claude/sessions`,
+        // which is only *found* on a machine that has one beside the test
+        // binary, and is wrong on every machine. `main` leaves abeam standing
+        // in `/` on Unix, so a container that exports an empty `HOME` â€” they
+        // exist â€” would have the queue reading a stranger's `/.claude/sessions`
+        // as the records of the agent on screen. Delete these and that comes
+        // back silently, on the machines least able to notice.
+        assert_eq!(sessions_path_from(None, Some(PathBuf::new())), None);
+        assert_eq!(sessions_dir_from(None, Some(PathBuf::new())), None);
+
+        // Blank is only the loudest way of being relative, so the rule is
+        // absoluteness and these are the quiet ways. `CLAUDE_CONFIG_DIR=.claude`
+        // is an ordinary thing to type at a repository, and it is the case that
+        // reads as working: it names something, so a guard against emptiness
+        // alone waves it through, and then Claude resolves it against the
+        // repository while abeam resolves the same string against `/` â€” two
+        // directories from one variable, and abeam reading the wrong one to
+        // decide whether a queued prompt may be sent.
+        for relative in [".claude", "claude/config", ".."] {
+            assert_eq!(
+                sessions_path_from(Some(PathBuf::from(relative)), dot_claude.clone()),
+                Some(home.path().join(".claude").join("sessions")),
+                "a relative CLAUDE_CONFIG_DIR was taken: {relative}"
+            );
+            assert_eq!(
+                sessions_path_from(None, Some(PathBuf::from(relative))),
+                None,
+                "a relative home was taken: {relative}"
+            );
+        }
+
+        // ...while a variable that does name somewhere still names it, which is
+        // what stops the guard above from being a guard against everything.
+        assert_eq!(
+            sessions_path_from(None, dot_claude.clone()),
+            Some(home.path().join(".claude").join("sessions"))
         );
 
         // Nothing to read is `None`, whichever half is missing: no variables at
@@ -1761,7 +1999,7 @@ mod tests {
     #[test]
     fn a_claude_that_cannot_be_found_is_a_sentence_naming_what_was_tried() {
         // `roster` is the one function here that starts a process, and no test
-        // in this file runs it against a real Claude — a machine without one
+        // in this file runs it against a real Claude â€” a machine without one
         // would fail the suite, and a test suite that spawns agents is not a
         // test suite. What is pinned instead is the failure it produces on such
         // a machine, and the failure is a sentence: abeam does not install
@@ -1778,24 +2016,59 @@ mod tests {
         );
     }
 
-    /// A `.cmd` that prints `what` and exits with `code`.
+    /// A program that prints `out` on standard output and `err` on standard
+    /// error, then exits with `code`.
     ///
     /// A shim rather than a real Claude for the reason the module doc gives,
-    /// and a `.cmd` rather than an `.exe` because a test cannot compile one —
-    /// which has the side benefit of exercising the routed-script path
-    /// `crate::launch` exists for, since that is what an npm-installed Claude
-    /// is.
+    /// and a script rather than a compiled program because a test cannot
+    /// compile one. On Windows that is a `.cmd`, which has the side benefit of
+    /// exercising the routed-script path `crate::launch` exists for, since that
+    /// is what an npm-installed Claude is; on Unix it is a `#!` script, which
+    /// the kernel runs itself with nothing in between.
+    ///
+    /// Both halves take the two streams as two arguments rather than having the
+    /// caller smuggle a `1>&2` into the text to be printed, which is how this
+    /// used to reach standard error: a test asking which of the two ends up in
+    /// abeam's message should not also be asking how each shell parses a
+    /// redirection sitting in the middle of an argument list. Neither half may
+    /// be handed a payload containing a single quote â€” the Unix one fences the
+    /// text with them and there is no escaping.
     #[cfg(windows)]
-    fn shim(dir: &TempDir, name: &str, what: &str, code: u8) -> Launch {
-        let path = dir.write(
-            &format!("{name}.cmd"),
-            format!("@echo off\r\necho {what}\r\nexit /b {code}\r\n").as_bytes(),
-        );
+    fn shim(dir: &TempDir, name: &str, out: &str, err: &str, code: u8) -> Launch {
+        let mut script = String::from("@echo off\r\n");
+        if !out.is_empty() {
+            script.push_str(&format!("echo {out}\r\n"));
+        }
+        if !err.is_empty() {
+            script.push_str(&format!("echo {err} 1>&2\r\n"));
+        }
+        script.push_str(&format!("exit /b {code}\r\n"));
+        let path = dir.write(&format!("{name}.cmd"), script.as_bytes());
         crate::launch::resolve(&path.to_string_lossy(), &[]).expect("a .cmd is launchable")
     }
 
+    #[cfg(unix)]
+    fn shim(dir: &TempDir, name: &str, out: &str, err: &str, code: u8) -> Launch {
+        let mut script = String::from("#!/bin/sh\n");
+        // `printf` with the payload in single quotes, because the payload is
+        // JSON: `echo [{"sessionId":"s"}]` hands the shell four quotes to eat
+        // and prints something that no longer parses, which would make this a
+        // test of `sh` quoting wearing a test of `ask` as a hat.
+        if !out.is_empty() {
+            script.push_str(&format!("printf '%s\\n' '{out}'\n"));
+        }
+        if !err.is_empty() {
+            script.push_str(&format!("printf '%s\\n' '{err}' 1>&2\n"));
+        }
+        script.push_str(&format!("exit {code}\n"));
+        // With the execute bit, which is the whole difference between this and
+        // a text file: without it `execve` refuses and the test would be about
+        // `crate::launch`'s error path instead of about `ask`'s rule.
+        let path = dir.write_exec(name, script.as_bytes());
+        crate::launch::resolve(&path.to_string_lossy(), &[]).expect("a `#!` script is launchable")
+    }
+
     #[test]
-    #[cfg(windows)]
     fn an_agent_list_that_arrived_is_kept_however_the_process_exited() {
         // The rule `roster` argues for and had no test under: what abeam asked
         // for is the array, so a Claude that printed one and then exited
@@ -1808,6 +2081,7 @@ mod tests {
             &dir,
             "abeam-roster-ok",
             r#"[{"sessionId":"s","kind":"interactive","status":"idle"}]"#,
+            "",
             1,
         );
         let roster = ask(&printed, &root).expect("stdout parsed, so the exit code is forgiven");
@@ -1817,7 +2091,7 @@ mod tests {
         // And only then. With nothing readable on stdout, the exit status and
         // what the child said are the whole of what abeam knows, so both are in
         // the message rather than an empty list that looks like an answer.
-        let broke = shim(&dir, "abeam-roster-bad", "Error: no such command 1>&2", 3);
+        let broke = shim(&dir, "abeam-roster-bad", "", "Error: no such command", 3);
         let refused = ask(&broke, &root).expect_err("nothing parsed and it failed");
         let said = refused.to_string();
         assert!(said.contains("claude agents --json --all"), "got: {said}");
@@ -1825,11 +2099,15 @@ mod tests {
             said.contains('3'),
             "the exit status is missing from: {said}"
         );
+        assert!(
+            said.contains("no such command"),
+            "what the child said is missing from: {said}"
+        );
 
         // A zero exit with unreadable output is still a failure, and it is the
-        // parser's error rather than a sentence about an exit code — there was
+        // parser's error rather than a sentence about an exit code â€” there was
         // nothing wrong with the exit.
-        let empty = shim(&dir, "abeam-roster-empty", "not json at all", 0);
+        let empty = shim(&dir, "abeam-roster-empty", "not json at all", "", 0);
         assert!(ask(&empty, &root).is_err());
     }
 

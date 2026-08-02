@@ -7,7 +7,7 @@
 //!
 //! Usage:  abeam                 (hosts the default agent)
 //!         abeam copilot         (hosts a known agent — see `crate::agent`)
-//!         abeam powershell      (hosts anything else)
+//!         abeam pwsh            (hosts anything else)
 //!
 //! Alt+Q quits, F1 lists the keys, F2 shows what the pty is doing.
 
@@ -28,7 +28,7 @@ mod watch;
 #[cfg(test)]
 mod testutil;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -74,26 +74,47 @@ fn main() -> Result<()> {
     };
 
     // Then stand somewhere nobody else can write to, for the rest of the
-    // session. This is the second half of a two-part defence, and the half that
-    // is kept precisely because it does not depend on the first one holding.
+    // session.
     //
-    // The first half is `crate::launch`, which resolves every program to an
-    // absolute path before `CreateProcessW` ever sees it — nothing leaves that
-    // module that is not absolute, and a bare name is exactly what Windows
-    // resolves against *this* process's current directory before it consults
-    // `PATH`. So with the resolver working, a `claude.exe` committed to the
-    // repository on screen is already unreachable. This line is what stands
-    // between a reader and that same file on the day the resolver is wrong: one
-    // module's invariant, one missed call site, one library spawning something
-    // on its own behalf. The cost of being wrong is a program running with the
-    // user's full token, so it is worth paying for twice.
+    // The defence a reader is looking for is `crate::launch`, which resolves
+    // every program to an absolute path before the operating system's spawn
+    // ever sees it — nothing leaves that module that is not absolute, so with
+    // the resolver working a `claude.exe` committed to the repository on screen
+    // is already unreachable. What this line adds on the day that is bypassed —
+    // one missed call site, one library spawning something on its own behalf —
+    // is a whole line of defence on Windows and *not one on Unix*, and saying
+    // otherwise would tell the next reader they are covered where they are not.
     //
-    // It costs nothing, either: every pty abeam opens is given an explicit
-    // working directory, and this covers the panes as well as this line. A
-    // failure leaves us exactly where the program stood before, which is why it
-    // is not fatal.
-    if let Some(system_root) = std::env::var_os("SystemRoot") {
-        let _ = std::env::set_current_dir(system_root);
+    // On Windows it is real. `CreateProcessW` resolves a bare name against
+    // *this* process's current directory before it consults `PATH` at all, and
+    // portable-pty's Windows `search_path` hands a name it could not find
+    // through unchanged rather than binding it to anything — so where abeam is
+    // standing is the answer, and standing in `%SystemRoot%` is what makes that
+    // answer harmless.
+    //
+    // On Unix it buys nothing against that hazard, because abeam never reaches
+    // `execvp`'s own `PATH` walk holding this process's directory. Every spawn
+    // goes through `portable_pty::CommandBuilder::search_path`, which resolves
+    // against `PtyConfig.cwd` and not against the process: for a bare name it
+    // computes `cwd.join(entry).join(name)`, and for a `./x` it computes
+    // `cwd.join(name)` (0.9.0, `src/cmdbuilder.rs`, `search_path` and
+    // `as_command`). Every pty abeam opens is given `.cwd(&root)`, which
+    // is the repository on screen — so a future call site building a
+    // `PtyConfig` with a bare name would resolve it against the repository
+    // however far this process has walked from it. There the backstop is
+    // `launch::resolve` returning absolute paths, and there is nothing behind
+    // it.
+    //
+    // Kept on both all the same, because it still covers anything that does
+    // consult the process's own directory, and because it costs nothing: every
+    // pty abeam opens is given an explicit working directory, so this covers
+    // the panes as well as this line. A failure leaves us exactly where the
+    // program stood before, which is why it is not fatal. And the residual
+    // value on Unix is smaller again than `/` suggests — `uvx abeam` inside a
+    // container commonly runs as root, where `/` is writable like anywhere
+    // else.
+    if let Some(unwritable) = somewhere_unwritable() {
+        let _ = std::env::set_current_dir(unwritable);
     }
 
     let mut terminal = term::setup()?;
@@ -116,8 +137,8 @@ fn main() -> Result<()> {
                 .title(&hosted.name)
                 // Explicit, and it has to be: `PtySession::spawn` falls back to
                 // the process's own directory, and after the line above that is
-                // `%SystemRoot%`. The agent belongs in the repository it was
-                // opened on.
+                // wherever abeam went to stand. The agent belongs in the
+                // repository it was opened on.
                 .cwd(&root)
                 .size(inner.height.max(1), inner.width.max(1)),
         )?;
@@ -190,8 +211,58 @@ fn host(choice: agent::Choice, args: &[String], root: &Path) -> Result<agent::Ho
     launch::resolve(&program, args).map(|launch| agent::Hosted::plain(&asked, launch))
 }
 
-/// Windows-only like the rest of the suite: what is under test is a `PATH` walk
-/// and a path joined onto the directory abeam was started in.
+/// Where abeam goes to stand for the rest of the session, or `None` if this
+/// machine will not say.
+///
+/// Asked of the environment rather than spelled `C:\Windows`: the Windows
+/// directory is not always on `C:` and not always called that, and a hardcoded
+/// path that is wrong on a machine is a `set_current_dir` that quietly does
+/// nothing on it.
+#[cfg(windows)]
+fn somewhere_unwritable() -> Option<PathBuf> {
+    std::env::var_os("SystemRoot").map(PathBuf::from)
+}
+
+/// The Unix answer to the same question, and there is nothing to ask: `/` is
+/// the one directory a Unix cannot be missing, every user can read it and an
+/// ordinary one cannot write to it. `Some` unconditionally, so that the caller
+/// reads the same on both platforms rather than growing a `cfg` of its own.
+#[cfg(unix)]
+fn somewhere_unwritable() -> Option<PathBuf> {
+    Some(PathBuf::from("/"))
+}
+
+/// The one question here that is about neither platform's `PATH`.
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_is_resolved_by_its_table_rather_than_by_the_path_rule_above() {
+        // The default is `claude`, which may or may not be installed on the
+        // machine running this — so what is asserted is the routing, not the
+        // outcome: whichever way it goes, it goes through the table, and the
+        // name that comes back is the table's rather than a path.
+        //
+        // Ungated, and that is the point of it being here rather than in either
+        // module below: the routing is the same decision on every platform, and
+        // a copy of this test per platform would be two places to notice that
+        // an agent had started going through the path rule instead.
+        let agent = agent::find("claude").expect("claude is a known agent");
+        match host(agent::Choice::Known(agent), &[], &std::env::temp_dir()) {
+            Ok(hosted) => assert_eq!(hosted.name, "claude"),
+            Err(why) => assert!(
+                why.contains("`claude`") && why.contains("Tried:"),
+                "an agent that is missing says what it looked for: {why}"
+            ),
+        }
+    }
+}
+
+/// Windows-side: what is under test is a `PATH` walk and a path joined onto the
+/// directory abeam was started in, and both of those are spelled differently
+/// enough on Unix to want the twin below rather than a `cfg` in the middle of
+/// each assertion.
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -238,20 +309,60 @@ mod tests {
         // name, which is `PATH`'s question and not this one's.
         assert!(host(program("abeam-rel.exe"), &[], dir.path()).is_err());
     }
+}
+
+/// The Unix twin of the two above, asking the same two questions of a `PATH`
+/// walk that answers with the execute bit rather than with an extension.
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    fn program(name: &str) -> agent::Choice {
+        agent::Choice::Program(name.to_string())
+    }
 
     #[test]
-    fn an_agent_is_resolved_by_its_table_rather_than_by_the_path_rule_above() {
-        // The default is `claude`, which may or may not be installed on the
-        // machine running this — so what is asserted is the routing, not the
-        // outcome: whichever way it goes, it goes through the table, and the
-        // name that comes back is the table's rather than a path.
-        let agent = agent::find("claude").expect("claude is a known agent");
-        match host(agent::Choice::Known(agent), &[], &std::env::temp_dir()) {
-            Ok(hosted) => assert_eq!(hosted.name, "claude"),
-            Err(why) => assert!(
-                why.contains("`claude`") && why.contains("Tried:"),
-                "an agent that is missing says what it looked for: {why}"
-            ),
-        }
+    fn a_program_named_outright_is_still_shown_under_the_name_that_was_typed() {
+        // Today's behaviour, and the case the agent table must not have
+        // changed: `abeam pwsh` resolves a program and the border says the
+        // word that was typed, not the absolute path it became.
+        //
+        // `sh` because it is the one program name a Unix is not allowed to be
+        // missing, so this test failing means the resolver and not the runner.
+        let root = std::env::temp_dir();
+        let hosted = host(program("sh"), &[], &root).expect("sh is on PATH");
+
+        assert_eq!(hosted.name, "sh");
+        assert!(hosted.launch.program.is_absolute());
+    }
+
+    #[test]
+    fn a_relative_path_is_resolved_against_the_directory_abeam_was_run_in() {
+        // `crate::launch` refuses a relative path outright, because there one
+        // arrives from `ABEAM_SHELL` or a candidate list and would be resolved
+        // against the repository on screen. One typed on the command line is a
+        // different question with a different answer, and this is the only
+        // place that knows which directory it was typed in.
+        let dir = TempDir::new("main-relative");
+        std::fs::create_dir_all(dir.path().join("tools")).expect("a subdirectory");
+        // With the execute bit, because that is the whole of what makes a file
+        // a program here — the Windows twin can write two bytes and be believed,
+        // and this one cannot.
+        dir.write_exec("tools/abeam-rel", b"#!/bin/sh\nexit 0\n");
+
+        let typed = "./tools/abeam-rel";
+        let hosted = host(program(typed), &[], dir.path()).expect("joined onto the root");
+
+        assert!(hosted.launch.program.is_absolute());
+        assert!(hosted.launch.program.starts_with(dir.path()));
+        assert!(hosted.launch.program.ends_with("abeam-rel"));
+        // Still the name that was typed. A border is 46 columns and an absolute
+        // path is not what a reader needs in them.
+        assert_eq!(hosted.name, typed);
+
+        // ...and the same name without a directory component in it is a bare
+        // name, which is `PATH`'s question and not this one's.
+        assert!(host(program("abeam-rel"), &[], dir.path()).is_err());
     }
 }

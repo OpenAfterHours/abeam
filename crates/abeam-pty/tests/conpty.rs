@@ -26,8 +26,12 @@
 //! `PtySession`. They pin *ConPTY's* behaviour, not ours; routing them through
 //! our own code would mean a bug in `session.rs` could make them agree with it.
 
-// Spawns cmd.exe unconditionally. The crate is presented as reusable, so its
-// test suite should not fail to run elsewhere — it just has nothing to say.
+// Gated, and staying gated now that the crate is not Windows-only: these pin
+// ConPTY's own behaviour, and the thing they pin hardest — a child that stalls
+// until `ESC [ 6 n` is answered — has no Unix analogue to write a weaker version
+// of. A Unix pty asks nothing at startup, so on Linux this file would not be the
+// same test proving less, it would be a test of nothing. `tests/session.rs` is
+// where the cross-platform half lives and it runs everywhere.
 #![cfg(windows)]
 
 use std::io::Read;

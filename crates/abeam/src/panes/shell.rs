@@ -8,9 +8,10 @@
 //! What it deliberately is not is a multiplexer. There is one child, started
 //! when the pane is first drawn and never restarted behind your back; there are
 //! no tabs and no splits. Nothing started here outlives abeam either, and that
-//! one is not free — `TerminateProcess` reaches a shell and not the `cargo
-//! build` the shell started, so `abeam_pty::job` puts the whole tree in a job
-//! object and closes it with the session. It also keeps no buffer of its own:
+//! one is not free — ending a shell does not end the `cargo build` the shell
+//! started, so `abeam-pty` takes down the tree rather than the one process it
+//! can see: a job object closed with the session on Windows, a kill aimed at
+//! the child's own process group on Unix. It also keeps no buffer of its own:
 //! the history it scrolls through is the one the `vt100` parser behind the pty
 //! already writes into, and this pane only moves the window onto it.
 //!
@@ -60,10 +61,59 @@ use crate::pane::{Handled, Pane};
 use crate::panes::TerminalPane;
 use crate::text::{self, dim, err};
 
-/// Candidate shells, best first. Tried in order at spawn time; the first one
-/// that starts wins, so a machine without PowerShell 7 falls back rather than
-/// showing an error nobody can act on.
+/// Candidate shells on Windows, best first. Tried in order at spawn time; the
+/// first one that starts wins, so a machine without PowerShell 7 falls back
+/// rather than showing an error nobody can act on.
+///
+/// A constant here and a function on Unix, because there the best answer is not
+/// a name anybody can write down in advance — see `shells` below.
+#[cfg(windows)]
 pub const SHELLS: &[&str] = &["pwsh.exe", "powershell.exe", "cmd.exe"];
+
+/// The Unix candidate list, best first, built from the value of `$SHELL`.
+///
+/// The first answer on Unix is the shell the user already chose, and that is
+/// something only the machine knows. `bash` and then `sh` stay behind it
+/// because `$SHELL` is a *preference* and not a choice: nobody typed it at
+/// abeam, it was set once and can name a shell that has been uninstalled since,
+/// and falling through from a broken one is better than a pane with nothing in
+/// it. `sh` is last because it is the one program name a Unix is not allowed to
+/// be missing.
+///
+/// The value is handed in rather than read here, so that the tests which pin
+/// this order can run beside two hundred others without one of them writing to
+/// an environment the whole process shares.
+#[cfg(unix)]
+fn shells(login: Option<std::ffi::OsString>) -> Vec<String> {
+    // Empty is unset with extra steps — `SHELL=` names no program, and passing
+    // "" on would ask the resolver to walk `PATH` looking for nothing.
+    //
+    // `into_string` rather than `to_string_lossy`: a `$SHELL` that is not valid
+    // UTF-8 cannot become the `String` the resolver takes, and a lossy
+    // rendering of it names a *different* file. Dropping it lands on `bash`,
+    // which is what having anything behind `$SHELL` at all is for.
+    let chosen = login
+        .and_then(|s| s.into_string().ok())
+        .filter(|s| !s.is_empty());
+    chosen
+        .into_iter()
+        .chain(["bash", "sh"].map(String::from))
+        .collect()
+}
+
+/// The list to try when nothing was chosen, which is the one thing the two
+/// platforms disagree about here: a constant on one and a question about the
+/// environment on the other.
+#[cfg(windows)]
+fn preferred() -> Vec<String> {
+    SHELLS.iter().copied().map(String::from).collect()
+}
+
+/// See the Windows twin above.
+#[cfg(unix)]
+fn preferred() -> Vec<String> {
+    shells(std::env::var_os("SHELL"))
+}
 
 /// Rows one notch of the wheel moves. Three is the terminal convention, and the
 /// same number `crate::scroll` uses; it is repeated rather than shared because
@@ -121,8 +171,13 @@ impl ShellPane {
             // back from it would hide a typo in `ABEAM_SHELL` behind a shell
             // nobody asked for, and the mistake would surface much later as
             // "why is my profile not loading".
+            //
+            // `$SHELL` sits on the other side of that line and is read by
+            // `preferred` rather than reaching here, precisely because it is
+            // the other kind of thing: a preference the user expressed to the
+            // operating system, not a program they typed at abeam.
             Some(p) => vec![Candidate::new(p)],
-            None => SHELLS.iter().copied().map(Candidate::new).collect(),
+            None => preferred().into_iter().map(Candidate::new).collect(),
         };
         Self {
             root,
@@ -157,16 +212,22 @@ impl ShellPane {
         let mut why = String::new();
         for candidate in &self.candidates {
             // Resolved to an absolute path first, and the pty is never given
-            // anything else. A bare name reaching `CreateProcessW` is a
-            // vulnerability rather than a convenience — see [`crate::launch`].
+            // anything else. A bare name reaching the spawn itself is a
+            // vulnerability rather than a convenience — on Windows because it
+            // is looked for in the current directory before `PATH` is consulted
+            // at all, and on Unix because a `PATH` with a relative or empty
+            // entry on it is a `PATH` the repository on screen can be part of.
+            // See [`crate::launch`], which refuses both.
             //
             // The same resolver the left pane uses, script routing included,
             // rather than a stricter one for this pane. `ABEAM_SHELL` pointing
-            // at a `.cmd` wrapper — a login script, a `nu.cmd` — is the same
-            // wish as `abeam claude` on an npm install, and two implementations
-            // of that wish would be two places for it to be got wrong. What is
-            // special about this pane is the *list* of shells and where they
-            // live, which is `SHELLS` and `known_home` and stays here.
+            // at a wrapper — a login script, a `nu.cmd` — is the same wish as
+            // `abeam claude` on an npm install, and two implementations of that
+            // wish would be two places for it to be got wrong. On Unix there is
+            // no routing to share, because a `#!` line is the kernel's business
+            // and the wrapper simply is the program. What is special about this
+            // pane is the *list* of shells and where they live, which is
+            // `preferred` and `known_home` and stays here.
             let launch = match launch::resolve_preferring(
                 &candidate.program,
                 &candidate.args,
@@ -491,9 +552,10 @@ fn args_for(program: &str) -> &'static [&'static str] {
 //
 // The search itself is `crate::launch`, shared with the program `main` hosts.
 // What is left here is the part that is knowledge about *shells* rather than
-// about launching: which ones to try, and where Windows keeps them.
+// about launching: which ones to try, which is `preferred` above, and where the
+// operating system keeps them, which is below.
 
-/// Where Windows keeps the shells in [`SHELLS`], consulted before `PATH`.
+/// Where Windows keeps the shells it ships, consulted before `PATH`.
 ///
 /// `cmd.exe` and `powershell.exe` are operating-system components with exactly
 /// one right answer, and taking that answer from `PATH` means taking it from
@@ -501,6 +563,7 @@ fn args_for(program: &str) -> &'static [&'static str] {
 /// list can reorder. PowerShell 7 is not part of Windows and its installer is
 /// only *usually* here, so its entry is a first guess with the `PATH` walk
 /// still behind it.
+#[cfg(windows)]
 fn known_home(program: &str) -> Option<PathBuf> {
     let windows = || std::env::var_os("SystemRoot").map(PathBuf::from);
     match stem_of(program).as_str() {
@@ -522,13 +585,44 @@ fn known_home(program: &str) -> Option<PathBuf> {
     }
 }
 
-/// `C:\…\pwsh.exe` is what gets started; `pwsh` is what the border says.
+/// Nothing, on Unix, and the emptiness is the decision rather than a gap left
+/// to fill in later.
+///
+/// The table above exists because a Windows component has exactly one right
+/// answer that `PATH` is not to be trusted for. Unix has no such answer to
+/// write down: the shells people run live in `/bin` on one distribution and
+/// `/usr/bin` on the next, with the two the same directory on some and not on
+/// others, and the candidate this list is most confident of — `$SHELL` —
+/// already arrives as an absolute path and never reaches a search at all.
+/// Hardcoding `/bin/sh` would buy nothing the `PATH` walk does not already
+/// give, because that walk takes absolute entries only and so cannot be
+/// steered by a relative one somebody put at the front; it would only be a
+/// second place to be wrong about a machine neither of us has seen.
+#[cfg(unix)]
+fn known_home(_program: &str) -> Option<PathBuf> {
+    None
+}
+
+/// `C:\…\pwsh.exe` is what gets started and `pwsh` is what the border says;
+/// `/usr/bin/fish` and `fish` are the same sentence on the other platform.
 fn name_of(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// The same name folded to one case, for the tables that match on it:
+/// [`args_for`] on both platforms and `known_home` on Windows.
+///
+/// The fold is a Windows fact applied everywhere, and on Unix it is wrong in a
+/// way worth writing down rather than repairing. `/usr/bin/Pwsh` is a different
+/// file from `/usr/bin/pwsh` there, and this hands `-NoLogo` to the first on
+/// the strength of a name only the second has. Nothing follows from it — the
+/// flag is PowerShell's under either spelling, and a capitalised `pwsh` is not
+/// a file anybody ships — so the one rule stays rather than growing a `cfg` for
+/// a machine that has never existed. It is here because a silent assumption
+/// left behind by a port that audited this exact class of them reads as an
+/// oversight.
 fn stem_of(program: &str) -> String {
     name_of(Path::new(program)).to_ascii_lowercase()
 }
@@ -537,7 +631,8 @@ fn stem_of(program: &str) -> String {
 ///
 /// It names every program that was tried, because the useful next move depends
 /// entirely on which list this was: a single name means `ABEAM_SHELL` is wrong,
-/// and all three of [`SHELLS`] means this is not the Windows anyone expected.
+/// and the whole candidate list means this is not the machine anyone expected —
+/// a Windows without `cmd.exe` on it, a Unix without `sh`.
 ///
 /// The reason from the operating system comes *last*, under the advice rather
 /// than above it. It is the only part of this screen nobody can act on, and it
@@ -560,9 +655,43 @@ fn failure(tried: &[String], why: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// The one table in this module whose answers are the same on both platforms,
+/// which is why it is not behind a `cfg` and not written twice: `pwsh` is a
+/// program on Linux as much as on Windows, and the flag it is given is the
+/// right flag in both places.
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn the_powershells_are_asked_not_to_print_a_banner_and_cmd_is_not() {
+        // Delete this and nothing notices until a shell pane opens on a banner
+        // and a blank line, which in a short pane is most of the first screen
+        // spent on nothing.
+        assert_eq!(args_for("pwsh.exe"), ["-NoLogo"]);
+        assert_eq!(args_for("powershell.exe"), ["-NoLogo"]);
+        // An explicit ABEAM_SHELL is often a full path, and is still PowerShell.
+        // The separator is the only thing on this table that is not the same in
+        // both places, so it is the one line that has to be asked twice.
+        #[cfg(windows)]
+        assert_eq!(
+            args_for(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            ["-NoLogo"]
+        );
+        #[cfg(unix)]
+        assert_eq!(args_for("/usr/bin/pwsh"), ["-NoLogo"]);
+        // Anything else is spawned bare: a flag a shell does not understand is
+        // a shell that refuses to start.
+        assert!(args_for("cmd.exe").is_empty());
+        assert!(args_for("bash").is_empty());
+        assert!(args_for("nu.exe").is_empty());
+    }
+}
+
 /// Everything here starts a real child in a real pty, so it is Windows-only
-/// like the rest of the pty-backed suite — including the two tests that only
-/// read a table, because the table is a list of Windows program names.
+/// like the rest of the pty-backed suite — including the two tests that start
+/// nothing, because what they read is a list of Windows program names and a
+/// directory only Windows has.
 ///
 /// The children are `cmd.exe`: bare when the test needs one that stays, `/c`
 /// when it needs one that is already gone. What is under test is what this pane
@@ -984,22 +1113,6 @@ mod tests {
     }
 
     #[test]
-    fn the_powershells_are_asked_not_to_print_a_banner_and_cmd_is_not() {
-        assert_eq!(args_for("pwsh.exe"), ["-NoLogo"]);
-        assert_eq!(args_for("powershell.exe"), ["-NoLogo"]);
-        // An explicit ABEAM_SHELL is often a full path, and is still PowerShell.
-        assert_eq!(
-            args_for(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-            ["-NoLogo"]
-        );
-        // Anything else is spawned bare: a flag a shell does not understand is
-        // a shell that refuses to start.
-        assert!(args_for("cmd.exe").is_empty());
-        assert!(args_for("bash").is_empty());
-        assert!(args_for("nu.exe").is_empty());
-    }
-
-    #[test]
     fn an_explicit_program_is_a_choice_rather_than_a_first_preference() {
         // Falling back from ABEAM_SHELL would hide a typo in it behind a shell
         // nobody asked for, and the mistake would surface much later.
@@ -1089,6 +1202,568 @@ mod tests {
         // every wrapper on the machine look like the same shell.
         let dir = TempDir::new("shell-wrapper");
         let script = dir.write("abeam-wrapper.cmd", b"@echo off\r\ncmd.exe\r\n");
+        let named = script.to_string_lossy().into_owned();
+        let mut pane = pane(&dir, &named, &[]);
+        draw(&mut pane, 40, 8);
+
+        assert!(pane.is_live(), "the wrapper did not start: {}", pane.title());
+        assert_eq!(pane.title(), "shell · abeam-wrapper");
+    }
+}
+
+/// The same suite on Unix, question for question. A second module rather than a
+/// `cfg` inside the first, because what differs is not the question but the
+/// child: every test here needs a real one, and `cmd.exe /c exit` and `/bin/sh
+/// -c exit` have no line in common. The three questions with no twin are the
+/// three whose answers are Windows program names or a Windows directory.
+///
+/// The children are `/bin/sh`, by absolute path: bare when the test needs one
+/// that stays, `-c` when it needs one that is already gone. Absolute so that a
+/// failure here is a fact about this pane and not about the runner's `PATH`.
+/// What is under test is what this pane does with a child, never what the child
+/// prints — with the one exception of the working directory, which is only
+/// observable by asking it.
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use crate::testutil::TempDir;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::time::{Duration, Instant};
+
+    /// The shell that is always there, and the one this module spawns.
+    const SH: &str = "/bin/sh";
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A pane that will spawn exactly this, bypassing the candidate search.
+    /// Tests need a child that exits the moment it starts, and `ABEAM_SHELL`
+    /// names a program rather than a command line.
+    fn pane(dir: &TempDir, program: &str, args: &[&str]) -> ShellPane {
+        ShellPane {
+            root: dir.path().to_path_buf(),
+            candidates: vec![Candidate {
+                program: program.to_string(),
+                args: args.iter().copied().map(String::from).collect(),
+            }],
+            state: State::Cold,
+            drawn: Rect::ZERO,
+        }
+    }
+
+    /// The same with a whole search list, for the two tests that are about the
+    /// list rather than about what is on it.
+    fn panes(dir: &TempDir, programs: &[&str]) -> ShellPane {
+        ShellPane {
+            root: dir.path().to_path_buf(),
+            candidates: programs.iter().copied().map(Candidate::new).collect(),
+            state: State::Cold,
+            drawn: Rect::ZERO,
+        }
+    }
+
+    /// Draw one frame at this size, which is also what starts the child.
+    fn draw(pane: &mut ShellPane, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| pane.render(f, f.area())).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn hosted(pane: &ShellPane) -> &TerminalPane {
+        match &pane.state {
+            State::Hosted { term, .. } => term,
+            _ => panic!("no child: {}", pane.title()),
+        }
+    }
+
+    /// Poll until the child has been reaped. The pane never blocks on a child
+    /// (`docs/conpty-findings.md`, constraint 2), so nor can the tests: there is
+    /// no `wait` to call, which is why this is a loop.
+    fn wait_for_exit(pane: &mut ShellPane) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            pane.tick();
+            if hosted(pane).has_exited() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the child never exited");
+    }
+
+    /// A live child with plenty behind the screen, and finished producing it.
+    ///
+    /// Both halves are load-bearing. The tests below count rows, so waiting for
+    /// merely *some* history lets a `PgUp` clamp against a scrollback that is
+    /// still filling. And `vt100` advances the offset itself as rows arrive —
+    /// on purpose, so that a reader who has scrolled back stays where they are
+    /// looking — so a test that began while output was still coming would watch
+    /// its own offsets move underneath it. Waiting for quiet buys both.
+    ///
+    /// `cat` of a file rather than a loop in the shell keeps the whole command
+    /// out of the quoting rules, which are their own subject; `exec` at the end
+    /// is what `cmd /k` is on the other side, leaving something alive to decline
+    /// a wheel event.
+    fn with_history(dir: &TempDir) -> ShellPane {
+        /// Comfortably more than the deepest scroll any test here performs.
+        const ENOUGH: usize = 20;
+
+        // `\r\n` rather than `\n`, so that this does not depend on the line
+        // discipline having `ONLCR` on: the parser is fed exactly what it needs
+        // either way, and a doubled carriage return costs a column nobody reads.
+        let body: String = (1..=60).map(|i| format!("line-{i}\r\n")).collect();
+        dir.write("many.txt", body.as_bytes());
+        let mut pane = pane(dir, SH, &["-c", "cat many.txt; exec /bin/sh"]);
+        draw(&mut pane, 30, 6);
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (mut last, mut still) = (0, 0);
+        while Instant::now() < deadline {
+            pane.tick();
+            let read = hosted(&pane).diagnostics().bytes_read;
+            // How much history there is, asked by going as far back as the
+            // parser will allow and reading where that landed.
+            pane.to(usize::MAX);
+            let depth = pane.at();
+            pane.to(0);
+
+            still = if depth >= ENOUGH && read == last { still + 1 } else { 0 };
+            if still == 3 {
+                return pane;
+            }
+            last = read;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("a six-row pane fed sixty lines never settled with history behind it");
+    }
+
+    #[test]
+    fn nothing_is_spawned_until_the_pane_is_drawn() {
+        // A session that never presses Alt+S must never pay for a shell
+        // process, and being drawn is the only signal a pane gets that it is
+        // the one on screen.
+        let dir = TempDir::new("shell-cold");
+        let mut pane = pane(&dir, SH, &[]);
+        assert!(matches!(pane.state, State::Cold));
+        assert_eq!(pane.title(), "shell");
+        assert!(!pane.takes_input());
+        // ...and nothing here that quitting abeam would kill.
+        assert!(!pane.is_live());
+        assert!(!pane.tick());
+
+        // A rect with nothing in it is not being on screen either.
+        let mut term = Terminal::new(TestBackend::new(10, 4)).unwrap();
+        term.draw(|f| pane.render(f, Rect::ZERO)).unwrap();
+        assert!(matches!(pane.state, State::Cold));
+
+        draw(&mut pane, 40, 8);
+        assert!(matches!(pane.state, State::Hosted { .. }));
+        assert!(pane.takes_input());
+        assert_eq!(pane.title(), "shell · sh");
+    }
+
+    #[test]
+    fn a_live_child_takes_esc_and_q_and_a_dead_one_leaves_them_to_the_shell() {
+        let dir = TempDir::new("shell-esc");
+
+        let mut live = pane(&dir, SH, &[]);
+        draw(&mut live, 40, 8);
+        assert!(live.takes_input(), "the border promises alt+s as the way out");
+        // The same fact the app reads before it lets abeam exit: quitting would
+        // kill this child, so quitting has to ask first.
+        assert!(live.is_live());
+        let mut sent = hosted(&live).diagnostics().keys_sent;
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert_eq!(live.handle_key(key(code)).unwrap(), Handled::Yes);
+            // `Yes` alone would still be reported by a `handle_key` that had
+            // stopped writing to the child altogether — claiming the key is
+            // only half of taking it.
+            let now = hosted(&live).diagnostics().keys_sent;
+            assert!(now > sent, "{code:?} was claimed but never sent");
+            sent = now;
+        }
+
+        let mut dead = pane(&dir, SH, &["-c", "exit"]);
+        draw(&mut dead, 40, 8);
+        wait_for_exit(&mut dead);
+        assert!(!dead.takes_input());
+        assert!(!dead.is_live(), "nothing left for abeam to wait for");
+        // ...so the app can read them as "give focus back to the agent", which
+        // is the only route out of a pane that is no longer hosting anything.
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert_eq!(dead.handle_key(key(code)).unwrap(), Handled::No);
+        }
+    }
+
+    #[test]
+    fn enter_restarts_a_dead_child_and_the_title_says_so_first() {
+        let dir = TempDir::new("shell-restart");
+        let mut pane = pane(&dir, SH, &["-c", "exit"]);
+        draw(&mut pane, 40, 8);
+        wait_for_exit(&mut pane);
+
+        let title = pane.title();
+        assert!(title.starts_with("exited (0)"), "got: {title}");
+        // A 46-column pane clips from the right, so the way back has to survive
+        // the clip that loses the shell's name.
+        assert!(title.contains("enter restarts"), "got: {title}");
+
+        assert_eq!(pane.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
+        assert!(pane.takes_input(), "a fresh child takes typing again");
+        assert_eq!(pane.title(), "shell · sh");
+    }
+
+    #[test]
+    fn the_rect_the_pane_was_drawn_into_is_the_size_the_pty_is_told() {
+        // One number, not two. A hosted shell wrapping in a different place
+        // from the pane it is drawn in is the failure this rules out, and it is
+        // ruled out by there being no second calculation to disagree.
+        //
+        // Both numbers are asserted, and `parser_size` is the one that matters:
+        // portable-pty answers `pty_size` from a field it wrote itself during
+        // the last resize, so on its own it only proves the call was made,
+        // whereas the parser's size is what the widget renders from.
+        let dir = TempDir::new("shell-size");
+        let mut pane = pane(&dir, SH, &[]);
+        draw(&mut pane, 40, 8);
+        assert_eq!(hosted(&pane).diagnostics().parser_size, (8, 40));
+        assert_eq!(hosted(&pane).diagnostics().pty_size, Some((8, 40)));
+
+        pane.on_resize(Rect::new(0, 0, 33, 11)).unwrap();
+        assert_eq!(hosted(&pane).diagnostics().parser_size, (11, 33));
+        assert_eq!(hosted(&pane).diagnostics().pty_size, Some((11, 33)));
+    }
+
+    #[test]
+    fn a_child_that_has_gone_takes_nothing_down_with_it() {
+        // Every call into the child is swallowed, and the reason is this exact
+        // window: `try_wait` is polled once a loop, so a key can arrive while
+        // the pane still believes a dead child is live. The other tests all go
+        // through the `live() == None` branch, which is not the branch the
+        // swallowing is in.
+        let dir = TempDir::new("shell-raced");
+        let mut pane = pane(&dir, SH, &["-c", "exit"]);
+        draw(&mut pane, 40, 8);
+
+        // Gone, but deliberately never polled — so the pane is in the state it
+        // would be in mid-loop, believing itself live.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(pane.is_live(), "nothing has told the pane yet, which is the point");
+
+        assert_eq!(pane.handle_key(key(KeyCode::Char('x'))).unwrap(), Handled::Yes);
+        assert_eq!(pane.handle_paste("git status\r").unwrap(), Handled::Yes);
+        pane.handle_mouse(&wheel(MouseEventKind::ScrollUp)).unwrap();
+
+        // And the one that used to be able to end the agent session in the
+        // *other* pane: `App::draw` propagates what this returns.
+        pane.on_resize(Rect::new(0, 0, 20, 5)).unwrap();
+        wait_for_exit(&mut pane);
+        pane.on_resize(Rect::new(0, 0, 25, 7)).unwrap();
+    }
+
+    #[test]
+    fn the_exit_is_news_exactly_once() {
+        // The frame this asks for is the only thing that puts "exited · enter
+        // restarts" in the border. Reported forever, it would redraw the
+        // agent's whole screen on every idle loop; reported never, the title
+        // would still say `shell · sh` over a dead pane until something else
+        // happened to want a frame.
+        let dir = TempDir::new("shell-news");
+        let mut pane = pane(&dir, SH, &["-c", "exit"]);
+        draw(&mut pane, 40, 8);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !hosted(&pane).has_exited() {
+            pane.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(hosted(&pane).has_exited(), "the child never exited");
+        assert!(pane.title().starts_with("exited"));
+
+        // Whatever output was still in flight has landed by now, so a further
+        // `true` could only be the transition being reported twice.
+        std::thread::sleep(Duration::from_millis(300));
+        pane.tick();
+        assert!(!pane.tick(), "a settled dead child is not news every loop");
+    }
+
+    #[test]
+    fn enter_before_the_first_frame_waits_for_it_rather_than_spawning_at_one_column() {
+        // `App` drains every pending event before drawing, so Alt+S and Enter
+        // pressed together both arrive while this pane has never been sized. A
+        // shell started at the 1x1 that gets clamped to has already reflowed
+        // its banner into one column by the time a frame corrects it.
+        let dir = TempDir::new("shell-early-enter");
+        let mut pane = pane(&dir, SH, &[]);
+        assert_eq!(pane.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
+        assert!(matches!(pane.state, State::Cold), "nothing was started");
+
+        // The frame that was always going to spawn it does so, at its size.
+        draw(&mut pane, 40, 8);
+        assert_eq!(hosted(&pane).diagnostics().parser_size, (8, 40));
+    }
+
+    #[test]
+    fn alt_j_scrolls_the_pane_where_a_typed_down_is_still_the_shells() {
+        // Alt+J arrives here as a bare `Down`. Forwarded to a live shell that
+        // is its history key, so glancing at this pane would load an earlier
+        // command into the prompt — silently, and while focus is elsewhere.
+        let dir = TempDir::new("shell-glance");
+        let mut pane = pane(&dir, SH, &[]);
+        draw(&mut pane, 40, 8);
+        let sent = hosted(&pane).diagnostics().keys_sent;
+
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::PageDown, KeyCode::PageUp] {
+            pane.scroll_key(key(code)).unwrap();
+        }
+        assert_eq!(
+            hosted(&pane).diagnostics().keys_sent,
+            sent,
+            "not one of them reached the child"
+        );
+        // Nothing has scrolled off yet, so none of them moved anything either,
+        // and a key that moved nothing must not cost a frame.
+        assert_eq!(pane.scroll_key(key(KeyCode::Down)).unwrap(), Handled::No);
+
+        // ...whereas the same key typed into the focused pane is the child's.
+        pane.handle_key(key(KeyCode::Down)).unwrap();
+        assert!(hosted(&pane).diagnostics().keys_sent > sent);
+    }
+
+    #[test]
+    fn output_that_scrolled_off_is_reachable_by_key_and_by_wheel() {
+        let dir = TempDir::new("shell-history");
+        let mut pane = with_history(&dir);
+        assert_eq!(pane.at(), 0, "the view starts on the live screen");
+
+        assert_eq!(pane.scroll_key(key(KeyCode::Up)).unwrap(), Handled::Yes);
+        assert_eq!(pane.at(), 1);
+        assert_eq!(pane.scroll_key(key(KeyCode::PageUp)).unwrap(), Handled::Yes);
+        assert_eq!(pane.at(), 1 + 5, "a page keeps one row of overlap");
+        pane.scroll_key(key(KeyCode::PageDown)).unwrap();
+        assert_eq!(pane.at(), 1);
+
+        // A plain shell asks for no mouse reports, so the notch is ours.
+        assert_eq!(
+            pane.handle_mouse(&wheel(MouseEventKind::ScrollUp)).unwrap(),
+            Handled::Yes
+        );
+        assert_eq!(pane.at(), 1 + WHEEL);
+        pane.handle_mouse(&wheel(MouseEventKind::ScrollDown)).unwrap();
+        assert_eq!(pane.at(), 1);
+
+        // Typing is a request to be at the prompt, and the prompt is at the
+        // bottom. Anything else types into a screen you cannot see.
+        pane.handle_key(key(KeyCode::Char('x'))).unwrap();
+        assert_eq!(pane.at(), 0);
+        assert_eq!(
+            pane.scroll_key(key(KeyCode::Down)).unwrap(),
+            Handled::No,
+            "already live, so nothing moved"
+        );
+    }
+
+    #[test]
+    fn a_cursor_is_drawn_in_a_live_prompt_and_nowhere_else() {
+        // The strongest focus signal there is: if it is not blinking in the
+        // shell's prompt, your keys are not going to the shell.
+        let dir = TempDir::new("shell-cursor");
+        let mut pane = with_history(&dir);
+        assert!(pane.cursor().is_some());
+
+        // Scrolled far enough back, the live screen — and the prompt on it —
+        // is off the bottom of the pane, so there is nothing to point at.
+        pane.to(usize::MAX);
+        assert_eq!(pane.cursor(), None);
+        pane.to(0);
+        assert!(pane.cursor().is_some());
+
+        let mut dead = pane_that_exited(&dir);
+        assert_eq!(dead.cursor(), None, "a dead child has no prompt");
+        assert_eq!(dead.handle_paste("git status\r").unwrap(), Handled::No);
+    }
+
+    fn pane_that_exited(dir: &TempDir) -> ShellPane {
+        let mut pane = pane(dir, SH, &["-c", "exit"]);
+        draw(&mut pane, 40, 8);
+        wait_for_exit(&mut pane);
+        pane
+    }
+
+    #[test]
+    fn a_spawn_that_fails_is_a_message_naming_what_was_tried() {
+        // `render` cannot return an error, so this has to be a state the pane
+        // holds. The alternative is an empty box, which is exactly what a shell
+        // that has not printed anything yet also looks like.
+        let dir = TempDir::new("shell-missing");
+        let mut pane = pane(&dir, "abeam-no-such-shell", &[]);
+        let screen = draw(&mut pane, 46, 12);
+
+        assert!(matches!(pane.state, State::Failed { .. }));
+        assert!(!pane.takes_input(), "there is nothing to type into");
+        assert_eq!(pane.title(), "no shell · enter retries");
+        // On screen, not merely in the struct — and naming the program, which
+        // is the only thing that tells a reader whether ABEAM_SHELL is at fault.
+        assert!(screen.contains("abeam-no-such-shell"), "got: {screen}");
+        assert!(screen.contains("ABEAM_SHELL"), "got: {screen}");
+
+        // Enter retries, for the case where the fix was made outside abeam.
+        assert_eq!(pane.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
+        assert!(matches!(pane.state, State::Failed { .. }));
+    }
+
+    #[test]
+    fn the_child_starts_in_the_directory_abeam_was_pointed_at() {
+        // The whole point of this pane over a second window: a `git status`
+        // typed here answers about the repository on screen, not about wherever
+        // abeam happened to be launched from.
+        let dir = TempDir::new("shell-cwd");
+        let mut pane = pane(&dir, SH, &["-c", "pwd"]);
+        draw(&mut pane, 100, 8);
+        wait_for_exit(&mut pane);
+        // try_wait can answer while the last of the output is still in flight.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Canonicalised, and not folded to one case the way the Windows twin
+        // is: `pwd` in a shell that has just been given a directory answers
+        // with the physical path, and a temporary directory can be reached
+        // through a symlinked `/tmp`. Case is not the difference here — these
+        // paths are compared exactly, because on this platform they are.
+        let printed = hosted(&pane).last_screen().join("\n");
+        let want = dir.path().canonicalize().expect("the temporary directory");
+        let want = want.to_string_lossy();
+        assert!(printed.contains(&*want), "expected {want:?} in {printed:?}");
+    }
+
+    #[test]
+    fn an_explicit_program_is_a_choice_and_a_login_shell_is_only_a_preference() {
+        // The distinction the whole module is built on, and the one thing that
+        // would be easy to lose in a port: `ABEAM_SHELL` gets no fallback,
+        // because falling back from it would hide a typo behind a shell nobody
+        // asked for. `$SHELL` gets two, because nobody typed it at abeam — it
+        // was set once, years ago, and a login shell uninstalled since must not
+        // leave this pane with nothing in it.
+        let named = ShellPane::new(PathBuf::from("."), Some("nu".to_string()));
+        let only: Vec<&str> = named.candidates.iter().map(|c| c.program.as_str()).collect();
+        assert_eq!(only, ["nu"]);
+
+        // Handed in rather than exported. Two hundred tests share this
+        // process's environment and run beside this one, so `$SHELL` is not a
+        // variable any of them gets to write — which is the whole reason the
+        // list is built by a function taking a value.
+        assert_eq!(
+            shells(Some(OsString::from("/usr/bin/fish"))),
+            ["/usr/bin/fish", "bash", "sh"],
+            "what the user already chose leads, and the name a Unix cannot be missing is last"
+        );
+        // Unset and set-to-empty are the same thing: neither names a program,
+        // and passing "" on would ask the resolver to search for nothing.
+        assert_eq!(shells(None), ["bash", "sh"]);
+        assert_eq!(shells(Some(OsString::new())), ["bash", "sh"]);
+        // And a `$SHELL` that is not text falls through to the same two. A Unix
+        // path is bytes, so this is a value the environment really can hold;
+        // the resolver takes a `String`, and a lossy rendering of these bytes
+        // would name a *different* file. Dropping it is what the `into_string`
+        // above is for, and without this line nothing would notice it becoming
+        // a `to_string_lossy`.
+        assert_eq!(shells(Some(OsString::from_vec(vec![0xff]))), ["bash", "sh"]);
+
+        // ...and the constructor's `None` arm really does ask `preferred` for
+        // that list, which is the coupling the Windows twin asserts outright
+        // and this one cannot: `$SHELL` belongs to whoever is running the
+        // suite, so the head of the list is not a thing to assert. The tail is.
+        // Replace the arm with a list of abeam's own and this fails here rather
+        // than in front of somebody whose login shell was ignored.
+        let searched = ShellPane::new(PathBuf::from("."), None);
+        let order: Vec<&str> = searched
+            .candidates
+            .iter()
+            .map(|c| c.program.as_str())
+            .collect();
+        assert_eq!(
+            order[order.len() - 2..],
+            ["bash", "sh"],
+            "the two names behind `$SHELL` are what `preferred` ends with"
+        );
+    }
+
+    // --- finding a shell, safely ------------------------------------------
+
+    #[test]
+    fn a_shell_the_first_candidate_cannot_supply_falls_through_to_the_next() {
+        // The reason the candidate list is a list: `$SHELL` can name a shell
+        // that was uninstalled after it was set, so the first name on it
+        // resolves to nothing and the pane must still open. Every other test
+        // here injects a single candidate, which is the one shape that cannot
+        // show this.
+        let dir = TempDir::new("shell-fallback");
+        let mut pane = panes(&dir, &["abeam-no-such-shell", SH]);
+        draw(&mut pane, 40, 8);
+
+        assert!(pane.is_live());
+        assert_eq!(pane.title(), "shell · sh", "the second candidate won");
+    }
+
+    #[test]
+    fn a_search_that_finds_nothing_names_every_shell_it_looked_for() {
+        // Which list this was is the whole diagnosis: one name means
+        // ABEAM_SHELL is wrong, the whole list means this is not the machine
+        // anyone expected — and the reader can only tell them apart by reading
+        // them.
+        let dir = TempDir::new("shell-none");
+        let missing = ["abeam-no-such-a", "abeam-no-such-b", "abeam-no-such-c"];
+        let mut pane = panes(&dir, &missing);
+        let screen = draw(&mut pane, 46, 14);
+
+        for name in missing {
+            assert!(screen.contains(name), "{name} is missing from: {screen}");
+        }
+        // That the reason from the resolver reached the screen at all, which is
+        // the last of the three things this pane promises to say. The sentence
+        // is `crate::launch`'s and is byte-identical on both platforms, so this
+        // is asserted as tightly as its Windows twin asserts it: at 46 columns
+        // it does not wrap, and a looser match would go green against wording
+        // that no longer says a search happened.
+        assert!(screen.contains("not found on PATH"), "got: {screen}");
+    }
+
+    #[test]
+    fn a_shell_that_is_a_script_wrapper_starts_and_the_border_names_the_wrapper() {
+        // `ABEAM_SHELL=~/bin/nu-wrapper` is the same wish as `abeam claude` on
+        // an npm install, and here the kernel grants it: a `#!` line is its
+        // business, so `launch::unix::into_launch` hands back a `Launch` whose
+        // `program` and `target` are the same file and nothing is routed.
+        //
+        // What this pins is therefore the two things that are left — that a
+        // script carrying the execute bit resolves and starts at all, and that
+        // the border says its stem rather than the full path it was named by.
+        // Not the regression its Windows twin exists for: replacing
+        // `name_of(&launch.target)` with `launch.program` leaves this test and
+        // the whole Unix suite green, because those two are never different
+        // here. Naming the interpreter is only catchable where something routes
+        // an interpreter, which is Windows.
+        let dir = TempDir::new("shell-wrapper");
+        // With the execute bit, because a script without one is not a program
+        // and the resolver is right to say so.
+        let script = dir.write_exec("abeam-wrapper", b"#!/bin/sh\nexec /bin/sh\n");
         let named = script.to_string_lossy().into_owned();
         let mut pane = pane(&dir, &named, &[]);
         draw(&mut pane, 40, 8);

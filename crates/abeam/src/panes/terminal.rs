@@ -27,10 +27,13 @@ impl TerminalPane {
     /// A child and a size, for the tests that want nothing else.
     ///
     /// `main` used this until it acquired a working directory it had to pass —
-    /// abeam now stands in `%SystemRoot%`, so a pty that is not told where to
-    /// start starts there. Test-only rather than merely unused, because a
-    /// constructor that silently accepts the process's own directory is exactly
-    /// what should no longer be reachable from the program.
+    /// abeam now spends the session standing in a directory an ordinary user
+    /// cannot write to, so a pty that is not told where to start starts there.
+    /// Not one *nobody* can write to, and `main` is careful about the same
+    /// thing: on Unix that directory is `/`, and a `uvx abeam` in a container
+    /// is commonly running as root. Test-only rather than merely unused,
+    /// because a constructor that silently accepts the process's own directory
+    /// is exactly what should no longer be reachable from the program.
     #[cfg(test)]
     pub fn spawn(program: &str, args: &[String], rows: u16, cols: u16) -> Result<Self> {
         Self::spawn_with(
@@ -44,10 +47,13 @@ impl TerminalPane {
     /// extra environment, a different scrollback. The way in.
     pub fn spawn_with(cfg: PtyConfig) -> Result<Self> {
         // The program only when nobody said otherwise. Once something in front
-        // of the pty resolves names, `cfg.program` is an absolute path — or,
-        // for a script routed through an interpreter, `cmd.exe` — and a border
-        // reading `C:\Users\…\npm\claude.cmd` or `cmd` is worse than useless in
-        // 46 columns. See [`PtyConfig::title`].
+        // of the pty resolves names, `cfg.program` is an absolute path — and on
+        // Windows, for a script routed through an interpreter, `cmd.exe` — and
+        // a border reading `C:\Users\…\npm\claude.cmd` or `cmd` is worse than
+        // useless in 46 columns. See [`PtyConfig::title`]. Unix needs no
+        // routing, so the second half of that is a Windows fact rather than a
+        // general one; the first half is true everywhere, and is the half this
+        // line is mostly for.
         let title = cfg.title.clone().unwrap_or_else(|| cfg.program.clone());
         Ok(Self {
             session: PtySession::spawn(cfg)?,
@@ -294,7 +300,9 @@ impl Pane for TerminalPane {
     }
 }
 
-/// Windows-only: both of these start a real child in a real pty.
+/// Windows-only: both of these start a real child in a real pty. The Unix
+/// module below asks the same question of `/bin/sh`, because the thing under
+/// test is a border and the child is only what makes one appear.
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -320,5 +328,37 @@ mod tests {
         // that does not care go on not caring.
         let bare = TerminalPane::spawn_with(cfg).unwrap();
         assert_eq!(bare.title(), resolved.to_string_lossy());
+    }
+}
+
+/// The same question on Unix. A second module rather than a `cfg` inside the
+/// first, because what differs is not one line of it: the child, its arguments
+/// and the path that comes back are all different, and the only thing the two
+/// share is what they assert about the border.
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn a_border_says_the_name_it_was_given_rather_than_the_path_that_was_started() {
+        // The regression this exists to stop, and it survives the port: `main`
+        // resolves what it was asked for into an absolute path before the pty
+        // sees it, so the obvious thing a border could show is a path nobody
+        // typed. In 46 columns, clipped from the right, that is a border which
+        // says `/home/p/.local`.
+        //
+        // `/bin/sh` by absolute path, so a failure here is a fact about this
+        // pane rather than about the runner's `PATH`.
+        let cfg = PtyConfig::new("/bin/sh")
+            .args(["-c".to_string(), "exit".to_string()])
+            .size(10, 40);
+
+        let named = TerminalPane::spawn_with(cfg.clone().title("claude")).unwrap();
+        assert_eq!(named.title(), "claude");
+
+        // Unset is the old behaviour exactly, which is what lets every caller
+        // that does not care go on not caring.
+        let bare = TerminalPane::spawn_with(cfg).unwrap();
+        assert_eq!(bare.title(), "/bin/sh");
     }
 }
