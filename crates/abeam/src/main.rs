@@ -22,10 +22,12 @@ mod launch;
 mod layout;
 mod pane;
 mod panes;
+mod paths;
 mod scroll;
 mod term;
 mod text;
 mod watch;
+mod workspace;
 
 #[cfg(test)]
 mod testutil;
@@ -56,7 +58,7 @@ fn main() -> Result<()> {
         Ok(config) => config,
         Err(why) => {
             eprintln!("{why}");
-            std::process::exit(2);
+            std::process::exit(REFUSED);
         }
     };
     let table = config.table();
@@ -66,31 +68,40 @@ fn main() -> Result<()> {
     // reached `CreateProcessW` as a program called `--help`, and the answer to
     // a question about abeam was a spawn failure naming a flag.
     //
-    // That papercut is worth keeping written down after the fact, because the
-    // rule `crate::agent` now parses under is the reason it can never happen
-    // again — and "we added a check for it" and "it stopped being expressible"
-    // are very different guarantees. A program name has to arrive behind a `+`
-    // today, so a dashed token cannot become one however it is spelled and
-    // whatever abeam does or does not recognise. `--help` is Claude's question
-    // now; `+help` is the only spelling that reaches the arm below. What this
-    // still catches before `term::setup` is the two answer-and-exit words and
-    // the parser's refusals, which is the same reason as ever: a message
-    // printed after raw mode is on is a message on a screen about to be thrown
-    // away.
-    let (choice, program_args) = match agent::parse(&args, table) {
-        Ok(agent::Cli::Help) => {
-            println!("{}", agent::help(table));
+    // That papercut is worth keeping written down after the fact, because
+    // "we added a check for it" and "it stopped being expressible" are very
+    // different guarantees and the rule `crate::agent` now parses under buys
+    // the second one — for the papercut, and *only* for the papercut. This
+    // comment used to claim more, and the correction is the useful part. It
+    // said a dashed token could no longer become a program name however it is
+    // spelled. It can: `abeam +--help` names one, `ABEAM_AGENT=--help` names
+    // one with no `+` on the line at all, and `abeam +./-weird` reaches a
+    // dash-named file through the relative-path branch in `host` below. All
+    // three are somebody asking for a dash-named program, which abeam has
+    // always allowed on purpose and has a test pinning.
+    //
+    // What the rule deleted is the *route* — a dashed token becoming a program
+    // name with nobody having named one. `--help` is Claude's question now, and
+    // `+help` is the only spelling that reaches the arm below. What keeps a
+    // dashed name that somebody *did* ask for off `CreateProcessW` is not this
+    // rule and never was: it is `launch::find`, which answers only with a path
+    // it has located and otherwise returns abeam's own "`--help` was not found
+    // on PATH". That predates all of this.
+    //
+    // What this still catches before `term::setup` is the two answer-and-exit
+    // words and the parser's refusals, which is the same reason as ever: a
+    // message printed after raw mode is on is a message on a screen about to be
+    // thrown away.
+    let (choice, program_args) = match reading(&args, table) {
+        Reading::Answered(said) => {
+            println!("{said}");
             return Ok(());
         }
-        Ok(agent::Cli::Version) => {
-            println!("{}", agent::version());
-            return Ok(());
-        }
-        Ok(agent::Cli::Host { choice, args }) => (choice, args),
-        Err(why) => {
+        Reading::Refused(why) => {
             eprintln!("{why}");
-            std::process::exit(2);
+            std::process::exit(REFUSED);
         }
+        Reading::Host(choice, args) => (choice, args),
     };
 
     // Read from the selection rather than from the command line, because a
@@ -100,7 +111,7 @@ fn main() -> Result<()> {
     // opening state with it, so it gets `[defaults]` like every other session.
     let opening = config.opening(match &choice {
         agent::Choice::Known(agent) => Some(agent.name),
-        agent::Choice::Program(_) => None,
+        agent::Choice::Program { .. } => None,
     });
 
     let root = std::env::current_dir()?;
@@ -114,7 +125,7 @@ fn main() -> Result<()> {
         Ok(hosted) => hosted,
         Err(why) => {
             eprintln!("{why}");
-            std::process::exit(2);
+            std::process::exit(REFUSED);
         }
     };
 
@@ -224,6 +235,50 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The exit code every refusal on this side of `term::setup` leaves with.
+///
+/// One constant rather than the same literal at three call sites, because it is
+/// a promise to whatever is scripting abeam — `abeam -p "…" && next-step`, a CI
+/// wrapper — and the three are one promise rather than three. A `2` that drifted
+/// to a `1` in one of them would be a promise kept in the other two, which is
+/// the shape of bug nobody notices until a pipeline behaves differently
+/// depending on which thing was wrong.
+const REFUSED: i32 = 2;
+
+/// What reading the command line settled, before anything has been started.
+///
+/// Three answers because `main` does three different things with them: print on
+/// standard output and leave happy, print on standard error and leave with
+/// [`REFUSED`], or go on and host something.
+#[derive(Debug)]
+enum Reading {
+    /// abeam's own two words, answered.
+    Answered(String),
+    /// A command line abeam will not act on — the refusals in `crate::agent`.
+    Refused(String),
+    /// Something to host, and the arguments left for it.
+    Host(agent::Choice, Vec<String>),
+}
+
+/// [`main`]'s first decision, as a value rather than as three `exit`s.
+///
+/// Split out for one reason and it is a testing one: `main` ends every one of
+/// these arms in `println!` or `std::process::exit`, and no in-process test can
+/// observe either. So the decision is here, where a test can hold it in its
+/// hand, and `main` above is the three lines that turn it into output and a
+/// status. What that leaves untested is `exit` being called at all, which is
+/// the part `crates/abeam/tests/end_to_end.rs` reaches by spawning the real
+/// binary; what it pins is the half that has actually gone wrong before, which
+/// is *which* answer a command line produces.
+fn reading(args: &[String], table: &'static [agent::Agent]) -> Reading {
+    match agent::parse(args, table) {
+        Ok(agent::Cli::Help) => Reading::Answered(agent::help(table)),
+        Ok(agent::Cli::Version) => Reading::Answered(agent::version()),
+        Ok(agent::Cli::Host { choice, args }) => Reading::Host(choice, args),
+        Err(why) => Reading::Refused(why),
+    }
+}
+
 /// Turn what was asked for into something to start.
 ///
 /// An agent is `crate::agent`'s question entirely — a table of candidates and
@@ -236,9 +291,9 @@ fn host(
     root: &Path,
     table: &[agent::Agent],
 ) -> Result<agent::Hosted, String> {
-    let asked = match choice {
+    let (asked, whence) = match choice {
         agent::Choice::Known(agent) => return agent::resolve_within(agent, args, table),
-        agent::Choice::Program(asked) => asked,
+        agent::Choice::Program { name, whence } => (name, whence),
     };
 
     // `abeam +./tools/agent.exe` named a place, and meant it relative to where
@@ -264,7 +319,16 @@ fn host(
         _ => asked.clone(),
     };
 
-    launch::resolve(&program, args).map(|launch| agent::Hosted::plain(&asked, launch))
+    // `launch`'s own sentence names the file it went looking for and stops
+    // there, which is right for a module whose whole subject is the search.
+    // What it cannot know is *why abeam was looking for that*, and that is the
+    // half a reader is most often missing here — one of them typed a `+` in
+    // front of a prompt, and the other has a variable set from another year.
+    // `agent::nowhere` writes the paragraph; `whence` is the only fact it needs
+    // and the only one that cannot be recovered from a failed `PATH` walk.
+    launch::resolve(&program, args)
+        .map(|launch| agent::Hosted::plain(&asked, launch))
+        .map_err(|why| agent::nowhere(&asked, whence, &why))
 }
 
 /// Where abeam goes to stand for the rest of the session, or `None` if this
@@ -318,6 +382,43 @@ mod portable_tests {
             ),
         }
     }
+
+    #[test]
+    fn a_command_line_that_used_to_select_is_refused_with_the_code_a_script_reads() {
+        // `abeam claude` is what every older copy of the README says to type,
+        // and it exits 2 rather than starting anything — which matters to
+        // whatever is on the other side of an `&&`. This is as close to `main`
+        // as an in-process test gets: `main` ends these arms in `exit`, which
+        // no test in this binary can observe, so what is pinned here is that
+        // the refusal reaches the arm holding the code and that the code is 2.
+        // The `exit` itself is `tests/end_to_end.rs`'s job.
+        let Reading::Refused(why) = reading(&[String::from("claude")], agent::AGENTS) else {
+            panic!("`abeam claude` is refused rather than hosted");
+        };
+        assert!(why.contains("used to host"), "got: {why}");
+        assert_eq!(
+            REFUSED, 2,
+            "the exit code is a promise to whatever is scripting abeam"
+        );
+
+        // The other two answers, so that this is a test of the routing rather
+        // than of one arm of it. Neither of these depends on the process
+        // environment: `+help` is answered before the default is read, and a
+        // `+` token overrides `ABEAM_AGENT` outright — which matters, because
+        // this binary shares its environment with three hundred other tests.
+        assert!(matches!(
+            reading(&[String::from("+help")], agent::AGENTS),
+            Reading::Answered(_)
+        ));
+        assert!(matches!(
+            reading(&[String::from("+version")], agent::AGENTS),
+            Reading::Answered(_)
+        ));
+        assert!(matches!(
+            reading(&[String::from("+claude")], agent::AGENTS),
+            Reading::Host(..)
+        ));
+    }
 }
 
 /// Windows-side: what is under test is a `PATH` walk and a path joined onto the
@@ -329,8 +430,15 @@ mod tests {
     use super::*;
     use crate::testutil::TempDir;
 
+    /// A program named by a `+` token, which is the way one is usually named.
+    /// Which of the two ways in it was changes nothing about the resolution —
+    /// `crate::agent::Whence` is read on the failure path and nowhere else —
+    /// so these tests pick one and say so rather than running each twice.
     fn program(name: &str) -> agent::Choice {
-        agent::Choice::Program(name.to_string())
+        agent::Choice::Program {
+            name: name.to_string(),
+            whence: agent::Whence::Sigil,
+        }
     }
 
     #[test]
@@ -381,8 +489,15 @@ mod unix_tests {
     use super::*;
     use crate::testutil::TempDir;
 
+    /// A program named by a `+` token, which is the way one is usually named.
+    /// Which of the two ways in it was changes nothing about the resolution —
+    /// `crate::agent::Whence` is read on the failure path and nowhere else —
+    /// so these tests pick one and say so rather than running each twice.
     fn program(name: &str) -> agent::Choice {
-        agent::Choice::Program(name.to_string())
+        agent::Choice::Program {
+            name: name.to_string(),
+            whence: agent::Whence::Sigil,
+        }
     }
 
     #[test]

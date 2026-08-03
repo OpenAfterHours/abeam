@@ -133,18 +133,39 @@ abeam agent               # ...and `claude agent`, subcommands included
 abeam +copilot --resume   # GitHub Copilot CLI, with its own --resume
 abeam +bash               # anything else on PATH
 abeam +help               # abeam's own help; `--help` is the agent's
-abeam -- +1 more thing    # `--` fences a leading `+` for the agent
+abeam -- +1 more thing    # `--` stops abeam reading, and goes to the agent too
 ```
+
+**If you used to write `abeam <program>`, write `abeam +<program>` now.**
+`abeam bash`, `abeam powershell`, `abeam nu` — anything this document used to
+describe as "anything else on `PATH`" — needs the sigil in front of it, and the
+next section says what those lines do without one.
 
 A `+` token is read only in the first position and there is at most one: a
 prompt may begin with a `+`, and `abeam config set +x` is a real command line.
 `+name` is resolved exactly as the old positional was — if it names an agent
 abeam knows, `claude` or `copilot`, or a preset out of your config file, matched
 without regard to case, abeam looks that entry's executables up on `PATH`;
-anything else is a program name and means what `abeam bash` used to mean. Two words behind the sigil are reserved and only
-two, `+help` and `+version`. There are no `+h`/`+V` short forms, deliberately: a
+anything else is a program name and means what `abeam bash` used to mean. Spaces
+around the name are trimmed, so `abeam "+claude "` is `abeam +claude` rather
+than a hunt for a program with a space on the end of it. Two words behind the
+sigil are reserved and only two, `+help` and `+version`, and like every other
+name behind a `+` they are matched without regard to case: `+HELP` and
+`+Version` are abeam's too. There are no `+h`/`+V` short forms, deliberately: a
 short form is one more word that can never be a program name, and `-h`, `-V`,
 `--help` and `--version` all go to the agent now, which is the help you wanted.
+
+**`--` is not a second exception, and it used to be one.** A leading `--` stops
+abeam reading the line — so a first argument beginning with `+` is safe behind
+it — and then goes to the agent along with everything after it, exactly as you
+typed it. That is a fix rather than a detail: abeam used to swallow the token,
+so `abeam -- --resume` started `claude --resume` and *resumed the session*,
+where `claude -- --resume` hands the literal string `--resume` over as a prompt.
+One command line meant two things depending on whether abeam was in front of
+it, which is the whole of what the rule above exists to prevent. So
+`abeam -- claude agent` is `claude -- claude agent` today, and whether that is a
+prompt or a complaint is Claude's business — the point is that it is the same
+answer either way.
 
 `ABEAM_AGENT` names what to host when no `+` token did — an agent name, a preset
 name, or any program — and this change is what made it worth setting: `ABEAM_AGENT=copilot
@@ -153,6 +174,21 @@ moment you had arguments to pass. An empty value counts as unset, because
 PowerShell leaves one behind — and so does a profile that exports a variable it
 then fails to fill — and `'' was not found on PATH` names nothing anyone can act
 on. A `+` token overrides it.
+
+**Its reach grew with that, and that is a cost as well as the feature.** The old
+code read the variable only when you gave abeam no arguments at all, because
+anything else was a positional that selected. It is read on every command line
+that does not lead with a `+` now — so one exported in a dotfile three years ago
+used to touch nothing but bare `abeam`, and today silently redirects `abeam -p
+"commit my changes"` into a different agent. There is no version of this that is
+only the good half. What stands against it is that a `+` overrides it for one
+run, that the left border says which agent is taking the typing, and that when
+what it names cannot be found abeam's message says the variable is why.
+
+It holds a **name**, not a command line, so `ABEAM_AGENT=+copilot` — the
+spelling every other line here teaches — is refused with the correction printed
+rather than accepted with the `+` quietly dropped. The sigil says which token on
+a command line is abeam's, and there is no token to mark inside a variable.
 
 **`abeam claude` and `abeam copilot` are refused rather than reinterpreted**,
 with exit code 2 and a message naming both readings and both ways out. They
@@ -163,6 +199,14 @@ have, on a screen that never mentions abeam. That refusal is permanent, not a
 migration aid, and it is a fixed lookup in abeam's own table rather than a `PATH`
 probe: a refusal that depended on what happened to be installed would accept a
 command line on your machine and reject it on a build server.
+
+The message rewrites the **first token** and leaves the rest of your line
+described rather than quoted, which is a correction: it used to print your whole
+command line back inside `` Write `abeam +…` ``, joined with single spaces,
+having never seen your shell's quotes. For `abeam claude -p "fix the tests &
+ship it"` that produced an instruction which in `bash` runs two commands. Only
+the first token ever changes, so that is the only part worth spelling out
+exactly.
 
 There is no `--agent` flag, and this document used to give a different reason
 for that than it gives now. The old one was that the positional already
@@ -180,8 +224,19 @@ subcommands the hosted agent grows next, which is not a list any README can
 hold. The change also deleted a class of bug rather than guarding against it:
 abeam used to refuse leading flags it did not recognise, because before that
 check existed `abeam --help` reached `CreateProcessW` as a program named
-`--help`. Under this rule a dashed token can never be a program name at all, so
-there is nothing left to check.
+`--help`. What the rule deletes is the *route* — a dashed token becoming a
+program name with nobody having named one — so there is nothing left to check.
+
+This paragraph used to claim something stronger and it was false, which is worth
+correcting rather than quietly softening, since its own point is that "we added
+a check for it" and "it stopped being expressible" are different guarantees. It
+said a dashed token could never be a program name at all. It can:
+`abeam +--help` names one, `ABEAM_AGENT=--help` names one with no `+` on the
+line, and `abeam +./-weird` reaches a dash-named file by path. All three are you
+asking for a dash-named program, which abeam allows on purpose. What keeps such
+a name off the operating system's own spawn is `launch`, which answers only with
+a path it has actually located and otherwise says `` `--help` was not found on
+PATH `` in abeam's own voice — and that predates this change entirely.
 
 An agent abeam cannot find is a sentence and never a download. Modern `gh
 copilot` is a launcher rather than the retired suggest/explain extension: it
@@ -197,6 +252,14 @@ copilot` included, as a command you run yourself. The third is the best line in
 the message and the one most often needed: the default agent missing on a
 machine where the other one is right there is a session one word away from
 starting, and nothing else on that screen would say so.
+
+Under all of that there is one more line, naming `abeam +help`, and it is there
+because **this message is also what `abeam --help` prints on a machine with no
+agent installed**. Trace it: no `+`, so `--help` belongs to the agent; the agent
+is not there; and what comes back is a page about installing Claude to somebody
+who was asking what abeam is. `F1` is not a route out of that — it needs a
+running agent — so without the line the only way to find abeam's own command
+line is this document.
 
 What each agent wants:
 
@@ -286,9 +349,12 @@ will not:
   whose names differ only in case are refused for the same reason, since every
   name behind a `+` is matched without regard to case.
 - **A preset name is refused in front of the sigil too.** `abeam fleet` gets the
-  same both-readings message `abeam claude` gets, because it is the same
+  same both-readings refusal `abeam claude` gets, because it is the same
   mistake — made, this time, by the one person on the machine most likely to
-  believe the word means their preset.
+  believe the word means their preset. The sentence differs in one place and had
+  to: `abeam claude` really did host Claude for years, and `abeam fleet` has
+  never hosted anybody's preset, so it says what that line *did* mean instead —
+  a `PATH` lookup for a program called `fleet`.
 
 A key abeam does not recognise is an error rather than a shrug. `[presets.fleet]`
 with the plural spelling, or a `them = "dark"`, is a line you wrote and expected
@@ -611,6 +677,22 @@ work, on either platform.
 
 **Not done, and known.**
 
+- **`abeam bash` is a prompt now, and nothing says so.** This document used to
+  advertise `abeam bash`, `abeam powershell` and "anything else on `PATH`", and
+  under the rule above every one of those is a word handed to Claude, which will
+  start answering it. That is strictly worse than what `abeam claude` gets: the
+  refusal catches the two agent names and every preset name, so those at least
+  produce a complaint with abeam's name on it. It cannot catch a bare program
+  name, and deliberately: the only way to know that `bash` is a program on
+  *this* machine is to probe `PATH`, and a refusal that depended on what happens
+  to be installed would accept a command line on your laptop and reject it on a
+  build server. So the cost is paid in documentation instead, which is what the
+  migration line under "Running it" is. The same shape, reversed, is the other
+  live cost of the flip: a prompt that genuinely begins with a `+` is read as a
+  program name, because first position is exactly where a prompt lands.
+  `abeam "+1 to shipping this"` looks for a program called `1 to shipping this`
+  — the message names the `--` escape, and it is still a line somebody will type
+  once before they learn it.
 - **The shell view has never been driven by a human.** A test types `set /a
   123*456` into the real binary and reads `56088` back off the screen, which is
   more than a smoke test and still less than use: the six pass criteria above
@@ -862,7 +944,12 @@ work, on either platform.
   that nothing leaves it unchecked.
 - **A non-UTF-8 command-line argument aborts abeam before anything runs.**
   `std::env::args()` panics on one. That is unreachable on Windows and entirely
-  reachable on Unix, where an argument is bytes; `args_os` is the fix.
+  reachable on Unix, where an argument is bytes; `args_os` is the fix. Its
+  exposure grew when the command line was handed to the agent, which is the
+  reason it is worth doing rather than noting: abeam's arguments used to be a
+  program name and a handful of flags abeam had written down itself, and they
+  are now *the prompt* — arbitrary text a user pasted, from an editor, an issue
+  tracker or another program's output, which is where a stray byte comes from.
 - **The reader's title and the find list spell the same path differently on
   Windows.** The file index rewrites `\` to `/` so that typing `src/panes` finds
   something; the reader's own label does not, so a title can read
