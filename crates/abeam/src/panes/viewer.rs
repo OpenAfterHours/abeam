@@ -120,7 +120,10 @@ enum State {
     Doc(Doc),
     /// A path that could not be read. Kept rather than discarded so `r` has
     /// something to retry and the title can say which file went wrong.
-    Failed { path: PathBuf, why: LoadError },
+    Failed {
+        path: PathBuf,
+        why: LoadError,
+    },
 }
 
 pub struct ViewerPane {
@@ -150,6 +153,31 @@ pub struct ViewerPane {
 
     /// A file the watcher noticed, waiting for the pane to be on screen.
     pending: Option<PathBuf>,
+    /// A document was taken up inside [`Pane::render`], so the title the shell
+    /// drew for this frame is a document behind the body under it.
+    ///
+    /// The shell renders the border — and asks this pane for its title — before
+    /// it renders the pane, so the frame on which a pending document is first
+    /// shown carries the *previous* state's title: `files`, over a page with a
+    /// document on it. Every later frame is right, which is why this went years
+    /// without being noticed. What makes it a bug rather than a cosmetic skew is
+    /// that there is no promise of a later frame. `crate::app` draws when
+    /// something asks it to, and a pane that changed its own state during a
+    /// render has asked nobody.
+    ///
+    /// It surfaced on Linux, and only once `crate::watch` stopped reporting
+    /// reads as writes: the events that used to arrive from abeam opening this
+    /// very document kept the loop drawing, so the title corrected itself on the
+    /// noise the pane itself generated. Take the noise away and a `sh` sitting
+    /// idle at a prompt produces nothing else to draw for, and the wrong title
+    /// stays on screen for the rest of the session.
+    ///
+    /// Answered on the next [`Pane::tick`], which is what "this pane wants to be
+    /// redrawn" already means everywhere else — rather than by moving the take
+    /// into `tick`, because being drawn is the only signal this pane gets that
+    /// it is the view on screen, and that is the whole reason the take is where
+    /// it is.
+    owed: bool,
     /// Markdown under the root, newest first. `Tab` walks it.
     recent: Vec<PathBuf>,
     recent_ix: usize,
@@ -179,6 +207,7 @@ impl ViewerPane {
             dirty: true,
             scroll,
             pending: None,
+            owed: false,
             recent: Vec::new(),
             recent_ix: 0,
             scan,
@@ -201,6 +230,76 @@ impl ViewerPane {
         self.theme = self.theme.flipped();
         self.dirty = true;
         self.browse.set_theme(self.theme);
+    }
+
+    /// Start on a chosen palette, before anything has been drawn.
+    ///
+    /// The setter this pane deliberately did not have while there was nowhere
+    /// to remember an answer: `F3` flips, and flipping needs no starting point
+    /// beyond the default. `crate::config`'s `theme` key is that somewhere, so
+    /// the pane is now told once — from `App::new`, before the first frame —
+    /// and flipped for the rest of the session.
+    ///
+    /// It takes `crate::config`'s two-valued type rather than this module's
+    /// [`theme::Mode`], which is the shorter of two changes: `Mode` carries the
+    /// palettes as well as the choice and is private to the viewer, and
+    /// publishing it to let a config file name a colour scheme would be
+    /// exporting the colours to import a word. The mapping is these four lines
+    /// and it is the whole of what the two types have to agree about.
+    pub fn set_theme(&mut self, theme: crate::config::Theme) {
+        let mode = match theme {
+            crate::config::Theme::Dark => theme::Mode::Dark,
+            crate::config::Theme::Light => theme::Mode::Light,
+        };
+        if self.theme != mode {
+            self.theme = mode;
+            // Same as `toggle_theme`: the laid-out document holds baked styles,
+            // so a palette that only took effect on the next file would be a
+            // setting that did nothing.
+            self.dirty = true;
+            self.browse.set_theme(mode);
+        }
+    }
+
+    /// Point the reader at another worktree.
+    ///
+    /// The [`Browser`] is rebuilt wholesale rather than given a `set_root` of
+    /// its own, and that is the shorter of two changes as well as the safer
+    /// one. `dir`, `entries`, `index`, `indexed`, `aligned`, `find`, `sel` and
+    /// `scroll` are every one of them relative to the root — a setter would have
+    /// to reset all eight, and the one it forgot would be silent. `aligned` is
+    /// the sharpest of them: [`Browser::align_to`] short-circuits when the
+    /// document has not changed, so a stale value would send the first `Alt+E`
+    /// in the new workspace back into a directory of the old one.
+    ///
+    /// The palette is carried over by hand, because it is the one thing here
+    /// that is a decision about *reading* rather than a fact about the root —
+    /// the same reason `raw` and `theme` outlive a document.
+    ///
+    /// [`State::Empty`] is deliberate and reuses machinery that already exists
+    /// rather than adding any: `tick` opens the newest markdown when the state
+    /// is `Empty` and a scan lands, so a workspace switch behaves exactly like
+    /// startup and the reader opens on the newest document *of the worktree it
+    /// has moved to*.
+    pub fn set_root(&mut self, root: PathBuf) {
+        self.browse = Browser::new(root.clone());
+        self.browse.set_theme(self.theme);
+        self.root = root.clone();
+        self.state = State::Empty;
+        self.pending = None;
+        // Otherwise `Tab` walks straight out of the workspace, into documents
+        // of the tree that is no longer on screen.
+        self.recent.clear();
+        self.recent_ix = 0;
+        self.scroll.to(0);
+        self.dirty = true;
+        // **Replaced, not re-requested.** `rescan` guards on `scan.is_none()`,
+        // so calling it here would leave a walk of the *old* root in flight and
+        // let its answer land in the new `Browser` as that workspace's index and
+        // recency list. Dropping the receiver makes the old answer unreachable
+        // rather than merely unwanted: the worker's `send` fails and nothing has
+        // to remember to ignore it.
+        self.scan = Some(files::spawn_scan(root));
     }
 
     /// Told once at startup, so the empty screen can admit it when there is no
@@ -362,7 +461,8 @@ impl ViewerPane {
         // This is not an extra layout: it is the one the next frame was going
         // to do, moved earlier by a few microseconds.
         self.ensure_layout(self.laid_out);
-        self.scroll.measure(self.lines.len(), self.scroll.viewport());
+        self.scroll
+            .measure(self.lines.len(), self.scroll.viewport());
         let to = was
             .saturating_mul(self.scroll.max())
             .checked_div(before)
@@ -591,6 +691,9 @@ impl Pane for ViewerPane {
         // exactly that reason.
         if let Some(path) = self.pending.take() {
             self.show(path);
+            // The border above this rect was drawn from the state that existed
+            // a moment ago, which is no longer the state under it. See `owed`.
+            self.owed = true;
         }
 
         // The column is reserved whether or not the bar is drawn: deciding per
@@ -599,8 +702,7 @@ impl Pane for ViewerPane {
         let text_width = inner.width - scroll::bar_width(inner.width);
 
         self.ensure_layout(text_width as usize);
-        self.scroll
-            .measure(self.lines.len(), inner.height as usize);
+        self.scroll.measure(self.lines.len(), inner.height as usize);
 
         let start = self.scroll.offset;
         let end = (start + inner.height as usize).min(self.lines.len());
@@ -616,7 +718,10 @@ impl Pane for ViewerPane {
     }
 
     fn tick(&mut self) -> bool {
-        let mut changed = false;
+        // A document taken up during the last render, whose title never made it
+        // onto the screen the body did. Claimed first and unconditionally, so it
+        // is owed exactly one frame however the rest of this goes.
+        let mut changed = std::mem::take(&mut self.owed);
 
         // The walk answers once, then the receiver is dropped.
         if let Some(found) = self.scan.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -947,13 +1052,20 @@ mod tests {
         let mut pane = scrollable(&dir);
         let total = pane.lines.len();
 
-        assert_eq!(pane.handle_key(key(KeyCode::Char('k'))).unwrap(), Handled::No);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('k'))).unwrap(),
+            Handled::No
+        );
         assert_eq!(pane.scroll.offset, 0, "already at the top");
 
         pane.handle_key(key(KeyCode::Char('j'))).unwrap();
         assert_eq!(pane.scroll.offset, 1);
         pane.handle_key(key(KeyCode::Char(' '))).unwrap();
-        assert_eq!(pane.scroll.offset, 1 + 9, "a page keeps one line of overlap");
+        assert_eq!(
+            pane.scroll.offset,
+            1 + 9,
+            "a page keeps one line of overlap"
+        );
         pane.handle_key(ctrl('d')).unwrap();
         assert_eq!(pane.scroll.offset, 15);
 
@@ -1152,6 +1264,47 @@ mod tests {
     }
 
     #[test]
+    fn taking_a_document_up_mid_frame_asks_for_the_frame_that_shows_its_title() {
+        // The shell asks this pane for its title and draws the border *before*
+        // it renders the pane, so the frame that first shows a pending document
+        // carries the title of the pane that had none: `files`, over a page with
+        // a document on it. Every later frame is right — and nothing promises a
+        // later frame, because a pane that changed its own state inside a render
+        // has asked nobody to draw again.
+        //
+        // It reached CI as a twenty-second timeout waiting for a title that was
+        // never going to arrive, on the one platform where nothing else was
+        // producing frames: a `sh` idle at a prompt, once `crate::watch` stopped
+        // reporting abeam's own reads as writes. Until then the pane was rescued
+        // by the events it generated by opening the document.
+        let dir = TempDir::new("view-owed");
+        let path = dir.write("fresh.md", b"# fresh\n");
+        let mut pane = quiet(dir.path());
+        pane.pending = Some(path.clone());
+
+        // Nothing is owed before the render that changes anything.
+        assert!(!pane.tick(), "a quiet pane asks for nothing");
+
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+
+        // The title the shell just drew and the body under it disagree, which is
+        // the state this frame has to be followed out of.
+        assert!(
+            pane.title().contains("fresh.md"),
+            "the pane is showing the document now: {}",
+            pane.title()
+        );
+        assert!(
+            pane.tick(),
+            "the frame that shows this title was never asked for"
+        );
+        // Exactly one, so an idle pane does not redraw for ever.
+        assert!(!pane.tick(), "one frame is owed, not a stream of them");
+    }
+
+    #[test]
     fn holding_r_down_does_not_start_a_walk_per_repeat_tick() {
         // The console emits a key event per auto-repeat tick, ~30 a second, and
         // the shell drains the whole batch before drawing. Starting a fresh
@@ -1271,7 +1424,10 @@ mod tests {
             .unwrap();
 
         assert!(pane.path().is_none(), "the document view is untouched");
-        assert!(pane.has_pending(), "and the shell can still mark the border");
+        assert!(
+            pane.has_pending(),
+            "and the shell can still mark the border"
+        );
         // No border to mark while the list is the thing showing, so the pane
         // says it itself.
         assert!(pane.title().starts_with("◆ "), "{}", pane.title());
@@ -1450,7 +1606,10 @@ mod tests {
         pane.show(&path);
         laid(&mut pane, 40, 10);
 
-        assert_eq!(pane.handle_key(key(KeyCode::Char('t'))).unwrap(), Handled::Yes);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('t'))).unwrap(),
+            Handled::Yes
+        );
         let lines = laid(&mut pane, 40, 10);
         // The source, gutter and all: the markers the rendering consumed are
         // back, and they are numbered.
@@ -1471,7 +1630,10 @@ mod tests {
         let path = dir.write("main.rs", b"fn main() {}\n");
         let mut pane = quiet(dir.path());
         pane.show(&path);
-        assert_eq!(pane.handle_key(key(KeyCode::Char('t'))).unwrap(), Handled::No);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('t'))).unwrap(),
+            Handled::No
+        );
         assert!(!pane.raw, "and the pane's idea of raw is unchanged");
 
         // Nor is there anything to toggle on a screen with no document on it.
@@ -1505,6 +1667,150 @@ mod tests {
         pane.handle_key(key(KeyCode::Char('g'))).unwrap();
         pane.handle_key(key(KeyCode::Char('t'))).unwrap();
         assert_eq!(pane.scroll.offset, 0);
+    }
+
+    // --- being pointed at another worktree ---------------------------------
+
+    #[test]
+    fn moving_to_another_worktree_starts_the_reader_over_inside_it() {
+        let here = TempDir::new("view-root-here");
+        let there = TempDir::new("view-root-there");
+        let mine = here.write("mine.md", b"# mine\n");
+        there.write("theirs.md", b"# theirs\n");
+
+        let mut pane = quiet(here.path());
+        pane.show(&mine);
+        pane.recent = vec![mine.clone()];
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(pane.path(), Some(mine.as_path()));
+
+        pane.set_root(there.path().to_path_buf());
+
+        assert!(
+            matches!(pane.state, State::Empty),
+            "the old worktree's document was still on screen under the new \
+             workspace's name"
+        );
+        assert!(
+            pane.recent.is_empty(),
+            "Tab would have walked straight out of the workspace"
+        );
+        assert!(pane.pending.is_none());
+        assert_eq!(pane.scroll.offset, 0);
+        assert!(pane.scan.is_some(), "nothing is walking the new root");
+
+        // `State::Empty` is not a blank screen for its own sake: `tick` opens
+        // the newest markdown when the state is `Empty` and a scan lands, so a
+        // switch behaves exactly like startup — in the worktree it moved to.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while pane.pending.is_none() && std::time::Instant::now() < deadline {
+            pane.tick();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            pane.pending.as_deref().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("theirs.md")),
+            "the reader opened on a document of the worktree it left"
+        );
+    }
+
+    #[test]
+    fn the_file_list_in_a_new_worktree_never_opens_in_the_old_one() {
+        // `Browser::align_to` short-circuits when the document has not changed,
+        // so a browser that kept its `aligned` would answer the first `Alt+E`
+        // after a switch with a directory of the tree that is no longer on
+        // screen — and every path in it would be one the new workspace has
+        // never heard of.
+        let here = TempDir::new("view-root-list-here");
+        std::fs::create_dir_all(here.path().join("docs")).expect("create docs");
+        let design = here.path().join("docs").join("design.md");
+        std::fs::write(&design, b"# design\n").expect("write");
+
+        let there = TempDir::new("view-root-list-there");
+        there.write("only-there.md", b"# only there\n");
+
+        let mut pane = quiet(here.path());
+        pane.show(&design);
+        pane.toggle_browse();
+        assert!(pane.title().starts_with("docs/"), "{}", pane.title());
+        pane.toggle_browse();
+
+        pane.set_root(there.path().to_path_buf());
+        // The walk is not what this test is about, and an answer landing
+        // halfway through would make it flap.
+        pane.scan = None;
+        pane.toggle_browse();
+        assert!(
+            pane.title().starts_with("./"),
+            "the list opened in a worktree that is no longer on screen: {}",
+            pane.title()
+        );
+
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("only-there.md"), "{text}");
+    }
+
+    #[test]
+    fn the_readers_palette_survives_a_move_to_another_worktree() {
+        // `raw` and `theme` are decisions about how to *read* rather than facts
+        // about a root, which is why they outlive a document — and a `Browser`
+        // rebuilt with its own default would put half the pane back to dark on
+        // every switch.
+        let here = TempDir::new("view-root-theme-here");
+        let there = TempDir::new("view-root-theme-there");
+        there.write("a.md", b"# a\n");
+
+        let mut pane = quiet(here.path());
+        pane.toggle_theme();
+        pane.set_root(there.path().to_path_buf());
+        pane.scan = None;
+        pane.toggle_browse();
+
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+        for cell in term.backend().buffer().content() {
+            assert!(
+                cell.bg == theme::LIGHT.bg || cell.bg == theme::LIGHT.sel_bg,
+                "the new workspace's list kept the old palette: {:?}",
+                cell.bg
+            );
+        }
+    }
+
+    #[test]
+    fn a_walk_of_the_old_root_cannot_land_in_the_new_one() {
+        // `rescan` guards on `scan.is_none()`, so re-requesting rather than
+        // *replacing* would leave the old root's walk in flight and let its
+        // answer arrive as the new workspace's index and recency list. Dropping
+        // the receiver makes that answer unreachable rather than merely
+        // unwanted.
+        let here = TempDir::new("view-root-scan-here");
+        let there = TempDir::new("view-root-scan-there");
+
+        let mut pane = quiet(here.path());
+        let (tx, rx) = std::sync::mpsc::channel::<Scan>();
+        pane.scan = Some(rx);
+
+        pane.set_root(there.path().to_path_buf());
+        // Whatever the walk of the old root eventually answers goes nowhere.
+        assert!(
+            tx.send(Scan {
+                recent: vec![here.write("stale.md", b"# stale\n")],
+                files: vec!["stale.md".into()],
+            })
+            .is_err(),
+            "the old walk still had somewhere to deliver its answer"
+        );
     }
 
     #[test]

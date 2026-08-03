@@ -1,4 +1,4 @@
-﻿//! What abeam can learn about the agent it is hosting, without asking it.
+//! What abeam can learn about the agent it is hosting, without asking it.
 //!
 //! The queue's whole difficulty is one question â€” *has the agent finished?* â€”
 //! and the honest answers available from a pty are all bad. Output quiescence
@@ -242,7 +242,7 @@ impl Session {
         // Case-insensitively, because what is being matched is Claude's own
         // vocabulary in a record it wrote and not a name on a filesystem â€”
         // where whether case folds is the platform's business and
-        // [`spelling`]'s, and on Unix the answer is that it does not. And
+        // [`crate::paths`]'s, and on Unix the answer is that it does not. And
         // without lowercasing a copy of a word it is only comparing.
         match self.status.as_deref() {
             Some(word) if word.eq_ignore_ascii_case("idle") => Readiness::Idle,
@@ -371,7 +371,10 @@ fn sessions_path_from(config: Option<PathBuf>, home: Option<PathBuf>) -> Option<
     // refusal of a relative program path.
     let dir = match config.filter(|dir| dir.is_absolute()) {
         Some(config) => config.join("sessions"),
-        None => home.filter(|dir| dir.is_absolute())?.join(".claude").join("sessions"),
+        None => home
+            .filter(|dir| dir.is_absolute())?
+            .join(".claude")
+            .join("sessions"),
     };
     Some(dir)
 }
@@ -386,19 +389,52 @@ pub struct Probe {
     pid: Option<u32>,
     root: PathBuf,
     spawned_at: u64,
-    /// The file the search settled on, so that the search runs about once per
-    /// session instead of once per frame.
+    /// The record the search settled on, so that the search runs about once
+    /// per session instead of once per frame.
     ///
-    /// A path and nothing else â€” deliberately not a `Session`, and that is what
-    /// makes it a cache that cannot go stale. What is remembered is *where to
-    /// look*, which is a fact about the machine and changes about never; what
-    /// is read is the file, every time, and it is checked against
-    /// [`Probe::is_mine`] every time. A remembered path that has stopped being
-    /// ours â€” the file gone, a pid handed to a Claude in another repository, a
-    /// dispatched background agent written over it â€” is thrown away and the
-    /// search runs again. So the memory can be wrong for exactly one read, and
-    /// that read is the one that notices.
-    found: Option<PathBuf>,
+    /// A place and a name and nothing else — deliberately not a `Session`, and
+    /// that is what makes it a cache that cannot go stale. What is remembered
+    /// is *where to look and what was there*, both of which are facts about
+    /// the machine and change about never; what is read is the file, every
+    /// time, and it is checked against [`Probe::is_still_mine`] every time. A
+    /// remembered record that has stopped being ours — the file gone, a pid
+    /// handed to a Claude in another repository, a dispatched background agent
+    /// written over it — is thrown away and the search runs again. So the
+    /// memory can be wrong for exactly one read, and that read is the one that
+    /// notices.
+    found: Option<Found>,
+    /// The other directories a session of ours may legitimately have moved to.
+    ///
+    /// Empty until `crate::app`'s discovery answers, which makes every failure
+    /// of it harmless: no git, no repository, a git too old for the porcelain
+    /// this needs, and the probe is exactly as strict as it was before this
+    /// field existed.
+    ///
+    /// **Read by exactly one thing** — [`Probe::has_moved`], which revalidates
+    /// a record this probe has already vouched for. It is never consulted by
+    /// the pid shortcut or by the candidate filter in [`Probe::search`], and
+    /// [`Probe::set_worktrees`] is where that separation is argued and where
+    /// the three ways the other arrangement went wrong are written out.
+    worktrees: Vec<PathBuf>,
+}
+
+/// A record that was positively the session abeam hosts, and which session it
+/// was when it was.
+///
+/// Two fields rather than a path, because a path here is a pid — the file is
+/// `<pid>.json` — and a pid outlives the process it named. The name is what the
+/// widened revalidation in [`Probe::has_moved`] is tied to, and there is where
+/// the record it refuses is described.
+#[derive(Debug)]
+struct Found {
+    path: PathBuf,
+    /// The `sessionId` of the session that was ours at that path.
+    ///
+    /// `None` for a record that carried none. Every record a real Claude writes
+    /// has one — `crate::agentstate`'s two captured fixtures both do — and a
+    /// record that does not is simply never allowed to have moved, which is the
+    /// strict answer rather than the convenient one.
+    session_id: Option<String>,
 }
 
 impl Probe {
@@ -420,7 +456,96 @@ impl Probe {
             root,
             spawned_at,
             found: None,
+            worktrees: Vec::new(),
         }
+    }
+
+    /// The worktrees of the repository on screen, as git last described them.
+    ///
+    /// ## The bug this closes
+    ///
+    /// A hosted session does not have to stay in the directory it started in.
+    /// Claude Code makes git worktrees and moves into them, and when it does it
+    /// rewrites its record with the new `cwd`. [`Probe::is_here`] compared that
+    /// `cwd` with one directory, so the match failed, the record stopped being
+    /// recognised as ours, [`Probe::readiness`] answered `Unknown` for ever, and
+    /// the queue's automatic send stopped — **silently and permanently**. The
+    /// pane goes on saying it is waiting for the agent to be idle and nothing
+    /// anywhere says why, which is the worst shape a failure can have here: the
+    /// feature looks present and is not.
+    ///
+    /// ## The fix that would have been worse than the bug
+    ///
+    /// `cwd.starts_with(root)`. It is one line, it fixes the symptom, and it is
+    /// exactly what `crate::paths::parts` argues against at length: this is *the
+    /// one function that decides whether a queued prompt may be typed into an
+    /// agent*, and a loose comparison here "sends somebody's prompt to a session
+    /// in another checkout, and it is not one they would see happen". A prefix
+    /// test would accept any session anywhere under the repository — including
+    /// the neighbouring agents Claude Code runs in `.claude/worktrees/`, which
+    /// is the very layout that produced this bug.
+    ///
+    /// ## And the set alone was not narrow enough either
+    ///
+    /// A known set matched exactly is not a prefix, and it is still too wide for
+    /// the question the *search* is asking. **Claude Code's neighbouring agents
+    /// run at those worktree roots.** That is what a worktree is for. So a
+    /// neighbour's `cwd` is not merely inside the set, it is an exact member of
+    /// it — and letting the set answer "could this be our session" admitted
+    /// precisely the sessions the paragraph above refuses. Three ways it went
+    /// wrong, each of them answering where the code before the widening answered
+    /// safely, and each with a test named after it:
+    ///
+    /// - a **recycled pid** landing on a neighbour's record — interactive,
+    ///   started after abeam, in a directory on the list — was taken by the pid
+    ///   shortcut outright. `Idle`, where it had been `Unknown`.
+    /// - **clock skew**: our own record stamped a few milliseconds before
+    ///   `spawned_at` makes [`Probe::search`]'s at-or-after filter find nothing,
+    ///   so the documented `or_else` runs — and that fallback ignores
+    ///   `spawned_at` and takes `max_by_key(started_at)` over the candidates. Over
+    ///   a pool spanning every worktree, the newest thing in the repository wins,
+    ///   which is whichever neighbour started last. [`Probe::found`] then
+    ///   memoises it, because it satisfied the old `is_mine`. Stable, not
+    ///   transient. `Idle`, where it had been `Busy`.
+    /// - **two abeam windows on two worktrees of one repository**: git describes
+    ///   the same repository to both, so window two spent its own startup window
+    ///   — the second or two before its Claude writes a record — adopting window
+    ///   one's session. `Idle`, where it had been `Unknown`.
+    ///
+    /// And `Idle` is exactly the answer that lets the queue type into a mid-turn
+    /// agent. The exposure is not narrow either: the pid shortcut only covers a
+    /// native install, and an npm install routes through `cmd.exe`, so the pid
+    /// abeam holds is the interpreter's and the search is always what answers.
+    ///
+    /// ## The two questions, kept apart
+    ///
+    /// The widening exists for exactly one case — *our own* session moving into
+    /// a worktree mid-flight — and by the time that happens the probe has
+    /// already identified it. So the set answers only the second of these:
+    ///
+    /// - **Discovery is strict.** The pid shortcut and the candidate filter in
+    ///   [`Probe::search`] match [`Probe::is_here`], which is an exact
+    ///   comparison against the agent's own root and nothing else. A session
+    ///   that has never been ours is never adopted, whatever directory it is
+    ///   standing in.
+    /// - **Revalidation is widened.** Once [`Probe::found`] names a record that
+    ///   *was* positively ours, that session is allowed to have moved to a
+    ///   directory on this list. [`Probe::has_moved`] is the whole of it, and it
+    ///   is tied to the `sessionId` that was ours, so the recycled pid above
+    ///   cannot walk back in through the revalidation door.
+    ///
+    /// Nothing about what counts as our session moved: `kind == Interactive` and
+    /// `started_at >= spawned_at` are checked on both paths. What changed is that
+    /// the set of places is asked about a session already known to be ours,
+    /// rather than being offered as evidence that an unknown one is.
+    ///
+    /// The cost of the strict half is worth naming: a session that had *already*
+    /// moved before the probe ever found it is not found at all, and the answer
+    /// is `Unknown` for the session. That is the pre-widening behaviour for that
+    /// one case — the queue drains by hand — and it is the direction this module
+    /// fails in on purpose.
+    pub fn set_worktrees(&mut self, worktrees: Vec<PathBuf>) {
+        self.worktrees = worktrees;
     }
 
     /// [`Probe::new`], over a directory handed in rather than looked up.
@@ -440,6 +565,7 @@ impl Probe {
             root,
             spawned_at,
             found: None,
+            worktrees: Vec::new(),
         }
     }
 
@@ -465,23 +591,38 @@ impl Probe {
     /// whole session, is the thing [`Probe::found`] exists to stop.
     ///
     /// It is not a cache of the answer. The file is read on every call and
-    /// checked on every call; what is remembered is only which file to read.
+    /// checked on every call; what is remembered is only which file to read and
+    /// which session was in it.
     pub fn session(&mut self) -> Option<Session> {
         // The remembered file first, and it is trusted for exactly as long as
-        // it goes on being ours.
+        // it goes on being ours — which is the one question this module asks
+        // that is allowed to know a session may have moved. See
+        // [`Probe::set_worktrees`] for why that is this question and not the
+        // search's.
         //
         // `Unreadable` keeps the memory rather than clearing it, which is the
         // one case where those two differ: a file that is there and half
         // written is *our* file, mid-rewrite, so there is nothing to look for
         // and nowhere better to look. The answer is `Unknown` for that poll and
         // the next one reads a whole file. A record that has *gone*, or that
-        // has stopped being ours, is a different matter â€” the memory is wrong,
+        // has stopped being ours, is a different matter — the memory is wrong,
         // so it is dropped and the search runs again below.
-        match self.found.as_deref().map(record) {
-            Some(Record::Read(session)) if self.is_mine(&session) => return Some(session),
-            Some(Record::Unreadable) => return None,
-            Some(_) => self.found = None,
-            None => {}
+        //
+        // Decided before the memory is touched rather than inside the match,
+        // because the borrow of `found` that reads the path is still live in
+        // the arms that would clear it.
+        let mut forget = false;
+        if let Some(found) = self.found.as_ref() {
+            match record(&found.path) {
+                Record::Read(session) if self.is_still_mine(found, &session) => {
+                    return Some(session);
+                }
+                Record::Unreadable => return None,
+                _ => forget = true,
+            }
+        }
+        if forget {
+            self.found = None;
         }
 
         // Only what the search finds is remembered, so a search that finds
@@ -490,12 +631,24 @@ impl Probe {
         // `Unknown` for the rest of the session because of what was true on the
         // frame after the spawn.
         let (path, session) = self.search()?;
-        self.found = Some(path);
+        self.found = Some(Found {
+            path,
+            session_id: session.session_id.clone(),
+        });
         Some(session)
     }
 
     /// Where the record is, when nothing is remembered â€” and the record, since
     /// finding it means reading it.
+    ///
+    /// **This is discovery, so every comparison in it is strict.** Both
+    /// branches ask [`Probe::is_here`], which is an exact match on the agent's
+    /// own root, and [`Probe::worktrees`] is not consulted anywhere below.
+    /// [`Probe::set_worktrees`] is where that is argued; the argument in one
+    /// line is that the neighbouring agents Claude Code starts are running *at*
+    /// those roots, so a candidate pool spanning them hands the `or_else` at
+    /// the bottom of this function the newest agent in the repository rather
+    /// than ours.
     fn search(&self) -> Option<(PathBuf, Session)> {
         let dir = self.dir.as_deref()?;
 
@@ -607,34 +760,103 @@ impl Probe {
 
     /// Whether this record describes a session in the repository on screen.
     ///
-    /// Asked of both branches of the search, which is what makes a record
-    /// carrying no `cwd` at all unmatchable by either: there is nothing in it
-    /// to check, and an unchecked record is exactly the one this is here to
-    /// refuse. Every record a real Claude writes has the field.
+    /// **One directory, matched exactly, and that is the whole of it.** Asked by
+    /// both branches of the search, which is what makes a record carrying no
+    /// `cwd` at all unmatchable by either: there is nothing in it to check, and
+    /// an unchecked record is exactly the one this is here to refuse. Every
+    /// record a real Claude writes has the field.
+    ///
+    /// The comparison itself is [`crate::paths`]'s rather than this module's,
+    /// and it moved there when a second question started needing the same
+    /// rule. A session's `cwd`, a watcher's event and a path out of
+    /// `git worktree list` are three spellings of the same kind of thing, and
+    /// on Windows the third arrives with forward slashes in it. Two modules
+    /// each keeping their own idea of when two spellings are one directory is
+    /// how they come to disagree about which repository is on screen, which is
+    /// a disagreement neither of them can see.
+    ///
+    /// The worktrees are **not** consulted here, and that is the correction the
+    /// widening needed rather than an omission. Claude Code's neighbouring
+    /// agents run *at* those roots, so a set that vouched for a discovery would
+    /// vouch for them — see [`Probe::set_worktrees`] for the three ways that
+    /// went wrong and for where the set is consulted instead.
     fn is_here(&self, session: &Session) -> bool {
         session
             .cwd
             .as_deref()
-            .is_some_and(|cwd| same_dir(cwd, &self.root))
+            .is_some_and(|cwd| crate::paths::same_dir(cwd, &self.root))
     }
 
-    /// Everything a record has to be before this probe will answer with it.
+    /// Everything a record has to be before this probe will *adopt* it.
     ///
     /// Asked by the pid shortcut, which is taking a record on the strength of a
-    /// number the operating system will hand out again, and asked of the
-    /// remembered path on every single read, which is what keeps that memory
-    /// honest.
+    /// number the operating system will hand out again, and by nothing else.
+    /// This is discovery, so it is strict: the record has to name the agent's
+    /// own root.
     ///
     /// It cannot catch everything, and the gap is worth naming: a record that
     /// is replaced by a *later* interactive session in the same repository
     /// passes all three checks, because all three are true of it. Nothing short
-    /// of `procStart` separates those two â€” see [`Wire`] â€” and the search has
+    /// of `procStart` separates those two — see [`Wire`] — and the search has
     /// the same blind spot, so the memory is no worse than the thing it stands
     /// in for.
     fn is_mine(&self, session: &Session) -> bool {
         self.is_here(session)
             && session.kind == Kind::Interactive
             && session.started_at.is_some_and(|at| at >= self.spawned_at)
+    }
+
+    /// Everything a *remembered* record has to be before this probe will go on
+    /// answering with it.
+    ///
+    /// The same two facts about the session — `kind == Interactive` and
+    /// `started_at >= spawned_at` — and a wider question about where it is
+    /// standing, because this record has already been positively ours and the
+    /// session in it is allowed to have moved since. [`Probe::set_worktrees`] is
+    /// where the split between this and [`Probe::is_mine`] is argued.
+    fn is_still_mine(&self, found: &Found, session: &Session) -> bool {
+        session.kind == Kind::Interactive
+            && session.started_at.is_some_and(|at| at >= self.spawned_at)
+            && (self.is_here(session) || self.has_moved(found, session))
+    }
+
+    /// Whether the session that was ours has moved to a directory git named as
+    /// a worktree of this repository.
+    ///
+    /// **The one place [`Probe::worktrees`] is read**, and the only widening in
+    /// this module. Two conditions, and dropping either one gives back a bug
+    /// that has already happened:
+    ///
+    /// *The same session.* The remembered path is `<pid>.json`, and a pid
+    /// outlives the process it named — so a record that was ours can be
+    /// rewritten by whatever got the number next. Without this, a recycled pid
+    /// landing on a neighbouring agent in a worktree passes every other check
+    /// (interactive, started after abeam, in a directory on the list) and is
+    /// then *memoised*: a wrong `Idle`, stably, for the rest of the run. That is
+    /// the same failure `a_dead_sessions_record_is_never_read_as_the_agent_on_screen`
+    /// pins for the root, arriving one worktree over.
+    ///
+    /// *A named directory, matched exactly.* A set, never a prefix, and never a
+    /// directory merely inside a member of it — `crate::paths::parts` is explicit
+    /// that a loose comparison in this decision "sends somebody's prompt to a
+    /// session in another checkout, and it is not one they would see happen".
+    ///
+    /// A record carrying no `sessionId` is refused outright rather than waved
+    /// through on the directory alone. Every record a real Claude writes has
+    /// one, so this costs nothing that exists, and what it buys is that the
+    /// identity check cannot be skipped by a record that simply omits the field.
+    fn has_moved(&self, found: &Found, session: &Session) -> bool {
+        let Some(known) = found.session_id.as_deref() else {
+            return false;
+        };
+        if session.session_id.as_deref() != Some(known) {
+            return false;
+        }
+        session.cwd.as_deref().is_some_and(|cwd| {
+            self.worktrees
+                .iter()
+                .any(|worktree| crate::paths::same_dir(cwd, worktree))
+        })
     }
 
     /// [`Session::readiness`], or `Unknown` when there is no record to read.
@@ -909,78 +1131,6 @@ fn is_named_for_a_pid(path: &Path) -> bool {
         .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Whether two paths name the same directory, as far as comparing two spellings
-/// can tell.
-///
-/// The two sides arrive by different routes â€” abeam's from
-/// `std::env::current_dir`, Claude's from whatever its own process was handed â€”
-/// so they agree about the directory and not always about how to write it down.
-/// Which of those disagreements is still the same *place* is a fact about the
-/// filesystem underneath, and that is [`spelling`]'s question rather than this
-/// one's.
-///
-/// Comparing spellings rather than `fs::canonicalize`, on purpose:
-/// canonicalising touches the disk, answers on Windows with a `\\?\` path that
-/// then has to be undone, and would run once per file in the directory every
-/// time the queue asks whether it may send.
-fn same_dir(a: &Path, b: &Path) -> bool {
-    spelling(a) == spelling(b)
-}
-
-/// The one form of a path this module compares, for the platform it was built
-/// for.
-///
-/// There is no rule that is right on both, and the reason to insist on that
-/// rather than pick the more forgiving one is that the two mistakes cost
-/// different amounts. Windows folds case, reads `/` and `\` as one separator,
-/// and calls `C:\` and `C:` the same place; a comparison there that did none of
-/// those would refuse a record that is genuinely ours, and the queue would
-/// drain by hand for no reason anybody could see. Unix does none of the three.
-/// `/home/phil/Work` and `/home/phil/work` are two directories, `\` is
-/// an ordinary byte in a file name rather than a separator, and a rule that
-/// folded either of those would be declaring two different places equal â€” in
-/// the one function that decides whether a queued prompt may be typed into an
-/// agent. That mistake sends somebody's prompt to a session in another
-/// checkout, and it is not one they would see happen.
-///
-/// macOS is the awkward middle: its kernel distinguishes case and its default
-/// volume does not. It takes the strict reading with the rest of Unix, because
-/// being strict costs a queue that drains by hand and being loose costs the
-/// paragraph above.
-#[cfg(windows)]
-fn spelling(path: &Path) -> Vec<u8> {
-    path.to_string_lossy()
-        .replace('/', "\\")
-        // A trailing separator is a spelling and not a place. `C:\` and `C:`
-        // both come out as `C:`, which is the same directory either way.
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
-        .into_bytes()
-}
-
-#[cfg(unix)]
-fn spelling(path: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-
-    // Bytes rather than `to_string_lossy`, because a Unix path is bytes and not
-    // text: two different names that are not UTF-8 both come back from a lossy
-    // conversion as the same run of replacement characters, and this is the
-    // comparison where calling two different directories equal is the answer
-    // that costs something.
-    let bytes = path.as_os_str().as_bytes();
-    // One trailing slash, and never the last one. `/home/me/forge/` and
-    // `/home/me/forge` are one directory, so the first is a spelling rather
-    // than a reason to refuse a record â€” but `trim_end_matches` would take `/`
-    // itself down to the empty string, which is also what a record carrying an
-    // empty `cwd` comes out as. The root would then be equal to a record that
-    // names nowhere, in the function that decides whether a prompt may be
-    // typed, and a Claude running at `/` is not a hypothetical in a container.
-    match bytes {
-        [head @ .., b'/'] if !head.is_empty() => head.to_vec(),
-        _ => bytes.to_vec(),
-    }
-}
-
 /// What abeam says when there is no Claude to ask.
 ///
 /// A sentence, and only a sentence. There is a version of this that notices
@@ -1027,7 +1177,8 @@ fn first_line(text: &str) -> String {
 /// straight. `RECORD` and `ROSTER` are captured output, so their Windows paths
 /// stay Windows paths on every platform â€” what they prove is that a string in
 /// the JSON reaches [`Session`] unaltered, and that is a fact about the parser.
-/// [`ROOT`] and [`ELSEWHERE`] are *places*, compared by [`same_dir`] under a
+/// [`ROOT`] and [`ELSEWHERE`] are *places*, compared by
+/// [`crate::paths::same_dir`] under a
 /// rule that differs by platform, so they are spelled for the platform running
 /// the test.
 #[cfg(test)]
@@ -1066,7 +1217,8 @@ mod tests {
     /// it â€” both as this platform writes a path.
     ///
     /// Every test that plants a record puts one of these in its `cwd`, and what
-    /// they are for is [`same_dir`], whose rule is not the same rule on the two
+    /// they are for is [`crate::paths::same_dir`], whose rule is not the same rule
+    /// on the two
     /// platforms. A Windows path planted on Linux would go through the
     /// case-sensitive comparison and pass, which is the shape of a test that
     /// runs everywhere and tests one thing in one place.
@@ -1192,7 +1344,7 @@ mod tests {
         assert_eq!(readiness(r#","state":"working""#), Readiness::Busy);
 
         // Case-insensitively, because this is Claude's vocabulary in a record
-        // rather than a path: [`spelling`] is the comparison in this module
+        // rather than a path: `crate::paths` holds the one comparison
         // that case matters to, and on Unix it is strict on purpose.
         assert_eq!(readiness(r#","status":"IDLE""#), Readiness::Idle);
         assert_eq!(readiness(r#","status":"Busy""#), Readiness::Busy);
@@ -1651,11 +1803,11 @@ mod tests {
         // directory and not always about how to write it down.
         //
         // Which of those disagreements is still the same place is the whole of
-        // what [`spelling`] decides, and the answer is different on the two
+        // what `crate::paths` decides, and the answer is different on the two
         // platforms. This test is written to invert with it, and that is
         // deliberate: a version of it that merely passed on both â€” the Windows
         // spellings, asserted to match everywhere â€” would have been testing
-        // nothing. It would go green against a `spelling` that lowercased a
+        // nothing. It would go green against a spelling rule that lowercased a
         // Linux path, which is the bug where a queued prompt is typed into the
         // session in `/home/phil/work` because the one on screen is
         // `/home/phil/Work`.
@@ -1885,6 +2037,7 @@ mod tests {
             root: PathBuf::from(ROOT),
             spawned_at: STARTED,
             found: None,
+            worktrees: Vec::new(),
         };
         assert!(nowhere.session().is_none());
         assert_eq!(nowhere.readiness(), Readiness::Unknown);
@@ -2120,5 +2273,316 @@ mod tests {
         assert_eq!(first_line(""), "it printed nothing");
         assert_eq!(first_line("   \n \n"), "it printed nothing");
         assert_eq!(first_line(&"x".repeat(400)).chars().count(), 200);
+    }
+
+    // --- a session that moved --------------------------------------------
+
+    /// A worktree of [`ROOT`], where Claude Code puts one, spelled for the
+    /// platform running the test.
+    fn worktree(name: &str) -> String {
+        Path::new(ROOT)
+            .join(".claude")
+            .join("worktrees")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The set `crate::app` really hands the probe.
+    ///
+    /// **Every root `git worktree list` printed**, which is the repository
+    /// itself and every worktree of it — including the ones the neighbouring
+    /// agents Claude Code starts are running in. That is the whole reason this
+    /// helper exists rather than each test naming one directory: a test that
+    /// seeds a set the production wiring never produces can only prove things
+    /// about a set nobody has. The test below this one used to do exactly that,
+    /// listing `review` while planting a record in `other`, and it passed
+    /// against a rule that admits both.
+    fn the_repository() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from(ROOT),
+            PathBuf::from(worktree("review")),
+            PathBuf::from(worktree("other")),
+        ]
+    }
+
+    /// Rewrite the record at `pid`, which is what Claude does when a session
+    /// moves: the file is replaced in place and the `sessionId` in it does not
+    /// change, because it is the same conversation in a different directory.
+    fn moves_to(dir: &TempDir, pid: u32, cwd: &str, started_at: u64, status: &str) {
+        let record = format!(
+            r#"{{"pid":{pid},"sessionId":"s-{pid}","cwd":{},"startedAt":{started_at},"peerProtocol":1,"kind":"interactive","name":"forge-{pid}","status":"{status}"}}"#,
+            serde_json::to_string(cwd).expect("a JSON string")
+        );
+        dir.write(&format!("{pid}.json"), record.as_bytes());
+    }
+
+    #[test]
+    fn a_session_that_moved_into_a_worktree_is_still_the_one_on_screen() {
+        // The live bug. Claude Code makes worktrees and moves into them, and
+        // when it does it rewrites its record with the new `cwd`. A probe that
+        // knew one directory stopped recognising its own session, answered
+        // `Unknown` for ever, and the queue's automatic send stopped —
+        // silently and permanently, with the pane still saying it was waiting
+        // for the agent to be idle.
+        //
+        // Found *here* first, and that is the shape of the fix rather than a
+        // convenience of the fixture: discovery is an exact match on the
+        // agent's own root, and only a record this probe has already vouched
+        // for is allowed to have moved.
+        let dir = TempDir::new("agentstate-moved");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(the_repository());
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // The session moves. Same file, same `sessionId`, new `cwd`.
+        moves_to(&dir, 46256, &worktree("review"), STARTED, "idle");
+        assert_eq!(probe.readiness(), Readiness::Idle);
+
+        // ...and again, which is what makes this a rule rather than one hop.
+        moves_to(&dir, 46256, &worktree("other"), STARTED, "busy");
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // Back to the root it started in, which is `is_here` unchanged.
+        moves_to(&dir, 46256, ROOT, STARTED, "idle");
+        assert_eq!(probe.readiness(), Readiness::Idle);
+    }
+
+    #[test]
+    fn a_session_in_a_worktree_that_was_never_ours_is_never_adopted() {
+        // The half the widening got wrong. Before discovery answers there is
+        // nothing vouching for any directory; *after* it answers, every
+        // neighbouring agent's worktree is in the set — so a rule that widened
+        // discovery would admit a session that has never been ours at any point
+        // in its life. Nothing about a directory being a worktree of this
+        // repository makes the agent in it the agent abeam hosts.
+        let dir = TempDir::new("agentstate-never-ours");
+        plant(&dir, 46256, &worktree("review"), STARTED, "idle");
+
+        // By the pid shortcut...
+        let mut by_pid = probe(&dir, Some(46256), STARTED);
+        by_pid.set_worktrees(the_repository());
+        assert_eq!(by_pid.readiness(), Readiness::Unknown);
+
+        // ...and by the search behind it, which is the branch an npm install
+        // always takes.
+        let mut by_search = probe(&dir, None, STARTED);
+        by_search.set_worktrees(the_repository());
+        assert_eq!(by_search.readiness(), Readiness::Unknown);
+    }
+
+    #[test]
+    fn a_worktree_nobody_named_is_not_ours_however_far_inside_the_repository_it_is() {
+        // The one-line fix this refuses. `cwd.starts_with(root)` closes the bug
+        // above and opens a worse one: `crate::paths` is explicit that a loose
+        // comparison in *this* function "sends somebody's prompt to a session
+        // in another checkout, and it is not one they would see happen" — and
+        // the neighbouring agents Claude Code runs in `.claude/worktrees/` are
+        // precisely the sessions a prefix test would accept.
+        //
+        // Seeded with the set `crate::app` really produces, which is what this
+        // test used to get wrong: it listed `review` while planting the record
+        // in `other`, so it passed for want of a set rather than for want of a
+        // prefix. Every worktree here is named, the neighbour's among them, and
+        // it is still not ours.
+        let dir = TempDir::new("agentstate-neighbour");
+        plant(&dir, 46256, &worktree("other"), STARTED, "idle");
+        let mut named = probe(&dir, Some(46256), STARTED);
+        named.set_worktrees(the_repository());
+        assert_eq!(named.readiness(), Readiness::Unknown);
+
+        // And a worktree that is not on the list at all is no more ours for
+        // being deep inside the repository — the prefix rule, refused twice.
+        let scratch = TempDir::new("agentstate-unlisted");
+        plant(&scratch, 46256, &worktree("scratch"), STARTED, "idle");
+        let mut unlisted = probe(&scratch, Some(46256), STARTED);
+        unlisted.set_worktrees(the_repository());
+        assert_eq!(unlisted.readiness(), Readiness::Unknown);
+    }
+
+    #[test]
+    fn a_recycled_pid_landing_on_a_neighbours_record_is_not_the_session_on_screen() {
+        // A pid is handed out again on both platforms, and once the set of
+        // worktrees was allowed to vouch for a *discovery*, the number could
+        // land on a neighbouring agent's record and be taken outright: an
+        // interactive session, started after abeam, in a directory on the list.
+        // Every check passes and not one of them is about our session.
+        //
+        // `Idle` is what that answers, and `Idle` is the one answer that lets
+        // the queue type into somebody else's mid-turn agent.
+        let dir = TempDir::new("agentstate-recycled-worktree");
+        plant(&dir, 46256, &worktree("other"), STARTED, "idle");
+
+        let mut alone = probe(&dir, Some(46256), STARTED - 12);
+        alone.set_worktrees(the_repository());
+        assert_eq!(alone.readiness(), Readiness::Unknown);
+
+        // The shortcut refuses the wrong record rather than abandoning the
+        // search, exactly as it does for a recycled pid in another repository:
+        // our own record, under a pid abeam never saw, is still found.
+        plant(&dir, 51000, ROOT, STARTED, "busy");
+        let mut beside = probe(&dir, Some(46256), STARTED - 12);
+        beside.set_worktrees(the_repository());
+        assert_eq!(beside.readiness(), Readiness::Busy);
+    }
+
+    #[test]
+    fn clock_skew_does_not_hand_the_probe_the_newest_agent_in_the_repository() {
+        // The documented `or_else` in `search`, which exists because abeam's
+        // stamp comes from `SystemTime::now` on this side of the spawn and
+        // Claude's from its own clock a moment later — so a record of ours can
+        // land a few milliseconds *before* `spawned_at` and the
+        // at-or-after filter can find nothing.
+        //
+        // That fallback ignores `spawned_at` entirely and takes
+        // `max_by_key(started_at)` over the candidate pool. Widen the pool to
+        // every worktree of the repository and the newest thing in it wins,
+        // which is whichever neighbouring agent was started last — and `found`
+        // then *memoises* it, because it satisfies `is_mine`. Stable, not
+        // transient, and `Idle`.
+        let dir = TempDir::new("agentstate-skew-neighbour");
+        plant(&dir, 46256, ROOT, STARTED - 3, "busy"); // ours, stamped early
+        plant(&dir, 47001, &worktree("other"), STARTED - 1, "idle"); // a neighbour, newer
+
+        let mut probe = probe(&dir, None, STARTED);
+        probe.set_worktrees(the_repository());
+        assert_eq!(probe.readiness(), Readiness::Busy);
+        // Twice, because the failure this is about is the memoised one: an
+        // answer that is wrong on the first read and then wrong for ever.
+        assert_eq!(probe.readiness(), Readiness::Busy);
+    }
+
+    #[test]
+    fn a_second_abeam_on_a_second_worktree_does_not_adopt_the_first_ones_session() {
+        // Two windows on two worktrees of one repository, which is the layout
+        // this whole feature is about. Both probes see the same set — git
+        // describes the same repository to both — so a rule that let the set
+        // vouch for a discovery gives window two the run of window one's
+        // sessions.
+        //
+        // The window it happens in is the startup one: for the second or two
+        // before Claude writes window two's own record, the only interactive
+        // session in the repository is window one's, it predates window two's
+        // spawn, and the `or_else` above takes it.
+        let dir = TempDir::new("agentstate-second-window");
+        plant(&dir, 11292, ROOT, STARTED - 60_000, "idle"); // window one
+
+        let mut window_two = Probe::over(
+            dir.path().to_path_buf(),
+            PathBuf::from(worktree("review")),
+            None,
+            STARTED,
+        );
+        window_two.set_worktrees(the_repository());
+        assert_eq!(
+            window_two.readiness(),
+            Readiness::Unknown,
+            "window two adopted window one's session during its own startup"
+        );
+
+        // ...and its own session, when it arrives, is the one it finds.
+        plant(&dir, 46256, &worktree("review"), STARTED + 2, "busy");
+        assert_eq!(window_two.readiness(), Readiness::Busy);
+    }
+
+    #[test]
+    fn a_directory_inside_a_known_worktree_is_not_that_worktree() {
+        // An exact match against a set, never a prefix — including against the
+        // members of the set, and including on the one path where the set is
+        // consulted at all.
+        let dir = TempDir::new("agentstate-deeper");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(the_repository());
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // A session that moves *inside* a known worktree has moved somewhere
+        // nobody named, and the probe stops answering for it rather than
+        // guessing which worktree it meant.
+        let deeper = Path::new(&worktree("review")).join("crates").join("abeam");
+        moves_to(&dir, 46256, &deeper.to_string_lossy(), STARTED, "idle");
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+    }
+
+    #[test]
+    fn widening_where_a_session_may_be_does_not_widen_what_counts_as_one() {
+        // `is_mine`'s other checks are untouched on both paths, and the one
+        // that matters most here is `kind`: a dispatched `claude -p --bg` runs
+        // with our `cwd` — and in our worktrees too — so it passes the
+        // directory check on its own and is still not the session abeam hosts.
+        let dir = TempDir::new("agentstate-worktree-kind");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(the_repository());
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // The remembered file becomes a background agent's, in a worktree that
+        // is on the list. Being somewhere our session may be is not being our
+        // session.
+        let cwd = serde_json::to_string(&worktree("review")).expect("a JSON string");
+        dir.write(
+            "46256.json",
+            format!(
+                r#"{{"pid":46256,"sessionId":"s-46256","cwd":{cwd},"startedAt":{},"peerProtocol":1,"kind":"bg","status":"idle"}}"#,
+                STARTED + 1
+            )
+            .as_bytes(),
+        );
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+    }
+
+    #[test]
+    fn only_the_session_that_was_ours_is_allowed_to_have_moved() {
+        // What the memory is a memory *of*. The remembered path is `<pid>.json`
+        // and a pid outlives the process it named, so a file that was ours can
+        // be rewritten by whatever got the number next — and if the widening
+        // trusted the path alone, a recycled pid landing on a neighbouring
+        // agent in a worktree would walk straight back in through the
+        // revalidation door, memoised, with every other check passing.
+        //
+        // So the widened arm is tied to the session that was positively ours:
+        // same file, same `sessionId`. At the agent's own root nothing is tied
+        // to anything, which keeps the blind spot `is_mine` already documents
+        // exactly the size it was.
+        let dir = TempDir::new("agentstate-moved-identity");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(the_repository());
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // A different session, in a worktree of this repository, under the pid
+        // ours had. Interactive, started after abeam, in a directory on the
+        // list: every check but the identity passes.
+        dir.write(
+            "46256.json",
+            format!(
+                r#"{{"pid":46256,"sessionId":"somebody-else","cwd":{},"startedAt":{},"peerProtocol":1,"kind":"interactive","status":"idle"}}"#,
+                serde_json::to_string(&worktree("other")).expect("a JSON string"),
+                STARTED + 1
+            )
+            .as_bytes(),
+        );
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+
+        // ...and the memory is gone with it, which is the cost of the strict
+        // half written as an assertion rather than as a promise. A session in a
+        // worktree that nothing has vouched for cannot be *discovered*, so the
+        // same session coming back under that pid is not found until it is
+        // somewhere discovery can see it.
+        moves_to(&dir, 46256, &worktree("other"), STARTED, "idle");
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Unknown,
+            "a worktree nobody vouched for was rediscovered"
+        );
+
+        // At the agent's own root it is found again, and from there it is free
+        // to move — which is what stops the identity check above from being a
+        // check against everything.
+        moves_to(&dir, 46256, ROOT, STARTED, "busy");
+        assert_eq!(probe.readiness(), Readiness::Busy);
+        moves_to(&dir, 46256, &worktree("other"), STARTED, "idle");
+        assert_eq!(probe.readiness(), Readiness::Idle);
     }
 }

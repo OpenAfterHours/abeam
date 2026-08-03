@@ -65,6 +65,15 @@ const DEADLINE: Duration = Duration::from_secs(20);
 /// killed. Named absolutely on Unix, exactly as `panes::shell`'s own suite
 /// names it, so that a failure here is a fact about abeam and not about the
 /// runner's `PATH`.
+///
+/// It is the program's *name*, without the `+` that asks abeam to host it, and
+/// the two call sites below add the sigil themselves. That is the shape the
+/// assertions want: the command line now belongs to the agent, so `+` is the
+/// only way left to name a program to host — while the border still reads the
+/// name that was typed with the sigil stripped, which is what every assertion
+/// about the left title is checking. One constant that means "the program"
+/// keeps those two facts from being written as one string that is right for
+/// neither.
 #[cfg(windows)]
 const HOSTED: &str = "cmd.exe";
 #[cfg(unix)]
@@ -222,6 +231,27 @@ impl Dir {
     fn mkdir(&self, name: &str) {
         std::fs::create_dir_all(self.0.join(name)).expect("create a scratch subdirectory");
     }
+
+    /// Run git here, and say whether it worked.
+    ///
+    /// An identity is handed in rather than assumed: a machine whose global
+    /// config has no `user.email` on it cannot commit, and a repository with no
+    /// commit has no HEAD to add a worktree at. `GIT_OPTIONAL_LOCKS=0` is the
+    /// same setting `panes::git` runs with, and for the same reason — abeam is
+    /// polling this repository while this runs.
+    fn git(&self, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&self.0)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_AUTHOR_NAME", "abeam")
+            .env("GIT_AUTHOR_EMAIL", "abeam@example.invalid")
+            .env("GIT_COMMITTER_NAME", "abeam")
+            .env("GIT_COMMITTER_EMAIL", "abeam@example.invalid")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
 }
 
 impl Drop for Dir {
@@ -243,7 +273,7 @@ impl Drop for Dir {
 fn abeam(dir: &Dir) -> PtySession {
     PtySession::spawn(
         PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
-            .arg(HOSTED)
+            .arg(format!("+{HOSTED}"))
             .cwd(&dir.0)
             // The command view would otherwise search: `pwsh` on Windows, whose
             // banner and startup time vary by machine, and `$SHELL` on Unix,
@@ -415,7 +445,7 @@ fn a_shell_planted_in_the_repository_is_not_what_alt_s_runs() {
     plant(&dir);
 
     let mut cfg = PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
-        .arg(HOSTED)
+        .arg(format!("+{HOSTED}"))
         .cwd(&dir.0)
         // The bare name, which is the only spelling that asks the question this
         // test is about: an absolute one is abeam being told exactly what to
@@ -482,6 +512,115 @@ fn the_second_alt_e_opens_a_file_list_that_can_be_walked_to_a_file() {
     send(&session, b"target");
     send(&session, b"\r");
     wait_for(&session, "# found me");
+
+    send(&session, &alt('q'));
+    send(&session, &alt('q'));
+    drop(session);
+}
+
+#[test]
+fn the_right_pane_can_be_pointed_at_a_worktree_and_both_of_its_views_follow() {
+    // The one test that drives a workspace switch end to end, and every step of
+    // it belongs to somebody else: git decides where the worktree lives and how
+    // it spells the path, `notify` and the filesystem decide what comes back,
+    // ConPTY or a Unix pty decides what the keystrokes look like on the wire.
+    // A unit test can prove `set_root` clears what it should; only this can
+    // prove that `w` reaches the pane at all, that the list is legible in 46
+    // columns, and that the two right-hand views really do land in the other
+    // worktree.
+    //
+    // The left pane is deliberately not in any of it: a live child's working
+    // directory belongs to the child, so the agent stays where it started. That
+    // asymmetry is what the border's workspace label exists to say out loud,
+    // and it is the last thing this test checks.
+    let dir = Dir::new("worktrees");
+
+    // Committed, so there is a HEAD to add a worktree at. `notes.md` is left
+    // untracked on purpose: the reader opens the *newest* markdown under its
+    // root, and one document per tree written in a known order is what makes
+    // "which one did it open" a question with an answer.
+    dir.write("README.md", "# repo\n");
+    if !dir.git(&["init", "-q", "-b", "main", "."])
+        || !dir.git(&["add", "-A"])
+        || !dir.git(&["commit", "-qm", "first"])
+        || !dir.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "review",
+            ".claude/worktrees/review",
+        ])
+    {
+        panic!("this test needs git on PATH; without it the switch is untested");
+    }
+
+    // One document and one untracked file per worktree, each naming its own, so
+    // that both right-hand views can be caught looking at the wrong tree rather
+    // than merely at a plausible one.
+    dir.write("notes.md", "# the agent's own root\n");
+    dir.write("only-in-main.txt", "x\n");
+    dir.write(
+        ".claude/worktrees/review/review-note.md",
+        "# only in the review worktree\n",
+    );
+    dir.write(".claude/worktrees/review/only-in-review.txt", "x\n");
+
+    let session = abeam(&dir);
+    wait_for(&session, "git");
+    // The agent's own root, before anything is switched: its untracked file is
+    // in the git pane, and the border says nothing about a workspace because
+    // there is nothing to say — the pane is 46 columns and a label that is true
+    // by default is one that costs a branch name.
+    let start = wait_for(&session, "only-in-main.txt");
+    assert!(
+        !start.contains("review · git"),
+        "the border named the agent's own workspace: {start}"
+    );
+
+    // `w` is pane-local, so the right pane has to have the keyboard: it is only
+    // ever delivered while the git view has focus, which is what exempts it
+    // from the invariant in `crate::keys`.
+    send(&session, b"\x1b[15~"); // F5, the focus-right key
+    send(&session, b"w");
+    let list = wait_for(&session, "worktrees");
+    assert!(
+        list.contains("review"),
+        "the worktree git just made is not on the list: {list}"
+    );
+
+    // git prints the main worktree first, so one Tab is the neighbour.
+    send(&session, b"\t");
+    send(&session, b"\r");
+
+    // The border now names the workspace, and the git pane is reporting the
+    // other tree: `review` is both the label before the pane title and the
+    // branch inside it.
+    let switched = wait_for(&session, "review · git");
+    let switched = if switched.contains("only-in-review.txt") {
+        switched
+    } else {
+        wait_for(&session, "only-in-review.txt")
+    };
+    assert!(
+        !switched.contains("only-in-main.txt"),
+        "the git pane is still reporting the workspace it was pointed away \
+         from: {switched}"
+    );
+
+    // ...and the reader followed, without being told which file: `set_root`
+    // leaves it empty and the startup walk of the *new* root opens the newest
+    // document it finds there.
+    send(&session, &alt('e'));
+    let read = wait_for(&session, "only in the review worktree");
+    assert!(
+        !read.contains("the agent's own root"),
+        "the reader is showing a document of the workspace that was left: {read}"
+    );
+    assert!(
+        read.contains("review · "),
+        "the border stopped naming the workspace the reader is in: {read}"
+    );
 
     send(&session, &alt('q'));
     send(&session, &alt('q'));

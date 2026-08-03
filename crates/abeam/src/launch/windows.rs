@@ -403,7 +403,7 @@ pub(super) fn probe(dir: &Path, name: &str) -> Option<PathBuf> {
 /// can actually **start**, which is not always the first match. The departure
 /// is invisible on the default `PATHEXT` and is the whole difference between
 /// hosting an npm agent and not on a customised one: with the real npm trio on
-/// `PATH`, `.PS1;.COM;.EXE;.BAT;.CMD` made `abeam claude` refuse a PowerShell
+/// `PATH`, `.PS1;.COM;.EXE;.BAT;.CMD` made `abeam +claude` refuse a PowerShell
 /// script and `.COM;.EXE;.JS;.CMD` made it refuse a `.js`, with the launchable
 /// `claude.cmd` sitting in the same directory both times. Windows' order
 /// answers "what does this name mean on this machine", which is a question
@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn a_customised_pathext_still_reaches_the_one_file_of_the_npm_trio_that_can_start() {
         // Both of the last two are real `PATHEXT` values off real machines, and
-        // both used to stop `abeam claude` dead with the launchable `.cmd`
+        // both used to stop `abeam +claude` dead with the launchable `.cmd`
         // sitting in the same directory: the first took the `.ps1` and refused
         // to guess a PowerShell, the second took the `.js` and said it was not
         // a program Windows can start. Windows' own rule is "first match wins";
@@ -877,7 +877,7 @@ mod tests {
         let shim = dir.write("abeam-agent.cmd", b"@echo off\r\n");
         dir.write("abeam-agent.ps1", b"# nothing\r\n");
 
-        // The way `abeam abeam-agent` would reach it, with the process's own
+        // The way `abeam +abeam-agent` would reach it, with the process's own
         // `PATH` left alone — it is shared with every test running beside this.
         assert_eq!(
             walk(dir.path().as_os_str(), "abeam-agent"),
@@ -1047,7 +1047,7 @@ mod tests {
     fn a_line_longer_than_cmd_will_run_is_refused_rather_than_quietly_doing_nothing() {
         // The worst failure this module had, because it had no symptom. Past
         // 8191 characters `cmd` starts nothing, prints nothing and exits 0, so
-        // `abeam claude -p "<10 KB prompt>"` drew an empty pane, printed
+        // `abeam -p "<10 KB prompt>"` drew an empty pane, printed
         // `exited: ExitStatus { code: 0 }` and left abeam exiting 0 as well.
         // Ten kilobytes is an ordinary prompt, and the cliff is invisible: the
         // same command works against a natively installed `claude.exe` and
@@ -1156,7 +1156,7 @@ mod tests {
         let home = script.parent().expect("the shim has a directory");
 
         // Found the way a `PATH` lookup would find it, so the resolution under
-        // test is the one an `abeam claude` performs...
+        // test is the one an `abeam +claude` performs...
         assert_eq!(
             walk(home.as_os_str(), "abeam-shim"),
             Some(script.clone()),

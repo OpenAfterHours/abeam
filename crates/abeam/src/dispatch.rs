@@ -208,8 +208,11 @@ impl Dispatcher {
     /// current directory first, which is the repository on screen.
     pub fn new(root: PathBuf, agent: &str) -> Result<Self, Unavailable> {
         // Through the table rather than by comparing the string, so that
-        // `abeam Claude` and `abeam claude` are one request here as they are
-        // everywhere else. A program named outright — `abeam C:\tools\claude.exe`
+        // `abeam +Claude` and `abeam +claude` are one request here as they are
+        // everywhere else. The `+` is the only part of a command line that is
+        // abeam's, so those are the spellings that get here at all — a bare
+        // `abeam claude` is `crate::agent`'s refusal and never a request to host
+        // anything. A program named outright — `abeam +C:\tools\claude.exe`
         // — is not the table's Claude and does not become it: abeam knows what
         // it was asked to host and nothing about what that turned out to be.
         let Some(claude) = crate::agent::find(agent).filter(|found| found.name == AGENT) else {
@@ -811,7 +814,7 @@ mod tests {
     }
 
     /// A program abeam could plausibly be hosting that is not an agent at all,
-    /// named the way the platform's users would name one. `abeam bash` has a
+    /// named the way the platform's users would name one. `abeam +bash` has a
     /// queue too, and one of its two modes is not available to it.
     #[cfg(windows)]
     const NOT_AN_AGENT: &str = "powershell";
@@ -996,7 +999,7 @@ mod tests {
 
     #[test]
     fn the_hosted_agents_name_is_read_the_same_way_wherever_it_was_typed() {
-        // Case-insensitively, like `crate::agent::find`. `abeam Claude` hosting
+        // Case-insensitively, like `crate::agent::find`. `abeam +Claude` hosting
         // Claude while its queue said dispatch was unavailable would be a
         // distinction with no visible cause.
         //

@@ -24,7 +24,30 @@ impl TempDir {
         let path = std::env::temp_dir().join(format!("abeam-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
-        Self(path)
+        // **Resolved, because `main` resolves.** `crate::main` calls
+        // `crate::paths::resolve_root` on `current_dir` before it builds
+        // anything from the answer, so every root in the program is a resolved
+        // one. A fixture that skipped that step would be handing the code under
+        // test a root the program can never actually be given, and the tests
+        // that compare it with a path from somewhere else — git's
+        // `worktree list`, `notify`, `fs::canonicalize` — would be asking
+        // whether two spellings agree rather than whether the code is right.
+        //
+        // `std::env::temp_dir` is exactly where that bites. It answers with
+        // `%TEMP%`, and on a Windows machine whose user name is longer than
+        // eight characters `%TEMP%` is an 8.3 short name —
+        // `C:\Users\RUNNER~1\AppData\Local\Temp` on every GitHub runner, where
+        // git and `canonicalize` both say `runneradmin`. On a five-letter user
+        // the two forms coincide and nothing here is visible, which is how a
+        // whole class of test defect stayed hidden on one desktop and failed
+        // five ways on a build server. `/var` symlinked to `/private/var` on
+        // macOS is the same fixture telling the same lie in the other dialect.
+        //
+        // Resolved *after* the directory exists, because `canonicalize` opens
+        // what it is given. A failure falls back to the path as written, which
+        // is `resolve_root`'s own promise and leaves the fixture exactly as it
+        // was before this line.
+        Self(crate::paths::resolve_root(&path))
     }
 
     pub fn path(&self) -> &Path {

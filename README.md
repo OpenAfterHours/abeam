@@ -11,7 +11,9 @@ It replaces a three-window setup: the agent in one terminal, git in another, and
 an editor open purely to read the markdown it produced.
 
 Two agents are known by name today — **Claude Code** and **GitHub Copilot CLI**
-— and any other program on `PATH` can be hosted by naming it. Which one you got
+— and any other program on `PATH` can be hosted as `abeam +<name>`. Everything
+else you type goes to the agent, so `abeam <claude args>` is `claude <claude
+args>` with two panes beside it; "Running it" is the whole rule. Which one you got
 is not a thing to remember: the left border says. Read the Copilot half of this
 document knowing that **abeam has never been run with Copilot CLI**, not once:
 the selection, the launcher and the failure message are tested, a session is
@@ -32,9 +34,11 @@ not, and "Not done, and known" says exactly why and what that leaves unproven.
 
 That title is the name you chose and never the path it resolved to, which is
 why an npm-installed agent started on Windows by way of `cmd.exe` says its own
-name rather than the interpreter's. `abeam copilot` should therefore draw
+name rather than the interpreter's. `abeam +copilot` should therefore draw
 `┌ copilot ─…` in the same place — "should" because that follows from the code
-and from a test of the naming, and nobody has watched it happen.
+and from a test of the naming, and nobody has watched it happen. The `+` is how
+abeam was told which agent to host and never part of what it was told, so it is
+not on the border either.
 
 ## Why this rather than wezterm + lazygit + glow
 
@@ -43,6 +47,14 @@ repository root feeds both views: markdown the agent writes becomes the document
 on screen, and any file it touches refreshes git within one debounce interval.
 That is the only thing here you cannot assemble out of existing tools, and it is
 the reason abeam exists.
+
+One watcher over one root turned out not to be one workspace, and that is the
+whole of "Worktrees" further down. Claude Code makes git worktrees *inside* the
+directory abeam is watching and runs other agents in them, so "what the agent
+just did" and "a file changed under this root" stopped being the same sentence
+the day somebody ran two agents on one project. The pane still knows what the
+agent just did. What it costs to keep that true is a routing rule with an
+argument in it.
 
 Everything else is a consequence of that. The panes are read-only, they never
 take focus from the agent, and they never switch themselves — a pane that yanks
@@ -115,49 +127,147 @@ actionable. Add each target when someone can run it.
 
 ## Running it
 
+**Everything on the command line belongs to the hosted agent, except a single
+leading token beginning `+`, which is abeam's.** That is the whole rule, and
+what it buys is that `uvx abeam <anything>` is the session `claude <anything>`
+would have started, with two panes around it.
+
 ```
-abeam                  # the default agent, in the current directory
-abeam copilot          # GitHub Copilot CLI
-abeam bash             # anything else on PATH
-abeam claude --resume  # everything after the name belongs to the agent
+abeam                     # the default agent, in the current directory
+abeam --resume            # ...which is `claude --resume`
+abeam -p "fix the tests"  # ...and `claude -p "fix the tests"`
+abeam agent               # ...and `claude agent`, subcommands included
+
+abeam +copilot --resume   # GitHub Copilot CLI, with its own --resume
+abeam +bash               # anything else on PATH
+abeam +help               # abeam's own help; `--help` is the agent's
+abeam -- +1 more thing    # `--` stops abeam reading, and goes to the agent too
 ```
 
-The first word that is not a flag is the whole of the selection. If it names an
-agent abeam knows — `claude` or `copilot`, matched without regard to case —
-abeam looks that agent's executables up on `PATH`; anything else is a program
-name and means exactly what `abeam bash` or `abeam powershell` has always meant.
-`ABEAM_AGENT` names the default for a shell where you always want the same one,
-and it is read on precisely those terms: an agent name, or any program. An empty
-value counts as unset, because PowerShell leaves one behind — and so does a
-profile that exports a variable it then fails to fill — and `'' was not found on
-PATH` names nothing anyone can act on.
+**If you used to write `abeam <program>`, write `abeam +<program>` now.**
+`abeam bash`, `abeam powershell`, `abeam nu` — anything this document used to
+describe as "anything else on `PATH`" — needs the sigil in front of it, and the
+next section says what those lines do without one.
 
-**abeam parses its own flags only up to that first non-flag word**, and it has
-two of them: `-h`/`--help` and `-V`/`--version`. Everything from the selector
-onwards is the child's, `--help` included — `abeam claude --help` is a question
-for Claude, and a multiplexer that quietly ate a flag meant for the thing it is
-hosting would be wrong in a way that is very hard to see from the outside. `--`
-first is the escape hatch, and covers the one case the rule cannot: a program
-whose own name starts with a dash.
+A `+` token is read only in the first position and there is at most one: a
+prompt may begin with a `+`, and `abeam config set +x` is a real command line.
+`+name` is resolved exactly as the old positional was — if it names an agent
+abeam knows, `claude` or `copilot`, or a preset out of your config file, matched
+without regard to case, abeam looks that entry's executables up on `PATH`;
+anything else is a program name and means what `abeam bash` used to mean. Spaces
+around the name are trimmed, so `abeam "+claude "` is `abeam +claude` rather
+than a hunt for a program with a space on the end of it. Two words behind the
+sigil are reserved and only two, `+help` and `+version`, and like every other
+name behind a `+` they are matched without regard to case: `+HELP` and
+`+Version` are abeam's too. There are no `+h`/`+V` short forms, deliberately: a
+short form is one more word that can never be a program name, and `-h`, `-V`,
+`--help` and `--version` all go to the agent now, which is the help you wanted.
 
-There is no `--agent` flag. The positional already selects, so a flag beside it
-would make `abeam --agent copilot powershell` expressible, and there is no
-honest answer to what that would mean.
+**`--` is not a second exception, and it used to be one.** A leading `--` stops
+abeam reading the line — so a first argument beginning with `+` is safe behind
+it — and then goes to the agent along with everything after it, exactly as you
+typed it. That is a fix rather than a detail: abeam used to swallow the token,
+so `abeam -- --resume` started `claude --resume` and *resumed the session*,
+where `claude -- --resume` hands the literal string `--resume` over as a prompt.
+One command line meant two things depending on whether abeam was in front of
+it, which is the whole of what the rule above exists to prevent. So
+`abeam -- claude agent` is `claude -- claude agent` today, and whether that is a
+prompt or a complaint is Claude's business — the point is that it is the same
+answer either way.
+
+`ABEAM_AGENT` names what to host when no `+` token did — an agent name, a preset
+name, or any program — and this change is what made it worth setting: `ABEAM_AGENT=copilot
+abeam --resume` resumes Copilot, where before the variable stopped applying the
+moment you had arguments to pass. An empty value counts as unset, because
+PowerShell leaves one behind — and so does a profile that exports a variable it
+then fails to fill — and `'' was not found on PATH` names nothing anyone can act
+on. A `+` token overrides it.
+
+**Its reach grew with that, and that is a cost as well as the feature.** The old
+code read the variable only when you gave abeam no arguments at all, because
+anything else was a positional that selected. It is read on every command line
+that does not lead with a `+` now — so one exported in a dotfile three years ago
+used to touch nothing but bare `abeam`, and today silently redirects `abeam -p
+"commit my changes"` into a different agent. There is no version of this that is
+only the good half. What stands against it is that a `+` overrides it for one
+run, that the left border says which agent is taking the typing, and that when
+what it names cannot be found abeam's message says the variable is why.
+
+It holds a **name**, not a command line, so `ABEAM_AGENT=+copilot` — the
+spelling every other line here teaches — is refused with the correction printed
+rather than accepted with the `+` quietly dropped. The sigil says which token on
+a command line is abeam's, and there is no token to mark inside a variable.
+
+**`abeam claude` and `abeam copilot` are refused rather than reinterpreted**,
+with exit code 2 and a message naming both readings and both ways out. They
+hosted those agents for the whole of abeam's life before this, they are written
+that way in every older copy of this document, and what you would otherwise get
+is `claude claude` — the agent's own complaint about an argument it does not
+have, on a screen that never mentions abeam. That refusal is permanent, not a
+migration aid, and it is a fixed lookup in abeam's own table rather than a `PATH`
+probe: a refusal that depended on what happened to be installed would accept a
+command line on your machine and reject it on a build server.
+
+The message rewrites the **first token** and leaves the rest of your line
+described rather than quoted, which is a correction: it used to print your whole
+command line back inside `` Write `abeam +…` ``, joined with single spaces,
+having never seen your shell's quotes. For `abeam claude -p "fix the tests &
+ship it"` that produced an instruction which in `bash` runs two commands. Only
+the first token ever changes, so that is the only part worth spelling out
+exactly.
+
+There is no `--agent` flag, and this document used to give a different reason
+for that than it gives now. The old one was that the positional already
+selected, so a flag beside it would make `abeam --agent copilot powershell`
+expressible with no honest meaning. Nothing positional selects any more, so that
+objection has gone with its premise — but the property it was defending is
+exactly what `+` keeps: there is one place a selection can be written, and it is
+impossible to write two.
+
+What the positional cost was the point of abeam. `abeam agent` looked for a
+program called `agent`, `abeam mcp list` looked for one called `mcp`, and
+`abeam --help` was abeam's help rather than Claude's — every argument that
+happened not to start with a dash was a trap, and the traps were whatever
+subcommands the hosted agent grows next, which is not a list any README can
+hold. The change also deleted a class of bug rather than guarding against it:
+abeam used to refuse leading flags it did not recognise, because before that
+check existed `abeam --help` reached `CreateProcessW` as a program named
+`--help`. What the rule deletes is the *route* — a dashed token becoming a
+program name with nobody having named one — so there is nothing left to check.
+
+This paragraph used to claim something stronger and it was false, which is worth
+correcting rather than quietly softening, since its own point is that "we added
+a check for it" and "it stopped being expressible" are different guarantees. It
+said a dashed token could never be a program name at all. It can:
+`abeam +--help` names one, `ABEAM_AGENT=--help` names one with no `+` on the
+line, and `abeam +./-weird` reaches a dash-named file by path. All three are you
+asking for a dash-named program, which abeam allows on purpose. What keeps such
+a name off the operating system's own spawn is `launch`, which answers only with
+a path it has actually located and otherwise says `` `--help` was not found on
+PATH `` in abeam's own voice — and that predates this change entirely.
 
 An agent abeam cannot find is a sentence and never a download. Modern `gh
 copilot` is a launcher rather than the retired suggest/explain extension: it
 will fetch the Copilot CLI if it is missing, and abeam had that fallback for a
-day before it was taken out on purpose. Typing `abeam copilot` is a request to
+day before it was taken out on purpose. Typing `abeam +copilot` is a request to
 run something, not consent for a network install, and a terminal border cannot
 close that gap after the fact. So what you get instead is four things: the
 names that were looked for, what the operating system said about the last of
 them, then — when another agent abeam knows is already sitting on `PATH` — the
-line that saves the ten minutes, `` `claude` is installed; `abeam claude` would
+line that saves the ten minutes, `` `claude` is installed; `abeam +claude` would
 host it. ``, and last one sentence on installing the one you asked for, `gh
 copilot` included, as a command you run yourself. The third is the best line in
 the message and the one most often needed: the default agent missing on a
 machine where the other one is right there is a session one word away from
 starting, and nothing else on that screen would say so.
+
+Under all of that there is one more line, naming `abeam +help`, and it is there
+because **this message is also what `abeam --help` prints on a machine with no
+agent installed**. Trace it: no `+`, so `--help` belongs to the agent; the agent
+is not there; and what comes back is a page about installing Claude to somebody
+who was asking what abeam is. `F1` is not a route out of that — it needs a
+running agent — so without the line the only way to find abeam's own command
+line is this document.
 
 What each agent wants:
 
@@ -173,10 +283,110 @@ What each agent wants:
   naming: it is the route that works where the other two do not.
 
 The current directory is both the child's working directory and the root that
-the git pane and the watcher use.
+the git pane and the watcher use — **resolved once, at startup, before any of
+the three is handed it.** `GetCurrentDirectoryW` reports the path the process
+was given and resolves neither a junction, nor a `subst` drive, nor an 8.3 short
+name; `git worktree list` resolves all three. So a session started through any
+of them stands in `…\link` while every root git names is `…/real`, and those are
+two different directories to every comparison abeam makes about a path — which
+would leave the routing rule under "Worktrees" wrong for the whole session
+rather than wrong once. The child is given the resolved spelling too, and that
+is not tidiness: the child writes its own working directory into the session
+record abeam reads back out. The visible cost is one surprise, and it is worth
+naming rather than describing the resolution as free — somebody who works on a
+`subst` drive `X:` gets an agent whose `pwd` says `C:\src\forge`. Between a name
+that surprises you once and a window that cannot tell your worktrees apart, the
+name is the cheaper of the two.
 
-From a checkout, `cargo run -p abeam` and `cargo run -p abeam -- copilot` do the
-same.
+The right pane can later be pointed at another worktree of the same repository.
+The left one cannot, ever, and "Worktrees" is where that asymmetry is argued.
+
+From a checkout, `cargo run -p abeam` and `cargo run -p abeam -- +copilot` do
+the same. Cargo's own `--` and abeam's are two different fences that happen to
+be spelled alike: the first ends Cargo's arguments, and everything past it is
+the line abeam reads under the rule above.
+
+## Configuration
+
+There is one file, it is optional, and most machines will not have one.
+
+```
+Windows  %APPDATA%\abeam\abeam.toml
+Linux    $XDG_CONFIG_HOME/abeam/abeam.toml, or ~/.config/abeam/abeam.toml
+```
+
+**Your profile, and never the repository**, which is a security decision rather
+than a filing one. The repository on screen is the one directory in this whole
+program that somebody else gets to write to — it is a clone, it is somebody's
+pull request, it is whatever `git checkout` just put there — and `launch` spends
+four hundred lines making sure a `claude.exe` committed to it can never be what
+starts. A `.abeam.toml` read out of that directory would undo all of that in six
+lines of TOML: `[preset.claude]`, `host = "./tools/claude"`, with abeam's own
+border obligingly printing the word `claude` over the top. So there is no
+repo-local config and there is not going to be one. The usual mitigation is a
+trust prompt, and a prompt that appears whenever a repository is fresh is a
+prompt that gets answered yes.
+
+No file is not an error; it is the ordinary state. A file that is there and does
+not parse *is* one: abeam prints the path and the parser's own line and column
+and exits 2, before it touches the terminal. This file names programs to start,
+so half-reading it is the one outcome worse than refusing it.
+
+```toml
+[defaults]
+view  = "git"    # git | files | shell | queue — which right-hand view opens
+focus = "left"   # left | right               — which pane has the keyboard
+zoom  = false
+theme = "dark"   # light | dark               — the reader's page
+
+[preset.fleet]
+host  = "claude"     # an agent abeam knows, or any program on PATH
+args  = ["agent"]
+view  = "queue"
+theme = "dark"
+```
+
+`[defaults]` is how every session on the machine opens. A **preset** is a name
+behind the sigil that behaves exactly like a built-in agent: `abeam +fleet
+--resume` starts `claude agent --resume` with the queue showing,
+`ABEAM_AGENT=fleet abeam` does the same, and `+help` lists `fleet` beside
+`claude` and `copilot`. A preset's own `args` go in *front* of what you typed,
+because a subcommand is the first word of the line it belongs to — behind them,
+`abeam +fleet --resume` would be `claude --resume agent`, which is a different
+command in every agent abeam hosts. Its four opening keys override `[defaults]`
+field by field, so the preset above moves the view and leaves the rest where the
+defaults put them.
+
+Three rules, each of them a refusal you will see rather than a surprise you
+will not:
+
+- **A preset's `host` is looked up in abeam's built-in table and on `PATH`,
+  never among the other presets.** There is no preset chaining, deliberately.
+  Without the rule, `[preset.claude] host = "claude"` is a row pointing at
+  itself; with it, there is no edge from a preset to a preset to recurse along.
+  What it costs is naming one preset from another, which is one saved line in a
+  config file — bought, otherwise, with a cycle check on the path that decides
+  which program starts.
+- **A preset may not take a name abeam already answers** — `claude`, `copilot`,
+  `help` or `version`. It would be a name with two meanings and one of them
+  unreachable, with nothing on screen saying which of the two ran. Two presets
+  whose names differ only in case are refused for the same reason, since every
+  name behind a `+` is matched without regard to case.
+- **A preset name is refused in front of the sigil too.** `abeam fleet` gets the
+  same both-readings refusal `abeam claude` gets, because it is the same
+  mistake — made, this time, by the one person on the machine most likely to
+  believe the word means their preset. The sentence differs in one place and had
+  to: `abeam claude` really did host Claude for years, and `abeam fleet` has
+  never hosted anybody's preset, so it says what that line *did* mean instead —
+  a `PATH` lookup for a program called `fleet`.
+
+A key abeam does not recognise is an error rather than a shrug. `[presets.fleet]`
+with the plural spelling, or a `them = "dark"`, is a line you wrote and expected
+to work, and a config file that quietly ignored it would behave exactly like a
+config file abeam never found. The cost is forward compatibility — a file
+written for a later abeam is refused by an earlier one rather than partly
+honoured — and that is the right way round for a file that names programs to
+start.
 
 ## Keys
 
@@ -229,6 +439,20 @@ rendered markdown for its source; in the file list, `/` finds a file anywhere
 under the root and `Backspace` goes up a directory. `Esc` or `q` hands focus
 back to the agent.
 
+`w` is the one key in that vocabulary that is not about reading: in the git view
+it opens the repository's worktrees, `Enter` there points the right pane at the
+selected one, and `Esc` gives you the status list back instead of the agent —
+which is why the border says `esc→git` while the list is up. **It is pane-local
+rather than an `Alt` key, and the table above is right to leave it out.**
+`crates/abeam/src/keys.rs`'s `HELP` lists it below the split that separates
+abeam's global bindings from the keys that only mean anything while the right
+pane has focus and one particular view is showing, and it is exempt from that
+file's invariant for exactly that reason: no agent can be listening for a key
+that is only ever delivered to a focused pane. A global spelling was available
+and refused twice over — `Alt+W` is Claude's, and a view key spelled `F6` would
+be a key nobody groups with `Alt+G` and `Alt+E`. The list is not a peer of those
+views anyway; it is how you point one of them somewhere else.
+
 The shell view is the exception, and it has to be: `Esc` and `q` belong to
 whatever is running in it. `Alt+S` or `F4` is the way out, and its border says
 so rather than leaving you to find out.
@@ -249,7 +473,9 @@ selected file in the viewer, when the row names one to open: git collapses an
 untracked tree to a single `dir/` entry and there is no directory view to open
 one in, and a deletion is a path git has just finished saying is gone. Enter
 does nothing on those, rather than trading the view you are reading for a
-viewer saying "no such file".
+viewer saying "no such file". `w` leaves the status list for the repository's
+other worktrees, which is how the right pane is pointed at one; the section
+after this is the whole of that.
 
 **files** — read-only markdown and source, and a way to reach any of it.
 Markdown is rendered, not shown as source: headings, lists, tables, quotes, GFM
@@ -314,6 +540,110 @@ producing output the rate should sit at the frame floor; a worst frame
 approaching the gap between frames means the renderer is what is setting the
 pace, and no amount of pacing will help.
 
+## Worktrees, and whose change is whose
+
+This section exists because of a bug, and the bug is the fastest way to explain
+the feature. Claude Code does not stay in one directory: it makes git worktrees
+— the usual place is `<root>/.claude/worktrees/<name>` — and runs agents in
+them, so a machine with two agents on one project has two working trees inside
+one watched directory. abeam runs a single recursive watch of the repository
+root and is right to. What that watch could not do on its own was say *whose*
+change it had just seen. So another agent, working in
+`<root>/.claude/worktrees/other`, refreshed your git pane on every file it wrote
+and pulled its scratch markdown into your reader, with nothing on screen
+admitting where any of it came from. A pane that reports somebody else's work as
+yours is worse than a pane that reports nothing, because it is not obviously
+broken.
+
+One line in the watcher's noise list would have stopped those events at the door
+and closed that bug in an afternoon. It would also have blinded abeam inside its
+own worktrees for ever, which is the half of the feature you can actually press
+a key on: the right pane is pointed *into* those directories now, and a noise
+entry means the watcher never wakes it. Noise is for directories nobody wants to
+read. `.claude/worktrees` is where the work is.
+
+**The obvious fix is not the fix, and that is the part worth reading.** Route by
+path prefix — take the event if it starts with the workspace root. It does not
+work. `<root>/.claude/worktrees/other/NOTES.md` **has `<root>` as a prefix**; it
+genuinely is inside the repository, which is exactly what makes the worktree
+layout convenient, so a prefix test hands it straight back to the workspace
+rooted at `<root>`, which is the case being complained about. The naive fix is a
+no-op dressed as a rule. What works is **innermost ownership**: a path belongs
+to the *longest* known root that contains it, and a pane takes an event only
+when that longest root is its own. That is not a convention invented here to
+make a bug go away — it is git's own model. `git status` in the main worktree
+does not report a nested worktree's modifications, because the nested tree has
+its own index and its own HEAD, and a pane that mirrors `git status` should
+agree with `git status` about whose changes those are.
+
+Ownership alone was half a rule, and the missing half is not a corner case — it
+is the ordinary shape of the very event the rule exists to route. **Writing one
+file inside a nested worktree makes the watcher report the directories above it
+in the same debounced batch.** The file is owned by the worktree and dropped
+correctly; `<root>/.claude` and `<root>/.claude/worktrees` are owned by the
+*enclosing* workspace, because nothing nested is an ancestor of them. Routed on
+ownership alone they are indistinguishable from somebody editing in the root by
+hand, so a neighbour's write still bought this window a frame and a `git status`
+— the whole thing the rule was built to stop, arriving one directory up. So the
+second half is that **a directory containing another workspace's root is not
+evidence about its own**. The only way such a directory can have changed is that
+something inside the nested workspace did, and that something has already been
+reported under its own name and routed to whoever owns it. A path that *is* a
+root stays evidence about itself, and that arm is load-bearing rather than tidy:
+every root contains a nested one the moment a worktree exists, so without it the
+agent's own workspace would go silent the first time anybody added one — the
+routing bug arriving through the back door, in the one workspace that is always
+on the list.
+
+With that settled, the worktrees are worth showing. `w` in the git view — plain
+`w`, with the right pane focused — lists every worktree git knows about: the
+branch name, or the directory's own name where a detached or bare worktree has
+no branch to use; `agent` against the one the hosted agent is running in; who is
+working there, in Claude's own words rather than a vocabulary abeam invented;
+and `unwatched` on anything the single watcher cannot see. A `▸` marks where the
+right pane is standing. `Enter` moves the right pane to the selected row and
+puts the status list back, because looking at that worktree's git is what the
+switch was *for*. `Esc` — or `w` again — leaves the list without moving
+anything, and the border says `esc→git` rather than `esc→agent` so you are not
+left guessing which of the two it means. The workspace you are in and the
+agent's own always have a row, discovered or not — the list is *how* the right
+pane is switched, so a workspace with no row on it is a workspace nobody can get
+back to, and neither absence is exotic: `git worktree list` names the repository
+rather than the subdirectory you started abeam in.
+
+**The left pane never moves, and that asymmetry is the design rather than an
+unfinished half of it.** A live child's working directory belongs to the child;
+there is no call that moves a running process to another directory, so the agent
+stays where it was started for as long as it runs. The window therefore
+deliberately disagrees with itself about where it is, and the border is what
+keeps that honest — it names the workspace the *right* pane is on, and **only
+when that is not the agent's own**. That suppression is not tidiness either. The
+pane is 46 columns; a label on every title spends three or four of them saying
+the one thing that is true by default, and pushes the branch name and change
+count the git title exists for off the end of the border. Shown only when it is
+news, it costs nothing and says everything. The list marks `agent` separately
+from `▸` for the same reason: the point of opening it is to look at a workspace
+the agent is *not* in.
+
+Three views read a directory, and the switch reaches all three. The git pane
+re-roots and says "reading the repository…" until the first refresh lands, in
+preference to drawing the other repository's branch and change count under the
+new workspace's name for most of a second. The reader rebuilds its whole index
+and opens the newest markdown of the worktree it has moved to, exactly as it
+does at startup. The command view is per workspace, and that is the one place
+the asymmetry above reaches the right-hand side as well: a shell cannot be
+re-rooted any more than the agent can, so switching with the shell up starts a
+*second* child, in the new worktree, the first time it is drawn there. Every
+one of them is ticked whether or not it is on screen, so a hidden workspace's
+child can still exit, and `Alt+Q` consults all of them — otherwise quitting
+would kill somebody's build in a workspace they were not looking at.
+
+What deliberately does *not* follow is everything belonging to the agent: the
+idle/busy probe, the queue and the background dispatcher stay where the agent
+is. They are the session's, not the view's. Re-rooting any of them would mean a
+prompt queued for the agent being aimed at a directory the agent is not in,
+which is the one mistake in this program nobody would see happen.
+
 ## Drawing
 
 Two intervals, with different jobs.
@@ -351,8 +681,15 @@ crates/abeam-pty/    the pty host layer: sessions, input encoding, DSR
 crates/abeam-pty/src/tree/         killing a child's children, per platform
 crates/abeam/        the binary: shell, layout, focus, panes
 crates/abeam/src/agent.rs          the agents abeam knows, and how one is chosen
+crates/abeam/src/config.rs         the one file abeam reads: presets, and how a
+                                   session opens. The profile, never the repo.
 crates/abeam/src/launch/           where a program may be found, and what may
                                    then be started: one shared half, two others
+crates/abeam/src/workspace.rs      the worktrees of the repository, and which of
+                                   them owns a watched path. The routing rule
+                                   and the argument for it live here.
+crates/abeam/src/paths.rs          when two spellings are one directory, and the
+                                   one spelling everything starts from
 crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
 docs/conpty-findings.md   what the spike learned. Read before touching the pty.
 docs/keymap.md            the keybinding collision audit
@@ -489,6 +826,111 @@ work, on either platform.
 
 **Not done, and known.**
 
+- **`abeam bash` is a prompt now, and nothing says so.** This document used to
+  advertise `abeam bash`, `abeam powershell` and "anything else on `PATH`", and
+  under the rule above every one of those is a word handed to Claude, which will
+  start answering it. That is strictly worse than what `abeam claude` gets: the
+  refusal catches the two agent names and every preset name, so those at least
+  produce a complaint with abeam's name on it. It cannot catch a bare program
+  name, and deliberately: the only way to know that `bash` is a program on
+  *this* machine is to probe `PATH`, and a refusal that depended on what happens
+  to be installed would accept a command line on your laptop and reject it on a
+  build server. So the cost is paid in documentation instead, which is what the
+  migration line under "Running it" is. The same shape, reversed, is the other
+  live cost of the flip: a prompt that genuinely begins with a `+` is read as a
+  program name, because first position is exactly where a prompt lands.
+  `abeam "+1 to shipping this"` looks for a program called `1 to shipping this`
+  — the message names the `--` escape, and it is still a line somebody will type
+  once before they learn it.
+- **Worktree discovery polls, so the routing rule is allowed to be ten seconds
+  out of date.** `git worktree list` runs immediately at startup and every ten
+  seconds after it, and both directions of that lag are worth naming rather than
+  leaving to be found. A worktree somebody has just added is not on the list
+  yet, so for up to ten seconds its whole checkout has no innermost root of its
+  own, every path in it is handed to the enclosing workspace, and all of it
+  counts as evidence — which is the original routing bug, for ten seconds, in a
+  worktree that has existed for ten seconds. A worktree somebody has just
+  removed is still *on* the list, so its former parent directories go on being
+  suppressed for the same window: a real edit at `<root>/.claude` in that window
+  is dropped rather than misrouted. Neither is fixable by being cleverer about
+  the rule, because both are the list being out of date rather than the rule
+  being wrong, and the rule has nothing but the list. The git pane's own
+  two-second poll makes both of them cost one wrong refresh rather than a screen
+  that stays wrong; the reader has no such net, so in the first window a
+  neighbour's document can still be pulled in front of you and in the second one
+  of your own is quietly dropped. Shortening the window would mean a second
+  watch, on `.git/worktrees`, and one recursive watch is a decision the watcher
+  makes on purpose.
+- **A worktree outside the repository root is listed, switchable, and not
+  watched.** `git worktree add ../elsewhere` is ordinary, and abeam shows it and
+  will point the right pane at it — but the single recursive watch covers the
+  directory abeam was started in, so nothing written in that worktree ever
+  reaches the router. The git pane falls back to its own two-second poll, which
+  is the same net a commit made in another terminal lands in, and the reader
+  does not follow anything at all: it opens the newest markdown once, on the
+  switch, and then sits there. The row in the `w` list reads `unwatched`, and
+  the reader says as much on the empty screen it shows when there is nothing
+  open — because a pane that is merely slow looks exactly like a pane that is
+  broken unless something admits which it is.
+- **The occupancy column shows an id where it should show a name.** Claude's
+  session records and roster entries both carry a `name` — `"forge-c5"`, or a
+  dispatched task's own title — and it is the field that column wants;
+  `crates/abeam/src/agentstate.rs`'s `Wire` does not parse it, so what is
+  rendered is the roster's short `id` beside the status word. That is worse than
+  it sounds, because the `id` is a *background* agent's and an interactive
+  session does not have one: the common case, somebody typing in a worktree,
+  renders as a bare `working` with nothing saying who. It is one field on
+  `Wire`, one on `Session`, and one line of a struct literal in the queue pane's
+  tests.
+- **A session that had already moved into a worktree before the probe first read
+  a record is never discovered.** The probe identifies the hosted session by an
+  exact match on the agent's own root, and the worktrees are consulted nowhere
+  in that search — which is a correction rather than an omission, and the reason
+  is worth having. Claude's neighbouring agents
+  run *at* the worktree roots git names, so a set consulted during discovery
+  does not merely blur the question, it admits exactly the sessions it was meant
+  to exclude: a recycled pid landing on a neighbour's record, a few milliseconds
+  of clock skew sending the search down a fallback that takes the newest agent
+  in the repository, or a second abeam window during the second before its own
+  Claude writes anything. Each of those answered `Idle`, and `Idle` is the one
+  answer that types a queued prompt into a mid-turn agent. Only *revalidation*
+  of a record already established as ours is widened, and it is tied to the
+  `sessionId` that was ours — without that the remembered path is a pid, and a
+  pid comes round again. What the strictness costs is the case in the heading:
+  readiness answers `Unknown` for the whole session, the automatic send never
+  fires, the queue pane goes on saying it is waiting for the agent to be idle,
+  and the queue drains by hand. That is the direction this module fails in on
+  purpose.
+- **`paths` compares spellings and does not normalise them**, and two things
+  follow that somebody will otherwise reach for a fix to. `..` is left where it
+  is, so `under(C:\a, C:\a\..\b\x.md)` is true and a containment rule can in
+  principle be walked out of; nothing abeam has emits a `..` — `notify` reports
+  resolved absolute paths, `git worktree list` prints absolute ones, and the one
+  path a person types is flattened at startup — which makes it unreachable today
+  and not unreachable by construction, and that is the difference worth writing
+  down. And `\\?\C:\repo` compares unequal to `C:\repo`, because the verbatim
+  prefix is a different first component to the platform's own parser. Both are
+  the same refusal: canonicalising per comparison touches the disk, and `under`
+  is asked once per watched path per known workspace — thousands of stat calls
+  under a `git checkout` to answer a question about two strings. What pays for
+  that is the single resolution at startup described under "Running it", which
+  is also the only reason a session reached through a junction routes correctly
+  at all; `resolve_root` strips the verbatim prefix back off rather than handing
+  a third spelling to everything downstream. The fix for a `..`, if a source
+  ever emits one, is to resolve it at that source — resolving it textually is
+  wrong wherever there is a symlink, since `a/link/..` is not `a`.
+- **Each workspace you visit gets its own shell, and any of them can hold the
+  door.** A shell cannot be re-rooted for the same reason the agent cannot, so
+  switching workspaces with the command view up starts a second child rather
+  than moving the first; the number of shell processes grows with the number of
+  worktrees somebody has typed in, and `Alt+Q` asks about every one of them, so
+  a build left running in a workspace nobody is looking at still makes quitting
+  ask twice. The related cost is a workspace `git worktree remove` has deleted
+  while a child of yours is still running in it: abeam keeps it rather than
+  killing the build, it drops off the list because the list is built from what
+  git said, and switching away from it is a one-way trip until that child
+  finishes. Unlisted-and-still-running is the smaller of the two failures, and
+  it is the one deliberately chosen.
 - **The shell view has never been driven by a human.** A test types `set /a
   123*456` into the real binary and reads `56088` back off the screen, which is
   more than a smoke test and still less than use: the six pass criteria above
@@ -684,15 +1126,16 @@ work, on either platform.
   terminal and that desktop, and no amount of reading an agent's source answers
   it. Run the probe in the terminal you launch abeam from before assuming the
   table holds; `docs/keymap.md` has the procedure.
-- **Almost no configuration**, and the "almost" is two environment variables.
-  Keybindings, the split ratio and both drawing intervals are constants in the
-  source. `ABEAM_AGENT` names the agent — or the program — to host when the
-  command line names none, and `ABEAM_SHELL` names what the command view starts.
-  There is no file, so nothing survives the session: the reader's light/dark
-  choice starts dark every time. Claude's own bindings are user-configurable and
+- **Keybindings are not configurable**, and neither are the split ratio or
+  either drawing interval: those are constants in the source. There is a config
+  file now — see "Configuration" — and it holds presets and the four things a
+  session opens with, which is where the reader's light/dark choice went. It
+  says nothing about keys. Claude's own bindings are user-configurable and
   abeam's should be too before anyone else uses it. Copilot's are not, which
   makes that the mirror image of the same gap rather than a reason to be relaxed
-  about it.
+  about it. The two environment variables are unchanged beside it: `ABEAM_AGENT`
+  names the agent, preset or program to host when no `+` token did, and
+  `ABEAM_SHELL` names what the command view starts.
 - **A scrolling pane is a full repaint.** ratatui diffs by cell and has no notion
   of a scroll region, so when the agent's output scrolls, every row has changed
   and the whole pane is rewritten — about 10 KB of escape sequences, measured
@@ -723,8 +1166,9 @@ work, on either platform.
   terminal's own background, so the git and diagnostics views follow whatever
   profile the terminal has and the two pty views show whatever their child sent.
   A TUI still cannot ask the terminal for its palette; the reader sidesteps the
-  question by owning every colour inside its own rect. The choice is per session
-  and starts dark — there is nowhere to persist it until there is a config file.
+  question by owning every colour inside its own rect. The choice is still per
+  session — `F3` flips it and the flip is not written back — but where it starts
+  is now `[defaults] theme` in the config file rather than always dark.
 - **UTF-16 files are reported as binary.** The sniff is a NUL byte in the first
   8 KiB, which is what git does.
 - **A path that is not UTF-8 breaks `launch`'s chain of custody.**
@@ -738,7 +1182,12 @@ work, on either platform.
   that nothing leaves it unchecked.
 - **A non-UTF-8 command-line argument aborts abeam before anything runs.**
   `std::env::args()` panics on one. That is unreachable on Windows and entirely
-  reachable on Unix, where an argument is bytes; `args_os` is the fix.
+  reachable on Unix, where an argument is bytes; `args_os` is the fix. Its
+  exposure grew when the command line was handed to the agent, which is the
+  reason it is worth doing rather than noting: abeam's arguments used to be a
+  program name and a handful of flags abeam had written down itself, and they
+  are now *the prompt* — arbitrary text a user pasted, from an editor, an issue
+  tracker or another program's output, which is where a stray byte comes from.
 - **The reader's title and the find list spell the same path differently on
   Windows.** The file index rewrites `\` to `/` so that typing `src/panes` finds
   something; the reader's own label does not, so a title can read
