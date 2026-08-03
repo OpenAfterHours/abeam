@@ -48,13 +48,20 @@
 //! session, including ours. The git pane's own two-second poll is the safety
 //! net for changes the watcher cannot see, and two seconds is the right latency
 //! for "someone committed elsewhere".
+//!
+//! The noise list is filtering by *path*. There is a second filter, by what the
+//! event says happened, and it is a Linux fact rather than a preference — see
+//! [`is_change`].
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{
+    DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache, new_debouncer,
+};
 
 /// One save from an editor is several filesystem events, and an agent writing a
 /// file is several more. Long enough to coalesce them, short enough that the
@@ -195,6 +202,48 @@ impl Change {
     }
 }
 
+/// Whether an event is news that something *changed*, or somebody merely
+/// reading.
+///
+/// **This is a Linux question, and it is not a small one.** `notify`'s inotify
+/// backend registers `IN_OPEN` alongside the write masks, so every `open(2)`
+/// anywhere inside the watched tree arrives here as an event carrying that
+/// path: a `grep`, a build reading a source file, the reader opening a
+/// document, `git status` re-hashing a file whose timestamp is too close to the
+/// index's to be trusted. The other three backends have nothing like it —
+/// `ReadDirectoryChangesW`, FSEvents and kqueue report writes, and `notify`
+/// constructs no `Access` event on any of them. So a rule that took the paths
+/// out of every event is right on three platforms and, on the fourth, cannot
+/// tell a file being read from a file being written.
+///
+/// What that costs is worse than a stray refresh, because two of the readers
+/// are abeam itself and both loops feed themselves:
+///
+/// - `crate::panes::git` runs `git status` in the watched root on every change
+///   it is told about. On Linux that status opens working-tree files, which is
+///   reported as a change, which asks for another status.
+/// - `crate::panes::viewer` opens the document it is about to show. That open
+///   is reported, `crate::app::route` follows it, and the pane is handed back
+///   the file it just displayed.
+///
+/// Neither loop shows up as anything on screen. The window is busy, the panes
+/// are correct, and the agent's whole screen is being re-rendered on a timer
+/// for news nobody generated — which is exactly the discipline
+/// `crate::app::route` says it exists to keep.
+///
+/// The rule is the one `AccessKind` already implies: **an access is somebody
+/// reading, unless it is the close of a write.** `Access(Close(Write))` is kept
+/// because on Linux it is the honest end of a write and costs nothing to keep;
+/// every other access is a read, and a write that matters is reported as
+/// `Create`, `Modify` or `Remove` besides.
+fn is_change(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        _ => true,
+    }
+}
+
 /// Split a debounced burst. Separated from the callback so the one part with a
 /// decision in it can be tested against a directory it was handed.
 fn classify<I: IntoIterator<Item = PathBuf>>(root: &Path, paths: I) -> Change {
@@ -224,6 +273,24 @@ fn classify<I: IntoIterator<Item = PathBuf>>(root: &Path, paths: I) -> Change {
     change
 }
 
+/// One debounced burst: filtered by what happened, then split for its readers.
+///
+/// Separated from the callback for the same reason [`classify`] is, and it buys
+/// something [`is_change`]'s own table cannot. That table is a pure function and
+/// the live test beside it can only *fail* on Linux, so with the filter merely
+/// present in this file and not wired in front of the split, every test here
+/// would still be green and the bug would be back. This is the seam where a
+/// burst that is half reads can be handed in by hand, on any platform.
+fn sift<I: IntoIterator<Item = DebouncedEvent>>(root: &Path, events: I) -> Change {
+    classify(
+        root,
+        events
+            .into_iter()
+            .filter(|event| is_change(&event.event.kind))
+            .flat_map(|event| event.event.paths),
+    )
+}
+
 pub struct Watch {
     // Held only to keep the watcher alive; dropping it stops the thread.
     _debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
@@ -241,7 +308,7 @@ impl Watch {
         let owned_root = root.to_path_buf();
         let debounced = move |result: DebounceEventResult| {
             let Ok(events) = result else { return };
-            let change = classify(&owned_root, events.into_iter().flat_map(|e| e.event.paths));
+            let change = sift(&owned_root, events);
             if !change.is_empty() {
                 let _ = tx.send(change);
             }
@@ -529,6 +596,141 @@ mod tests {
             seen.changed.iter().all(|p| p.starts_with(&root)),
             "notify reported something outside the watched root: {:?}",
             seen.changed
+        );
+    }
+
+    #[test]
+    fn being_read_is_not_being_written() {
+        use notify::event::{
+            CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode,
+        };
+
+        // Every shape Linux's inotify backend constructs, sorted by whether
+        // anything happened. `Open` is the row this function exists for: it is
+        // what `git status` hashing a file and the reader opening a document
+        // both arrive as, and both used to be taken for writes.
+        //
+        // `Open(Write)` is on this side too, which is a decision rather than an
+        // oversight — an open for writing is an intention, and the write itself
+        // still arrives as `Modify` and as `Close(Write)` below.
+        for read in [
+            EventKind::Access(AccessKind::Any),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Open(AccessMode::Write)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Other),
+        ] {
+            assert!(!is_change(&read), "{read:?} is somebody reading");
+        }
+
+        for wrote in [
+            // The one access that is the end of a write rather than a read.
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Create(CreateKind::File),
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Remove(RemoveKind::File),
+            // A backend that will not say must be taken at its word, or the
+            // one platform that reports nothing more specific goes quiet.
+            EventKind::Any,
+        ] {
+            assert!(is_change(&wrote), "{wrote:?} is news");
+        }
+    }
+
+    #[test]
+    fn a_burst_that_is_half_reads_reaches_the_panes_as_the_other_half() {
+        use notify::Event;
+        use notify::event::{DataChange, ModifyKind};
+
+        // The wiring, and it is asserted here rather than left to the live test
+        // below because that one cannot fail anywhere but Linux. Without this,
+        // the filter could be lifted straight back out of `Watch::start` and
+        // every test in this file would still pass.
+        let fx = Fixture::new("watch-sift");
+        let read = fx.touch("read.md");
+        let wrote = fx.touch("wrote.md");
+
+        let at = Instant::now();
+        let change = sift(
+            fx.root(),
+            [
+                DebouncedEvent::new(
+                    Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+                        .add_path(read.clone()),
+                    at,
+                ),
+                DebouncedEvent::new(
+                    Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
+                        .add_path(wrote.clone()),
+                    at,
+                ),
+            ],
+        );
+
+        assert_eq!(
+            change.markdown,
+            std::slice::from_ref(&wrote),
+            "the document somebody only read was put in front of the reader"
+        );
+        assert_eq!(
+            change.changed,
+            std::slice::from_ref(&wrote),
+            "...and git was asked to refresh over it"
+        );
+        assert!(!change.overflowed);
+    }
+
+    /// The mirror of the live test above, and the pair is the point: that one
+    /// proves a write is reported, this one proves a read is not.
+    ///
+    /// It can only *fail* on Linux — `IN_OPEN` has no counterpart in
+    /// `ReadDirectoryChangesW`, FSEvents or kqueue, so on every other platform
+    /// this passes without the filter existing. It is still run everywhere,
+    /// because the rule is one rule and the day a backend grows an equivalent
+    /// is the day this should start failing there too.
+    #[test]
+    fn a_real_watcher_says_nothing_about_a_file_that_was_only_read() {
+        let fx = Fixture::new("watch-read");
+        // Before the watch, so the only thing this test can be about is the
+        // read below.
+        let note = fx.touch("note.md");
+        let watch = Watch::start(fx.root()).expect("watch a temp directory");
+
+        assert_eq!(std::fs::read(&note).expect("read the document"), b"x");
+
+        // Several debounces, which is long enough that an event still on its
+        // way would have arrived.
+        let settle = Instant::now() + Duration::from_millis(1500);
+        let mut seen = Change::default();
+        while Instant::now() < settle {
+            seen.absorb(watch.drain());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            seen.is_empty(),
+            "reading a file was reported as changing it: {seen:?}"
+        );
+
+        // ...and the watcher was alive the whole time, which is what stops the
+        // assertion above from passing for the worst possible reason.
+        std::fs::write(&note, b"# hello\n").expect("write");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            seen.absorb(watch.drain());
+            if !seen.markdown.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            seen.markdown.last().map(|p| p.file_name()),
+            Some(Some(std::ffi::OsStr::new("note.md"))),
+            "the watcher stopped reporting writes too"
         );
     }
 }

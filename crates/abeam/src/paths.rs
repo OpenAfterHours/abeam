@@ -485,15 +485,39 @@ mod tests {
         // that will not answer. A worse spelling is better than not starting,
         // and what it falls back to is what every abeam before this function
         // did unconditionally.
-        let nowhere = Path::new(ROOT).join("no-such-directory-abeam-ever-made");
+        //
+        // Hung off a directory that really exists, so that the one thing this
+        // cannot resolve is the one component that is missing. Built from a
+        // literal — some machine's home directory — it would pass just as
+        // cheerfully on a machine where *none* of the path is there, which is
+        // the same assertion proving nothing.
+        let dir = crate::testutil::TempDir::new("paths-fallback");
+        let nowhere = dir.path().join("no-such-directory-abeam-ever-made");
         assert_eq!(resolve_root(&nowhere), nowhere);
+    }
 
-        // ...and a real directory comes back naming the same place, whatever it
-        // did to the spelling on the way. This is the assertion that would fail
-        // if the verbatim prefix were left on: `\\?\C:\…` is a different first
-        // component, so `same_dir` would say the temp directory is not itself.
+    /// The other half of the promise, and the half a five-letter user name
+    /// hides.
+    ///
+    /// `std::env::temp_dir` answers with `%TEMP%`, and on a Windows machine
+    /// whose user name is longer than eight characters that is an 8.3 short
+    /// name — `C:\Users\RUNNER~1\AppData\Local\Temp` on every GitHub runner,
+    /// where `fs::canonicalize` and git both say `runneradmin`. That is the
+    /// disagreement [`resolve_root`] exists to end, and it is the same one a
+    /// junction makes; it simply arrives without anybody having to build it.
+    ///
+    /// So the spelling this starts from is taken from the platform rather than
+    /// from `crate::testutil::TempDir`, whose whole job is now to have resolved
+    /// it already. Where the two forms coincide — most desktops — this still
+    /// asserts something true and cannot fail, which is precisely why the
+    /// spelling has to come from somewhere that has not been fixed up.
+    #[test]
+    fn a_root_resolves_to_the_one_spelling_everything_else_starts_from() {
         let dir = crate::testutil::TempDir::new("paths-resolve");
-        let resolved = resolve_root(dir.path());
+        let raw =
+            std::env::temp_dir().join(dir.path().file_name().expect("a temp directory has a name"));
+
+        let resolved = resolve_root(&raw);
         assert!(
             same_dir(&resolved, dir.path()),
             "{} is not {}",
@@ -501,6 +525,22 @@ mod tests {
             dir.path().display()
         );
         assert!(resolved.is_absolute());
+        assert!(resolved.is_dir(), "...and it is still the directory itself");
+
+        // Idempotent, which is what "one resolution, one spelling, and nothing
+        // left holding the other one" has to mean: everything downstream is
+        // built from this answer, and an answer that resolved again to
+        // something else would be two spellings after all.
+        assert_eq!(resolve_root(&resolved), resolved);
+
+        // The assertion that would fail if the verbatim prefix were left on:
+        // `\\?\C:\…` is a different first component, so it would match neither
+        // git's spelling nor the watcher's.
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "{} still carries the verbatim prefix",
+            resolved.display()
+        );
     }
 
     /// The respelling, on paths this machine does not have to have.
