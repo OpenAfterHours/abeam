@@ -114,7 +114,21 @@ fn main() -> Result<()> {
         agent::Choice::Program { .. } => None,
     });
 
-    let root = std::env::current_dir()?;
+    // Resolved once, here, and never again: this is the only spelling of the
+    // repository that anything downstream is allowed to hold — the pty's
+    // working directory on the line below, the watcher, the first workspace,
+    // the git pane, the reader and the readiness probe.
+    //
+    // `current_dir` is `GetCurrentDirectoryW` on Windows, which reports the
+    // path this process was *given*. `git worktree list --porcelain` reports
+    // the path the filesystem resolves to. A junction, a `subst` drive or an
+    // 8.3 short name between them is enough to make those two different
+    // strings for one directory, and `crate::paths` is explicit that two
+    // spellings are two directories — so the watcher's events would be owned by
+    // a root git never named, every neighbouring agent's writes would land in
+    // this window, and the workspace list would say you are nowhere.
+    // `crate::paths::resolve_root` is where the whole failure is written out.
+    let root = paths::resolve_root(&std::env::current_dir()?);
 
     // Before `term::setup`, and that is the whole reason it is on this line. A
     // program that cannot be found is the single most likely way for abeam to
@@ -195,6 +209,17 @@ fn main() -> Result<()> {
                 // the process's own directory, and after the line above that is
                 // wherever abeam went to stand. The agent belongs in the
                 // repository it was opened on.
+                //
+                // The *resolved* spelling of it, which is the second reason
+                // that resolution happens before this line rather than inside
+                // `App`. A child handed `…\link` reports `…\link` as its own
+                // `cwd` — Node's `process.cwd()` is `GetCurrentDirectoryW` too
+                // — and that is the string Claude writes into its session
+                // record. `crate::agentstate::Probe` compares that record's
+                // `cwd` with abeam's root to decide whether a queued prompt may
+                // be typed, so starting the agent under one spelling while
+                // holding the other is the silent, permanent stall that module
+                // is written to make impossible.
                 .cwd(&root)
                 .size(inner.height.max(1), inner.width.max(1)),
         )?;

@@ -98,6 +98,14 @@ const ROSTER_EVERY: Duration = Duration::from_secs(3);
 /// the old behaviour and therefore the old bug; ten seconds of that at startup
 /// would be ten seconds of a neighbouring agent's writes landing in this
 /// window before the fix switched on.
+///
+/// **This interval is how stale the routing rule is allowed to be**, and that
+/// is inherent to polling rather than a gap in it. A worktree a neighbour
+/// created has its whole checkout owned by the enclosing root until the next
+/// pass, and one they removed keeps its former parents out of
+/// [`workspace::is_evidence`] for the same window.
+/// `crate::workspace::is_evidence` is where both directions are written out,
+/// because that is the function a reader is standing in when it matters.
 const WORKTREES_EVERY: Duration = Duration::from_secs(10);
 
 /// Why the loop woke up.
@@ -1263,11 +1271,19 @@ impl App {
                     // reconciliation reads one list rather than borrowing
                     // `self` twice.
                     self.sync_workspaces(&found);
-                    // The set the probe will accept a session's `cwd` against.
-                    // A hosted Claude that moves into a worktree keeps writing
-                    // records — with a different `cwd` — and without this the
-                    // exact match fails, readiness goes `Unknown`, and the
-                    // queue's automatic send stalls silently and permanently.
+                    // The set the probe will let a session it has *already*
+                    // identified move to. A hosted Claude that moves into a
+                    // worktree keeps writing records — with a different `cwd` —
+                    // and without this the exact match fails, readiness goes
+                    // `Unknown`, and the queue's automatic send stalls silently
+                    // and permanently.
+                    //
+                    // Every root git printed, which includes the worktrees
+                    // Claude Code's *neighbouring* agents are running at. That
+                    // is not a leak: `crate::agentstate::Probe::set_worktrees`
+                    // spells out that discovery is strict and only revalidation
+                    // consults this list, precisely because what is being handed
+                    // over here is a list with the neighbours on it.
                     self.probe.set_worktrees(
                         found.iter().map(|worktree| worktree.root.clone()).collect(),
                     );
@@ -3225,7 +3241,13 @@ mod tests {
     /// so out loud rather than passing quietly.
     fn app_in_a_repository_with_a_neighbour() -> Option<Fixture> {
         let dir = TempDir::new("app-worktrees");
-        let root = dir.path();
+        let root = dir.path().to_path_buf();
+        a_repository_with_a_neighbour(&root).then(|| app_over(dir, root))
+    }
+
+    /// A real repository at `root`, with a real worktree where Claude Code puts
+    /// one. `false` when git is not on this machine.
+    fn a_repository_with_a_neighbour(root: &Path) -> bool {
         let git = |args: &[&str]| -> bool {
             std::process::Command::new("git")
                 .args(args)
@@ -3241,10 +3263,10 @@ mod tests {
         };
 
         std::fs::write(root.join("README.md"), b"# repo\n").expect("write");
-        if !git(&["init", "-q", "-b", "main", "."])
-            || !git(&["add", "-A"])
-            || !git(&["commit", "-qm", "first"])
-            || !git(&[
+        git(&["init", "-q", "-b", "main", "."])
+            && git(&["add", "-A"])
+            && git(&["commit", "-qm", "first"])
+            && git(&[
                 "worktree",
                 "add",
                 "-q",
@@ -3252,20 +3274,36 @@ mod tests {
                 "other",
                 ".claude/worktrees/other",
             ])
-        {
-            return None;
-        }
+    }
 
+    /// An `App` on `root`, with `dir` held so the watcher outlives nothing.
+    ///
+    /// `root` is passed rather than taken from `dir` because the two are not
+    /// always the same directory: `main` resolves what `current_dir` gave it
+    /// before it builds anything, and the test below is about a root where that
+    /// resolution changes the answer.
+    fn app_over(dir: TempDir, root: PathBuf) -> Fixture {
         let (program, args) = EXITS;
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         let left = TerminalPane::spawn(program, &args, 20, 60).expect("spawn a child in a pty");
-        let app = App::new(
-            left,
-            root.to_path_buf(),
-            "claude",
-            crate::config::Opening::default(),
-        );
-        Some(Fixture { app, dir })
+        let app = App::new(left, root, "claude", crate::config::Opening::default());
+        Fixture { app, dir }
+    }
+
+    /// Wait until discovery has answered with `n` worktrees, pumping as the
+    /// loop would. `false` if it never did.
+    ///
+    /// Discovery runs on a worker thread, and until it answers abeam knows
+    /// about one workspace and routes everything to it — the old behaviour, and
+    /// the old bug. Waiting is not slack in a test; it is the window
+    /// [`WORKTREES_EVERY`]'s first pass exists to keep short.
+    fn discovered(fx: &mut Fixture, n: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fx.app.worktrees.len() < n && Instant::now() < deadline {
+            fx.app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fx.app.worktrees.len() >= n
     }
 
     #[test]
@@ -3282,18 +3320,8 @@ mod tests {
             panic!("this test needs git on PATH; without it the claim is untested");
         };
 
-        // Discovery runs on a worker thread, and until it answers abeam knows
-        // about one workspace and routes everything to it — the old behaviour,
-        // and the old bug. Waiting for it here is not slack in the test; it is
-        // the window `WORKTREES_EVERY`'s first pass exists to keep short.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while fx.app.worktrees.len() < 2 && Instant::now() < deadline {
-            fx.app.pump();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            fx.app.worktrees.len(),
-            2,
+        assert!(
+            discovered(&mut fx, 2),
             "git never described the two worktrees"
         );
 
@@ -3333,6 +3361,220 @@ mod tests {
             fx.app.viewer.has_pending(),
             "the watcher never reported a write in the repository on screen"
         );
+    }
+
+    /// The same repository, reached through a real junction — which is how a
+    /// person who keeps `C:\src\forge` pointed at a directory on another drive
+    /// reaches it every day.
+    ///
+    /// `mklink /J` needs no elevation, which is why the fixture can make one;
+    /// `mklink /D` would need it and is not what this is about.
+    #[cfg(windows)]
+    fn app_in_a_repository_reached_through_a_junction() -> Option<(Fixture, PathBuf, PathBuf)> {
+        let dir = TempDir::new("app-junction");
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir_all(&real).expect("create the repository directory");
+        if !a_repository_with_a_neighbour(&real) {
+            return None;
+        }
+
+        let made = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success());
+        assert!(
+            made,
+            "this test needs `mklink /J`, which needs no elevation"
+        );
+
+        // Exactly `main`'s line, and the whole subject of the test: what
+        // `current_dir` would have handed back is `link`, and what every root
+        // git prints is `real`.
+        let root = paths::resolve_root(&link);
+        Some((app_over(dir, root), link, real))
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_repository_reached_through_a_junction_still_knows_whose_worktree_is_whose() {
+        // The routing rule defeated in one step, and not by anything exotic:
+        // `GetCurrentDirectoryW` does not resolve a junction and
+        // `git worktree list --porcelain` does. Started through one, abeam's own
+        // root is `…\link` while every root git names is `…\real` — two
+        // different directories to `crate::paths`, which is correct — so the
+        // only root in `workspace_roots` containing any watched path is the
+        // agent's own, `owner` hands it every path including the ones inside a
+        // neighbour's worktree, `is_evidence` has nothing to suppress, and the
+        // bug two commits exist to close is back with nothing on screen saying
+        // so. A `subst` drive and an 8.3 short name do the same thing.
+        //
+        // Everything below is somebody else's answer rather than a fixture's:
+        // Windows decides what a junction resolves to, git decides how it
+        // spells a worktree, `notify` decides how an event arrives.
+        let Some((mut fx, link, real)) = app_in_a_repository_reached_through_a_junction() else {
+            panic!("this test needs git on PATH; without it the claim is untested");
+        };
+
+        // The fixture proves something only if the two spellings really are two
+        // directories to the rule that routes on them. Asserted of the fixture
+        // rather than of the app's root, so that it goes on being true — and
+        // goes on being the reason this test is worth running — however the
+        // resolution above answers.
+        assert!(
+            !paths::same_dir(&link, &real),
+            "the junction resolved to itself, so this test is about nothing"
+        );
+
+        assert!(
+            discovered(&mut fx, 2),
+            "git never described the two worktrees"
+        );
+
+        // The agent's own root is the one git named, so the list that switches
+        // workspaces can say where you are — and says it once rather than
+        // twice.
+        let roots = fx.app.workspace_roots();
+        let named = roots
+            .iter()
+            .filter(|root| paths::same_dir(root, &fx.app.root))
+            .count();
+        assert_eq!(
+            named, 2,
+            "the agent's root and git's main worktree are one directory under \
+             two spellings, which is the duplicate `workspace_roots` documents"
+        );
+        assert!(
+            roots.iter().any(
+                |root| paths::under(&fx.app.root, root) && !paths::same_dir(root, &fx.app.root)
+            ),
+            "git's nested worktree is not inside the root abeam is holding"
+        );
+
+        let rows = workspace::rows(
+            &fx.app.worktrees,
+            &fx.app.roster,
+            &fx.app.root,
+            &fx.app.workspace().root,
+            Some(fx.app.root.as_path()),
+        );
+        assert!(
+            rows.iter().any(|row| row.here && row.agent_here),
+            "no row is where the agent is: {:#?}",
+            rows.iter().map(|row| &row.label).collect::<Vec<_>>()
+        );
+
+        // And the whole point of it: the neighbouring agent's write reaches
+        // nobody. Written through the junction, because a neighbour that
+        // reached the repository the same way abeam did is the ordinary case
+        // and the filesystem does not care which name was used.
+        let theirs = link.join(".claude/worktrees/other/THEIRS.md");
+        std::fs::write(&theirs, b"# not yours\n").expect("write");
+
+        let settle = Instant::now() + Duration::from_millis(1500);
+        let mut leaked = false;
+        while Instant::now() < settle {
+            leaked |= fx.app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !fx.app.viewer.has_pending(),
+            "another agent's document was put in front of the reader"
+        );
+        assert!(
+            !leaked,
+            "another agent's write cost this window a frame it had no news for"
+        );
+
+        // ...with the watcher alive the whole time, which is what stops the two
+        // assertions above from passing for the worst possible reason.
+        std::fs::write(link.join("MINE.md"), b"# yours\n").expect("write");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.app.viewer.has_pending() && Instant::now() < deadline {
+            fx.app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            fx.app.viewer.has_pending(),
+            "the watcher never reported a write in the repository on screen"
+        );
+    }
+
+    #[test]
+    fn a_session_started_below_the_repository_can_still_switch_back_to_where_it_is() {
+        // `spaces[0]` is the agent's own root and is never removed, and the `w`
+        // list is what switches between workspaces — so a `spaces[0]` with no
+        // row on it is a workspace nobody can get back to. That is not an
+        // exotic state: **abeam started in a subdirectory of the repository**
+        // produces it every time, because `git worktree list` names the
+        // repository and not the directory somebody was standing in. The git
+        // pane fully supports being started there; it resolves `toplevel` for
+        // every open.
+        //
+        // Real git, because the claim is about what git names rather than about
+        // what a fixture says it names.
+        let dir = TempDir::new("app-subdirectory");
+        let repository = dir.path().to_path_buf();
+        assert!(
+            a_repository_with_a_neighbour(&repository),
+            "this test needs git on PATH; without it the claim is untested"
+        );
+        let below = repository.join("crates").join("abeam");
+        std::fs::create_dir_all(&below).expect("create the subdirectory");
+
+        let mut fx = app_over(dir, paths::resolve_root(&below));
+        assert!(
+            discovered(&mut fx, 2),
+            "git never described the two worktrees"
+        );
+        assert!(
+            !fx.app
+                .worktrees
+                .iter()
+                .any(|worktree| paths::same_dir(&worktree.root, &fx.app.root)),
+            "git named the subdirectory, so this test is about nothing"
+        );
+
+        let rows = workspace::rows(
+            &fx.app.worktrees,
+            &fx.app.roster,
+            &fx.app.root,
+            &fx.app.workspace().root,
+            Some(fx.app.root.as_path()),
+        );
+
+        // The invariant the list has to keep, asserted of every row rather than
+        // of the one this test added: `pump` looks a chosen row up in `spaces`
+        // by root, so a row naming a workspace that is not there is a row that
+        // does nothing when it is pressed.
+        for row in &rows {
+            assert!(
+                fx.app
+                    .spaces
+                    .iter()
+                    .any(|space| paths::same_dir(&space.root, &row.root)),
+                "`{}` is on the list and is no workspace",
+                row.root.display()
+            );
+        }
+        assert!(
+            rows.iter().any(|row| row.here && row.agent_here),
+            "no row is where the agent is, so the list says you are nowhere"
+        );
+
+        // ...and switching away from it is not a one-way trip.
+        let repository = fx
+            .app
+            .spaces
+            .iter()
+            .position(|space| paths::same_dir(&space.root, &repository))
+            .expect("the repository is a workspace of its own");
+        assert!(fx.app.set_workspace(repository));
+        assert!(fx.app.set_workspace(0), "there is no way back to the agent");
+        assert!(paths::same_dir(&fx.app.workspace().root, &fx.app.root));
     }
 
     #[test]

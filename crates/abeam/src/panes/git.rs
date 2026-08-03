@@ -234,6 +234,11 @@ impl GitPane {
     /// list under the new workspace's title until the first refresh lands, which
     /// on a cold repository is most of a second of a confidently wrong screen.
     /// "Reading the repository…" is slower to look at and true the whole time.
+    /// It is true only for as long as something really is reading, which is why
+    /// [`request`](Self::request) below owns the case where nothing is: written
+    /// here unconditionally and left there by a request that quietly did
+    /// nothing, "reading the repository…" is the pane's account of a worker
+    /// that stopped before the switch, for the rest of the session.
     ///
     /// `open` goes for the reason [`Ask`] gives. It holds a porcelain path,
     /// which is relative to a worktree root, and the `Enter` that produced it
@@ -324,9 +329,23 @@ impl GitPane {
         self.open = Some(path.to_string());
     }
 
-    fn request(&mut self) {
+    /// Ask the worker for a report about the current root.
+    ///
+    /// Returns whether the pane's own content changed, which it only ever does
+    /// when there is no worker to ask — see [`stopped`](Self::stopped). Callers
+    /// that always owe a frame anyway (a switch, a watcher event) discard it;
+    /// [`tick`](Self::tick) is the one that has to pass it on.
+    fn request(&mut self) -> bool {
+        // A worker that is gone is *said* rather than silently skipped, and
+        // that is this line rather than the early return it replaced. Every
+        // caller here sets `report` before it asks — `set_root` writes
+        // `Pending`, and `Pending` renders as "reading the repository…" — so a
+        // request that quietly did nothing left the pane saying it was busy
+        // reading, for ever: `inflight` stays `None` so `slow` never fires, and
+        // `tick`'s `Disconnected` arm is guarded on the worker still being
+        // believed alive, so nothing ever put the message back.
         if !self.worker_alive {
-            return;
+            return self.stopped();
         }
         self.again = false;
         let ask = Ask {
@@ -335,9 +354,34 @@ impl GitPane {
         };
         if self.req.send(ask).is_err() {
             self.worker_alive = false;
-            return;
+            return self.stopped();
         }
         self.inflight = Some(Instant::now());
+        false
+    }
+
+    /// What the pane says when there is no worker behind it.
+    ///
+    /// One place, reached from both directions — the channel reporting the
+    /// worker gone, and a request finding it already gone — because the two
+    /// used to disagree about who was responsible for saying so and the answer
+    /// was nobody. Returns whether a frame is owed, which is `false` once the
+    /// message is already up: `tick` comes back here every `REFRESH_AFTER` for
+    /// the rest of the session, and a redraw on each of those would be a full
+    /// re-render of the agent's screen every two seconds for a pane that is not
+    /// going to change.
+    fn stopped(&mut self) -> bool {
+        self.inflight = None;
+        self.again = false;
+        self.slow = false;
+
+        let report = Report::Failed("the git worker stopped".into());
+        if self.report == report {
+            return false;
+        }
+        self.report = report;
+        self.rebuild();
+        true
     }
 
     /// Take one answer, or drop it because it is about a root this pane has
@@ -641,10 +685,7 @@ impl Pane for GitPane {
                     // finished normally: it either never started or it panicked.
                     if self.worker_alive {
                         self.worker_alive = false;
-                        self.inflight = None;
-                        self.report = Report::Failed("the git worker stopped".into());
-                        self.rebuild();
-                        dirty = true;
+                        dirty |= self.stopped();
                     }
                     break;
                 }
@@ -660,7 +701,7 @@ impl Pane for GitPane {
         }
 
         if self.inflight.is_none() && (self.again || self.settled.elapsed() >= REFRESH_AFTER) {
-            self.request();
+            dirty |= self.request();
         }
 
         dirty
@@ -2405,6 +2446,68 @@ mod tests {
             .expect("the pane is listening");
         assert!(!pane.tick());
         assert_eq!(pane.report, Report::Pending);
+    }
+
+    #[test]
+    fn a_switch_with_no_worker_behind_it_says_so_rather_than_reading_for_ever() {
+        // The wedge. `set_root` writes `Pending` unconditionally and then calls
+        // `request`, which used to return early when the worker was gone —
+        // without setting `inflight`, so nothing was out, and `tick`'s
+        // `Disconnected` arm is guarded on the worker still being believed
+        // alive, so the "worker stopped" report was overwritten and never
+        // restored.
+        //
+        // What was left on screen is "reading the repository…", for the rest of
+        // the session. `inflight` is `None`, so `slow` never fires and the
+        // title never admits to anything either. A pane that is broken and says
+        // it is busy is the one failure shape this file is otherwise careful
+        // about.
+        let (mut pane, _asks, answers) = detached(ONE);
+        drop(answers);
+
+        assert!(pane.tick(), "the worker going costs a frame");
+        assert!(!pane.worker_alive);
+        assert_eq!(
+            pane.report,
+            Report::Failed("the git worker stopped".into()),
+            "the pane never noticed"
+        );
+
+        pane.set_root(PathBuf::from(TWO));
+        assert_eq!(
+            pane.report,
+            Report::Failed("the git worker stopped".into()),
+            "the switch left the pane reading a repository nobody is reading"
+        );
+        assert!(
+            pane.inflight.is_none(),
+            "nothing is out, and nothing can be"
+        );
+
+        // ...and it stays said. `tick` goes on asking on the refresh timer,
+        // which is what keeps this from being a one-frame message, and the
+        // report has to survive every one of those without costing a frame.
+        for _ in 0..3 {
+            assert!(!pane.tick(), "a dead worker cost the agent a frame");
+            assert_eq!(pane.report, Report::Failed("the git worker stopped".into()));
+        }
+        assert!(!pane.slow, "nothing is out to be slow");
+
+        // And what is actually drawn, which is the whole complaint: the rows
+        // are rebuilt from the report, so a report nobody rebuilt from would
+        // leave the old sentence on screen however right the field was.
+        let shown: String = pane
+            .rows
+            .iter()
+            .flat_map(|row| {
+                row.to_line(60, false, 0)
+                    .spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+            })
+            .collect();
+        assert!(shown.contains("worker stopped"), "{shown}");
+        assert!(!shown.contains("reading the repository"), "{shown}");
     }
 
     // --- the worktree list -------------------------------------------------

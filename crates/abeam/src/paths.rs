@@ -46,8 +46,40 @@
 //! then has to be undone, and [`under`] is asked once per watched path per
 //! known workspace — which under a `git checkout` is thousands of stat calls to
 //! answer a question about two strings.
+//!
+//! That is an argument about *comparing*, and it does not reach [`resolve_root`],
+//! which canonicalises exactly once for the whole session. The two decisions
+//! look contradictory and are not: one is about the cost of a rule asked
+//! thousands of times a second, and the other is about the one spelling every
+//! one of those comparisons starts from. See [`resolve_root`] for what a
+//! junction does to a session that skips it.
+//!
+//! ## Two things this rule does not do
+//!
+//! Both are worth naming, because both are places somebody could later reach
+//! for a fix that would make the module disagree with itself.
+//!
+//! **`..` is not normalised.** [`parts`] compares the components a path is
+//! written with, and `Path::components` folds `.` away and leaves `..` where it
+//! is — so `under(C:\a, C:\a\..\b\x.md)` is `true`, and a containment rule can
+//! in principle be walked out of. Nothing abeam has emits a `..`: `notify`
+//! reports absolute resolved paths, `git worktree list` prints absolute ones,
+//! a session record carries the agent's own `cwd`, and [`resolve_root`] has
+//! already flattened the one path a person types. So it is unreachable today
+//! and it is not unreachable by construction, which is the difference worth
+//! writing down. Resolving `..` textually is *wrong* in the presence of
+//! symlinks — `a/link/..` is not `a` — so the fix, if a source ever emits one,
+//! is to resolve it at the source rather than to teach this rule a shortcut.
+//!
+//! **`\\?\C:\repo` compares unequal to `C:\repo`.** The verbatim prefix is a
+//! different `Prefix` to the platform's own parser, so it is a different first
+//! component and therefore a different directory here. That is consistent with
+//! refusing to canonicalise per comparison — a rule that quietly accepted both
+//! spellings would be half a canonicalisation, applied to the prefix and to
+//! nothing else — and it is why [`resolve_root`] strips the prefix back off
+//! rather than handing `\\?\`-shaped paths to the rest of abeam.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Whether two paths name the same directory, as far as comparing two
 /// spellings can tell.
@@ -83,6 +115,139 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 /// arriving through the back door.
 pub fn under(root: &Path, path: &Path) -> bool {
     parts(path).starts_with(&parts(root))
+}
+
+/// The directory abeam is standing in, spelled the way git will spell it.
+///
+/// Called **once, at startup**, on the answer `std::env::current_dir` gave, and
+/// the result is the root everything downstream is built from: the watcher, the
+/// first workspace, the git pane, the reader, the probe, and the working
+/// directory the agent's pty is opened in. One resolution, one spelling, and
+/// nothing left holding the other one.
+///
+/// ## The failure this closes, which is a Windows failure
+///
+/// `GetCurrentDirectoryW` reports the path the process was *given*. It does not
+/// resolve a junction, a `subst` drive or an 8.3 short name. `git worktree list
+/// --porcelain` resolves all three. So a session started through a junction —
+/// this is real output, from a real shell, on this machine:
+///
+/// ```text
+/// > cmd /c "cd /d C:\…\junc\link && cd && git rev-parse --show-toplevel"
+/// C:\…\junc\link
+/// C:/…/junc/real
+/// ```
+///
+/// — is standing in `…\link` while every root git names is `…/real`, and
+/// **those are two different directories to every comparison in this module.**
+/// That is not a cosmetic disagreement. `crate::app::workspace_roots` then holds
+/// one root that contains the watcher's events (the agent's own, spelled the
+/// link's way) and a set of git's that contain none of them, so
+/// `crate::workspace::owner` hands *every* watched path to the agent's
+/// workspace — including the paths inside a neighbouring agent's worktree, which
+/// no longer have an innermost root to belong to. `is_evidence` has nothing to
+/// suppress, and the bug two commits exist to close is silently reinstated. The
+/// agent's own workspace also appears twice in that list, under two spellings,
+/// and no row in the `w` list is marked `here` or `agent_here` — so the list
+/// that switches workspaces says you are nowhere.
+///
+/// Unix is unaffected and still goes through this. `getcwd(3)` resolves
+/// symlinks, so `current_dir` and git already agree there, and canonicalising a
+/// path that is already canonical is one `realpath` call for the whole process.
+/// One code path that is right everywhere beats two, one of which is only ever
+/// exercised by half the machines — `crate::agentstate::roster` makes the same
+/// argument about `crate::launch`.
+///
+/// ## Why this is not the `fs::canonicalize` this module refuses
+///
+/// The module header's refusal is a *cost* argument about [`under`], which is
+/// asked once per watched path per known workspace — thousands of stat calls
+/// under a `git checkout`, to answer a question about two strings. This is one
+/// call, at startup, on one path. The rule for comparing is untouched: what
+/// changes is the spelling that goes into it.
+///
+/// ## What comes back, and what is undone before it does
+///
+/// On Windows `fs::canonicalize` answers with a verbatim path — `\\?\C:\…`, or
+/// `\\?\UNC\server\share\…` for a network path. [`parts`] reads that prefix as
+/// a different first component, so a verbatim root would be a *third* spelling
+/// that matches neither git's nor the watcher's, which is the same bug wearing
+/// a different hat. So the prefix is taken back off, and the UNC form is
+/// respelled as `\\server\share\…` rather than being mangled into a path
+/// beginning with a directory called `UNC`.
+///
+/// A verbatim prefix with no ordinary spelling — `\\?\Volume{…}`, a volume
+/// mounted with no drive letter — is left exactly as it is. There is nothing to
+/// rewrite it to, and a wrong guess is worse than a long path.
+///
+/// **Any failure answers with the path it was given.** A directory that cannot
+/// be opened, a permission error, a platform that will not say: a worse
+/// spelling is better than not starting, and the behaviour that falls back to is
+/// precisely the behaviour of every abeam before this function existed.
+///
+/// ## What somebody sees change
+///
+/// One thing, and it is worth being honest about it rather than describing this
+/// as free. A person who works on a `subst` drive — `X:` standing for
+/// `C:\src\forge` — gets an agent whose own `pwd` says `C:\src\forge`, because
+/// that is the directory abeam hands its pty. The alternative is the spelling
+/// they typed and a window that cannot tell their worktrees apart, and between
+/// a name that surprises somebody once and a routing rule that is wrong all
+/// session, the name is the cheaper of the two.
+pub fn resolve_root(root: &Path) -> PathBuf {
+    match std::fs::canonicalize(root) {
+        Ok(resolved) => plain(resolved),
+        Err(_) => root.to_path_buf(),
+    }
+}
+
+/// A canonical path written the way the rest of the machine writes one.
+///
+/// See [`resolve_root`]. Split out so the respelling can be tested on paths
+/// this machine does not have to have — a UNC share, a bare volume GUID — which
+/// is most of what there is to get wrong here.
+#[cfg(windows)]
+fn plain(path: PathBuf) -> PathBuf {
+    use std::ffi::OsString;
+    use std::path::{Component, Prefix};
+
+    let mut parts = path.components();
+    let Some(Component::Prefix(prefix)) = parts.next() else {
+        return path;
+    };
+
+    // Built as `OsString` rather than through `to_string_lossy`, for the reason
+    // the Unix half of `parts` gives: a lossy conversion of a name that is not
+    // valid Unicode comes back as replacement characters, and this is a path
+    // abeam is about to spawn a child in.
+    let mut head = OsString::new();
+    match prefix.kind() {
+        Prefix::VerbatimDisk(letter) => head.push(format!("{}:\\", letter as char)),
+        Prefix::VerbatimUNC(server, share) => {
+            head.push(r"\\");
+            head.push(server);
+            head.push("\\");
+            head.push(share);
+            head.push("\\");
+        }
+        // Already ordinary, or verbatim with nothing to be ordinary as.
+        _ => return path,
+    }
+
+    // The root component belongs to the prefix and has been written back above;
+    // keeping it would leave a `\` between `C:\` and the first directory.
+    Path::new(&head).join(
+        parts
+            .filter(|part| !matches!(part, Component::RootDir))
+            .collect::<PathBuf>(),
+    )
+}
+
+/// Nothing to undo. `realpath(3)` answers with an ordinary absolute path, which
+/// is the spelling everything else on this platform already uses.
+#[cfg(unix)]
+fn plain(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// The one form of a path this module compares, for the platform it was built
@@ -309,5 +474,123 @@ mod tests {
         assert!(!under(below, top));
         assert!(!same_dir(top, Path::new("")), "nowhere is not the root");
         assert!(!under(top, Path::new("")));
+    }
+
+    // --- the one spelling everything else starts from ----------------------
+
+    #[test]
+    fn a_root_that_cannot_be_resolved_is_the_root_it_was_given() {
+        // The fallback, and it is the whole of what `resolve_root` promises on
+        // a bad day: a directory that is gone, a permission error, a platform
+        // that will not answer. A worse spelling is better than not starting,
+        // and what it falls back to is what every abeam before this function
+        // did unconditionally.
+        let nowhere = Path::new(ROOT).join("no-such-directory-abeam-ever-made");
+        assert_eq!(resolve_root(&nowhere), nowhere);
+
+        // ...and a real directory comes back naming the same place, whatever it
+        // did to the spelling on the way. This is the assertion that would fail
+        // if the verbatim prefix were left on: `\\?\C:\…` is a different first
+        // component, so `same_dir` would say the temp directory is not itself.
+        let dir = crate::testutil::TempDir::new("paths-resolve");
+        let resolved = resolve_root(dir.path());
+        assert!(
+            same_dir(&resolved, dir.path()),
+            "{} is not {}",
+            resolved.display(),
+            dir.path().display()
+        );
+        assert!(resolved.is_absolute());
+    }
+
+    /// The respelling, on paths this machine does not have to have.
+    ///
+    /// `resolve_root` can only be tested against directories that exist, and
+    /// the two shapes most worth getting right — a UNC share and a volume with
+    /// no drive letter — are not on every machine that builds this. What they
+    /// have in common is that they are pure string surgery once
+    /// `fs::canonicalize` has answered, so they are tested as string surgery.
+    #[test]
+    #[cfg(windows)]
+    fn a_canonical_path_is_respelled_the_way_the_rest_of_the_machine_writes_one() {
+        let plain_of = |raw: &str| plain(PathBuf::from(raw)).to_string_lossy().into_owned();
+
+        // The ordinary case: the prefix comes off and the drive root stays.
+        assert_eq!(
+            plain_of(r"\\?\C:\Users\philm\forge"),
+            r"C:\Users\philm\forge"
+        );
+        assert_eq!(plain_of(r"\\?\C:\"), r"C:\");
+
+        // The UNC form, which is the one a naive `strip_prefix(r"\\?\")` turns
+        // into a path beginning with a directory called `UNC` — a directory
+        // that is on no machine anywhere, so the failure is a root that names
+        // nothing rather than a root that names the wrong thing.
+        assert_eq!(
+            plain_of(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        assert_eq!(plain_of(r"\\?\UNC\server\share"), r"\\server\share\");
+
+        // Nothing to undo, and nothing to guess at. A volume mounted without a
+        // drive letter has no ordinary spelling, and a wrong guess is worse
+        // than a long path.
+        for untouched in [
+            r"C:\Users\philm\forge",
+            r"\\server\share\repo",
+            r"\\?\Volume{b75e2c83-0000-0000-0000-602f00000000}\repo",
+        ] {
+            assert_eq!(plain_of(untouched), untouched);
+        }
+    }
+
+    /// The failure the whole function exists for, built rather than described.
+    ///
+    /// A real `mklink /J` junction over a real directory, and the two answers
+    /// abeam has to reconcile: `GetCurrentDirectoryW` reports the link, and
+    /// anything that opens the directory reports the target. A test that
+    /// asserted this with two string constants would pass on a machine where
+    /// junctions do not work at all.
+    #[test]
+    #[cfg(windows)]
+    fn a_root_reached_through_a_junction_resolves_to_the_directory_git_will_name() {
+        let dir = crate::testutil::TempDir::new("paths-junction");
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir_all(&real).expect("create the target directory");
+
+        let made = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success());
+        assert!(
+            made,
+            "this test needs `mklink /J`, which needs no elevation"
+        );
+
+        // The disagreement, stated before it is fixed: these are two spellings
+        // of one directory and this module calls them two directories — which
+        // is correct, and is exactly why the resolution has to happen once, at
+        // the top, rather than being smuggled into the comparison.
+        assert!(!same_dir(&link, &real), "the fixture proves nothing");
+
+        let resolved = resolve_root(&link);
+        assert!(
+            same_dir(&resolved, &real),
+            "{} is not {}",
+            resolved.display(),
+            real.display()
+        );
+        // ...and an ordinary drive path rather than a verbatim one, because a
+        // verbatim root is a third spelling that matches neither git's nor the
+        // watcher's.
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "{} still carries the verbatim prefix",
+            resolved.display()
+        );
     }
 }
