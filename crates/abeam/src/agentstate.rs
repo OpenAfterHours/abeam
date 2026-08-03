@@ -402,6 +402,16 @@ pub struct Probe {
     /// search runs again. So the memory can be wrong for exactly one read, and
     /// that read is the one that notices.
     found: Option<PathBuf>,
+    /// The other directories a session of ours may legitimately be sitting in.
+    ///
+    /// Empty until `crate::app`'s discovery answers, which makes every failure
+    /// of it harmless: no git, no repository, a git too old for the porcelain
+    /// this needs, and the probe is exactly as strict as it was before this
+    /// field existed.
+    ///
+    /// See [`Probe::set_worktrees`] for the bug this closes and, more
+    /// importantly, for the tempting fix it refuses.
+    worktrees: Vec<PathBuf>,
 }
 
 impl Probe {
@@ -423,7 +433,44 @@ impl Probe {
             root,
             spawned_at,
             found: None,
+            worktrees: Vec::new(),
         }
+    }
+
+    /// The worktrees of the repository on screen, as git last described them.
+    ///
+    /// ## The bug this closes
+    ///
+    /// A hosted session does not have to stay in the directory it started in.
+    /// Claude Code makes git worktrees and moves into them, and when it does it
+    /// rewrites its record with the new `cwd`. [`Probe::is_here`] compared that
+    /// `cwd` with one directory, so the match failed, the record stopped being
+    /// recognised as ours, [`Probe::readiness`] answered `Unknown` for ever, and
+    /// the queue's automatic send stopped — **silently and permanently**. The
+    /// pane goes on saying it is waiting for the agent to be idle and nothing
+    /// anywhere says why, which is the worst shape a failure can have here: the
+    /// feature looks present and is not.
+    ///
+    /// ## The fix that would have been worse than the bug
+    ///
+    /// `cwd.starts_with(root)`. It is one line, it fixes the symptom, and it is
+    /// exactly what `crate::paths::parts` argues against at length: this is *the
+    /// one function that decides whether a queued prompt may be typed into an
+    /// agent*, and a loose comparison here "sends somebody's prompt to a session
+    /// in another checkout, and it is not one they would see happen". A prefix
+    /// test would accept any session anywhere under the repository — including
+    /// the neighbouring agents Claude Code runs in `.claude/worktrees/`, which
+    /// is the very layout that produced this bug.
+    ///
+    /// So the widening is to a **known set, matched exactly**: the directories
+    /// git named as worktrees of this repository, each compared with
+    /// `same_dir`. A directory merely *inside* one of them is still not it.
+    /// `is_mine` is untouched — `kind == Interactive` and
+    /// `started_at >= spawned_at` still have to hold — so what this changes is
+    /// the set of places our session may be, and nothing about what counts as
+    /// our session once it is found.
+    pub fn set_worktrees(&mut self, worktrees: Vec<PathBuf>) {
+        self.worktrees = worktrees;
     }
 
     /// [`Probe::new`], over a directory handed in rather than looked up.
@@ -443,6 +490,7 @@ impl Probe {
             root,
             spawned_at,
             found: None,
+            worktrees: Vec::new(),
         }
     }
 
@@ -623,11 +671,20 @@ impl Probe {
     /// each keeping their own idea of when two spellings are one directory is
     /// how they come to disagree about which repository is on screen, which is
     /// a disagreement neither of them can see.
+    ///
+    /// "The repository on screen" is a *set* of directories rather than one,
+    /// because a session can move into a worktree of it and go on being ours.
+    /// It is a set of exact matches and never a prefix, and
+    /// [`Probe::set_worktrees`] is where that distinction is argued and where
+    /// the bug it closes is described.
     fn is_here(&self, session: &Session) -> bool {
-        session
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| crate::paths::same_dir(cwd, &self.root))
+        session.cwd.as_deref().is_some_and(|cwd| {
+            crate::paths::same_dir(cwd, &self.root)
+                || self
+                    .worktrees
+                    .iter()
+                    .any(|worktree| crate::paths::same_dir(cwd, worktree))
+        })
     }
 
     /// Everything a record has to be before this probe will answer with it.
@@ -1827,6 +1884,7 @@ mod tests {
             root: PathBuf::from(ROOT),
             spawned_at: STARTED,
             found: None,
+            worktrees: Vec::new(),
         };
         assert!(nowhere.session().is_none());
         assert_eq!(nowhere.readiness(), Readiness::Unknown);
@@ -2062,5 +2120,103 @@ mod tests {
         assert_eq!(first_line(""), "it printed nothing");
         assert_eq!(first_line("   \n \n"), "it printed nothing");
         assert_eq!(first_line(&"x".repeat(400)).chars().count(), 200);
+    }
+
+    // --- a session that moved --------------------------------------------
+
+    /// A worktree of [`ROOT`], where Claude Code puts one, spelled for the
+    /// platform running the test.
+    fn worktree(name: &str) -> String {
+        Path::new(ROOT)
+            .join(".claude")
+            .join("worktrees")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn a_session_that_moved_into_a_worktree_is_still_the_one_on_screen() {
+        // The live bug. Claude Code makes worktrees and moves into them, and
+        // when it does it rewrites its record with the new `cwd`. A probe that
+        // knew one directory stopped recognising its own session, answered
+        // `Unknown` for ever, and the queue's automatic send stopped —
+        // silently and permanently, with the pane still saying it was waiting
+        // for the agent to be idle.
+        let dir = TempDir::new("agentstate-moved");
+        let inside = worktree("review");
+        plant(&dir, 46256, &inside, STARTED, "idle");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Unknown,
+            "before discovery answers there is nothing vouching for that \
+             directory, and this is exactly as strict as it was"
+        );
+
+        probe.set_worktrees(vec![PathBuf::from(&inside)]);
+        assert_eq!(probe.readiness(), Readiness::Idle);
+    }
+
+    #[test]
+    fn a_worktree_nobody_named_is_not_ours_however_far_inside_the_repository_it_is() {
+        // The one-line fix this refuses. `cwd.starts_with(root)` closes the bug
+        // above and opens a worse one: `crate::paths` is explicit that a loose
+        // comparison in *this* function "sends somebody's prompt to a session
+        // in another checkout, and it is not one they would see happen" — and
+        // the neighbouring agents Claude Code runs in `.claude/worktrees/` are
+        // precisely the sessions a prefix test would accept.
+        let dir = TempDir::new("agentstate-neighbour");
+        let theirs = worktree("other");
+        plant(&dir, 46256, &theirs, STARTED, "idle");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+
+        // A different worktree of the same repository is known and named, and
+        // this session is not in it.
+        probe.set_worktrees(vec![PathBuf::from(worktree("review"))]);
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+    }
+
+    #[test]
+    fn a_directory_inside_a_known_worktree_is_not_that_worktree() {
+        // An exact match against a set, never a prefix — including against the
+        // members of the set.
+        let dir = TempDir::new("agentstate-deeper");
+        let inside = worktree("review");
+        let deeper = Path::new(&inside).join("crates").join("abeam");
+        plant(&dir, 46256, &deeper.to_string_lossy(), STARTED, "idle");
+
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(vec![PathBuf::from(&inside)]);
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+    }
+
+    #[test]
+    fn widening_where_a_session_may_be_does_not_widen_what_counts_as_one() {
+        // `is_mine`'s other checks are untouched, and the one that matters most
+        // here is `kind`: a dispatched `claude -p --bg` runs with our `cwd` —
+        // and now in our worktrees too — so it passes the directory check on
+        // its own and is still not the session abeam hosts.
+        let dir = TempDir::new("agentstate-worktree-kind");
+        let inside = worktree("review");
+        let cwd = serde_json::to_string(&inside).expect("a JSON string");
+        dir.write(
+            "900.json",
+            format!(
+                r#"{{"pid":900,"sessionId":"s-900","cwd":{cwd},"startedAt":{},"peerProtocol":1,"kind":"bg","status":"idle"}}"#,
+                STARTED + 1
+            )
+            .as_bytes(),
+        );
+
+        // No pid, so this is the fallback search rather than the shortcut.
+        let mut probe = probe(&dir, None, STARTED);
+        probe.set_worktrees(vec![PathBuf::from(&inside)]);
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+
+        // ...and the interactive session in the same worktree is found.
+        plant(&dir, 902, &inside, STARTED + 2, "idle");
+        assert_eq!(probe.readiness(), Readiness::Idle);
     }
 }

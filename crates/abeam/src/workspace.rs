@@ -201,6 +201,44 @@ pub fn owner<'a>(roots: &'a [PathBuf], path: &Path) -> Option<&'a Path> {
         .reduce(|best, root| if paths::under(best, root) { root } else { best })
 }
 
+/// Whether a changed path says anything about the workspace that [`owner`]
+/// gives it to.
+///
+/// Ownership alone is not enough, and the gap is not a corner case — it is the
+/// ordinary shape of the very event this module exists to route. Writing one
+/// file inside a nested worktree makes the watcher report the **parent
+/// directories** as changed too: for a Claude worktree, `<root>/.claude` and
+/// `<root>/.claude/worktrees` arrive in the same debounced batch as the file
+/// itself. The file belongs to the worktree and is dropped correctly. Those two
+/// directories belong to the *enclosing* workspace, because nothing nested is
+/// an ancestor of them — so routed on ownership alone they are indistinguishable
+/// from somebody editing in the root by hand, and the neighbour's write still
+/// costs this window a frame and a `git status`. Which is the entire thing
+/// ownership routing was built to stop.
+///
+/// So the rule has a second half: **a directory that contains another
+/// workspace's root is not evidence about its own workspace.** The only way it
+/// could have changed is that something inside the nested workspace did, and
+/// that something has already been reported under its own name and routed to
+/// the workspace that owns it.
+///
+/// A path that *is* a workspace root stays evidence about itself, which is the
+/// first arm below and not a special case to be tidied away later: every root
+/// contains a nested root somewhere below it, so without that arm the agent's
+/// own root would be silenced the moment a worktree existed under it — the
+/// routing bug arriving through the back door, in the one workspace that is
+/// always on the list.
+///
+/// Nothing here touches the filesystem. It is two containment questions asked
+/// of the same [`paths`] rule that decided ownership, so the two cannot drift
+/// apart about a trailing separator or a `C:/` against a `C:\`.
+pub fn is_evidence(roots: &[PathBuf], path: &Path) -> bool {
+    if roots.iter().any(|root| paths::same_dir(root, path)) {
+        return true;
+    }
+    !roots.iter().any(|root| paths::under(path, root))
+}
+
 /// Every worktree of the repository at `root`.
 ///
 /// **Blocking** — it starts a process. Call it from a worker thread, never
@@ -270,17 +308,11 @@ fn run(root: &Path, args: &[&str]) -> Option<String> {
 /// Rendered from a [`Worktree`] and everything abeam knows *about* being in it,
 /// joined here so that the join is a pure function with a test rather than a
 /// paragraph of conditionals inside a `render`.
-/// Nothing renders a row yet — the list this feeds is the second half of this
-/// work — and the join is here rather than there for the reason
+/// The join is here rather than in the `render` that draws it for the reason
 /// `crate::agentstate::Session`'s unread fields are kept: it is the part with
-/// the decisions in it, it is pure, and it is tested. A `render` that arrives
-/// later and finds this waiting is a `render`; one that arrives and has to work
-/// out `here` against `agent_here` for itself is where those two quietly become
-/// the same field.
-#[allow(
-    dead_code,
-    reason = "the pure join, written and tested ahead of the list that draws it"
-)]
+/// the decisions in it, it is pure, and it is tested. A `render` that finds this
+/// waiting is a `render`; one that has to work out `here` against `agent_here`
+/// for itself is where those two quietly become the same field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     /// The branch name, or the directory's own name when there is no branch to
@@ -304,13 +336,9 @@ pub struct Row {
 /// Join what git said, what Claude said, and where abeam is standing.
 ///
 /// Pure and I/O-free, like everything above [`discover`]. `at` is the
-/// workspace the right pane is on and `agent_root` is the hosted agent's; they
-/// are the same directory today and the whole reason this takes two arguments
-/// is that they are about to stop being.
-#[allow(
-    dead_code,
-    reason = "the pure join, written and tested ahead of the list that draws it"
-)]
+/// workspace the right pane is on and `agent_root` is the hosted agent's, and
+/// the two really do differ now: the right pane can be pointed at a worktree
+/// and the left one — a live child's pty — can never be moved at all.
 pub fn rows(
     worktrees: &[Worktree],
     roster: &[Session],
@@ -336,18 +364,31 @@ pub fn rows(
         .collect()
 }
 
-fn label_of(worktree: &Worktree) -> String {
+/// What a worktree goes by in a list, and in the border of the pane looking at
+/// it.
+///
+/// Public because `crate::app` names a workspace in two places where there is
+/// no [`Row`] to read it off: the agent's own root, which exists before any
+/// discovery has answered, and the reconciliation that folds a fresh discovery
+/// into the workspaces already open. One rule for a worktree's name, so a
+/// window cannot call the same directory two things.
+pub fn label_of(worktree: &Worktree) -> String {
     if let Some(branch) = &worktree.branch {
         return branch.clone();
     }
-    // A detached or bare worktree still lives somewhere a person named. Only a
-    // path with no last component at all — a drive root, `/` — falls through to
-    // being written out in full, and it is better to be long than nameless.
-    worktree
-        .root
-        .file_name()
+    dir_label(&worktree.root)
+}
+
+/// The name a directory goes by when there is no branch to use it instead.
+///
+/// A detached or bare worktree still lives somewhere a person named, and so
+/// does a repository git has not been asked about yet. Only a path with no last
+/// component at all — a drive root, `/` — falls through to being written out in
+/// full, and it is better to be long than nameless.
+pub fn dir_label(root: &Path) -> String {
+    root.file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| worktree.root.display().to_string())
+        .unwrap_or_else(|| root.display().to_string())
 }
 
 /// Who is in this directory, and what they are doing, from the roster.
@@ -582,6 +623,57 @@ mod tests {
         let reversed = vec![nested("other"), PathBuf::from(ROOT)];
         assert_eq!(owner(&reversed, &theirs), Some(nested("other").as_path()));
         assert_eq!(owner(&reversed, &mine), Some(Path::new(ROOT)));
+    }
+
+    #[test]
+    fn the_parent_of_a_worktree_is_not_news_about_the_repository_holding_it() {
+        // The other half of the routing rule, and the half whose absence made
+        // ownership alone look like it worked while it did not. Writing one
+        // file in a nested worktree makes the watcher report the directories
+        // above it in the same batch, and every one of those is owned by the
+        // *enclosing* workspace — so `owner` hands them to the root, exactly as
+        // it hands it somebody editing there by hand.
+        let roots = vec![PathBuf::from(ROOT), nested("other")];
+
+        for parent in [
+            Path::new(ROOT).join(".claude"),
+            Path::new(ROOT).join(".claude/worktrees"),
+        ] {
+            // Owned by the root — which is the trap, not a mistake in `owner`.
+            assert_eq!(owner(&roots, &parent), Some(Path::new(ROOT)));
+            // ...and still not evidence about it.
+            assert!(
+                !is_evidence(&roots, &parent),
+                "{} is only ever news about what is nested under it",
+                parent.display()
+            );
+        }
+
+        // A root is always evidence about itself. Every root contains a nested
+        // root somewhere below it once a worktree exists, so without this the
+        // agent's own workspace would be silenced the moment one was created —
+        // the routing bug arriving through the back door.
+        assert!(is_evidence(&roots, Path::new(ROOT)));
+        assert!(is_evidence(&roots, &nested("other")));
+
+        // Ordinary files on both sides are untouched by the second rule; it is
+        // `owner` that separates them, and it still does.
+        let mine = Path::new(ROOT).join("README.md");
+        let theirs = nested("other").join("NOTES.md");
+        assert!(is_evidence(&roots, &mine));
+        assert!(is_evidence(&roots, &theirs));
+
+        // And a file that merely lives beside the worktrees directory is a real
+        // edit in the root, not a parent of anything. This is the line between
+        // the two rules: `.claude/settings.json` is somebody's own file.
+        let settings = Path::new(ROOT).join(".claude/settings.json");
+        assert!(is_evidence(&roots, &settings));
+        assert_eq!(owner(&roots, &settings), Some(Path::new(ROOT)));
+
+        // With no nested workspace there is nothing to suppress, so the rule
+        // has to be inert rather than merely quiet.
+        let alone = vec![PathBuf::from(ROOT)];
+        assert!(is_evidence(&alone, &Path::new(ROOT).join(".claude")));
     }
 
     #[test]

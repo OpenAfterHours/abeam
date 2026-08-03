@@ -47,6 +47,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::pane::{Handled, Pane};
 use crate::scroll::{self, Scroll};
 use crate::text::{clip, clip_line, dim, elide_left, err};
+use crate::workspace;
 
 /// How long after a result lands before asking for another. Timed from
 /// completion, so a slow repo throttles itself.
@@ -68,11 +69,41 @@ const RECENT_COMMITS: &str = "6";
 // the pane
 // ---------------------------------------------------------------------------
 
+/// Which of the two lists this pane is showing.
+///
+/// A mode rather than a fifth right-hand view, and `crate::keys` is where the
+/// argument for that lives: `Alt+G`, `Alt+E`, `Alt+S` and `Alt+A` are a set of
+/// four workspace views, and a fifth spelled `F6` would be a key nobody groups
+/// with the other three. The list of worktrees is not a peer of those — it is
+/// how you point *this* pane somewhere else — so it is reached by a pane-local
+/// key, which is exempt from the global invariant because it is only ever
+/// delivered while the right pane has focus and this view is up.
+enum Mode {
+    Status,
+    Worktrees,
+}
+
 pub struct GitPane {
     root: PathBuf,
 
-    req: Sender<()>,
-    res: Receiver<Report>,
+    req: Sender<Ask>,
+    res: Receiver<Answer>,
+    /// Which root the answers still in flight were asked about.
+    ///
+    /// A monotonic counter rather than a comparison against [`root`](Self::root),
+    /// and the difference shows up in one sequence: switching A → B → A within
+    /// a single refresh cycle leaves an in-flight report about A that was asked
+    /// for *before* the first switch, and a root comparison would accept it as
+    /// current. It is not — it describes A as it was two workspaces ago. A
+    /// number that only ever goes up cannot be confused that way.
+    ///
+    /// It is stamped on the envelope rather than inside [`Snapshot`], which is
+    /// also deliberate. `Snapshot`'s equality is what keeps an idle repository
+    /// at zero frames a second, and a generation inside it would make every
+    /// report unequal to the last. On the envelope it also reaches `NotRepo`,
+    /// `NoGit` and `Failed`, which carry no snapshot to hide a stamp in and are
+    /// exactly the answers a wrong root produces.
+    generation: u64,
     /// Cleared the first time the channel reports the worker gone, so a dead
     /// worker is reported once rather than spun on.
     worker_alive: bool,
@@ -98,15 +129,67 @@ pub struct GitPane {
     open: Option<String>,
 
     scroll: Scroll,
+
+    // --- the worktree list ------------------------------------------------
+    mode: Mode,
+    /// Every worktree of the repository, joined with what abeam knows about
+    /// being in them. Pushed in by the shell — the discovery is on its worker
+    /// channel and the occupancy comes from its roster, neither of which is
+    /// this pane's to start.
+    worktrees: Vec<workspace::Row>,
+    wt_sel: usize,
+    /// The list's own scroll, not the status list's. Sharing one would make
+    /// `w` and `Esc` a round trip that loses the reader's place in whichever
+    /// list they were not looking at.
+    wt_scroll: Scroll,
+    /// The workspace `Enter` asked for, waiting to be drained by the shell.
+    workspace: Option<PathBuf>,
+    /// The list has been opened at least once. Sticky, and read by the shell:
+    /// occupancy comes from `claude agents --json`, which is a *process*, and
+    /// the rule `crate::app` keeps is that a session which never uses a feature
+    /// never starts it.
+    worktrees_wanted: bool,
+}
+
+/// A refresh, and which root it is about.
+///
+/// The root travels with the request rather than being read from a variable the
+/// worker set up once, because the pane it serves can be re-rooted underneath
+/// it. A worker holding a stale root joins the porcelain paths of one worktree
+/// onto the toplevel of another, so `Enter` opens a file in the wrong tree —
+/// and reports no error at all, because the file it lands on exists.
+struct Ask {
+    generation: u64,
+    root: PathBuf,
+}
+
+/// A report, and which request it answers.
+struct Answer {
+    generation: u64,
+    report: Report,
 }
 
 impl GitPane {
     pub fn new(root: PathBuf) -> Self {
         let (req, res) = spawn_worker(root.clone());
+        Self::over(root, req, res)
+    }
+
+    /// [`GitPane::new`], over channels handed in rather than a worker started.
+    ///
+    /// The test seam, and the reason it is worth having is the rule at the top
+    /// of this file: no test here shells out. `new` starts a thread that runs
+    /// `git` in whatever directory it was given, so a test about *this pane's*
+    /// bookkeeping — which request went out, which answer was refused — would
+    /// otherwise be a test with a subprocess in it. Handed both ends, a test
+    /// can read exactly what was asked for and answer it by hand, which is
+    /// stricter than a real worker rather than weaker.
+    fn over(root: PathBuf, req: Sender<Ask>, res: Receiver<Answer>) -> Self {
         let mut pane = Self {
             root,
             req,
             res,
+            generation: 0,
             worker_alive: true,
             inflight: None,
             again: false,
@@ -119,10 +202,91 @@ impl GitPane {
             sel_path: None,
             open: None,
             scroll: Scroll::default(),
+            mode: Mode::Status,
+            worktrees: Vec::new(),
+            wt_sel: 0,
+            wt_scroll: Scroll::default(),
+            workspace: None,
+            worktrees_wanted: false,
         };
         pane.rebuild();
         pane.request();
         pane
+    }
+
+    /// A pane with no worker behind it, and the two ends a worker would have
+    /// held. See [`GitPane::over`].
+    #[cfg(test)]
+    fn detached(root: PathBuf) -> (Self, Receiver<Ask>, Sender<Answer>) {
+        let (req, asks) = mpsc::channel::<Ask>();
+        let (answers, res) = mpsc::channel::<Answer>();
+        (Self::over(root, req, res), asks, answers)
+    }
+
+    /// Point this pane at another worktree.
+    ///
+    /// Everything the old root produced has to go, and the list below is not
+    /// housekeeping — each line is a specific way for one repository's answer to
+    /// be drawn under another repository's name.
+    ///
+    /// [`Report::Pending`] is the one worth reading twice. Without it the pane
+    /// goes on drawing the *other* repository's branch, change count and file
+    /// list under the new workspace's title until the first refresh lands, which
+    /// on a cold repository is most of a second of a confidently wrong screen.
+    /// "Reading the repository…" is slower to look at and true the whole time.
+    ///
+    /// `open` goes for the reason [`Ask`] gives. It holds a porcelain path,
+    /// which is relative to a worktree root, and the `Enter` that produced it
+    /// was aimed at the toplevel this pane is about to stop having.
+    pub fn set_root(&mut self, root: PathBuf) {
+        self.root = root;
+        // Before the request, so the request carries the new stamp and every
+        // answer already in flight is now stale by construction.
+        self.generation = self.generation.wrapping_add(1);
+        self.inflight = None;
+        self.again = false;
+        self.slow = false;
+        self.open = None;
+        self.sel = 0;
+        self.sel_path = None;
+        self.scroll.to(0);
+        self.report = Report::Pending;
+        self.rebuild();
+        self.request();
+    }
+
+    /// The worktrees of the repository, as the shell last heard them described.
+    ///
+    /// Returns whether a frame is owed, on [`crate::panes::QueuePane::set_roster`]'s
+    /// convention: only what is on screen can owe one, and this list is on
+    /// screen only while it is the mode showing. Discovery runs every ten
+    /// seconds for the whole session, so a bare "it changed" here would be a
+    /// full re-render of the agent's screen for a list nobody has opened.
+    pub fn set_worktree_rows(&mut self, rows: Vec<workspace::Row>) -> bool {
+        if self.worktrees == rows {
+            return false;
+        }
+        self.worktrees = rows;
+        self.wt_sel = self.wt_sel.min(self.worktrees.len().saturating_sub(1));
+        matches!(self.mode, Mode::Worktrees)
+    }
+
+    /// The workspace the user pressed `Enter` on, if any.
+    ///
+    /// Draining rather than peeking, and drained unconditionally by the shell,
+    /// for [`take_open_request`](Self::take_open_request)'s reason: a request
+    /// left sitting fires late, at whatever unrelated moment next reads it.
+    pub fn take_workspace_request(&mut self) -> Option<PathBuf> {
+        self.workspace.take()
+    }
+
+    /// Whether anything has asked to see the worktree list yet.
+    ///
+    /// The shell reads this to decide whether the occupancy column is worth a
+    /// `claude agents --json` process. See
+    /// [`worktrees_wanted`](Self::worktrees_wanted).
+    pub fn wants_worktrees(&self) -> bool {
+        self.worktrees_wanted
     }
 
     /// Ask for a refresh. Idempotent and non-blocking, by design: this is the
@@ -165,11 +329,41 @@ impl GitPane {
             return;
         }
         self.again = false;
-        if self.req.send(()).is_err() {
+        let ask = Ask {
+            generation: self.generation,
+            root: self.root.clone(),
+        };
+        if self.req.send(ask).is_err() {
             self.worker_alive = false;
             return;
         }
         self.inflight = Some(Instant::now());
+    }
+
+    /// Take one answer, or drop it because it is about a root this pane has
+    /// left.
+    ///
+    /// A stale answer must touch **nothing** — not `inflight`, not `settled`,
+    /// not `slow`. [`set_root`](Self::set_root) has already cleared all three
+    /// and made a fresh request; letting a report from the old root clear them
+    /// again would mark the *new* request as settled, so the pane would sit on
+    /// "reading the repository…" until the two-second poll rescued it.
+    fn absorb(&mut self, answer: Answer) -> bool {
+        if answer.generation != self.generation {
+            return false;
+        }
+
+        self.inflight = None;
+        self.settled = Instant::now();
+        let mut dirty = std::mem::take(&mut self.slow);
+        // Comparing reports rather than redrawing on arrival is what keeps an
+        // idle repo at zero frames per second.
+        if answer.report != self.report {
+            self.report = answer.report;
+            self.rebuild();
+            dirty = true;
+        }
+        dirty
     }
 
     fn selected_row(&self) -> Option<usize> {
@@ -219,6 +413,93 @@ impl GitPane {
 
         self.sel = refind(&self.rows, &self.picks, self.sel_path.as_deref(), self.sel);
         self.sel_path = self.selected_path().map(str::to_owned);
+    }
+
+    // --- the worktree list ------------------------------------------------
+
+    fn open_worktrees(&mut self) {
+        self.mode = Mode::Worktrees;
+        // The one place this is ever set. Sticky, because the roster it turns
+        // on is a process and a session that opened the list once has shown
+        // that it wants the column.
+        self.worktrees_wanted = true;
+    }
+
+    fn wt_select(&mut self, delta: isize) -> Handled {
+        if self.worktrees.is_empty() {
+            return Handled::No;
+        }
+        let n = self.worktrees.len() as isize;
+        // Wraps, like the status list's own selection: Tab from the last row
+        // back to the first is what a reader means, not a dead key.
+        self.wt_sel = (((self.wt_sel as isize + delta) % n + n) % n) as usize;
+
+        // Bring it into view without recentring, for `reveal`'s reason.
+        let page = self.wt_scroll.viewport().max(1);
+        if self.wt_sel < self.wt_scroll.offset {
+            self.wt_scroll.to(self.wt_sel);
+        } else if self.wt_sel >= self.wt_scroll.offset + page {
+            self.wt_scroll.to(self.wt_sel + 1 - page);
+        }
+        Handled::Yes
+    }
+
+    /// The keys the list owns while it is up.
+    ///
+    /// `Esc` is claimed rather than left to fall through, which is the one place
+    /// this pane differs from every other read-only view: `crate::pane`'s
+    /// `exit_hint` spells out that a sub-mode's `Esc` gives you back the list
+    /// you came from rather than the agent, and the border says so.
+    ///
+    /// Everything else falls through to the shared scroll vocabulary and then
+    /// to `No`, including `q` — it means what it has always meant here, which is
+    /// back to the agent.
+    fn worktree_key(&mut self, key: KeyEvent) -> Handled {
+        match key.code {
+            KeyCode::Tab | KeyCode::Down => self.wt_select(1),
+            KeyCode::BackTab | KeyCode::Up => self.wt_select(-1),
+            KeyCode::Enter => match self.worktrees.get(self.wt_sel) {
+                Some(row) => {
+                    self.workspace = Some(row.root.clone());
+                    // Back to the status list, because what the switch is *for*
+                    // is looking at the other worktree's git. The border's
+                    // workspace label is what confirms it landed.
+                    self.mode = Mode::Status;
+                    Handled::Yes
+                }
+                None => Handled::No,
+            },
+            KeyCode::Char('w') | KeyCode::Esc => {
+                self.mode = Mode::Status;
+                Handled::Yes
+            }
+            _ => self.wt_scroll.key(key).unwrap_or(Handled::No),
+        }
+    }
+
+    fn render_worktrees(&mut self, f: &mut Frame, inner: Rect) {
+        // The scrollbar takes a column from the text rather than sitting on top
+        // of it, as it does in the status list.
+        let text_w = inner.width - scroll::bar_width(inner.width);
+        let lines = worktree_lines(&self.worktrees, text_w, self.wt_sel);
+        self.wt_scroll.measure(lines.len(), inner.height as usize);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let visible: Vec<Line> = lines
+            .into_iter()
+            .skip(self.wt_scroll.offset)
+            .take(inner.height as usize)
+            .collect();
+        f.render_widget(
+            Paragraph::new(visible),
+            Rect {
+                width: text_w,
+                ..inner
+            },
+        );
+        self.wt_scroll.render_bar(f, inner);
     }
 }
 
@@ -273,6 +554,13 @@ fn report_rows(report: &Report, root: &Path, rows: &mut Vec<Row>, picks: &mut Ve
 
 impl Pane for GitPane {
     fn title(&self) -> String {
+        // The list says what it is and nothing about the repository: a branch
+        // name and a change count belong to one worktree, and the whole subject
+        // of this mode is the several of them.
+        if matches!(self.mode, Mode::Worktrees) {
+            return format!("git · worktrees ({})", self.worktrees.len());
+        }
+
         let mut t = String::from("git");
         match &self.report {
             Report::Pending => t.push_str(" · reading"),
@@ -306,6 +594,11 @@ impl Pane for GitPane {
     }
 
     fn render(&mut self, f: &mut Frame, inner: Rect) {
+        if matches!(self.mode, Mode::Worktrees) {
+            self.render_worktrees(f, inner);
+            return;
+        }
+
         self.scroll.measure(self.rows.len(), inner.height as usize);
         if inner.width == 0 || inner.height == 0 {
             return;
@@ -341,20 +634,7 @@ impl Pane for GitPane {
 
         loop {
             match self.res.try_recv() {
-                Ok(report) => {
-                    self.inflight = None;
-                    self.settled = Instant::now();
-                    if std::mem::take(&mut self.slow) {
-                        dirty = true;
-                    }
-                    // Comparing reports rather than redrawing on arrival is
-                    // what keeps an idle repo at zero frames per second.
-                    if report != self.report {
-                        self.report = report;
-                        self.rebuild();
-                        dirty = true;
-                    }
-                }
+                Ok(answer) => dirty |= self.absorb(answer),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // We hold the request sender, so the worker cannot have
@@ -387,6 +667,13 @@ impl Pane for GitPane {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Handled> {
+        // The list owns every key while it is up, the scroll ones included:
+        // there `Down` moves a selection rather than an offset, and a pane
+        // cannot hand one key to two vocabularies and hope.
+        if matches!(self.mode, Mode::Worktrees) {
+            return Ok(self.worktree_key(key));
+        }
+
         // One shared scroll vocabulary, so the F1 table cannot be true here and
         // false in the pane next door.
         if let Some(handled) = self.scroll.key(key) {
@@ -398,6 +685,12 @@ impl Pane for GitPane {
             KeyCode::BackTab => self.select(-1),
             KeyCode::Enter => self.open = self.openable_path().map(str::to_owned),
             KeyCode::Char('r') => self.request_refresh(),
+            // `w` for worktree. Free in both vocabularies this pane already
+            // matches — `crate::scroll` claims `j k b space g G` and Ctrl+D/U,
+            // and the four arms above claim the rest — and pane-local, so it is
+            // never in front of the agent. `Alt+W` is Claude's and is not what
+            // this is.
+            KeyCode::Char('w') => self.open_worktrees(),
             // Esc and q fall through: the shell reads an unhandled one as
             // "give focus back to the agent".
             _ => return Ok(Handled::No),
@@ -406,6 +699,20 @@ impl Pane for GitPane {
     }
 
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
+        if matches!(self.mode, Mode::Worktrees) {
+            if let Some(handled) = self.wt_scroll.mouse(ev) {
+                return Ok(handled);
+            }
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let row = self.wt_scroll.offset + ev.row as usize;
+                if row < self.worktrees.len() {
+                    self.wt_sel = row;
+                    return Ok(Handled::Yes);
+                }
+            }
+            return Ok(Handled::No);
+        }
+
         if let Some(handled) = self.scroll.mouse(ev) {
             return Ok(handled);
         }
@@ -422,11 +729,107 @@ impl Pane for GitPane {
         }
         Ok(Handled::Yes)
     }
+
+    /// `Esc` in the worktree list gives you back the status list, which is one
+    /// press short of the agent — so the border must not promise `esc→agent`
+    /// there. `crate::pane` argues the three-answer rule this is the third
+    /// answer to.
+    fn exit_hint(&self) -> &'static str {
+        match self.mode {
+            Mode::Worktrees => " · esc→git",
+            Mode::Status => " · esc→agent",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // rows
 // ---------------------------------------------------------------------------
+
+/// The worktree list, one line per worktree.
+///
+/// Built at render because the interesting decision is what to drop when the
+/// pane is 46 columns wide, and that cannot be made before the width is known.
+/// The label is what survives — it is the only part naming which worktree the
+/// row is — so the notes are laid out first and the label takes what is left.
+fn worktree_lines(rows: &[workspace::Row], width: u16, sel: usize) -> Vec<Line<'static>> {
+    let w = width as usize;
+    if rows.is_empty() {
+        // Two states with one screen, and saying so beats an empty box: either
+        // discovery has not answered yet or it answered with nothing, and from
+        // here they look the same.
+        return vec![
+            Line::from(Span::styled("no worktrees to show", dim())),
+            Line::default(),
+            Line::from(Span::styled(
+                "git worktree list has said nothing yet",
+                dim(),
+            )),
+        ];
+    }
+
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let gutter = if row.here { " ▸ " } else { "   " };
+            let note = worktree_note(row);
+            let budget = w.saturating_sub(gutter.width() + note.width());
+            let label = clip(&row.label, budget);
+            let pad = budget.saturating_sub(label.width());
+
+            let style = if row.here {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let mut spans = vec![
+                Span::styled(gutter, style),
+                Span::styled(label, style),
+                Span::raw(" ".repeat(pad)),
+            ];
+            if !note.is_empty() {
+                spans.push(Span::styled(note, dim()));
+            }
+
+            // Clipped here and nowhere else, exactly as `Row::to_line` is: a
+            // pane that overflows its rect corrupts the frame rather than
+            // merely looking wrong.
+            let mut spans = clip_line(Line::from(spans), w).spans;
+            if i == sel {
+                let used: usize = spans.iter().map(|s| s.content.width()).sum();
+                spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
+                Line::from(spans).style(Style::default().bg(Color::DarkGray))
+            } else {
+                Line::from(spans)
+            }
+        })
+        .collect()
+}
+
+/// Everything about a worktree that is not its name, in one string.
+///
+/// `unwatched` is the one that has to be said. One recursive watch covers the
+/// agent's root, so a worktree somewhere else on the disk refreshes on the git
+/// pane's own two-second timer instead — and a pane that is merely slow looks
+/// exactly like a pane that is broken unless something admits which it is.
+fn worktree_note(row: &workspace::Row) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if row.agent_here {
+        parts.push("agent");
+    }
+    if let Some(who) = &row.occupant {
+        parts.push(who);
+    }
+    if !row.watched {
+        parts.push("unwatched");
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(" {}", parts.join(" · "))
+}
 
 /// One line of the view, held in a form that does not depend on the pane width.
 ///
@@ -771,9 +1174,9 @@ struct Snapshot {
     toplevel: Option<PathBuf>,
 }
 
-fn spawn_worker(root: PathBuf) -> (Sender<()>, Receiver<Report>) {
-    let (req_tx, req_rx) = mpsc::channel::<()>();
-    let (res_tx, res_rx) = mpsc::channel::<Report>();
+fn spawn_worker(root: PathBuf) -> (Sender<Ask>, Receiver<Answer>) {
+    let (req_tx, req_rx) = mpsc::channel::<Ask>();
+    let (res_tx, res_rx) = mpsc::channel::<Answer>();
 
     // A failed spawn drops `res_tx` with the closure, and the pane's
     // disconnected-channel path reports it. Nothing here can panic the UI
@@ -782,20 +1185,43 @@ fn spawn_worker(root: PathBuf) -> (Sender<()>, Receiver<Report>) {
     let _ = std::thread::Builder::new()
         .name("abeam-git".into())
         .spawn(move || {
-            // Asked once, on the first refresh rather than at construction, so
-            // that `GitPane::new` still returns without waiting on a
-            // subprocess. `None` outside a repository, which is also the case
-            // where nothing will ever be opened.
-            let toplevel = toplevel(&root);
+            // Where the answers below are about. Owned by the worker rather
+            // than captured once, because the pane can be pointed at another
+            // worktree while a refresh is in flight — see [`Ask`] for what a
+            // stale toplevel costs.
+            let mut at = root;
+            // Asked once per root, on the first refresh rather than at
+            // construction, so that `GitPane::new` still returns without
+            // waiting on a subprocess. `None` outside a repository, which is
+            // also the case where nothing will ever be opened.
+            let mut top = toplevel(&at);
             // The log only changes when HEAD moves, so it is cached against the
             // oid. In the common case — the agent editing files — a whole refresh
             // is one `git status`.
             let mut log_cache: Option<(String, Vec<Commit>)> = None;
-            while req_rx.recv().is_ok() {
-                if res_tx
-                    .send(collect(&root, toplevel.clone(), &mut log_cache))
-                    .is_err()
-                {
+
+            while let Ok(ask) = req_rx.recv() {
+                if !crate::paths::same_dir(&ask.root, &at) {
+                    at = ask.root;
+                    top = toplevel(&at);
+                    // Not because it would be wrong. The cache is keyed on the
+                    // HEAD oid alone, and two worktrees sitting at the same oid
+                    // genuinely have the same log — so leaving it would be
+                    // *correct* today. It is cleared because the invariant
+                    // worth keeping is "this cache is keyed on everything that
+                    // varies", and the day a field enters `Commit` that depends
+                    // on the worktree rather than on the commit, a cache that
+                    // was quietly relying on an accident would start answering
+                    // one worktree's question with another's, with nothing on
+                    // screen saying so.
+                    log_cache = None;
+                }
+                let report = collect(&at, top.clone(), &mut log_cache);
+                let answer = Answer {
+                    generation: ask.generation,
+                    report,
+                };
+                if res_tx.send(answer).is_err() {
                     break;
                 }
             }
@@ -1800,5 +2226,319 @@ mod tests {
         assert!(text(&Report::NotRepo).contains("not a git repository"));
         assert!(text(&Report::Failed("boom".into())).contains("boom"));
         assert!(text(&Report::Pending).contains("reading the repository"));
+    }
+
+    // --- being pointed at another worktree ---------------------------------
+    //
+    // All of it through [`GitPane::detached`], so that a pane appears in this
+    // file without a `git` process appearing with it.
+
+    /// Two worktrees, spelled for the platform running the test.
+    ///
+    /// Places rather than strings, for `crate::paths`'s reason: what makes two
+    /// spellings one directory is not the same rule on the two platforms, and a
+    /// Windows path asserted on Linux would take the case-sensitive comparison
+    /// without ever exercising it.
+    #[cfg(windows)]
+    const ONE: &str = r"C:\Users\philm\PycharmProjects\forge";
+    #[cfg(windows)]
+    const TWO: &str = r"C:\Users\philm\PycharmProjects\forge\.claude\worktrees\other";
+    #[cfg(unix)]
+    const ONE: &str = "/home/philm/PycharmProjects/forge";
+    #[cfg(unix)]
+    const TWO: &str = "/home/philm/PycharmProjects/forge/.claude/worktrees/other";
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn detached(root: &str) -> (GitPane, Receiver<Ask>, Sender<Answer>) {
+        GitPane::detached(PathBuf::from(root))
+    }
+
+    /// A report with a branch name and a change count in it — the two things
+    /// the title draws, and so the two things a stale report puts on screen
+    /// under the wrong workspace's name.
+    fn a_report(branch: &str) -> Report {
+        Report::Ok(Box::new(Snapshot {
+            status: parse_status(&z(&[
+                &format!("# branch.oid {OID}"),
+                &format!("# branch.head {branch}"),
+                "1 .M N... 100644 100644 100644 aaaa bbbb dirty.rs",
+            ])),
+            ..Snapshot::default()
+        }))
+    }
+
+    fn a_row(label: &str, root: &str, here: bool) -> workspace::Row {
+        workspace::Row {
+            label: label.to_string(),
+            root: PathBuf::from(root),
+            here,
+            agent_here: false,
+            occupant: None,
+            watched: true,
+        }
+    }
+
+    #[test]
+    fn set_root_asks_the_new_root_and_forgets_what_the_old_one_produced() {
+        let (mut pane, asks, answers) = detached(ONE);
+        let first = asks.recv().expect("the pane asks on construction");
+        assert!(crate::paths::same_dir(&first.root, Path::new(ONE)));
+
+        answers
+            .send(Answer {
+                generation: first.generation,
+                report: a_report("main"),
+            })
+            .expect("the pane is listening");
+        assert!(pane.tick());
+
+        // A reader who has been using the pane: a selection, a scroll position,
+        // and an `Enter` on a file that has not been drained yet.
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+        pane.scroll.measure(100, 10);
+        pane.scroll.by(5);
+        pane.stub_open_request("dirty.rs");
+        assert!(pane.sel_path.is_some());
+
+        pane.set_root(PathBuf::from(TWO));
+
+        assert_eq!(
+            pane.report,
+            Report::Pending,
+            "the other repository's branch and change count stayed on screen \
+             under the new workspace's name"
+        );
+        assert_eq!(
+            pane.take_open_request(),
+            None,
+            "an Enter aimed at the old toplevel survived the switch, and would \
+             have opened whatever sits at that path in the new one"
+        );
+        assert_eq!(pane.sel, 0);
+        assert_eq!(pane.sel_path, None);
+        assert_eq!(pane.scroll.offset, 0);
+        assert!(!pane.slow);
+
+        let second = asks.recv().expect("a refresh of the new root");
+        assert!(crate::paths::same_dir(&second.root, Path::new(TWO)));
+        assert_ne!(second.generation, first.generation);
+        assert!(pane.inflight.is_some(), "nothing is out for the new root");
+    }
+
+    #[test]
+    fn an_answer_from_before_the_switch_is_dropped_and_settles_nothing() {
+        // The failure this guards is not a wrong screen for one frame. A stale
+        // answer that cleared `inflight` and `settled` would mark the *new*
+        // request as finished, so the pane would sit on "reading the
+        // repository…" until the two-second poll happened to rescue it.
+        let (mut pane, asks, answers) = detached(ONE);
+        let first = asks.recv().expect("the pane asks on construction");
+        pane.set_root(PathBuf::from(TWO));
+        let second = asks.recv().expect("a refresh of the new root");
+
+        let settled = pane.settled;
+        // As if the new request had already outlived `SLOW_AFTER`, so the title
+        // is saying so and a stale answer clearing it would be visible.
+        pane.slow = true;
+
+        answers
+            .send(Answer {
+                generation: first.generation,
+                report: a_report("main"),
+            })
+            .expect("the pane is listening");
+        assert!(
+            !pane.tick(),
+            "a report about the workspace we left cost the agent a frame"
+        );
+        assert_eq!(pane.report, Report::Pending);
+        assert!(
+            pane.inflight.is_some(),
+            "the stale answer marked the new request as finished"
+        );
+        assert_eq!(pane.settled, settled, "and restarted the refresh timer");
+        assert!(pane.slow, "and took the title's own note down with it");
+
+        // ...and the answer that does belong to the new root is taken.
+        answers
+            .send(Answer {
+                generation: second.generation,
+                report: a_report("other"),
+            })
+            .expect("the pane is listening");
+        assert!(pane.tick());
+        assert!(pane.title().contains("other"), "{}", pane.title());
+        assert!(pane.inflight.is_none());
+    }
+
+    #[test]
+    fn switching_away_and_back_does_not_let_the_first_answer_pass_as_current() {
+        // Why the stamp is a counter and not the root. A → B → A inside one
+        // refresh cycle leaves a report about A that was asked for *before* the
+        // first switch — it describes A as it was two workspaces ago — and a
+        // root comparison would accept it as current.
+        let (mut pane, asks, answers) = detached(ONE);
+        let first = asks.recv().expect("the pane asks on construction");
+
+        pane.set_root(PathBuf::from(TWO));
+        asks.recv().expect("a refresh of the second root");
+        pane.set_root(PathBuf::from(ONE));
+        let third = asks.recv().expect("a refresh of the first root again");
+
+        assert!(
+            crate::paths::same_dir(&third.root, Path::new(ONE)),
+            "back where we started, which is the whole trap"
+        );
+        assert_ne!(
+            third.generation, first.generation,
+            "a root comparison would call these two the same request"
+        );
+
+        answers
+            .send(Answer {
+                generation: first.generation,
+                report: a_report("main"),
+            })
+            .expect("the pane is listening");
+        assert!(!pane.tick());
+        assert_eq!(pane.report, Report::Pending);
+    }
+
+    // --- the worktree list -------------------------------------------------
+
+    #[test]
+    fn w_opens_the_worktree_list_and_esc_gives_back_the_status_list() {
+        let (mut pane, _asks, _answers) = detached(ONE);
+        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert!(!pane.wants_worktrees(), "nothing has asked for anything");
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('w'))).unwrap(),
+            Handled::Yes
+        );
+        assert!(
+            pane.wants_worktrees(),
+            "the roster stayed gated, so the occupancy column would never fill in"
+        );
+        assert!(pane.title().contains("worktrees"), "{}", pane.title());
+        assert_eq!(
+            pane.exit_hint(),
+            " · esc→git",
+            "Esc here is one press short of the agent, and the border is the \
+             only place that is written down"
+        );
+        assert!(!pane.takes_input(), "nothing here is typed into");
+
+        // Claimed rather than falling through to the shell as "back to the
+        // agent", which is what every other Esc in this pane does.
+        assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::Yes);
+        assert_eq!(pane.exit_hint(), " · esc→agent");
+
+        // ...and `w` is the way out as well as the way in.
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('w'))).unwrap(),
+            Handled::Yes
+        );
+        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert!(!pane.takes_input());
+        assert!(pane.wants_worktrees(), "and the flag is sticky");
+    }
+
+    #[test]
+    fn enter_on_a_row_asks_for_a_switch_once_and_comes_back_to_the_status_list() {
+        let (mut pane, _asks, _answers) = detached(ONE);
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+
+        assert_eq!(pane.handle_key(key(KeyCode::Tab)).unwrap(), Handled::Yes);
+        assert_eq!(pane.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
+
+        let asked = pane
+            .take_workspace_request()
+            .expect("a switch was asked for");
+        assert!(crate::paths::same_dir(&asked, Path::new(TWO)));
+        // Drained, not left to fire late at whatever unrelated moment next
+        // reads it — the same contract as `take_open_request`.
+        assert_eq!(pane.take_workspace_request(), None);
+        assert_eq!(
+            pane.exit_hint(),
+            " · esc→agent",
+            "what a switch is for is the other worktree's git"
+        );
+
+        // BackTab walks the other way, and both wrap.
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::BackTab)).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(crate::paths::same_dir(
+            &pane.take_workspace_request().expect("a switch"),
+            Path::new(ONE)
+        ));
+    }
+
+    #[test]
+    fn a_worktree_list_nobody_has_opened_never_costs_a_frame() {
+        // Discovery runs every ten seconds for the whole session, and a frame
+        // re-renders the agent's entire screen. `QueuePane::set_roster`'s
+        // convention: only what is on screen can owe one.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        let rows = vec![a_row("main", ONE, true)];
+        assert!(!pane.set_worktree_rows(rows.clone()));
+        assert!(
+            !pane.set_worktree_rows(rows.clone()),
+            "and unchanged is not news"
+        );
+
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        assert!(
+            !pane.set_worktree_rows(rows),
+            "an unchanged list is not news with the list open either"
+        );
+        assert!(pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]));
+    }
+
+    #[test]
+    fn every_row_of_the_worktree_list_fits_the_pane_it_is_drawn_in() {
+        let rows = vec![
+            workspace::Row {
+                agent_here: true,
+                ..a_row("hand-the-command-line-to-the-agent", ONE, true)
+            },
+            workspace::Row {
+                occupant: Some("a1b2c3d4 · working".into()),
+                watched: false,
+                ..a_row("other", TWO, false)
+            },
+        ];
+
+        for width in [1u16, 2, 5, 22, 46, 120] {
+            for line in worktree_lines(&rows, width, 0) {
+                let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+                assert!(w <= width as usize, "a row is {w} cells wide at {width}");
+            }
+        }
+
+        let text = |rows: &[workspace::Row]| -> String {
+            worktree_lines(rows, 120, 0)
+                .into_iter()
+                .flat_map(|line| line.spans.into_iter().map(|s| s.content.into_owned()))
+                .collect()
+        };
+        let drawn = text(&rows);
+        assert!(drawn.contains("agent"), "{drawn}");
+        assert!(drawn.contains("a1b2c3d4 · working"), "{drawn}");
+        assert!(
+            drawn.contains("unwatched"),
+            "a worktree the one watcher cannot reach looks broken rather than \
+             slow unless the row says which: {drawn}"
+        );
+
+        // An empty list is two states — discovery has not answered, or it
+        // answered with nothing — and an empty box says neither.
+        assert!(text(&[]).contains("no worktrees"), "{}", text(&[]));
     }
 }

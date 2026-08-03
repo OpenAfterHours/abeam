@@ -232,10 +232,20 @@ pub const HELP: &[(&str, &str)] = &[
         "Enter",
         "git: open the file · list: open · queue: do it now",
     ),
+    // The right pane only. The agent's pty cannot be moved to another
+    // directory — a live child's cwd is the child's — so this is the one place
+    // the two halves of the window deliberately disagree about where they are.
+    ("Enter (worktrees)", "point the right pane at that worktree"),
     ("t", "files: rendered markdown / its source"),
     ("/", "file list: find a file anywhere under the root"),
     ("Backspace or -", "file list: up a directory"),
     ("r", "refresh · queue: clear what has finished"),
+    // Pane-local, and exempt from the invariant at the top of this file for
+    // that reason: it is only ever delivered while the right pane has focus and
+    // the git view is showing, so no agent can be listening. It is not a fifth
+    // global view key — `Alt+W` is Claude's, and a fifth view spelled `F6`
+    // would be a key nobody groups with the other three.
+    ("w", "git: the worktrees of this repository"),
     // The queue's own four. `space` is conspicuously not among them: it pages,
     // here as in every other pane, and arming moved to `a` rather than take a
     // key out of the shared vocabulary this table promises three rows above.
@@ -245,7 +255,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("a", "queue: arm / disarm sending to the agent"),
     ("d", "queue: delete the selected item"),
     ("m", "queue: switch an item between send and dispatch"),
-    ("Esc or q", "back to the agent (the shell keeps them)"),
+    (
+        "Esc or q",
+        "back to the agent (a shell keeps both; the worktree list keeps Esc)",
+    ),
 ];
 
 #[cfg(test)]

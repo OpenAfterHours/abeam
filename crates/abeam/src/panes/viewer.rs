@@ -232,6 +232,47 @@ impl ViewerPane {
         }
     }
 
+    /// Point the reader at another worktree.
+    ///
+    /// The [`Browser`] is rebuilt wholesale rather than given a `set_root` of
+    /// its own, and that is the shorter of two changes as well as the safer
+    /// one. `dir`, `entries`, `index`, `indexed`, `aligned`, `find`, `sel` and
+    /// `scroll` are every one of them relative to the root — a setter would have
+    /// to reset all eight, and the one it forgot would be silent. `aligned` is
+    /// the sharpest of them: [`Browser::align_to`] short-circuits when the
+    /// document has not changed, so a stale value would send the first `Alt+E`
+    /// in the new workspace back into a directory of the old one.
+    ///
+    /// The palette is carried over by hand, because it is the one thing here
+    /// that is a decision about *reading* rather than a fact about the root —
+    /// the same reason `raw` and `theme` outlive a document.
+    ///
+    /// [`State::Empty`] is deliberate and reuses machinery that already exists
+    /// rather than adding any: `tick` opens the newest markdown when the state
+    /// is `Empty` and a scan lands, so a workspace switch behaves exactly like
+    /// startup and the reader opens on the newest document *of the worktree it
+    /// has moved to*.
+    pub fn set_root(&mut self, root: PathBuf) {
+        self.browse = Browser::new(root.clone());
+        self.browse.set_theme(self.theme);
+        self.root = root.clone();
+        self.state = State::Empty;
+        self.pending = None;
+        // Otherwise `Tab` walks straight out of the workspace, into documents
+        // of the tree that is no longer on screen.
+        self.recent.clear();
+        self.recent_ix = 0;
+        self.scroll.to(0);
+        self.dirty = true;
+        // **Replaced, not re-requested.** `rescan` guards on `scan.is_none()`,
+        // so calling it here would leave a walk of the *old* root in flight and
+        // let its answer land in the new `Browser` as that workspace's index and
+        // recency list. Dropping the receiver makes the old answer unreachable
+        // rather than merely unwanted: the worker's `send` fails and nothing has
+        // to remember to ignore it.
+        self.scan = Some(files::spawn_scan(root));
+    }
+
     /// Told once at startup, so the empty screen can admit it when there is no
     /// watcher rather than looking like a pane that simply never notices.
     pub fn set_watching(&mut self, on: bool) {
@@ -1534,6 +1575,150 @@ mod tests {
         pane.handle_key(key(KeyCode::Char('g'))).unwrap();
         pane.handle_key(key(KeyCode::Char('t'))).unwrap();
         assert_eq!(pane.scroll.offset, 0);
+    }
+
+    // --- being pointed at another worktree ---------------------------------
+
+    #[test]
+    fn moving_to_another_worktree_starts_the_reader_over_inside_it() {
+        let here = TempDir::new("view-root-here");
+        let there = TempDir::new("view-root-there");
+        let mine = here.write("mine.md", b"# mine\n");
+        there.write("theirs.md", b"# theirs\n");
+
+        let mut pane = quiet(here.path());
+        pane.show(&mine);
+        pane.recent = vec![mine.clone()];
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(pane.path(), Some(mine.as_path()));
+
+        pane.set_root(there.path().to_path_buf());
+
+        assert!(
+            matches!(pane.state, State::Empty),
+            "the old worktree's document was still on screen under the new \
+             workspace's name"
+        );
+        assert!(
+            pane.recent.is_empty(),
+            "Tab would have walked straight out of the workspace"
+        );
+        assert!(pane.pending.is_none());
+        assert_eq!(pane.scroll.offset, 0);
+        assert!(pane.scan.is_some(), "nothing is walking the new root");
+
+        // `State::Empty` is not a blank screen for its own sake: `tick` opens
+        // the newest markdown when the state is `Empty` and a scan lands, so a
+        // switch behaves exactly like startup — in the worktree it moved to.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while pane.pending.is_none() && std::time::Instant::now() < deadline {
+            pane.tick();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            pane.pending.as_deref().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("theirs.md")),
+            "the reader opened on a document of the worktree it left"
+        );
+    }
+
+    #[test]
+    fn the_file_list_in_a_new_worktree_never_opens_in_the_old_one() {
+        // `Browser::align_to` short-circuits when the document has not changed,
+        // so a browser that kept its `aligned` would answer the first `Alt+E`
+        // after a switch with a directory of the tree that is no longer on
+        // screen — and every path in it would be one the new workspace has
+        // never heard of.
+        let here = TempDir::new("view-root-list-here");
+        std::fs::create_dir_all(here.path().join("docs")).expect("create docs");
+        let design = here.path().join("docs").join("design.md");
+        std::fs::write(&design, b"# design\n").expect("write");
+
+        let there = TempDir::new("view-root-list-there");
+        there.write("only-there.md", b"# only there\n");
+
+        let mut pane = quiet(here.path());
+        pane.show(&design);
+        pane.toggle_browse();
+        assert!(pane.title().starts_with("docs/"), "{}", pane.title());
+        pane.toggle_browse();
+
+        pane.set_root(there.path().to_path_buf());
+        // The walk is not what this test is about, and an answer landing
+        // halfway through would make it flap.
+        pane.scan = None;
+        pane.toggle_browse();
+        assert!(
+            pane.title().starts_with("./"),
+            "the list opened in a worktree that is no longer on screen: {}",
+            pane.title()
+        );
+
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("only-there.md"), "{text}");
+    }
+
+    #[test]
+    fn the_readers_palette_survives_a_move_to_another_worktree() {
+        // `raw` and `theme` are decisions about how to *read* rather than facts
+        // about a root, which is why they outlive a document — and a `Browser`
+        // rebuilt with its own default would put half the pane back to dark on
+        // every switch.
+        let here = TempDir::new("view-root-theme-here");
+        let there = TempDir::new("view-root-theme-there");
+        there.write("a.md", b"# a\n");
+
+        let mut pane = quiet(here.path());
+        pane.toggle_theme();
+        pane.set_root(there.path().to_path_buf());
+        pane.scan = None;
+        pane.toggle_browse();
+
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+        for cell in term.backend().buffer().content() {
+            assert!(
+                cell.bg == theme::LIGHT.bg || cell.bg == theme::LIGHT.sel_bg,
+                "the new workspace's list kept the old palette: {:?}",
+                cell.bg
+            );
+        }
+    }
+
+    #[test]
+    fn a_walk_of_the_old_root_cannot_land_in_the_new_one() {
+        // `rescan` guards on `scan.is_none()`, so re-requesting rather than
+        // *replacing* would leave the old root's walk in flight and let its
+        // answer arrive as the new workspace's index and recency list. Dropping
+        // the receiver makes that answer unreachable rather than merely
+        // unwanted.
+        let here = TempDir::new("view-root-scan-here");
+        let there = TempDir::new("view-root-scan-there");
+
+        let mut pane = quiet(here.path());
+        let (tx, rx) = std::sync::mpsc::channel::<Scan>();
+        pane.scan = Some(rx);
+
+        pane.set_root(there.path().to_path_buf());
+        // Whatever the walk of the old root eventually answers goes nowhere.
+        assert!(
+            tx.send(Scan {
+                recent: vec![here.write("stale.md", b"# stale\n")],
+                files: vec!["stale.md".into()],
+            })
+            .is_err(),
+            "the old walk still had somewhere to deliver its answer"
+        );
     }
 
     #[test]
