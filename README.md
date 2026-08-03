@@ -139,15 +139,15 @@ abeam -- +1 more thing    # `--` fences a leading `+` for the agent
 A `+` token is read only in the first position and there is at most one: a
 prompt may begin with a `+`, and `abeam config set +x` is a real command line.
 `+name` is resolved exactly as the old positional was — if it names an agent
-abeam knows, `claude` or `copilot`, matched without regard to case, abeam looks
-that agent's executables up on `PATH`; anything else is a program name and means
-what `abeam bash` used to mean. Two words behind the sigil are reserved and only
+abeam knows, `claude` or `copilot`, or a preset out of your config file, matched
+without regard to case, abeam looks that entry's executables up on `PATH`;
+anything else is a program name and means what `abeam bash` used to mean. Two words behind the sigil are reserved and only
 two, `+help` and `+version`. There are no `+h`/`+V` short forms, deliberately: a
 short form is one more word that can never be a program name, and `-h`, `-V`,
 `--help` and `--version` all go to the agent now, which is the help you wanted.
 
-`ABEAM_AGENT` names what to host when no `+` token did — an agent name, or any
-program — and this change is what made it worth setting: `ABEAM_AGENT=copilot
+`ABEAM_AGENT` names what to host when no `+` token did — an agent name, a preset
+name, or any program — and this change is what made it worth setting: `ABEAM_AGENT=copilot
 abeam --resume` resumes Copilot, where before the variable stopped applying the
 moment you had arguments to pass. An empty value counts as unset, because
 PowerShell leaves one behind — and so does a profile that exports a variable it
@@ -218,6 +218,85 @@ From a checkout, `cargo run -p abeam` and `cargo run -p abeam -- +copilot` do
 the same. Cargo's own `--` and abeam's are two different fences that happen to
 be spelled alike: the first ends Cargo's arguments, and everything past it is
 the line abeam reads under the rule above.
+
+## Configuration
+
+There is one file, it is optional, and most machines will not have one.
+
+```
+Windows  %APPDATA%\abeam\abeam.toml
+Linux    $XDG_CONFIG_HOME/abeam/abeam.toml, or ~/.config/abeam/abeam.toml
+```
+
+**Your profile, and never the repository**, which is a security decision rather
+than a filing one. The repository on screen is the one directory in this whole
+program that somebody else gets to write to — it is a clone, it is somebody's
+pull request, it is whatever `git checkout` just put there — and `launch` spends
+four hundred lines making sure a `claude.exe` committed to it can never be what
+starts. A `.abeam.toml` read out of that directory would undo all of that in six
+lines of TOML: `[preset.claude]`, `host = "./tools/claude"`, with abeam's own
+border obligingly printing the word `claude` over the top. So there is no
+repo-local config and there is not going to be one. The usual mitigation is a
+trust prompt, and a prompt that appears whenever a repository is fresh is a
+prompt that gets answered yes.
+
+No file is not an error; it is the ordinary state. A file that is there and does
+not parse *is* one: abeam prints the path and the parser's own line and column
+and exits 2, before it touches the terminal. This file names programs to start,
+so half-reading it is the one outcome worse than refusing it.
+
+```toml
+[defaults]
+view  = "git"    # git | files | shell | queue — which right-hand view opens
+focus = "left"   # left | right               — which pane has the keyboard
+zoom  = false
+theme = "dark"   # light | dark               — the reader's page
+
+[preset.fleet]
+host  = "claude"     # an agent abeam knows, or any program on PATH
+args  = ["agent"]
+view  = "queue"
+theme = "dark"
+```
+
+`[defaults]` is how every session on the machine opens. A **preset** is a name
+behind the sigil that behaves exactly like a built-in agent: `abeam +fleet
+--resume` starts `claude agent --resume` with the queue showing,
+`ABEAM_AGENT=fleet abeam` does the same, and `+help` lists `fleet` beside
+`claude` and `copilot`. A preset's own `args` go in *front* of what you typed,
+because a subcommand is the first word of the line it belongs to — behind them,
+`abeam +fleet --resume` would be `claude --resume agent`, which is a different
+command in every agent abeam hosts. Its four opening keys override `[defaults]`
+field by field, so the preset above moves the view and leaves the rest where the
+defaults put them.
+
+Three rules, each of them a refusal you will see rather than a surprise you
+will not:
+
+- **A preset's `host` is looked up in abeam's built-in table and on `PATH`,
+  never among the other presets.** There is no preset chaining, deliberately.
+  Without the rule, `[preset.claude] host = "claude"` is a row pointing at
+  itself; with it, there is no edge from a preset to a preset to recurse along.
+  What it costs is naming one preset from another, which is one saved line in a
+  config file — bought, otherwise, with a cycle check on the path that decides
+  which program starts.
+- **A preset may not take a name abeam already answers** — `claude`, `copilot`,
+  `help` or `version`. It would be a name with two meanings and one of them
+  unreachable, with nothing on screen saying which of the two ran. Two presets
+  whose names differ only in case are refused for the same reason, since every
+  name behind a `+` is matched without regard to case.
+- **A preset name is refused in front of the sigil too.** `abeam fleet` gets the
+  same both-readings message `abeam claude` gets, because it is the same
+  mistake — made, this time, by the one person on the machine most likely to
+  believe the word means their preset.
+
+A key abeam does not recognise is an error rather than a shrug. `[presets.fleet]`
+with the plural spelling, or a `them = "dark"`, is a line you wrote and expected
+to work, and a config file that quietly ignored it would behave exactly like a
+config file abeam never found. The cost is forward compatibility — a file
+written for a later abeam is refused by an earlier one rather than partly
+honoured — and that is the right way round for a file that names programs to
+start.
 
 ## Keys
 
@@ -392,6 +471,8 @@ crates/abeam-pty/    the pty host layer: sessions, input encoding, DSR
 crates/abeam-pty/src/tree/         killing a child's children, per platform
 crates/abeam/        the binary: shell, layout, focus, panes
 crates/abeam/src/agent.rs          the agents abeam knows, and how one is chosen
+crates/abeam/src/config.rs         the one file abeam reads: presets, and how a
+                                   session opens. The profile, never the repo.
 crates/abeam/src/launch/           where a program may be found, and what may
                                    then be started: one shared half, two others
 crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
@@ -725,15 +806,16 @@ work, on either platform.
   terminal and that desktop, and no amount of reading an agent's source answers
   it. Run the probe in the terminal you launch abeam from before assuming the
   table holds; `docs/keymap.md` has the procedure.
-- **Almost no configuration**, and the "almost" is two environment variables.
-  Keybindings, the split ratio and both drawing intervals are constants in the
-  source. `ABEAM_AGENT` names the agent — or the program — to host when no `+`
-  token did, and `ABEAM_SHELL` names what the command view starts.
-  There is no file, so nothing survives the session: the reader's light/dark
-  choice starts dark every time. Claude's own bindings are user-configurable and
+- **Keybindings are not configurable**, and neither are the split ratio or
+  either drawing interval: those are constants in the source. There is a config
+  file now — see "Configuration" — and it holds presets and the four things a
+  session opens with, which is where the reader's light/dark choice went. It
+  says nothing about keys. Claude's own bindings are user-configurable and
   abeam's should be too before anyone else uses it. Copilot's are not, which
   makes that the mirror image of the same gap rather than a reason to be relaxed
-  about it.
+  about it. The two environment variables are unchanged beside it: `ABEAM_AGENT`
+  names the agent, preset or program to host when no `+` token did, and
+  `ABEAM_SHELL` names what the command view starts.
 - **A scrolling pane is a full repaint.** ratatui diffs by cell and has no notion
   of a scroll region, so when the agent's output scrolls, every row has changed
   and the whole pane is rewritten — about 10 KB of escape sequences, measured
@@ -764,8 +846,9 @@ work, on either platform.
   terminal's own background, so the git and diagnostics views follow whatever
   profile the terminal has and the two pty views show whatever their child sent.
   A TUI still cannot ask the terminal for its palette; the reader sidesteps the
-  question by owning every colour inside its own rect. The choice is per session
-  and starts dark — there is nowhere to persist it until there is a config file.
+  question by owning every colour inside its own rect. The choice is still per
+  session — `F3` flips it and the flip is not written back — but where it starts
+  is now `[defaults] theme` in the config file rather than always dark.
 - **UTF-16 files are reported as binary.** The sniff is a NUL byte in the first
   8 KiB, which is what git does.
 - **A path that is not UTF-8 breaks `launch`'s chain of custody.**

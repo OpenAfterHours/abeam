@@ -52,9 +52,10 @@
 //! agent grows next and that is not a list this file can hold.
 //!
 //! The one thing the old meaning leaves behind is the refusal in
-//! [`parse_with`]: a first token naming an agent in [`AGENTS`] is an error and
-//! not a re-reading. It is permanent rather than transitional, and the comment
-//! at it says why — `abeam claude` is what every older copy of the README tells
+//! [`parse_with`]: a first token naming anything in the table — a built-in out
+//! of [`AGENTS`] or one of the user's presets — is an error and not a
+//! re-reading. It is permanent rather than transitional, and the comment at it
+//! says why — `abeam claude` is what every older copy of the README tells
 //! people to type, and silently passing `claude` to Claude is a confusing
 //! failure with abeam's name nowhere on it.
 //!
@@ -89,14 +90,50 @@
 //!
 //! ## `ABEAM_AGENT`, which this change made worth setting
 //!
-//! Its contract has not moved: it names what to host — an agent from [`AGENTS`]
-//! or any program at all — when no `+` token said otherwise, a blank value
-//! counts as unset, and a `+` token overrides it. What moved is how much of
-//! that is usable. `ABEAM_AGENT=copilot abeam --resume` resumes Copilot today;
-//! before this it was an unrecognised abeam flag, and the only way to name
-//! Copilot was a positional which then shadowed everything you wanted to send
-//! after it. A default that stopped applying the moment you had arguments was a
-//! default for `abeam` on its own and for nothing else.
+//! Its contract has not moved: it names what to host — anything in the table or
+//! any program at all — when no `+` token said otherwise, a blank value counts
+//! as unset, and a `+` token overrides it. What moved is how much of that is
+//! usable. `ABEAM_AGENT=copilot abeam --resume` resumes Copilot today; before
+//! this it was an unrecognised abeam flag, and the only way to name Copilot was
+//! a positional which then shadowed everything you wanted to send after it. A
+//! default that stopped applying the moment you had arguments was a default for
+//! `abeam` on its own and for nothing else.
+//!
+//! A preset name is a legal value there and costs no code to make so:
+//! `ABEAM_AGENT=fleet abeam --resume` runs the preset's command line with
+//! `--resume` on the end of it, because the variable is read through
+//! [`Choice::of`] against the same table `+fleet` is read against. It is worth
+//! writing down precisely because nothing was added for it — a reader looking
+//! for the line that permits it will not find one.
+//!
+//! ## The table is built at run time, and this file is half of it
+//!
+//! [`AGENTS`] is still where abeam's own agents are written down and it is no
+//! longer the whole table. `crate::config` reads a file out of the user's
+//! profile and turns every `[preset.<name>]` in it into a row of exactly this
+//! shape, which is what makes `+fleet` a command line rather than a feature:
+//! every rule on this page then applies to a preset without a branch anywhere
+//! for it. The refusal below grows to preset names. [`Choice::of`] finds one.
+//! `+help` still wins over a preset called `help`, because that name is refused
+//! when the file is read rather than shadowed when the line is parsed.
+//!
+//! Two rules keep that arrangement honest and both are enforced in
+//! `crate::config`, at load time, which is the only moment at which anything
+//! can be said about a name before somebody is waiting for a program to start.
+//!
+//! **A preset's `host` is resolved against [`AGENTS`] and `PATH`, and never
+//! against another preset.** [`find`] is the built-in lookup and stays the
+//! built-in lookup for exactly this reason: a preset named `claude` whose host
+//! is `claude` is otherwise a row pointing at itself, and the parser has no way
+//! to notice. There is no preset chaining, that is a decision rather than a
+//! missing feature, and what it costs is naming one preset from another — which
+//! is a saving of one line in a config file, bought with a cycle check on the
+//! path that decides which program starts.
+//!
+//! **A preset may not take a built-in's name.** A `[preset.claude]` that
+//! shadowed the entry above would make the built-in unreachable, with nothing
+//! anywhere on screen saying which of the two was running. It is refused with
+//! the conflict named, which is the same standard the refusal below is held to.
 //!
 //! ## Why an agent that is missing is a sentence and never a download
 //!
@@ -114,13 +151,32 @@
 //! this module does with a name it cannot find is say so, and say how to fix
 //! it — `gh copilot` included, as a command a person runs themselves.
 //!
-//! That is why [`Agent`] has three fields and not four, and why
-//! [`Hosted`] has no notion of *how* something was started: there is one way.
+//! That is why [`Agent`] has no field saying *how* to start something, and why
+//! [`Hosted`] has no notion of it either: there is one way. Both have since
+//! grown a field for presets, and neither of those is that one — [`Agent::args`]
+//! is what to pass and [`Hosted::agent`] is what the thing turned out to be,
+//! and both are known before anything is spawned.
 
 use crate::launch::{self, Launch};
 
 /// An agent abeam knows how to start.
-#[derive(Debug)]
+///
+/// One row of the table a `+` token is read against: a built-in from [`AGENTS`],
+/// or a preset `crate::config` read out of the user's profile. The two are one
+/// type deliberately. A preset that behaved *almost* like a built-in on the
+/// command line would be a second set of rules to learn for no gain, and every
+/// reader of this table — the parser, the resolver, the help — would grow a
+/// branch asking which kind it was holding.
+///
+/// Every field is `&'static`, and for a table half of which is read from a file
+/// that is a claim about lifetime rather than about literals. `crate::config`
+/// builds its rows once, at startup, out of strings it then leaks: the table
+/// lives until the process exits whatever happens to it, so saying so outright
+/// is cheaper than threading a lifetime through [`Cli`], [`Choice`] and every
+/// test that builds a table of its own. That was the version that was written
+/// first, and what it produced was a borrow parameter on six signatures to
+/// describe memory nothing ever frees.
+#[derive(Clone, Copy, Debug)]
 pub struct Agent {
     /// What the user types, and what the border shows. Never a path.
     pub name: &'static str,
@@ -135,7 +191,40 @@ pub struct Agent {
     /// How to install it, in one sentence. Read only on the failure path, and
     /// it is the whole reason that path is worth writing carefully — someone
     /// reading it has abeam in front of them and the agent nowhere.
+    ///
+    /// A preset whose host is a built-in borrows that built-in's sentence,
+    /// because the thing that is missing really is Claude or Copilot. A preset
+    /// whose host is an ordinary program has nothing abeam knows how to install,
+    /// so its sentence names the config file instead — the reader's next move
+    /// there is to open the file and look at what they asked for.
     pub install: &'static str,
+    /// What this entry puts in front of the command line's own arguments.
+    ///
+    /// Empty for every built-in, and the whole of what a preset adds to the
+    /// spawn: with `args = ["agent"]`, `abeam +fleet --resume` starts `claude
+    /// agent --resume`. In front rather than behind, and it is the only order
+    /// that can work — a subcommand is the first word of the line it belongs
+    /// to, and everything typed after `+fleet` is being typed *at* whatever the
+    /// preset names. Behind, `[preset.fleet] args = ["agent"]` would turn
+    /// `abeam +fleet --resume` into `claude --resume agent`, which is a
+    /// different command in every agent abeam hosts.
+    pub args: &'static [&'static str],
+    /// Which of abeam's own agents this actually is, for the questions that are
+    /// about *what* is being hosted rather than about what to call it.
+    ///
+    /// Its own [`name`](Self::name) for a built-in, and the host's name for a
+    /// preset — so a `[preset.fleet]` hosting `claude` answers `claude` here
+    /// and `fleet` above. The distinction pays for itself in exactly one place
+    /// today and it is not a cosmetic one: `crate::dispatch` will only start a
+    /// background agent when what abeam is hosting is Claude, and a preset that
+    /// answered `fleet` to that question would silently lose the queue's
+    /// dispatch mode to a name in a config file.
+    ///
+    /// Not a `&'static Agent` back into the table, which is what this wants to
+    /// be: a preset may host a program that is in no table at all, and a field
+    /// that is `None` for that case makes every reader handle a shape that is
+    /// really just "a name abeam has nothing else to say about".
+    pub hosts: &'static str,
 }
 
 /// How to install Copilot, in the words of the platform this was built for.
@@ -155,9 +244,21 @@ const COPILOT_INSTALL: &str = "Install it with `npm i -g @github/copilot`, or ru
                                `gh copilot` once to fetch it.";
 
 /// The agents abeam knows, and the only place their names are written down.
+///
+/// Half of the table a `+` token is read against, and the only half abeam
+/// wrote: the rest is whatever `crate::config` found in the user's profile.
+/// Nothing here may be shadowed by that half — see the module docs — so this
+/// stays a `const` that a preset is checked against rather than merged into.
 pub const AGENTS: &[Agent] = &[
     Agent {
         name: "claude",
+        // A built-in adds nothing to the command line it was given. That is
+        // `crate::agentstate`'s promise as much as this file's — the record it
+        // reads is written by the agent abeam started, and an argument abeam
+        // slipped in unasked is an argument in somebody's `ps` output that they
+        // did not type.
+        args: &[],
+        hosts: "claude",
         // One candidate because there is genuinely only one name: every route
         // onto a machine writes the file as plain `claude` — `~/.local/bin`
         // from the native installer, npm's global `bin` from the package, both
@@ -170,6 +271,8 @@ pub const AGENTS: &[Agent] = &[
     },
     Agent {
         name: "copilot",
+        args: &[],
+        hosts: "copilot",
         candidates: &["copilot"],
         // Two routes on either platform, and `gh copilot` is here as something
         // the reader runs rather than something abeam runs for them. It is
@@ -197,19 +300,39 @@ pub const DEFAULT: &str = "claude";
 /// business and `crate::launch`'s — it does on Windows and does not on Linux —
 /// and neither answer belongs in a table abeam wrote itself.
 ///
-/// The only place [`AGENTS`] is consulted by name, and deliberately the only
-/// one: the parser reads it to answer `+claude`, and reads it again to refuse
-/// a bare `claude`, and those two must agree about what a name is for as long
-/// as there is one table. A later change that builds the table at run time from
-/// user presets replaces the body of this function and nothing above it.
+/// The **built-in** table and nothing else, which is what makes this the
+/// function two other rules are written in terms of rather than an accident of
+/// where it was first needed.
+///
+/// `crate::config` resolves a preset's `host` through here, so a preset can
+/// only ever name one of abeam's own agents or a program on `PATH` — never
+/// another preset, and so never itself. `crate::dispatch` asks it whether the
+/// thing abeam is hosting is Claude, which is a question about an agent abeam
+/// wrote down and not about a name somebody chose in a file.
+///
+/// The whole table — presets included — is [`find_within`], and the parser uses
+/// that one. Two functions rather than one with a flag, because the difference
+/// between them is not a detail of the lookup: it is which of two questions is
+/// being asked.
 pub fn find(name: &str) -> Option<&'static Agent> {
-    AGENTS.iter().find(|a| a.name.eq_ignore_ascii_case(name))
+    find_within(name, AGENTS)
+}
+
+/// The same lookup over a table handed in: the built-ins plus whatever
+/// `crate::config` read.
+///
+/// The only place a table is consulted by name, and deliberately so: the parser
+/// reads it to answer `+claude`, and reads it again to refuse a bare `claude`,
+/// and those two must agree about what a name is for as long as there is one
+/// table.
+pub fn find_within<'t>(name: &str, table: &'t [Agent]) -> Option<&'t Agent> {
+    table.iter().find(|a| a.name.eq_ignore_ascii_case(name))
 }
 
 /// What abeam was asked to host.
 #[derive(Debug)]
 pub enum Choice {
-    /// A name from [`AGENTS`].
+    /// A name in the table: a built-in from [`AGENTS`], or a preset.
     Known(&'static Agent),
     /// Anything else, meaning exactly what `abeam powershell` used to mean and
     /// what `abeam +powershell` means now.
@@ -217,8 +340,14 @@ pub enum Choice {
 }
 
 impl Choice {
-    fn of(name: &str) -> Self {
-        match find(name) {
+    /// The one place a name becomes a selection, whether it was typed behind a
+    /// `+` or read out of `ABEAM_AGENT`.
+    ///
+    /// Which is why the variable takes a preset name with nothing added for it:
+    /// there is one function turning a word into a choice, it is this one, and
+    /// it has been reading the whole table since the whole table grew presets.
+    fn of(name: &str, table: &'static [Agent]) -> Self {
+        match find_within(name, table) {
             Some(agent) => Choice::Known(agent),
             None => Choice::Program(name.to_string()),
         }
@@ -243,19 +372,39 @@ pub enum Cli {
 /// `+`, and `claude config set +x` is a command line somebody has.
 const SIGIL: char = '+';
 
+/// The words behind the sigil that abeam answers itself.
+///
+/// Two, and the argument for it staying two is at the arm that reads them.
+/// Written down as a list *as well as* as two `if`s because `crate::config` has
+/// to refuse a preset that takes one: `[preset.help]` is a preset nothing can
+/// ever select, since these are answered before the table is consulted at all,
+/// and a reader who wrote one would get silence rather than a reason. Two files
+/// with their own copy of a list eventually disagree about it, so there is one
+/// copy and a test that pins each word to the answer it produces.
+pub const RESERVED: &[&str] = &["help", "version"];
+
 /// Read `abeam`'s own arguments, with `ABEAM_AGENT` as the default.
-pub fn parse(args: &[String]) -> Result<Cli, String> {
-    parse_with(args, std::env::var("ABEAM_AGENT").ok())
+///
+/// `table` is the built-ins plus the user's presets — `crate::config::Config::table`
+/// builds it, and `main` builds it once before this is called.
+pub fn parse(args: &[String], table: &'static [Agent]) -> Result<Cli, String> {
+    parse_with(args, std::env::var("ABEAM_AGENT").ok(), table)
 }
 
 /// [`parse`], with the default handed in rather than read.
 ///
 /// Split out for the tests, which cannot touch the process environment: it is
 /// shared with the two hundred other tests running beside them, and half of
-/// those spawn children that inherit it.
-pub fn parse_with(args: &[String], default: Option<String>) -> Result<Cli, String> {
+/// those spawn children that inherit it. The table is handed in for the same
+/// reason twice over — it is read from a file in the user's profile, and a test
+/// that wanted a preset in it would otherwise have to put one there.
+pub fn parse_with(
+    args: &[String],
+    default: Option<String>,
+    table: &'static [Agent],
+) -> Result<Cli, String> {
     let Some((first, rest)) = args.split_first() else {
-        return Ok(hosting(default, Vec::new()));
+        return Ok(hosting(default, Vec::new(), table));
     };
 
     // `--` ends abeam's reading of the line rather than the line itself, and
@@ -266,7 +415,7 @@ pub fn parse_with(args: &[String], default: Option<String>) -> Result<Cli, Strin
     // from the refusal below — `abeam -- claude agent` is how you say `claude`
     // to the default agent and mean the word.
     if first == "--" {
-        return Ok(hosting(default, rest.to_vec()));
+        return Ok(hosting(default, rest.to_vec(), table));
     }
 
     if let Some(word) = first.strip_prefix(SIGIL) {
@@ -300,7 +449,7 @@ pub fn parse_with(args: &[String], default: Option<String>) -> Result<Cli, Strin
         }
 
         return Ok(Cli::Host {
-            choice: Choice::of(word),
+            choice: Choice::of(word, table),
             args: rest.to_vec(),
         });
     }
@@ -319,16 +468,20 @@ pub fn parse_with(args: &[String], default: Option<String>) -> Result<Cli, Strin
     // plausible argument, which means asking the machine whether `agent` is on
     // `PATH` — and then abeam accepts a command line on one machine and refuses
     // it on the next, for a reason living in a directory nobody mentioned.
-    // These two names are refused because abeam wrote these two names down
-    // itself. When the table is later built at run time from user presets this
-    // refusal grows with it, still without asking the filesystem anything.
-    if let Some(agent) = find(first) {
+    // The table and never `PATH`, and that is now a table with somebody's
+    // presets in it: `[preset.fleet]` makes `abeam fleet` a refusal too,
+    // because it is the same mistake. A name that selects behind a `+` is a
+    // name that used to select in front of one, whoever wrote it down — and the
+    // reader who typed it is the one person on the machine most likely to
+    // believe `fleet` means their preset. Still without asking the filesystem
+    // anything: what grew is a list abeam read at startup, not a probe.
+    if let Some(agent) = find_within(first, table) {
         return Err(ambiguous(agent.name, args));
     }
 
     // And everything else — dashed, blank, a subcommand, a prompt — is the
     // agent's, in the order it was typed.
-    Ok(hosting(default, args.to_vec()))
+    Ok(hosting(default, args.to_vec(), table))
 }
 
 /// Host whatever the default names, with these arguments.
@@ -336,7 +489,7 @@ pub fn parse_with(args: &[String], default: Option<String>) -> Result<Cli, Strin
 /// The default is read on exactly the same terms a `+` token would be, an agent
 /// or a program. That is what `ABEAM_SHELL` does, and two overrides that looked
 /// alike while meaning different things would be worse than either.
-fn hosting(default: Option<String>, args: Vec<String>) -> Cli {
+fn hosting(default: Option<String>, args: Vec<String>, table: &'static [Agent]) -> Cli {
     // A blank value counts as unset. PowerShell will happily leave
     // `$env:ABEAM_AGENT = ""` behind, and "`` was not found on PATH" names
     // nothing a reader can act on.
@@ -345,7 +498,7 @@ fn hosting(default: Option<String>, args: Vec<String>) -> Cli {
         .unwrap_or_else(|| DEFAULT.to_string());
 
     Cli::Host {
-        choice: Choice::of(&name),
+        choice: Choice::of(&name, table),
         args,
     }
 }
@@ -396,11 +549,18 @@ fn ambiguous(name: &str, args: &[String]) -> String {
 ///
 /// Deliberately short. abeam is a terminal user interface with one token of its
 /// own; the keys are the interesting part and they are behind `F1`, where they
-/// can be read next to the thing they act on. The agents are listed from
-/// [`AGENTS`] rather than written out, because a help text that can disagree
-/// with the table eventually does.
-pub fn help() -> String {
-    let agents: Vec<&str> = AGENTS.iter().map(|a| a.name).collect();
+/// can be read next to the thing they act on. The agents are listed from the
+/// table rather than written out, because a help text that can disagree with
+/// the table eventually does.
+///
+/// Which now means the user's presets are in it, and that is the point of
+/// listing rather than writing: `+help` on a machine with a config file answers
+/// with what *that* machine can host. A preset is not marked out as one — it is
+/// a name behind the sigil like any other, and a help text that sorted them
+/// into two groups would be teaching a distinction the command line does not
+/// have.
+pub fn help(table: &[Agent]) -> String {
+    let agents: Vec<&str> = table.iter().map(|a| a.name).collect();
     format!(
         "abeam - one window for an AI coding session.
 
@@ -420,7 +580,9 @@ Everything else on the command line belongs to the agent, `--help` and
 `--version` included: `abeam --resume` resumes the default agent and `abeam
 agent` sends it `agent`, exactly as the agent itself would have read them.
 
-ABEAM_AGENT names the default agent — or program — to host. A `+` overrides it.
+ABEAM_AGENT names the default agent — or program, or preset — to host. A `+`
+overrides it. A preset is a `[preset.<name>]` block in abeam.toml under your
+profile, and is listed above with everything else a `+` can name.
 
 F1 inside abeam lists the keys.",
         agents.join(", ")
@@ -443,45 +605,70 @@ pub struct Hosted {
     /// sigil is not part of the name either — it is how abeam was told, not
     /// what it was told.
     ///
-    /// One field, and it was briefly two. While the launcher fallback existed
-    /// the border had something to say that the line abeam prints on the way
-    /// out did not — `copilot · via gh` — so `name` and `title` were separate.
-    /// With one way to start an agent there is one name for it, and a second
-    /// field that always held the same string would be a question for every
-    /// reader after this one.
+    /// One field, and it was briefly two, and it is two again — which is worth
+    /// setting out rather than quietly reversing. While the launcher fallback
+    /// existed the border had something to say that the line abeam prints on
+    /// the way out did not — `copilot · via gh` — so `name` and `title` were
+    /// separate, and that pair was deleted because with one way to start an
+    /// agent the second field always held the same string as the first.
+    ///
+    /// [`Hosted::agent`] below is not that field coming back. It differs from
+    /// this one exactly when a preset is hosting a built-in — `fleet` here and
+    /// `claude` there — which is a case that could not arise until presets did,
+    /// and the two answers go to two different readers rather than to the same
+    /// one twice.
     pub name: String,
+    /// What is actually taking the typing, by the name abeam knows it under.
+    ///
+    /// The same as [`name`](Self::name) for a built-in and for a program named
+    /// outright; the host's name for a preset. Read by the parts of abeam whose
+    /// question is *what agent is this* rather than *what do I call it* —
+    /// `crate::dispatch` is the whole list today, and its question is whether
+    /// `--bg` is a flag the hosted agent has.
+    pub agent: String,
     pub launch: Launch,
 }
 
 impl Hosted {
     /// A program that was named outright, and so is its own explanation.
+    ///
+    /// Both names are the typed one. A program abeam was pointed at is not an
+    /// agent abeam knows anything about, and answering `crate::dispatch` with
+    /// the same word it was given is how it comes to say "abeam is hosting
+    /// `pwsh`" rather than guessing on the user's behalf.
     pub fn plain(name: &str, launch: Launch) -> Self {
         Self {
             name: name.to_string(),
+            agent: name.to_string(),
             launch,
         }
     }
 }
 
 /// Find this agent on the machine, or say what was looked for.
-pub fn resolve(agent: &Agent, args: &[String]) -> Result<Hosted, String> {
-    resolve_within(agent, args, AGENTS)
-}
-
-/// [`resolve`], over a table handed in rather than [`AGENTS`].
 ///
-/// Split out for the tests, and not only for tidiness: Copilot is not installed
-/// on the machine this was written on and cannot easily be — its npm package
-/// wants Node 22 and this box has 20 — so the failure message is only reachable
-/// at all with a table whose candidates are known to be absent. Testing it
-/// against the real table would mean testing whichever branch the machine
-/// happened to make reachable, which on a build server is the other one.
-fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result<Hosted, String> {
+/// The table is handed in rather than read from [`AGENTS`], which is a seam
+/// that was here for the tests before it was needed for anything else. Copilot
+/// is not installed on the machine this was written on and cannot easily be —
+/// its npm package wants Node 22 and this box has 20 — so the failure message
+/// is only reachable at all with a table whose candidates are known to be
+/// absent, and testing it against the real table would mean testing whichever
+/// branch the machine happened to make reachable. It now carries the presets
+/// too, which is what lets [`missing`] offer one as the alternative that *is*
+/// installed.
+pub fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result<Hosted, String> {
     // Only the last reason is kept, for the same reason `panes::shell::start`
     // keeps only the last: with a list, the earlier entries are the ones
     // expected to be missing, and leading with those is leading with the least
     // informative half of the answer.
     let mut why = String::new();
+
+    // A preset's own arguments, and then the ones that were typed. Built once
+    // and before the search, because `crate::launch` is not always handed a
+    // program: a Windows npm shim is a `.cmd`, and the arguments for one are
+    // quoted *into* the command line `cmd.exe` is pointed at — so a list
+    // extended after resolution would be a list that never reached the child.
+    let args = &line(agent, args);
 
     for candidate in agent.candidates {
         match launch::resolve(candidate, args) {
@@ -492,6 +679,7 @@ fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result<Hos
             Ok(launch) => {
                 return Ok(Hosted {
                     name: agent.name.to_string(),
+                    agent: agent.hosts.to_string(),
                     launch,
                 });
             }
@@ -503,6 +691,27 @@ fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result<Hos
     // the module docs for the one that was written and then deliberately taken
     // out again.
     Err(missing(agent, table, &why))
+}
+
+/// The child's whole command line: what this table entry adds, then what was
+/// typed.
+///
+/// A built-in adds nothing, so for `abeam --resume` this is the identity
+/// function and the promise `crate::agentstate` relies on — that abeam puts no
+/// argument of its own in front of anybody — is unchanged. It was never a
+/// promise that *nothing* would be there; it was a promise that abeam would not
+/// invent one. A preset's `args` were typed by the user in their own file,
+/// which is the same standard as the rest of the line.
+fn line(agent: &Agent, typed: &[String]) -> Vec<String> {
+    if agent.args.is_empty() {
+        return typed.to_vec();
+    }
+    agent
+        .args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .chain(typed.iter().cloned())
+        .collect()
 }
 
 /// What abeam says when there is nothing to host.
@@ -607,11 +816,15 @@ mod tests {
             name: "abeam-test-one",
             candidates: &["abeam-no-such-agent-a", "abeam-no-such-agent-b"],
             install: "Install abeam-test-one by running `abeam-test-fetch`.",
+            args: &[],
+            hosts: "abeam-test-one",
         },
         Agent {
             name: "abeam-test-two",
             candidates: &["abeam-no-such-agent-c"],
             install: "Install abeam-test-two from the test suite.",
+            args: &[],
+            hosts: "abeam-test-two",
         },
     ];
 
@@ -621,11 +834,15 @@ mod tests {
             name: "abeam-test-one",
             candidates: &["abeam-no-such-agent-a"],
             install: "Install abeam-test-one from the test suite.",
+            args: &[],
+            hosts: "abeam-test-one",
         },
         Agent {
             name: "abeam-test-two",
             candidates: &[EVERY_MACHINE],
             install: "Install abeam-test-two from the test suite.",
+            args: &[],
+            hosts: "abeam-test-two",
         },
     ];
 
@@ -634,7 +851,21 @@ mod tests {
         name: "abeam-test-direct",
         candidates: &["abeam-no-such-agent-d", EVERY_MACHINE],
         install: "Install abeam-test-direct from the test suite.",
+        args: &[],
+        hosts: "abeam-test-direct",
     };
+
+    /// The shape `crate::config` builds a preset into, written by hand so that
+    /// this file can prove what the shape *does* without a config file in it:
+    /// a name of its own, a built-in's candidates behind it, arguments in
+    /// front, and `hosts` naming what is really being started.
+    const PRESET: &[Agent] = &[Agent {
+        name: "abeam-test-fleet",
+        candidates: &["abeam-no-such-agent-d", EVERY_MACHINE],
+        install: "Install abeam-test-direct from the test suite.",
+        args: &["agent", "--fleet"],
+        hosts: "abeam-test-direct",
+    }];
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().copied().map(String::from).collect()
@@ -644,7 +875,16 @@ mod tests {
     /// that an assertion can say which of the two it wanted without a table in
     /// it, and the arguments that were left for the child.
     fn chose(argv: &[&str], default: Option<&str>) -> (String, Vec<String>) {
-        match parse_with(&args(argv), default.map(String::from)).expect("a command line") {
+        chose_in(argv, default, AGENTS)
+    }
+
+    /// The same, against a table with something in it that abeam did not write.
+    fn chose_in(
+        argv: &[&str],
+        default: Option<&str>,
+        table: &'static [Agent],
+    ) -> (String, Vec<String>) {
+        match parse_with(&args(argv), default.map(String::from), table).expect("a command line") {
             Cli::Host {
                 choice: Choice::Known(agent),
                 args,
@@ -692,6 +932,18 @@ mod tests {
                 agent.name
             );
             assert!(!agent.install.is_empty(), "{} has no way in", agent.name);
+            // A built-in puts nothing of abeam's on the command line, which is
+            // the promise `crate::agentstate` and `crate::dispatch` are written
+            // on top of. `args` exists for presets, where the arguments were
+            // typed by the user in their own file.
+            assert!(
+                agent.args.is_empty(),
+                "{} adds arguments nobody asked for",
+                agent.name
+            );
+            // ...and answers both name questions with the same word, so that a
+            // preset is the only thing that can ever make them differ.
+            assert_eq!(agent.hosts, agent.name);
         }
 
         // `gh copilot` is named in the hint and nowhere else in this file: it
@@ -897,13 +1149,13 @@ mod tests {
     fn the_two_reserved_words_are_answered_rather_than_hosted() {
         for word in ["+help", "+HELP", "+Help"] {
             assert!(
-                matches!(parse_with(&args(&[word]), None), Ok(Cli::Help)),
+                matches!(parse_with(&args(&[word]), None, AGENTS), Ok(Cli::Help)),
                 "{word} is abeam's help"
             );
         }
         for word in ["+version", "+VERSION", "+Version"] {
             assert!(
-                matches!(parse_with(&args(&[word]), None), Ok(Cli::Version)),
+                matches!(parse_with(&args(&[word]), None, AGENTS), Ok(Cli::Version)),
                 "{word} is abeam's version"
             );
         }
@@ -913,10 +1165,25 @@ mod tests {
         assert!(matches!(
             parse_with(
                 &args(&["+help", "extra"]),
-                Some("abeam-no-such-agent".into())
+                Some("abeam-no-such-agent".into()),
+                AGENTS
             ),
             Ok(Cli::Help)
         ));
+
+        // ...and the list `crate::config` refuses preset names against is the
+        // same two words, which is what stops a `[preset.help]` being accepted
+        // into a table that can never be reached for it.
+        assert_eq!(RESERVED, &["help", "version"]);
+        for word in RESERVED {
+            assert!(
+                !matches!(
+                    parse_with(&args(&[&format!("{SIGIL}{word}")]), None, AGENTS),
+                    Ok(Cli::Host { .. })
+                ),
+                "`+{word}` is answered rather than hosted"
+            );
+        }
 
         // Two words, and the set stays two. `+h` and `+V` are not short forms
         // of these: a short form is one more name that can never be a program,
@@ -930,7 +1197,10 @@ mod tests {
         // and this is the assertion that fails if anyone puts them back.
         for flag in ["-h", "--help", "-V", "--version"] {
             assert!(
-                matches!(parse_with(&args(&[flag]), None), Ok(Cli::Host { .. })),
+                matches!(
+                    parse_with(&args(&[flag]), None, AGENTS),
+                    Ok(Cli::Host { .. })
+                ),
                 "{flag} belongs to the agent"
             );
         }
@@ -943,8 +1213,8 @@ mod tests {
         // a request, and answering a request for nothing by starting the
         // default agent hands the arguments after it to a program nobody named.
         for typed in ["+", "+ ", "+   ", "+\t"] {
-            let refused =
-                parse_with(&args(&[typed]), None).expect_err("a bare sigil is not a program");
+            let refused = parse_with(&args(&[typed]), None, AGENTS)
+                .expect_err("a bare sigil is not a program");
             assert!(refused.contains('+'), "got: {refused}");
             // What used to come out, and what a reader could do nothing with.
             assert!(
@@ -955,10 +1225,10 @@ mod tests {
 
         // Especially with arguments after it, which is where defaulting would
         // do real damage.
-        assert!(parse_with(&args(&["+", "--resume"]), None).is_err());
+        assert!(parse_with(&args(&["+", "--resume"]), None, AGENTS).is_err());
         // A default that is set makes no difference — the token is what was
         // asked for, and it asked for nothing.
-        assert!(parse_with(&args(&["+"]), Some("copilot".into())).is_err());
+        assert!(parse_with(&args(&["+"]), Some("copilot".into()), AGENTS).is_err());
 
         // Behind the fence, and anywhere but the front, it is an argument like
         // any other: there is no sigil there to be empty.
@@ -980,7 +1250,7 @@ mod tests {
         // the hazard is precisely a name abeam itself once treated as a
         // selection, and a new agent brings a new one.
         for agent in AGENTS {
-            let refused = parse_with(&args(&[agent.name, "agent"]), None)
+            let refused = parse_with(&args(&[agent.name, "agent"]), None, AGENTS)
                 .expect_err("a name that used to select is not silently rewritten");
 
             // Both readings, named. Somebody has just typed a line that was
@@ -1005,13 +1275,13 @@ mod tests {
             // Case-insensitively, because the table is: somebody typing `abeam
             // Claude` is the same person making the same mistake.
             let shouted = agent.name.to_uppercase();
-            assert!(parse_with(&args(&[shouted.as_str()]), None).is_err());
+            assert!(parse_with(&args(&[shouted.as_str()]), None, AGENTS).is_err());
             // With nothing after it, which is the commonest way to arrive here
             // — it is what the old README said to type.
-            assert!(parse_with(&args(&[agent.name]), None).is_err());
+            assert!(parse_with(&args(&[agent.name]), None, AGENTS).is_err());
             // And whatever the default is. This is a fixed lookup on the token
             // rather than a question about what would otherwise have run.
-            assert!(parse_with(&args(&[agent.name]), Some("pwsh".into())).is_err());
+            assert!(parse_with(&args(&[agent.name]), Some("pwsh".into()), AGENTS).is_err());
         }
 
         // Only the table, and never `PATH`. A word that is not in it is an
@@ -1102,7 +1372,7 @@ mod tests {
 
     #[test]
     fn the_help_names_every_agent_the_table_knows() {
-        let help = help();
+        let help = help(AGENTS);
         for agent in AGENTS {
             assert!(
                 help.contains(agent.name),
@@ -1110,6 +1380,15 @@ mod tests {
                 agent.name
             );
         }
+        // Including the rows abeam did not write. `+help` is what somebody
+        // types when they have forgotten what they called a preset, and a help
+        // text listing only the built-ins would be answering a question nobody
+        // asked on a machine that has a config file.
+        assert!(
+            super::help(PRESET).contains("abeam-test-fleet"),
+            "a preset is missing from +help"
+        );
+
         assert!(help.contains("ABEAM_AGENT"), "the override has to be in it");
         assert!(help.contains("F1"), "the keys live behind F1, not here");
         // abeam's own two words, in the spelling that reaches them. A help text
@@ -1206,5 +1485,91 @@ mod tests {
             refused.contains("`abeam +abeam-test-two` would host it"),
             "the sentence has to be the command to type: {refused}"
         );
+    }
+
+    // --- a row somebody else wrote ----------------------------------------
+
+    #[test]
+    fn a_preset_is_a_row_of_the_table_and_every_rule_here_applies_to_it() {
+        // Selected behind the sigil, folded like the built-ins are, and
+        // reachable through the default variable — none of which has a line of
+        // its own anywhere: `Choice::of` reads the table it is given and does
+        // not care who wrote which row.
+        assert_eq!(
+            chose_in(&["+abeam-test-fleet"], None, PRESET),
+            ("agent:abeam-test-fleet".into(), vec![])
+        );
+        assert_eq!(
+            chose_in(&["+ABEAM-TEST-FLEET"], None, PRESET),
+            ("agent:abeam-test-fleet".into(), vec![])
+        );
+        assert_eq!(
+            chose_in(&["--resume"], Some("abeam-test-fleet"), PRESET),
+            ("agent:abeam-test-fleet".into(), args(&["--resume"])),
+            "`ABEAM_AGENT=<preset>` needed no code and has to keep needing none"
+        );
+
+        // And refused in front of the sigil, which is the sentence in the
+        // module docs made true: a name that selects behind a `+` is a name
+        // somebody will type without one.
+        let refused = parse_with(&args(&["abeam-test-fleet", "agent"]), None, PRESET)
+            .expect_err("a preset name is a selection, not an argument");
+        assert!(refused.contains("used to host"), "got: {refused}");
+        assert!(
+            refused.contains("`abeam +abeam-test-fleet agent`"),
+            "got: {refused}"
+        );
+
+        // A name that is *not* in the table it was given is still a word, which
+        // is what stops this refusal growing into a `PATH` probe by the back
+        // door: the same token against the built-in table is an argument.
+        assert_eq!(
+            chose(&["abeam-test-fleet"], None),
+            ("agent:claude".into(), args(&["abeam-test-fleet"]))
+        );
+    }
+
+    #[test]
+    fn a_presets_own_arguments_go_in_front_of_the_ones_that_were_typed() {
+        let hosted = resolve_within(&PRESET[0], &args(&["--resume"]), PRESET).expect(EVERY_MACHINE);
+
+        // The whole of the ordering rule, in the line somebody types: `abeam
+        // +fleet --resume` is `claude agent --resume` and never `claude
+        // --resume agent`, because a subcommand is the first word of the line
+        // it belongs to.
+        assert_eq!(hosted.launch.args, args(&["agent", "--fleet", "--resume"]));
+        // With nothing typed, the preset's own line is the whole line.
+        assert_eq!(
+            resolve_within(&PRESET[0], &[], PRESET).unwrap().launch.args,
+            args(&["agent", "--fleet"])
+        );
+
+        // Two names, and they differ here in the one way that matters: the
+        // border says what was asked for, and `crate::dispatch` is told what is
+        // actually running — otherwise a preset hosting Claude would quietly
+        // lose the queue's dispatch mode.
+        assert_eq!(hosted.name, "abeam-test-fleet");
+        assert_eq!(hosted.agent, "abeam-test-direct");
+
+        // A built-in adds nothing and answers both questions with one word,
+        // which is the promise `crate::agentstate` reads this file for.
+        let plain = resolve_within(&DIRECT, &args(&["--resume"]), PRESENT).expect(EVERY_MACHINE);
+        assert_eq!(plain.launch.args, args(&["--resume"]));
+        assert_eq!(plain.name, plain.agent);
+    }
+
+    #[test]
+    fn a_preset_hosts_name_is_looked_up_in_the_built_in_table_and_not_the_whole_one() {
+        // The rule that makes preset chaining impossible rather than merely
+        // absent: `find` is the built-in lookup, `crate::config` resolves a
+        // host through it, and a preset is therefore never something a preset
+        // can name. There is no cycle to check for because there is no edge.
+        assert!(find("abeam-test-fleet").is_none());
+        assert!(find_within("abeam-test-fleet", PRESET).is_some());
+
+        // ...and the built-ins are in both, because they are what a host may
+        // name.
+        assert_eq!(find("claude").unwrap().name, "claude");
+        assert_eq!(find_within("claude", AGENTS).unwrap().name, "claude");
     }
 }

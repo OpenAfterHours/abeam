@@ -39,6 +39,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::agentstate::Probe;
+use crate::config::Opening;
 use crate::keys::{self, Action};
 use crate::layout as abeam_layout;
 use crate::pane::{Focus, Pane};
@@ -292,11 +293,18 @@ enum Work {
 }
 
 impl App {
-    /// `agent` is the hosted agent's name as the user named it — not a path.
-    /// It decides whether background dispatch is available at all, because
-    /// `--bg` is Claude's and abeam will not reach for a different agent than
-    /// the one it was asked to host. See `crate::dispatch`.
-    pub fn new(left: TerminalPane, root: PathBuf, agent: &str) -> Self {
+    /// `agent` is the hosted agent's name — `crate::agent::Hosted::agent`, so
+    /// the agent behind a preset rather than the preset's own word, and never a
+    /// path. It decides whether background dispatch is available at all,
+    /// because `--bg` is Claude's and abeam will not reach for a different
+    /// agent than the one it was asked to host. See `crate::dispatch`.
+    ///
+    /// `opening` is where the session starts: which right-hand view, which
+    /// pane has the keyboard, whether it is zoomed, and which page the reader
+    /// is on. Those four were literals on the lines below until there was
+    /// somewhere to write an answer down — `crate::config` is that somewhere,
+    /// and its [`Opening::default`] is exactly what they used to say.
+    pub fn new(left: TerminalPane, root: PathBuf, agent: &str, opening: Opening) -> Self {
         // Taken here rather than inside the probe: the record abeam is looking
         // for is the one written *after* this moment, and a clock read at
         // construction is the closest to the spawn anything gets.
@@ -313,6 +321,9 @@ impl App {
         // Told rather than discovered, so a pane that will never update says so
         // on screen instead of looking like one that simply never notices.
         viewer.set_watching(watch.is_some());
+        // Before the first frame, so the reader's page is right the first time
+        // it is drawn rather than repainted a frame later.
+        viewer.set_theme(opening.theme);
 
         Self {
             left,
@@ -324,11 +335,15 @@ impl App {
             probe,
             shell: ShellPane::new(root.clone(), std::env::var("ABEAM_SHELL").ok()),
             diag: DiagPane::new(),
-            right_view: RightView::Git,
-            last_workspace_view: RightView::Git,
+            right_view: opening.view,
+            // The same view, because F2 puts back what it displaced and
+            // nothing has displaced anything yet. `Opening` cannot name the
+            // diagnostics view — `crate::config` leaves it out of the
+            // vocabulary — so this stays the "never `Diag`" the field promises.
+            last_workspace_view: opening.view,
             watch,
-            focus: Focus::Left,
-            zoom: false,
+            focus: opening.focus,
+            zoom: opening.zoom,
             help: false,
             literal_next: false,
             pending_quit: false,
@@ -1524,7 +1539,12 @@ mod tests {
         let (program, args) = EXITS;
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         let left = TerminalPane::spawn(program, &args, 20, 60).expect("spawn a child in a pty");
-        let app = App::new(left, dir.path().to_path_buf(), "claude");
+        let app = App::new(
+            left,
+            dir.path().to_path_buf(),
+            "claude",
+            crate::config::Opening::default(),
+        );
         Fixture { app, dir }
     }
 

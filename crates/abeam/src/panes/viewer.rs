@@ -203,6 +203,35 @@ impl ViewerPane {
         self.browse.set_theme(self.theme);
     }
 
+    /// Start on a chosen palette, before anything has been drawn.
+    ///
+    /// The setter this pane deliberately did not have while there was nowhere
+    /// to remember an answer: `F3` flips, and flipping needs no starting point
+    /// beyond the default. `crate::config`'s `theme` key is that somewhere, so
+    /// the pane is now told once — from `App::new`, before the first frame —
+    /// and flipped for the rest of the session.
+    ///
+    /// It takes `crate::config`'s two-valued type rather than this module's
+    /// [`theme::Mode`], which is the shorter of two changes: `Mode` carries the
+    /// palettes as well as the choice and is private to the viewer, and
+    /// publishing it to let a config file name a colour scheme would be
+    /// exporting the colours to import a word. The mapping is these four lines
+    /// and it is the whole of what the two types have to agree about.
+    pub fn set_theme(&mut self, theme: crate::config::Theme) {
+        let mode = match theme {
+            crate::config::Theme::Dark => theme::Mode::Dark,
+            crate::config::Theme::Light => theme::Mode::Light,
+        };
+        if self.theme != mode {
+            self.theme = mode;
+            // Same as `toggle_theme`: the laid-out document holds baked styles,
+            // so a palette that only took effect on the next file would be a
+            // setting that did nothing.
+            self.dirty = true;
+            self.browse.set_theme(mode);
+        }
+    }
+
     /// Told once at startup, so the empty screen can admit it when there is no
     /// watcher rather than looking like a pane that simply never notices.
     pub fn set_watching(&mut self, on: bool) {

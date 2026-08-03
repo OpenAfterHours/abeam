@@ -54,6 +54,29 @@ unicode-width = "0.2.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 
+# --- the one file abeam reads of its own ---------------------------------
+# `src/config.rs` reads `abeam.toml` out of the user's profile: the opening
+# state, and the presets that put a name behind the `+` sigil. TOML because
+# that is what a person hand-edits and what every other tool in this stack
+# already made them learn — the two manifests beside this line included — and
+# because the alternative on the table was JSON, which has no comments and so
+# no way for somebody to leave a dead preset in the file with a note about
+# why.
+#
+# Not a hand-rolled parser, and that is the same argument the JSON block above
+# makes rather than a second one. `key = "value"` is easy right up to the
+# first quoted string with a `#` in it, the first `[preset.name]` whose name
+# needs quoting, and the first multi-line array — and a scanner that
+# misreads any of those does not fail, it silently reads a *different*
+# program name behind somebody's preset.
+#
+# `default-features = false` drops `display`: abeam reads this file and never
+# writes one, so the serializer is a whole half of the crate compiled to be
+# called by nothing. What is left — `parse`, `serde`, `std` — is a parser
+# hung off the `derive` that was already here for the records above, which is
+# why this is one crate and not a new dependency stack.
+toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }
+
 # Also deliberately absent, having been tried and not needed: `textwrap` (the
 # viewer wraps with a first-line and a continuation prefix, which is the whole
 # point of its wrapper and not something a general one does), `similar` (there

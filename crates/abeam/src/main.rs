@@ -15,6 +15,7 @@
 mod agent;
 mod agentstate;
 mod app;
+mod config;
 mod dispatch;
 mod keys;
 mod launch;
@@ -39,7 +40,28 @@ use crate::panes::TerminalPane;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // First of everything, and for a stronger version of the reason the
+    // Before `term::setup` for the same reason everything else on this side of
+    // it is, and before the parse because the parse needs what it produces: the
+    // table a `+` is read against is the built-ins plus this file's presets, so
+    // `abeam fleet` cannot be refused as a preset name until the presets are
+    // known.
+    //
+    // A file that will not parse is fatal rather than ignored, which
+    // `crate::config` argues at length and the short version of which is that
+    // this file names programs to start. What it costs is that `+help` on a
+    // machine with a broken config answers with the config error instead of the
+    // help — and of those two answers, the one naming the file and the line is
+    // the one worth having in front of you.
+    let config = match config::load() {
+        Ok(config) => config,
+        Err(why) => {
+            eprintln!("{why}");
+            std::process::exit(2);
+        }
+    };
+    let table = config.table();
+
+    // First of the command line, and for a stronger version of the reason the
     // resolution below is where it is: until this existed, `abeam --help`
     // reached `CreateProcessW` as a program called `--help`, and the answer to
     // a question about abeam was a spawn failure naming a flag.
@@ -55,9 +77,9 @@ fn main() -> Result<()> {
     // the parser's refusals, which is the same reason as ever: a message
     // printed after raw mode is on is a message on a screen about to be thrown
     // away.
-    let (choice, program_args) = match agent::parse(&args) {
+    let (choice, program_args) = match agent::parse(&args, table) {
         Ok(agent::Cli::Help) => {
-            println!("{}", agent::help());
+            println!("{}", agent::help(table));
             return Ok(());
         }
         Ok(agent::Cli::Version) => {
@@ -71,6 +93,16 @@ fn main() -> Result<()> {
         }
     };
 
+    // Read from the selection rather than from the command line, because a
+    // preset can be selected three ways — `+fleet`, `ABEAM_AGENT=fleet`, and
+    // `abeam` on its own if somebody makes one the default — and only the
+    // parser knows which of them happened. A program named outright brings no
+    // opening state with it, so it gets `[defaults]` like every other session.
+    let opening = config.opening(match &choice {
+        agent::Choice::Known(agent) => Some(agent.name),
+        agent::Choice::Program(_) => None,
+    });
+
     let root = std::env::current_dir()?;
 
     // Before `term::setup`, and that is the whole reason it is on this line. A
@@ -78,7 +110,7 @@ fn main() -> Result<()> {
     // fail, and failing after raw mode and the alternate screen are on leaves
     // the console in a state the shell underneath does not recover from — the
     // message is there, on a screen that has just been thrown away.
-    let hosted = match host(choice, &program_args, &root) {
+    let hosted = match host(choice, &program_args, &root, table) {
         Ok(hosted) => hosted,
         Err(why) => {
             eprintln!("{why}");
@@ -155,7 +187,12 @@ fn main() -> Result<()> {
                 .cwd(&root)
                 .size(inner.height.max(1), inner.width.max(1)),
         )?;
-        App::new(left, root, &hosted.name).run(&mut terminal)
+        // `hosted.agent` and not `hosted.name`: what the shell needs here is
+        // what is actually taking the typing, because the question it goes on
+        // to ask is whether `--bg` is a flag it has. A preset hosting Claude
+        // answers `claude`, and a border reading `fleet` does not cost the
+        // queue its dispatch mode.
+        App::new(left, root, &hosted.agent, opening).run(&mut terminal)
     })();
 
     // Every frame ends by emptying the frame buffer, so this should have
@@ -193,9 +230,14 @@ fn main() -> Result<()> {
 /// nothing else. A program named outright is this function's, and stays here
 /// for one reason: `root`. It is the directory abeam was *run* in, and this is
 /// the last moment at which that is also this process's current directory.
-fn host(choice: agent::Choice, args: &[String], root: &Path) -> Result<agent::Hosted, String> {
+fn host(
+    choice: agent::Choice,
+    args: &[String],
+    root: &Path,
+    table: &[agent::Agent],
+) -> Result<agent::Hosted, String> {
     let asked = match choice {
-        agent::Choice::Known(agent) => return agent::resolve(agent, args),
+        agent::Choice::Known(agent) => return agent::resolve_within(agent, args, table),
         agent::Choice::Program(asked) => asked,
     };
 
@@ -263,7 +305,12 @@ mod portable_tests {
         // a copy of this test per platform would be two places to notice that
         // an agent had started going through the path rule instead.
         let agent = agent::find("claude").expect("claude is a known agent");
-        match host(agent::Choice::Known(agent), &[], &std::env::temp_dir()) {
+        match host(
+            agent::Choice::Known(agent),
+            &[],
+            &std::env::temp_dir(),
+            agent::AGENTS,
+        ) {
             Ok(hosted) => assert_eq!(hosted.name, "claude"),
             Err(why) => assert!(
                 why.contains("`claude`") && why.contains("Tried:"),
@@ -292,7 +339,8 @@ mod tests {
         // may have changed: `abeam +powershell` resolves a program and the
         // border says the word that was typed, not the absolute path it became.
         let root = std::env::temp_dir();
-        let hosted = host(program("cmd.exe"), &[], &root).expect("cmd.exe is on PATH");
+        let hosted =
+            host(program("cmd.exe"), &[], &root, agent::AGENTS).expect("cmd.exe is on PATH");
 
         assert_eq!(hosted.name, "cmd.exe");
         assert!(hosted.launch.program.is_absolute());
@@ -310,7 +358,8 @@ mod tests {
         std::fs::write(dir.path().join("tools").join("abeam-rel.exe"), b"MZ").expect("a program");
 
         let typed = r".\tools\abeam-rel.exe";
-        let hosted = host(program(typed), &[], dir.path()).expect("joined onto the root");
+        let hosted =
+            host(program(typed), &[], dir.path(), agent::AGENTS).expect("joined onto the root");
 
         assert!(hosted.launch.program.is_absolute());
         assert!(hosted.launch.program.starts_with(dir.path()));
@@ -321,7 +370,7 @@ mod tests {
 
         // ...and the same name without a directory component in it is a bare
         // name, which is `PATH`'s question and not this one's.
-        assert!(host(program("abeam-rel.exe"), &[], dir.path()).is_err());
+        assert!(host(program("abeam-rel.exe"), &[], dir.path(), agent::AGENTS).is_err());
     }
 }
 
@@ -345,7 +394,7 @@ mod unix_tests {
         // `sh` because it is the one program name a Unix is not allowed to be
         // missing, so this test failing means the resolver and not the runner.
         let root = std::env::temp_dir();
-        let hosted = host(program("sh"), &[], &root).expect("sh is on PATH");
+        let hosted = host(program("sh"), &[], &root, agent::AGENTS).expect("sh is on PATH");
 
         assert_eq!(hosted.name, "sh");
         assert!(hosted.launch.program.is_absolute());
@@ -366,7 +415,8 @@ mod unix_tests {
         dir.write_exec("tools/abeam-rel", b"#!/bin/sh\nexit 0\n");
 
         let typed = "./tools/abeam-rel";
-        let hosted = host(program(typed), &[], dir.path()).expect("joined onto the root");
+        let hosted =
+            host(program(typed), &[], dir.path(), agent::AGENTS).expect("joined onto the root");
 
         assert!(hosted.launch.program.is_absolute());
         assert!(hosted.launch.program.starts_with(dir.path()));
@@ -377,6 +427,6 @@ mod unix_tests {
 
         // ...and the same name without a directory component in it is a bare
         // name, which is `PATH`'s question and not this one's.
-        assert!(host(program("abeam-rel"), &[], dir.path()).is_err());
+        assert!(host(program("abeam-rel"), &[], dir.path(), agent::AGENTS).is_err());
     }
 }
