@@ -420,7 +420,7 @@ mod tests {
         let dir = TempDir::new("launch-npm");
         let shim = dir.write_exec("abeam-agent", b"#!/usr/bin/env node\n");
 
-        // The way `abeam abeam-agent` would reach it, with the process's own
+        // The way `abeam +abeam-agent` would reach it, with the process's own
         // `PATH` left alone — it is shared with every test running beside this.
         assert_eq!(
             walk(dir.path().as_os_str(), "abeam-agent"),
@@ -570,7 +570,7 @@ mod tests {
         let home = script.parent().expect("the shim has a directory");
 
         // Found the way a `PATH` lookup would find it, so the resolution under
-        // test is the one an `abeam claude` performs...
+        // test is the one an `abeam +claude` performs...
         assert_eq!(
             walk(home.as_os_str(), "abeam-shim"),
             Some(script.clone()),

@@ -222,7 +222,7 @@ impl ShellPane {
             // The same resolver the left pane uses, script routing included,
             // rather than a stricter one for this pane. `ABEAM_SHELL` pointing
             // at a wrapper — a login script, a `nu.cmd` — is the same wish as
-            // `abeam claude` on an npm install, and two implementations of that
+            // `abeam +claude` on an npm install, and two implementations of that
             // wish would be two places for it to be got wrong. On Unix there is
             // no routing to share, because a `#!` line is the kernel's business
             // and the wrapper simply is the program. What is special about this
@@ -1194,7 +1194,7 @@ mod tests {
 
     #[test]
     fn a_shell_that_is_a_cmd_wrapper_starts_and_the_border_names_the_wrapper() {
-        // `ABEAM_SHELL=…\nu.cmd` is the same wish as `abeam claude` on an npm
+        // `ABEAM_SHELL=…\nu.cmd` is the same wish as `abeam +claude` on an npm
         // install, so this pane routes scripts too rather than holding a
         // stricter contract of its own. What is specific to the pane is the
         // border: it has to name what the person chose, because the
@@ -1747,7 +1747,7 @@ mod unix_tests {
 
     #[test]
     fn a_shell_that_is_a_script_wrapper_starts_and_the_border_names_the_wrapper() {
-        // `ABEAM_SHELL=~/bin/nu-wrapper` is the same wish as `abeam claude` on
+        // `ABEAM_SHELL=~/bin/nu-wrapper` is the same wish as `abeam +claude` on
         // an npm install, and here the kernel grants it: a `#!` line is its
         // business, so `launch::unix::into_launch` hands back a `Launch` whose
         // `program` and `target` are the same file and nothing is routed.
