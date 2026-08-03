@@ -48,6 +48,14 @@ on screen, and any file it touches refreshes git within one debounce interval.
 That is the only thing here you cannot assemble out of existing tools, and it is
 the reason abeam exists.
 
+One watcher over one root turned out not to be one workspace, and that is the
+whole of "Worktrees" further down. Claude Code makes git worktrees *inside* the
+directory abeam is watching and runs other agents in them, so "what the agent
+just did" and "a file changed under this root" stopped being the same sentence
+the day somebody ran two agents on one project. The pane still knows what the
+agent just did. What it costs to keep that true is a routing rule with an
+argument in it.
+
 Everything else is a consequence of that. The panes are read-only, they never
 take focus from the agent, and they never switch themselves — a pane that yanks
 itself into view while you are reading is delightful twice and infuriating
@@ -275,7 +283,23 @@ What each agent wants:
   naming: it is the route that works where the other two do not.
 
 The current directory is both the child's working directory and the root that
-the git pane and the watcher use.
+the git pane and the watcher use — **resolved once, at startup, before any of
+the three is handed it.** `GetCurrentDirectoryW` reports the path the process
+was given and resolves neither a junction, nor a `subst` drive, nor an 8.3 short
+name; `git worktree list` resolves all three. So a session started through any
+of them stands in `…\link` while every root git names is `…/real`, and those are
+two different directories to every comparison abeam makes about a path — which
+would leave the routing rule under "Worktrees" wrong for the whole session
+rather than wrong once. The child is given the resolved spelling too, and that
+is not tidiness: the child writes its own working directory into the session
+record abeam reads back out. The visible cost is one surprise, and it is worth
+naming rather than describing the resolution as free — somebody who works on a
+`subst` drive `X:` gets an agent whose `pwd` says `C:\src\forge`. Between a name
+that surprises you once and a window that cannot tell your worktrees apart, the
+name is the cheaper of the two.
+
+The right pane can later be pointed at another worktree of the same repository.
+The left one cannot, ever, and "Worktrees" is where that asymmetry is argued.
 
 From a checkout, `cargo run -p abeam` and `cargo run -p abeam -- +copilot` do
 the same. Cargo's own `--` and abeam's are two different fences that happen to
@@ -415,6 +439,20 @@ rendered markdown for its source; in the file list, `/` finds a file anywhere
 under the root and `Backspace` goes up a directory. `Esc` or `q` hands focus
 back to the agent.
 
+`w` is the one key in that vocabulary that is not about reading: in the git view
+it opens the repository's worktrees, `Enter` there points the right pane at the
+selected one, and `Esc` gives you the status list back instead of the agent —
+which is why the border says `esc→git` while the list is up. **It is pane-local
+rather than an `Alt` key, and the table above is right to leave it out.**
+`crates/abeam/src/keys.rs`'s `HELP` lists it below the split that separates
+abeam's global bindings from the keys that only mean anything while the right
+pane has focus and one particular view is showing, and it is exempt from that
+file's invariant for exactly that reason: no agent can be listening for a key
+that is only ever delivered to a focused pane. A global spelling was available
+and refused twice over — `Alt+W` is Claude's, and a view key spelled `F6` would
+be a key nobody groups with `Alt+G` and `Alt+E`. The list is not a peer of those
+views anyway; it is how you point one of them somewhere else.
+
 The shell view is the exception, and it has to be: `Esc` and `q` belong to
 whatever is running in it. `Alt+S` or `F4` is the way out, and its border says
 so rather than leaving you to find out.
@@ -435,7 +473,9 @@ selected file in the viewer, when the row names one to open: git collapses an
 untracked tree to a single `dir/` entry and there is no directory view to open
 one in, and a deletion is a path git has just finished saying is gone. Enter
 does nothing on those, rather than trading the view you are reading for a
-viewer saying "no such file".
+viewer saying "no such file". `w` leaves the status list for the repository's
+other worktrees, which is how the right pane is pointed at one; the section
+after this is the whole of that.
 
 **files** — read-only markdown and source, and a way to reach any of it.
 Markdown is rendered, not shown as source: headings, lists, tables, quotes, GFM
@@ -500,6 +540,110 @@ producing output the rate should sit at the frame floor; a worst frame
 approaching the gap between frames means the renderer is what is setting the
 pace, and no amount of pacing will help.
 
+## Worktrees, and whose change is whose
+
+This section exists because of a bug, and the bug is the fastest way to explain
+the feature. Claude Code does not stay in one directory: it makes git worktrees
+— the usual place is `<root>/.claude/worktrees/<name>` — and runs agents in
+them, so a machine with two agents on one project has two working trees inside
+one watched directory. abeam runs a single recursive watch of the repository
+root and is right to. What that watch could not do on its own was say *whose*
+change it had just seen. So another agent, working in
+`<root>/.claude/worktrees/other`, refreshed your git pane on every file it wrote
+and pulled its scratch markdown into your reader, with nothing on screen
+admitting where any of it came from. A pane that reports somebody else's work as
+yours is worse than a pane that reports nothing, because it is not obviously
+broken.
+
+One line in the watcher's noise list would have stopped those events at the door
+and closed that bug in an afternoon. It would also have blinded abeam inside its
+own worktrees for ever, which is the half of the feature you can actually press
+a key on: the right pane is pointed *into* those directories now, and a noise
+entry means the watcher never wakes it. Noise is for directories nobody wants to
+read. `.claude/worktrees` is where the work is.
+
+**The obvious fix is not the fix, and that is the part worth reading.** Route by
+path prefix — take the event if it starts with the workspace root. It does not
+work. `<root>/.claude/worktrees/other/NOTES.md` **has `<root>` as a prefix**; it
+genuinely is inside the repository, which is exactly what makes the worktree
+layout convenient, so a prefix test hands it straight back to the workspace
+rooted at `<root>`, which is the case being complained about. The naive fix is a
+no-op dressed as a rule. What works is **innermost ownership**: a path belongs
+to the *longest* known root that contains it, and a pane takes an event only
+when that longest root is its own. That is not a convention invented here to
+make a bug go away — it is git's own model. `git status` in the main worktree
+does not report a nested worktree's modifications, because the nested tree has
+its own index and its own HEAD, and a pane that mirrors `git status` should
+agree with `git status` about whose changes those are.
+
+Ownership alone was half a rule, and the missing half is not a corner case — it
+is the ordinary shape of the very event the rule exists to route. **Writing one
+file inside a nested worktree makes the watcher report the directories above it
+in the same debounced batch.** The file is owned by the worktree and dropped
+correctly; `<root>/.claude` and `<root>/.claude/worktrees` are owned by the
+*enclosing* workspace, because nothing nested is an ancestor of them. Routed on
+ownership alone they are indistinguishable from somebody editing in the root by
+hand, so a neighbour's write still bought this window a frame and a `git status`
+— the whole thing the rule was built to stop, arriving one directory up. So the
+second half is that **a directory containing another workspace's root is not
+evidence about its own**. The only way such a directory can have changed is that
+something inside the nested workspace did, and that something has already been
+reported under its own name and routed to whoever owns it. A path that *is* a
+root stays evidence about itself, and that arm is load-bearing rather than tidy:
+every root contains a nested one the moment a worktree exists, so without it the
+agent's own workspace would go silent the first time anybody added one — the
+routing bug arriving through the back door, in the one workspace that is always
+on the list.
+
+With that settled, the worktrees are worth showing. `w` in the git view — plain
+`w`, with the right pane focused — lists every worktree git knows about: the
+branch name, or the directory's own name where a detached or bare worktree has
+no branch to use; `agent` against the one the hosted agent is running in; who is
+working there, in Claude's own words rather than a vocabulary abeam invented;
+and `unwatched` on anything the single watcher cannot see. A `▸` marks where the
+right pane is standing. `Enter` moves the right pane to the selected row and
+puts the status list back, because looking at that worktree's git is what the
+switch was *for*. `Esc` — or `w` again — leaves the list without moving
+anything, and the border says `esc→git` rather than `esc→agent` so you are not
+left guessing which of the two it means. The workspace you are in and the
+agent's own always have a row, discovered or not — the list is *how* the right
+pane is switched, so a workspace with no row on it is a workspace nobody can get
+back to, and neither absence is exotic: `git worktree list` names the repository
+rather than the subdirectory you started abeam in.
+
+**The left pane never moves, and that asymmetry is the design rather than an
+unfinished half of it.** A live child's working directory belongs to the child;
+there is no call that moves a running process to another directory, so the agent
+stays where it was started for as long as it runs. The window therefore
+deliberately disagrees with itself about where it is, and the border is what
+keeps that honest — it names the workspace the *right* pane is on, and **only
+when that is not the agent's own**. That suppression is not tidiness either. The
+pane is 46 columns; a label on every title spends three or four of them saying
+the one thing that is true by default, and pushes the branch name and change
+count the git title exists for off the end of the border. Shown only when it is
+news, it costs nothing and says everything. The list marks `agent` separately
+from `▸` for the same reason: the point of opening it is to look at a workspace
+the agent is *not* in.
+
+Three views read a directory, and the switch reaches all three. The git pane
+re-roots and says "reading the repository…" until the first refresh lands, in
+preference to drawing the other repository's branch and change count under the
+new workspace's name for most of a second. The reader rebuilds its whole index
+and opens the newest markdown of the worktree it has moved to, exactly as it
+does at startup. The command view is per workspace, and that is the one place
+the asymmetry above reaches the right-hand side as well: a shell cannot be
+re-rooted any more than the agent can, so switching with the shell up starts a
+*second* child, in the new worktree, the first time it is drawn there. Every
+one of them is ticked whether or not it is on screen, so a hidden workspace's
+child can still exit, and `Alt+Q` consults all of them — otherwise quitting
+would kill somebody's build in a workspace they were not looking at.
+
+What deliberately does *not* follow is everything belonging to the agent: the
+idle/busy probe, the queue and the background dispatcher stay where the agent
+is. They are the session's, not the view's. Re-rooting any of them would mean a
+prompt queued for the agent being aimed at a directory the agent is not in,
+which is the one mistake in this program nobody would see happen.
+
 ## Drawing
 
 Two intervals, with different jobs.
@@ -541,6 +685,11 @@ crates/abeam/src/config.rs         the one file abeam reads: presets, and how a
                                    session opens. The profile, never the repo.
 crates/abeam/src/launch/           where a program may be found, and what may
                                    then be started: one shared half, two others
+crates/abeam/src/workspace.rs      the worktrees of the repository, and which of
+                                   them owns a watched path. The routing rule
+                                   and the argument for it live here.
+crates/abeam/src/paths.rs          when two spellings are one directory, and the
+                                   one spelling everything starts from
 crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
 docs/conpty-findings.md   what the spike learned. Read before touching the pty.
 docs/keymap.md            the keybinding collision audit
@@ -693,6 +842,95 @@ work, on either platform.
   `abeam "+1 to shipping this"` looks for a program called `1 to shipping this`
   — the message names the `--` escape, and it is still a line somebody will type
   once before they learn it.
+- **Worktree discovery polls, so the routing rule is allowed to be ten seconds
+  out of date.** `git worktree list` runs immediately at startup and every ten
+  seconds after it, and both directions of that lag are worth naming rather than
+  leaving to be found. A worktree somebody has just added is not on the list
+  yet, so for up to ten seconds its whole checkout has no innermost root of its
+  own, every path in it is handed to the enclosing workspace, and all of it
+  counts as evidence — which is the original routing bug, for ten seconds, in a
+  worktree that has existed for ten seconds. A worktree somebody has just
+  removed is still *on* the list, so its former parent directories go on being
+  suppressed for the same window: a real edit at `<root>/.claude` in that window
+  is dropped rather than misrouted. Neither is fixable by being cleverer about
+  the rule, because both are the list being out of date rather than the rule
+  being wrong, and the rule has nothing but the list. The git pane's own
+  two-second poll makes both of them cost one wrong refresh rather than a screen
+  that stays wrong; the reader has no such net, so in the first window a
+  neighbour's document can still be pulled in front of you and in the second one
+  of your own is quietly dropped. Shortening the window would mean a second
+  watch, on `.git/worktrees`, and one recursive watch is a decision the watcher
+  makes on purpose.
+- **A worktree outside the repository root is listed, switchable, and not
+  watched.** `git worktree add ../elsewhere` is ordinary, and abeam shows it and
+  will point the right pane at it — but the single recursive watch covers the
+  directory abeam was started in, so nothing written in that worktree ever
+  reaches the router. The git pane falls back to its own two-second poll, which
+  is the same net a commit made in another terminal lands in, and the reader
+  does not follow anything at all: it opens the newest markdown once, on the
+  switch, and then sits there. The row in the `w` list reads `unwatched`, and
+  the reader says as much on the empty screen it shows when there is nothing
+  open — because a pane that is merely slow looks exactly like a pane that is
+  broken unless something admits which it is.
+- **The occupancy column shows an id where it should show a name.** Claude's
+  session records and roster entries both carry a `name` — `"forge-c5"`, or a
+  dispatched task's own title — and it is the field that column wants;
+  `crates/abeam/src/agentstate.rs`'s `Wire` does not parse it, so what is
+  rendered is the roster's short `id` beside the status word. That is worse than
+  it sounds, because the `id` is a *background* agent's and an interactive
+  session does not have one: the common case, somebody typing in a worktree,
+  renders as a bare `working` with nothing saying who. It is one field on
+  `Wire`, one on `Session`, and one line of a struct literal in the queue pane's
+  tests.
+- **A session that had already moved into a worktree before the probe first read
+  a record is never discovered.** The probe identifies the hosted session by an
+  exact match on the agent's own root, and the worktrees are consulted nowhere
+  in that search — which is a correction rather than an omission, and the reason
+  is worth having. Claude's neighbouring agents
+  run *at* the worktree roots git names, so a set consulted during discovery
+  does not merely blur the question, it admits exactly the sessions it was meant
+  to exclude: a recycled pid landing on a neighbour's record, a few milliseconds
+  of clock skew sending the search down a fallback that takes the newest agent
+  in the repository, or a second abeam window during the second before its own
+  Claude writes anything. Each of those answered `Idle`, and `Idle` is the one
+  answer that types a queued prompt into a mid-turn agent. Only *revalidation*
+  of a record already established as ours is widened, and it is tied to the
+  `sessionId` that was ours — without that the remembered path is a pid, and a
+  pid comes round again. What the strictness costs is the case in the heading:
+  readiness answers `Unknown` for the whole session, the automatic send never
+  fires, the queue pane goes on saying it is waiting for the agent to be idle,
+  and the queue drains by hand. That is the direction this module fails in on
+  purpose.
+- **`paths` compares spellings and does not normalise them**, and two things
+  follow that somebody will otherwise reach for a fix to. `..` is left where it
+  is, so `under(C:\a, C:\a\..\b\x.md)` is true and a containment rule can in
+  principle be walked out of; nothing abeam has emits a `..` — `notify` reports
+  resolved absolute paths, `git worktree list` prints absolute ones, and the one
+  path a person types is flattened at startup — which makes it unreachable today
+  and not unreachable by construction, and that is the difference worth writing
+  down. And `\\?\C:\repo` compares unequal to `C:\repo`, because the verbatim
+  prefix is a different first component to the platform's own parser. Both are
+  the same refusal: canonicalising per comparison touches the disk, and `under`
+  is asked once per watched path per known workspace — thousands of stat calls
+  under a `git checkout` to answer a question about two strings. What pays for
+  that is the single resolution at startup described under "Running it", which
+  is also the only reason a session reached through a junction routes correctly
+  at all; `resolve_root` strips the verbatim prefix back off rather than handing
+  a third spelling to everything downstream. The fix for a `..`, if a source
+  ever emits one, is to resolve it at that source — resolving it textually is
+  wrong wherever there is a symlink, since `a/link/..` is not `a`.
+- **Each workspace you visit gets its own shell, and any of them can hold the
+  door.** A shell cannot be re-rooted for the same reason the agent cannot, so
+  switching workspaces with the command view up starts a second child rather
+  than moving the first; the number of shell processes grows with the number of
+  worktrees somebody has typed in, and `Alt+Q` asks about every one of them, so
+  a build left running in a workspace nobody is looking at still makes quitting
+  ask twice. The related cost is a workspace `git worktree remove` has deleted
+  while a child of yours is still running in it: abeam keeps it rather than
+  killing the build, it drops off the list because the list is built from what
+  git said, and switching away from it is a one-way trip until that child
+  finishes. Unlisted-and-still-running is the smaller of the two failures, and
+  it is the one deliberately chosen.
 - **The shell view has never been driven by a human.** A test types `set /a
   123*456` into the real binary and reads `56088` back off the screen, which is
   more than a smoke test and still less than use: the six pass criteria above
