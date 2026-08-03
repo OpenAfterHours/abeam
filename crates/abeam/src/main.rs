@@ -5,9 +5,10 @@
 //! to the real terminal. The right pane toggles between a git view and a file /
 //! markdown viewer that follows what the agent just wrote.
 //!
-//! Usage:  abeam                 (hosts the default agent)
-//!         abeam copilot         (hosts a known agent — see `crate::agent`)
-//!         abeam pwsh            (hosts anything else)
+//! Usage:  abeam [args...]           (the default agent, handed the whole line)
+//!         abeam +copilot [args...]  (a known agent — see `crate::agent`)
+//!         abeam +pwsh               (anything else)
+//!         abeam +help               (abeam's own; `--help` is the agent's)
 //!
 //! Alt+Q quits, F1 lists the keys, F2 shows what the pty is doing.
 
@@ -42,6 +43,18 @@ fn main() -> Result<()> {
     // resolution below is where it is: until this existed, `abeam --help`
     // reached `CreateProcessW` as a program called `--help`, and the answer to
     // a question about abeam was a spawn failure naming a flag.
+    //
+    // That papercut is worth keeping written down after the fact, because the
+    // rule `crate::agent` now parses under is the reason it can never happen
+    // again — and "we added a check for it" and "it stopped being expressible"
+    // are very different guarantees. A program name has to arrive behind a `+`
+    // today, so a dashed token cannot become one however it is spelled and
+    // whatever abeam does or does not recognise. `--help` is Claude's question
+    // now; `+help` is the only spelling that reaches the arm below. What this
+    // still catches before `term::setup` is the two answer-and-exit words and
+    // the parser's refusals, which is the same reason as ever: a message
+    // printed after raw mode is on is a message on a screen about to be thrown
+    // away.
     let (choice, program_args) = match agent::parse(&args) {
         Ok(agent::Cli::Help) => {
             println!("{}", agent::help());
@@ -164,9 +177,9 @@ fn main() -> Result<()> {
             // The name that was chosen, for the same reason the border uses it.
             println!("{} exited: {status:?}", hosted.name);
             std::io::Write::flush(&mut std::io::stdout())?;
-            // Anything scripting abeam — `abeam claude -p "…" && next-step`, a
-            // CI wrapper — reads this, and a failed child reported as success
-            // is the kind of thing that is only noticed much later.
+            // Anything scripting abeam — `abeam -p "…" && next-step`, a CI
+            // wrapper — reads this, and a failed child reported as success is
+            // the kind of thing that is only noticed much later.
             std::process::exit(status.exit_code() as i32);
         }
         Outcome::Detached => {}
@@ -186,9 +199,10 @@ fn host(choice: agent::Choice, args: &[String], root: &Path) -> Result<agent::Ho
         agent::Choice::Program(asked) => asked,
     };
 
-    // `abeam ./tools/agent.exe` named a place, and meant it relative to where
+    // `abeam +./tools/agent.exe` named a place, and meant it relative to where
     // abeam was run — which is about to stop being this process's directory.
-    // Resolved here, while it still means that.
+    // Resolved here, while it still means that. The sigil is gone by now: it
+    // said which token was abeam's and never formed part of the path.
     //
     // It has to happen before `launch::resolve`, which refuses a relative path
     // outright: the two are asking different questions. There, a relative path
@@ -274,9 +288,9 @@ mod tests {
 
     #[test]
     fn a_program_named_outright_is_still_shown_under_the_name_that_was_typed() {
-        // Today's behaviour, and the case the agent table must not have
-        // changed: `abeam powershell` resolves a program and the border says
-        // the word that was typed, not the absolute path it became.
+        // Today's behaviour, and the case neither the agent table nor the sigil
+        // may have changed: `abeam +powershell` resolves a program and the
+        // border says the word that was typed, not the absolute path it became.
         let root = std::env::temp_dir();
         let hosted = host(program("cmd.exe"), &[], &root).expect("cmd.exe is on PATH");
 
@@ -324,9 +338,9 @@ mod unix_tests {
 
     #[test]
     fn a_program_named_outright_is_still_shown_under_the_name_that_was_typed() {
-        // Today's behaviour, and the case the agent table must not have
-        // changed: `abeam pwsh` resolves a program and the border says the
-        // word that was typed, not the absolute path it became.
+        // Today's behaviour, and the case neither the agent table nor the sigil
+        // may have changed: `abeam +pwsh` resolves a program and the border
+        // says the word that was typed, not the absolute path it became.
         //
         // `sh` because it is the one program name a Unix is not allowed to be
         // missing, so this test failing means the resolver and not the runner.

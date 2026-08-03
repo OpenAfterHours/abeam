@@ -11,7 +11,9 @@ It replaces a three-window setup: the agent in one terminal, git in another, and
 an editor open purely to read the markdown it produced.
 
 Two agents are known by name today — **Claude Code** and **GitHub Copilot CLI**
-— and any other program on `PATH` can be hosted by naming it. Which one you got
+— and any other program on `PATH` can be hosted as `abeam +<name>`. Everything
+else you type goes to the agent, so `abeam <claude args>` is `claude <claude
+args>` with two panes beside it; "Running it" is the whole rule. Which one you got
 is not a thing to remember: the left border says. Read the Copilot half of this
 document knowing that **abeam has never been run with Copilot CLI**, not once:
 the selection, the launcher and the failure message are tested, a session is
@@ -32,9 +34,11 @@ not, and "Not done, and known" says exactly why and what that leaves unproven.
 
 That title is the name you chose and never the path it resolved to, which is
 why an npm-installed agent started on Windows by way of `cmd.exe` says its own
-name rather than the interpreter's. `abeam copilot` should therefore draw
+name rather than the interpreter's. `abeam +copilot` should therefore draw
 `┌ copilot ─…` in the same place — "should" because that follows from the code
-and from a test of the naming, and nobody has watched it happen.
+and from a test of the naming, and nobody has watched it happen. The `+` is how
+abeam was told which agent to host and never part of what it was told, so it is
+not on the border either.
 
 ## Why this rather than wezterm + lazygit + glow
 
@@ -115,44 +119,79 @@ actionable. Add each target when someone can run it.
 
 ## Running it
 
+**Everything on the command line belongs to the hosted agent, except a single
+leading token beginning `+`, which is abeam's.** That is the whole rule, and
+what it buys is that `uvx abeam <anything>` is the session `claude <anything>`
+would have started, with two panes around it.
+
 ```
-abeam                  # the default agent, in the current directory
-abeam copilot          # GitHub Copilot CLI
-abeam bash             # anything else on PATH
-abeam claude --resume  # everything after the name belongs to the agent
+abeam                     # the default agent, in the current directory
+abeam --resume            # ...which is `claude --resume`
+abeam -p "fix the tests"  # ...and `claude -p "fix the tests"`
+abeam agent               # ...and `claude agent`, subcommands included
+
+abeam +copilot --resume   # GitHub Copilot CLI, with its own --resume
+abeam +bash               # anything else on PATH
+abeam +help               # abeam's own help; `--help` is the agent's
+abeam -- +1 more thing    # `--` fences a leading `+` for the agent
 ```
 
-The first word that is not a flag is the whole of the selection. If it names an
-agent abeam knows — `claude` or `copilot`, matched without regard to case —
-abeam looks that agent's executables up on `PATH`; anything else is a program
-name and means exactly what `abeam bash` or `abeam powershell` has always meant.
-`ABEAM_AGENT` names the default for a shell where you always want the same one,
-and it is read on precisely those terms: an agent name, or any program. An empty
-value counts as unset, because PowerShell leaves one behind — and so does a
-profile that exports a variable it then fails to fill — and `'' was not found on
-PATH` names nothing anyone can act on.
+A `+` token is read only in the first position and there is at most one: a
+prompt may begin with a `+`, and `abeam config set +x` is a real command line.
+`+name` is resolved exactly as the old positional was — if it names an agent
+abeam knows, `claude` or `copilot`, matched without regard to case, abeam looks
+that agent's executables up on `PATH`; anything else is a program name and means
+what `abeam bash` used to mean. Two words behind the sigil are reserved and only
+two, `+help` and `+version`. There are no `+h`/`+V` short forms, deliberately: a
+short form is one more word that can never be a program name, and `-h`, `-V`,
+`--help` and `--version` all go to the agent now, which is the help you wanted.
 
-**abeam parses its own flags only up to that first non-flag word**, and it has
-two of them: `-h`/`--help` and `-V`/`--version`. Everything from the selector
-onwards is the child's, `--help` included — `abeam claude --help` is a question
-for Claude, and a multiplexer that quietly ate a flag meant for the thing it is
-hosting would be wrong in a way that is very hard to see from the outside. `--`
-first is the escape hatch, and covers the one case the rule cannot: a program
-whose own name starts with a dash.
+`ABEAM_AGENT` names what to host when no `+` token did — an agent name, or any
+program — and this change is what made it worth setting: `ABEAM_AGENT=copilot
+abeam --resume` resumes Copilot, where before the variable stopped applying the
+moment you had arguments to pass. An empty value counts as unset, because
+PowerShell leaves one behind — and so does a profile that exports a variable it
+then fails to fill — and `'' was not found on PATH` names nothing anyone can act
+on. A `+` token overrides it.
 
-There is no `--agent` flag. The positional already selects, so a flag beside it
-would make `abeam --agent copilot powershell` expressible, and there is no
-honest answer to what that would mean.
+**`abeam claude` and `abeam copilot` are refused rather than reinterpreted**,
+with exit code 2 and a message naming both readings and both ways out. They
+hosted those agents for the whole of abeam's life before this, they are written
+that way in every older copy of this document, and what you would otherwise get
+is `claude claude` — the agent's own complaint about an argument it does not
+have, on a screen that never mentions abeam. That refusal is permanent, not a
+migration aid, and it is a fixed lookup in abeam's own table rather than a `PATH`
+probe: a refusal that depended on what happened to be installed would accept a
+command line on your machine and reject it on a build server.
+
+There is no `--agent` flag, and this document used to give a different reason
+for that than it gives now. The old one was that the positional already
+selected, so a flag beside it would make `abeam --agent copilot powershell`
+expressible with no honest meaning. Nothing positional selects any more, so that
+objection has gone with its premise — but the property it was defending is
+exactly what `+` keeps: there is one place a selection can be written, and it is
+impossible to write two.
+
+What the positional cost was the point of abeam. `abeam agent` looked for a
+program called `agent`, `abeam mcp list` looked for one called `mcp`, and
+`abeam --help` was abeam's help rather than Claude's — every argument that
+happened not to start with a dash was a trap, and the traps were whatever
+subcommands the hosted agent grows next, which is not a list any README can
+hold. The change also deleted a class of bug rather than guarding against it:
+abeam used to refuse leading flags it did not recognise, because before that
+check existed `abeam --help` reached `CreateProcessW` as a program named
+`--help`. Under this rule a dashed token can never be a program name at all, so
+there is nothing left to check.
 
 An agent abeam cannot find is a sentence and never a download. Modern `gh
 copilot` is a launcher rather than the retired suggest/explain extension: it
 will fetch the Copilot CLI if it is missing, and abeam had that fallback for a
-day before it was taken out on purpose. Typing `abeam copilot` is a request to
+day before it was taken out on purpose. Typing `abeam +copilot` is a request to
 run something, not consent for a network install, and a terminal border cannot
 close that gap after the fact. So what you get instead is four things: the
 names that were looked for, what the operating system said about the last of
 them, then — when another agent abeam knows is already sitting on `PATH` — the
-line that saves the ten minutes, `` `claude` is installed; `abeam claude` would
+line that saves the ten minutes, `` `claude` is installed; `abeam +claude` would
 host it. ``, and last one sentence on installing the one you asked for, `gh
 copilot` included, as a command you run yourself. The third is the best line in
 the message and the one most often needed: the default agent missing on a
@@ -175,8 +214,10 @@ What each agent wants:
 The current directory is both the child's working directory and the root that
 the git pane and the watcher use.
 
-From a checkout, `cargo run -p abeam` and `cargo run -p abeam -- copilot` do the
-same.
+From a checkout, `cargo run -p abeam` and `cargo run -p abeam -- +copilot` do
+the same. Cargo's own `--` and abeam's are two different fences that happen to
+be spelled alike: the first ends Cargo's arguments, and everything past it is
+the line abeam reads under the rule above.
 
 ## Keys
 
@@ -686,8 +727,8 @@ work, on either platform.
   table holds; `docs/keymap.md` has the procedure.
 - **Almost no configuration**, and the "almost" is two environment variables.
   Keybindings, the split ratio and both drawing intervals are constants in the
-  source. `ABEAM_AGENT` names the agent — or the program — to host when the
-  command line names none, and `ABEAM_SHELL` names what the command view starts.
+  source. `ABEAM_AGENT` names the agent — or the program — to host when no `+`
+  token did, and `ABEAM_SHELL` names what the command view starts.
   There is no file, so nothing survives the session: the reader's light/dark
   choice starts dark every time. Claude's own bindings are user-configurable and
   abeam's should be too before anyone else uses it. Copilot's are not, which

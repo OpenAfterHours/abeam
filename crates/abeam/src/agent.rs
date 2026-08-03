@@ -9,30 +9,94 @@
 //!
 //! It is [`crate::panes::shell`]'s sibling on purpose, down to the shape: a
 //! small list of known programs, tried best first, with an environment variable
-//! that overrides the lot. The two differ in exactly one place, and the reason
-//! is worth stating. A shell is chosen by `ABEAM_SHELL` alone because no shell
-//! is ever named on abeam's command line; an agent is usually chosen by the
-//! first word after `abeam`, so this module owns an argument parser as well as
-//! a table.
+//! that overrides the lot. The two differ in one place, and it is a smaller
+//! place than it was. A shell is chosen by `ABEAM_SHELL` alone, because no
+//! shell is ever named on abeam's command line; an agent is chosen by
+//! `ABEAM_AGENT` or by the one token on that line abeam is allowed to read. So
+//! this module owns an argument parser as well as a table — an argument parser
+//! whose whole vocabulary is a single character.
 //!
-//! ## Why there is no `--agent` flag
+//! ## The whole rule
 //!
-//! The positional argument already selects the program — `abeam powershell` has
-//! meant "host powershell" since long before there was a table. A flag beside
-//! it would make `abeam --agent copilot powershell` expressible, and there is
-//! no honest answer to what that means. So the first non-flag token is the
-//! whole of the selection: a name in [`AGENTS`] picks that agent, and anything
-//! else is a program to resolve exactly as before.
+//! **Everything on the command line belongs to the hosted agent, except a
+//! single leading token beginning `+`, which is abeam's.**
 //!
-//! ## Why abeam stops parsing at the first non-flag token
+//! `abeam agent` is `claude agent`. `abeam --resume` is `claude --resume`.
+//! `abeam -p "fix the tests"` is `claude -p "fix the tests"`, and `uvx abeam`
+//! written in front of any command line at all is the session that command line
+//! would have started, with two panes around it. What is abeam's is the sigil:
+//! `abeam +copilot --resume` hosts Copilot, `abeam +pwsh` hosts a shell,
+//! `+help` and `+version` answer and exit, and `--` first hands even a leading
+//! `+` to the agent, so `abeam -- +1 more thing` passes `+1` on.
 //!
-//! Everything from the selector onwards belongs to the child. `abeam claude
-//! --resume` has to resume Claude, and `abeam copilot --help` has to be
-//! Copilot's help rather than abeam's — a multiplexer that quietly ate a flag
-//! meant for the thing it is hosting would be wrong in a way that is very hard
-//! to see from the outside. abeam's own two flags therefore have to come first,
-//! and `--` is there for the one case the rule cannot cover on its own: a
-//! program whose own name starts with a dash.
+//! ## What the first word used to mean, and why it stopped
+//!
+//! It selected. `abeam powershell` meant "host powershell" since long before
+//! there was a table, and where this paragraph sits there used to be a section
+//! headed "Why there is no `--agent` flag". Its argument was that the
+//! positional already selected, so a flag beside it would make `abeam --agent
+//! copilot powershell` expressible with no honest answer to what that meant.
+//! The argument was about a *second* selector, it was right, and its premise
+//! has gone: nothing positional selects now, so there is nothing for `+copilot`
+//! to disagree with. It is recorded rather than deleted because the property it
+//! was defending is the one this rule keeps — there is exactly one place a
+//! selection can be written, and it is impossible to write two.
+//!
+//! What the positional cost was the thing abeam is for. abeam hosts an agent
+//! and draws two panes beside it, and the less `abeam <args>` differs from
+//! `claude <args>` the less there is to know — but `abeam agent` looked for a
+//! program called `agent`, `abeam --resume` was abeam's business rather than
+//! Claude's, and `abeam mcp list` started a program called `mcp`. Every
+//! argument that happened not to begin with a dash was a trap, and the traps
+//! could not be enumerated, because they are whatever subcommands the hosted
+//! agent grows next and that is not a list this file can hold.
+//!
+//! The one thing the old meaning leaves behind is the refusal in
+//! [`parse_with`]: a first token naming an agent in [`AGENTS`] is an error and
+//! not a re-reading. It is permanent rather than transitional, and the comment
+//! at it says why — `abeam claude` is what every older copy of the README tells
+//! people to type, and silently passing `claude` to Claude is a confusing
+//! failure with abeam's name nowhere on it.
+//!
+//! ## Why abeam reads one token and then stops
+//!
+//! This section was headed "Why abeam stops parsing at the first non-flag
+//! token", and what happened to it is that the boundary moved rather than that
+//! the argument was wrong. Everything from the selector onwards belonged to the
+//! child; everything belongs to the child now, and there is no longer anything
+//! to stop at.
+//!
+//! What it was defending is unchanged and worth restating. A multiplexer that
+//! quietly ate a flag meant for the thing it is hosting would be wrong in a way
+//! that is very hard to see from the outside — and abeam ate four spellings.
+//! `-h`, `--help`, `-V` and `--version` were abeam's whenever they came first,
+//! so `abeam --help` could not be Claude's help and you had to know to write
+//! `abeam claude --help` to get it. All four are the agent's now, which is the
+//! right answer to a question typed at the program taking the typing, and it is
+//! why abeam's own two words are `+help` and `+version` — spellings nothing
+//! else wanted.
+//!
+//! It also deleted a class of bug rather than guarding against it, which is the
+//! strongest thing that can be said for the change. There was an `unknown()`
+//! error in this file, and the papercut it was written for is recorded in
+//! `main`: `abeam --help` reached `CreateProcessW` as a program named `--help`,
+//! and the answer to a question about abeam was a spawn failure naming a flag.
+//! That error caught it, and would have had to keep catching every leading
+//! dashed token abeam did not recognise, forever. Under this rule a dashed
+//! token cannot be a program name at all — the only token that can name one
+//! begins with `+` — so there is nothing left to catch, and the error is gone
+//! with the hazard rather than standing in front of it.
+//!
+//! ## `ABEAM_AGENT`, which this change made worth setting
+//!
+//! Its contract has not moved: it names what to host — an agent from [`AGENTS`]
+//! or any program at all — when no `+` token said otherwise, a blank value
+//! counts as unset, and a `+` token overrides it. What moved is how much of
+//! that is usable. `ABEAM_AGENT=copilot abeam --resume` resumes Copilot today;
+//! before this it was an unrecognised abeam flag, and the only way to name
+//! Copilot was a positional which then shadowed everything you wanted to send
+//! after it. A default that stopped applying the moment you had arguments was a
+//! default for `abeam` on its own and for nothing else.
 //!
 //! ## Why an agent that is missing is a sentence and never a download
 //!
@@ -44,7 +108,7 @@
 //! without seeing it happen.
 //!
 //! It was taken out on purpose, and the decision was the user's rather than
-//! this file's. abeam is a host. Typing `abeam copilot` is a request to run
+//! this file's. abeam is a host. Typing `abeam +copilot` is a request to run
 //! something, not consent for a network install, and the gap between those two
 //! is not one a terminal border can close after the fact. So the only thing
 //! this module does with a name it cannot find is say so, and say how to fix
@@ -126,12 +190,18 @@ pub const DEFAULT: &str = "claude";
 /// The agent this name selects, if it is one abeam knows.
 ///
 /// Case-insensitively, because what is being matched is abeam's own table of
-/// names and not a file: `abeam Claude` and `abeam claude` are the same
+/// names and not a file: `abeam +Claude` and `abeam +claude` are the same
 /// request, and one of them finding the preset while the other fell through to
 /// a `PATH` lookup for a program spelled `Claude` would be a distinction with
 /// no visible cause. Whether that lookup then folds case is the filesystem's
 /// business and `crate::launch`'s — it does on Windows and does not on Linux —
 /// and neither answer belongs in a table abeam wrote itself.
+///
+/// The only place [`AGENTS`] is consulted by name, and deliberately the only
+/// one: the parser reads it to answer `+claude`, and reads it again to refuse
+/// a bare `claude`, and those two must agree about what a name is for as long
+/// as there is one table. A later change that builds the table at run time from
+/// user presets replaces the body of this function and nothing above it.
 pub fn find(name: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|a| a.name.eq_ignore_ascii_case(name))
 }
@@ -141,7 +211,8 @@ pub fn find(name: &str) -> Option<&'static Agent> {
 pub enum Choice {
     /// A name from [`AGENTS`].
     Known(&'static Agent),
-    /// Anything else, meaning exactly what `abeam powershell` has always meant.
+    /// Anything else, meaning exactly what `abeam powershell` used to mean and
+    /// what `abeam +powershell` means now.
     Program(String),
 }
 
@@ -162,6 +233,16 @@ pub enum Cli {
     Host { choice: Choice, args: Vec<String> },
 }
 
+/// The one token on the command line that is abeam's.
+///
+/// A sigil rather than a flag or a subcommand, because it has to be a shape the
+/// hosted agent's own command line cannot collide with: `-a` is a flag
+/// something already has, and `agent` is a word Claude already takes. Only the
+/// first token is read this way and there is only ever one, which is what makes
+/// that collision impossible rather than unlikely — a prompt may begin with a
+/// `+`, and `claude config set +x` is a command line somebody has.
+const SIGIL: char = '+';
+
 /// Read `abeam`'s own arguments, with `ABEAM_AGENT` as the default.
 pub fn parse(args: &[String]) -> Result<Cli, String> {
     parse_with(args, std::env::var("ABEAM_AGENT").ok())
@@ -173,75 +254,107 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
 /// shared with the two hundred other tests running beside them, and half of
 /// those spawn children that inherit it.
 pub fn parse_with(args: &[String], default: Option<String>) -> Result<Cli, String> {
-    // abeam has two flags and both of them answer and exit, so the first token
-    // is the only place one can be — a flag that did *not* end the parse would
-    // need a loop here, and there is no such flag. Everything after the first
-    // non-flag token belongs to the child, `--help` included.
-    if let Some(first) = args.first().filter(|token| is_flag(token)) {
-        return match first.as_str() {
-            "-h" | "--help" => Ok(Cli::Help),
-            "-V" | "--version" => Ok(Cli::Version),
-            other => Err(unknown(other)),
-        };
+    let Some((first, rest)) = args.split_first() else {
+        return Ok(hosting(default, Vec::new()));
+    };
+
+    // `--` ends abeam's reading of the line rather than the line itself, and
+    // the one thing it still has to cover is a first argument that begins with
+    // a `+`. A shell will not do it for you: `abeam "+1 more"` arrives here as
+    // a token starting `+` exactly as the unquoted form does, because the
+    // quotes are the shell's and abeam never sees them. It is also the escape
+    // from the refusal below — `abeam -- claude agent` is how you say `claude`
+    // to the default agent and mean the word.
+    if first == "--" {
+        return Ok(hosting(default, rest.to_vec()));
     }
 
-    // `--` ends abeam's own parsing rather than the command line: what follows
-    // is the program even though it starts with a dash, which is the only way
-    // to name one that does. It does not fence off the table — a name in
-    // [`AGENTS`] never starts with a dash, so `abeam -- claude` would be a
-    // second spelling of `abeam claude` and not a different request.
-    let rest = match args.split_first() {
-        Some((first, tail)) if first == "--" => tail,
-        _ => args,
-    };
+    if let Some(word) = first.strip_prefix(SIGIL) {
+        // A sigil with nothing behind it is refused rather than defaulted, and
+        // that is the opposite of what a blank `ABEAM_AGENT` gets on purpose. A
+        // variable is a *default*, and a default nobody set is a default that
+        // should not be there; a typed `+` is a *request*, and `abeam + --resume`
+        // quietly becoming `abeam --resume` would hand somebody's arguments to a
+        // program they did not name — the one thing this parser exists not to do.
+        if is_blank(word) {
+            return Err(nothing());
+        }
 
-    let (asked, args) = match rest.split_first() {
-        // A typed name that is nothing is refused rather than defaulted, which
-        // is the opposite of what an empty `ABEAM_AGENT` gets and is meant to
-        // be. A variable is a *default*, and a default nobody set is a default
-        // that should not be there; an argument is a *request*, and `abeam ""
-        // --resume` quietly becoming `abeam claude --resume` would hand
-        // somebody's arguments to a program they did not name — the one thing
-        // this parser exists not to do.
-        Some((first, _)) if is_blank(first) => return Err(nothing()),
-        Some((first, tail)) => (first.clone(), tail.to_vec()),
-        // Nothing was named, so the default decides — and it is read on exactly
-        // the same terms a typed name would be, an agent or a program. That is
-        // what `ABEAM_SHELL` does, and two overrides that looked alike while
-        // meaning different things would be worse than either.
+        // Two reserved words, and there is not going to be a third. `+h` and
+        // `+V` are deliberately absent: every word behind the sigil is one more
+        // program that can never be hosted under its own name, and a short form
+        // spends that on two keystrokes of a command nobody types twice. What
+        // the set costs today is programs called `help` and `version`, and both
+        // are still reachable as a path — `abeam +./help` — which is the whole
+        // reason the set is kept small rather than made empty.
         //
-        // A blank value counts as unset. PowerShell will happily leave
-        // `$env:ABEAM_AGENT = ""` behind, and "``" was not found on PATH" names
-        // nothing a reader can act on.
-        None => (
-            default
-                .filter(|name| !is_blank(name))
-                .unwrap_or_else(|| DEFAULT.to_string()),
-            Vec::new(),
-        ),
-    };
+        // Folded like the table is, and for `find`'s reason: `abeam +HELP`
+        // falling through to a `PATH` lookup for a program spelled `HELP` while
+        // `abeam +help` printed this help would be a distinction with no visible
+        // cause.
+        if word.eq_ignore_ascii_case("help") {
+            return Ok(Cli::Help);
+        }
+        if word.eq_ignore_ascii_case("version") {
+            return Ok(Cli::Version);
+        }
 
-    Ok(Cli::Host {
-        choice: Choice::of(&asked),
-        args,
-    })
+        return Ok(Cli::Host {
+            choice: Choice::of(word),
+            args: rest.to_vec(),
+        });
+    }
+
+    // The refusal, and it is permanent rather than transitional. `abeam claude`
+    // hosted Claude for the whole of abeam's life before this rule, and it is
+    // written that way in a README that is already cloned, already quoted and
+    // already in somebody's shell history — people will type it in five years,
+    // having read something that was true when it was written. What they get
+    // without this line is `claude claude agent`: Claude's own complaint about
+    // an argument it does not have, at one remove from anything they did, on a
+    // screen that never mentions abeam.
+    //
+    // A fixed table lookup, and never a `PATH` probe. The tempting version of
+    // this refuses any first token that is *both* a plausible program and a
+    // plausible argument, which means asking the machine whether `agent` is on
+    // `PATH` — and then abeam accepts a command line on one machine and refuses
+    // it on the next, for a reason living in a directory nobody mentioned.
+    // These two names are refused because abeam wrote these two names down
+    // itself. When the table is later built at run time from user presets this
+    // refusal grows with it, still without asking the filesystem anything.
+    if let Some(agent) = find(first) {
+        return Err(ambiguous(agent.name, args));
+    }
+
+    // And everything else — dashed, blank, a subcommand, a prompt — is the
+    // agent's, in the order it was typed.
+    Ok(hosting(default, args.to_vec()))
 }
 
-/// A token abeam would read as one of its own flags.
+/// Host whatever the default names, with these arguments.
 ///
-/// `--` is not one: it is a fence, handled where the fence matters. A lone `-`
-/// is not one either — it is a dash with no flag behind it, so it goes through
-/// as a program name and fails saying so, which is more use than a complaint
-/// about a flag nobody typed.
-fn is_flag(token: &str) -> bool {
-    token.starts_with('-') && token != "-" && token != "--"
+/// The default is read on exactly the same terms a `+` token would be, an agent
+/// or a program. That is what `ABEAM_SHELL` does, and two overrides that looked
+/// alike while meaning different things would be worse than either.
+fn hosting(default: Option<String>, args: Vec<String>) -> Cli {
+    // A blank value counts as unset. PowerShell will happily leave
+    // `$env:ABEAM_AGENT = ""` behind, and "`` was not found on PATH" names
+    // nothing a reader can act on.
+    let name = default
+        .filter(|name| !is_blank(name))
+        .unwrap_or_else(|| DEFAULT.to_string());
+
+    Cli::Host {
+        choice: Choice::of(&name),
+        args,
+    }
 }
 
 /// A name that names nothing, wherever it came from.
 ///
 /// Whitespace and not merely emptiness, because the two arrive by the same
 /// route and neither is a program: PowerShell leaves `$env:ABEAM_AGENT = ""`
-/// behind when a variable is cleared and passes `abeam " "` through as one
+/// behind when a variable is cleared and passes `abeam "+ "` through as one
 /// token about as readily. "`   ` was not found on PATH" is no more use than
 /// "`` was not found on PATH", so one rule covers both spellings on both paths.
 fn is_blank(name: &str) -> bool {
@@ -249,29 +362,41 @@ fn is_blank(name: &str) -> bool {
 }
 
 fn nothing() -> String {
-    "abeam was given an empty program name, which names nothing it can look \
-     for. `abeam` on its own hosts the default agent, and `abeam <agent>` or \
-     `abeam <program>` hosts what you name. An empty argument is usually a \
-     shell variable that is not set: PowerShell passes `\"$env:THING\"` on as \
-     an empty string rather than dropping it."
+    "abeam was given a `+` with no name behind it, which names nothing it can \
+     look for. `abeam` on its own hosts the default agent and hands it the rest \
+     of the line; `abeam +<agent>` or `abeam +<program>` hosts what you name. A \
+     bare `+` is usually a shell variable that is not set: PowerShell passes \
+     `+\"$env:THING\"` on as a lone `+` rather than dropping it."
         .to_string()
 }
 
-fn unknown(flag: &str) -> String {
+/// What abeam says to a command line that used to mean the other thing.
+///
+/// Both readings by name, because the reader has just typed something that was
+/// correct for years and the failure they are being saved from is one where
+/// nothing on screen would have said abeam's name. The two ways out are the
+/// same line with one word added, which is why they are spelled out in full
+/// rather than described.
+///
+/// The tokens are joined with single spaces rather than re-quoted: abeam never
+/// saw the shell's quotes, so a line that had any comes back as its words. That
+/// is a shape to recognise rather than one to paste, and the difference between
+/// the two rewrites is visible either way.
+fn ambiguous(name: &str, args: &[String]) -> String {
+    let line = args.join(" ");
     format!(
-        "`{flag}` is not an abeam flag. abeam takes `-h`/`--help` and \
-         `-V`/`--version`, and nothing else: everything from the agent or \
-         program name onwards is passed to it, so `abeam claude --resume` \
-         resumes Claude. Put `--` first to host a program whose own name \
-         starts with a dash."
+        "`abeam {line}` used to host {name}; the command line now belongs to \
+         the agent, so this would pass `{line}` to the default agent.\n\
+         Write `abeam +{line}` to host {name}, or `abeam -- {line}` to mean \
+         `{name}` as an argument to the default one."
     )
 }
 
-/// What `abeam --help` prints.
+/// What `abeam +help` prints.
 ///
-/// Deliberately short. abeam is a terminal user interface with one argument and
-/// two flags; the keys are the interesting part and they are behind `F1`, where
-/// they can be read next to the thing they act on. The agents are listed from
+/// Deliberately short. abeam is a terminal user interface with one token of its
+/// own; the keys are the interesting part and they are behind `F1`, where they
+/// can be read next to the thing they act on. The agents are listed from
 /// [`AGENTS`] rather than written out, because a help text that can disagree
 /// with the table eventually does.
 pub fn help() -> String {
@@ -280,22 +405,22 @@ pub fn help() -> String {
         "abeam - one window for an AI coding session.
 
 Usage:
-  abeam                      host the default agent
-  abeam <agent> [args...]    host one of the agents below
-  abeam <program> [args...]  host any program on PATH
-  abeam -- <program> [...]   ...even one whose name starts with a dash
+  abeam [args...]             host the default agent, and hand it the lot
+  abeam +<agent> [args...]    host one of the agents below instead
+  abeam +<program> [args...]  host any program on PATH
+  abeam -- [args...]          ...when the first argument starts with `+`
 
 Agents: {}
 
-Flags:
-  -h, --help     this
-  -V, --version  the version
+abeam's own, and the only two words it reads:
+  +help     this
+  +version  the version
 
-Everything from the agent or program onwards is passed to it, so abeam's own
-flags have to come first: `abeam claude --resume` resumes Claude.
+Everything else on the command line belongs to the agent, `--help` and
+`--version` included: `abeam --resume` resumes the default agent and `abeam
+agent` sends it `agent`, exactly as the agent itself would have read them.
 
-ABEAM_AGENT names the default. It may be one of the agents above, or any
-program.
+ABEAM_AGENT names the default agent — or program — to host. A `+` overrides it.
 
 F1 inside abeam lists the keys.",
         agents.join(", ")
@@ -312,9 +437,11 @@ pub struct Hosted {
     /// What to call it: the agent's name, or the program as it was typed.
     /// Never the path it *resolved to* — see [`abeam_pty::PtyConfig::title`].
     /// A program typed as a path keeps the path that was typed, which is the
-    /// same rule rather than an exception to it: `abeam .\tools\agent.exe` puts
-    /// exactly that on the border, not the absolute path it became, and
-    /// certainly not the `cmd.exe` a Windows npm shim routes through.
+    /// same rule rather than an exception to it: `abeam +.\tools\agent.exe`
+    /// puts `.\tools\agent.exe` on the border, not the absolute path it became,
+    /// and certainly not the `cmd.exe` a Windows npm shim routes through. The
+    /// sigil is not part of the name either — it is how abeam was told, not
+    /// what it was told.
     ///
     /// One field, and it was briefly two. While the launcher fallback existed
     /// the border had something to say that the line abeam prints on the way
@@ -419,7 +546,7 @@ fn missing(agent: &Agent, table: &[Agent], why: &str) -> String {
             .any(|name| launch::resolve(name, &[]).is_ok())
         {
             said.push(format!(
-                "`{}` is installed; `abeam {}` would host it.",
+                "`{}` is installed; `abeam +{}` would host it.",
                 other.name, other.name
             ));
         }
@@ -537,13 +664,14 @@ mod tests {
         assert_eq!(find("claude").expect("claude is known").name, "claude");
         assert_eq!(find("copilot").expect("copilot is known").name, "copilot");
         // A name that is not in the table is not half-matched into one: it is a
-        // program, and `abeam powershell` has to keep meaning what it meant.
+        // program, and `abeam +powershell` has to keep meaning what `abeam
+        // powershell` meant.
         assert!(find("powershell").is_none());
         assert!(find("claude-code").is_none());
         assert!(find("").is_none());
 
         // Case-insensitively, because this table is abeam's own and `abeam
-        // Claude` is the same request as `abeam claude` on a filesystem that
+        // +Claude` is the same request as `abeam +claude` on a filesystem that
         // folds case and on one that does not.
         assert_eq!(find("Claude").expect("Claude is claude").name, "claude");
         assert_eq!(find("COPILOT").expect("COPILOT is copilot").name, "copilot");
@@ -591,68 +719,333 @@ mod tests {
         assert!(!claude.contains("winget"), "got: {claude}");
     }
 
-    // --- selection --------------------------------------------------------
+    // --- the flip ---------------------------------------------------------
 
     #[test]
-    fn the_first_positional_selects_and_everything_after_it_belongs_to_the_child() {
-        // Nothing named at all: the default.
+    fn everything_on_the_command_line_belongs_to_the_agent() {
+        // The change, in the lines somebody will actually type. Each of these
+        // used to select a program, or be refused, or be answered by abeam;
+        // all of them are the agent's now, in the order they were written.
+        assert_eq!(
+            chose(&["agent"], None),
+            ("agent:claude".into(), args(&["agent"])),
+            "`abeam agent` has to be `claude agent`"
+        );
+        assert_eq!(
+            chose(&["--resume"], None),
+            ("agent:claude".into(), args(&["--resume"]))
+        );
+        assert_eq!(
+            chose(&["-p", "fix the tests"], None),
+            ("agent:claude".into(), args(&["-p", "fix the tests"]))
+        );
         assert_eq!(chose(&[], None), ("agent:claude".into(), vec![]));
 
-        // A name in the table selects that agent...
-        assert_eq!(chose(&["copilot"], None), ("agent:copilot".into(), vec![]));
-        // ...and one that is not keeps today's meaning exactly.
+        // Including the four spellings abeam used to answer itself, which is
+        // the whole of what a reader loses here and the whole of what they
+        // gain: that is Claude's help, and Claude's help is what they asked for.
+        for flag in ["-h", "--help", "-V", "--version"] {
+            assert_eq!(
+                chose(&[flag], None),
+                ("agent:claude".into(), args(&[flag])),
+                "{flag} is the agent's"
+            );
+        }
+
+        // Subcommands nobody could have enumerated in advance, which is the
+        // argument for the rule rather than an example of it.
         assert_eq!(
-            chose(&["powershell"], None),
-            ("program:powershell".into(), vec![])
+            chose(&["mcp", "list"], None),
+            ("agent:claude".into(), args(&["mcp", "list"]))
+        );
+        assert_eq!(
+            chose(&["config", "set", "+x"], None),
+            ("agent:claude".into(), args(&["config", "set", "+x"]))
         );
 
-        // The boundary. abeam parses its own flags only up to here, so these
-        // are the child's — including the one abeam has a use for itself.
+        // An empty argument is an ordinary thing to send a program, and used to
+        // be refused as a name that named nothing. Only a bare `+` is that now.
+        assert_eq!(chose(&[""], None), ("agent:claude".into(), args(&[""])));
         assert_eq!(
-            chose(&["copilot", "--resume"], None),
+            chose(&["", "--resume"], None),
+            ("agent:claude".into(), args(&["", "--resume"]))
+        );
+
+        // A lone dash, which used to be a program name with a sentence waiting
+        // for it and is now a word like any other.
+        assert_eq!(chose(&["-"], None), ("agent:claude".into(), args(&["-"])));
+    }
+
+    // --- the sigil --------------------------------------------------------
+
+    #[test]
+    fn a_leading_plus_token_selects_and_nothing_else_does() {
+        // A name in the table picks that agent...
+        assert_eq!(chose(&["+copilot"], None), ("agent:copilot".into(), vec![]));
+        // ...and one that is not is a program, which is the whole of what the
+        // positional used to do and all that moved.
+        assert_eq!(chose(&["+pwsh"], None), ("program:pwsh".into(), vec![]));
+
+        // The sigil is stripped: it is how abeam was told, not what it was told,
+        // and the border shows the name that was typed behind it.
+        assert_eq!(
+            chose(&["+powershell", "-NoLogo", "-c", "gci"], None),
+            ("program:powershell".into(), args(&["-NoLogo", "-c", "gci"]))
+        );
+
+        // Everything after it is the child's, `--help` included.
+        assert_eq!(
+            chose(&["+copilot", "--resume"], None),
             ("agent:copilot".into(), args(&["--resume"]))
         );
         assert_eq!(
-            chose(&["claude", "-p", "hi"], None),
-            ("agent:claude".into(), args(&["-p", "hi"]))
-        );
-        assert_eq!(
-            chose(&["claude", "--help"], None),
+            chose(&["+claude", "--help"], None),
             ("agent:claude".into(), args(&["--help"])),
-            "`abeam claude --help` is a question for Claude"
+            "`abeam +claude --help` is a question for Claude"
         );
+
+        // Folded, like the table it is read against.
+        assert_eq!(chose(&["+COPILOT"], None), ("agent:copilot".into(), vec![]));
+        assert_eq!(chose(&["+Claude"], None), ("agent:claude".into(), vec![]));
+
+        // A path is a program like any other here. What makes a *relative* one
+        // mean the directory abeam was run in is `main::host`, which is the
+        // only place that still knows which directory that was.
+        let absolute = format!("{SIGIL}{A_PATH}");
         assert_eq!(
-            chose(&["powershell", "-NoLogo", "-c", "gci"], None),
-            ("program:powershell".into(), args(&["-NoLogo", "-c", "gci"]))
+            chose(&[absolute.as_str()], None),
+            (format!("program:{A_PATH}"), vec![])
         );
     }
 
     #[test]
-    fn a_double_dash_ends_abeams_parsing_and_not_the_command_line() {
-        // The one case the "flags first" rule cannot cover on its own.
+    fn only_the_first_token_can_be_abeams() {
+        // A prompt may begin with a `+`, and `config set +x` is a command line
+        // somebody has. Anywhere but the front, a `+` is a character.
         assert_eq!(
-            chose(&["--", "--weird-program"], None),
-            ("program:--weird-program".into(), vec![])
+            chose(&["+claude", "+copilot"], None),
+            ("agent:claude".into(), args(&["+copilot"])),
+            "the second sigil is Claude's argument, not a second selection"
         );
         assert_eq!(
-            chose(&["--", "--weird-program", "-x", "--help"], None),
-            ("program:--weird-program".into(), args(&["-x", "--help"]))
+            chose(&["-p", "+1 for the parser"], None),
+            ("agent:claude".into(), args(&["-p", "+1 for the parser"]))
         );
-
-        // It fences off abeam's flags, not the table. A name in `AGENTS` never
-        // starts with a dash, so this is a second spelling of `abeam claude`
-        // rather than a different request.
         assert_eq!(
-            chose(&["--", "claude"], None),
-            ("agent:claude".into(), vec![])
+            chose(&["+pwsh", "+help"], None),
+            ("program:pwsh".into(), args(&["+help"])),
+            "a reserved word is only reserved in the one position abeam reads"
         );
-
-        // A lone dash is a program name, not a flag with nothing behind it.
-        assert_eq!(chose(&["-"], None), ("program:-".into(), vec![]));
+        assert_eq!(
+            chose(&["+1"], None),
+            ("program:1".into(), vec![]),
+            "...and in that position it is read, however unlike a program it looks"
+        );
     }
 
     #[test]
-    fn abeam_agent_names_the_default_and_a_positional_overrides_it() {
+    fn a_double_dash_fences_a_leading_plus_and_that_is_all_it_has_left_to_do() {
+        // The one case the rule cannot cover on its own, and now the only one:
+        // a first argument that genuinely begins with a `+`. A shell will not
+        // do it for you — `"+1"` arrives here as a token starting `+` exactly
+        // as the unquoted form does.
+        assert_eq!(
+            chose(&["--", "+1", "more", "thing"], None),
+            ("agent:claude".into(), args(&["+1", "more", "thing"]))
+        );
+        assert_eq!(
+            chose(&["--", "+claude"], None),
+            ("agent:claude".into(), args(&["+claude"])),
+            "behind the fence a sigil is a character"
+        );
+        assert_eq!(
+            chose(&["--", "+help"], None),
+            ("agent:claude".into(), args(&["+help"]))
+        );
+
+        // It fences abeam's reading of the line and it does not select: what
+        // follows is arguments and never a program to host. `abeam -- pwsh`
+        // sends the word `pwsh` to the default agent, which is the reverse of
+        // what `--` used to do and is the point of it now.
+        assert_eq!(
+            chose(&["--", "pwsh"], None),
+            ("agent:claude".into(), args(&["pwsh"]))
+        );
+        assert_eq!(
+            chose(&["--", "claude"], Some("copilot")),
+            ("agent:copilot".into(), args(&["claude"]))
+        );
+
+        // Only the first one is abeam's. Any others are the child's, because
+        // plenty of programs read a `--` of their own.
+        assert_eq!(
+            chose(&["--", "--", "-x"], None),
+            ("agent:claude".into(), args(&["--", "-x"]))
+        );
+        assert_eq!(
+            chose(&["-p", "--"], None),
+            ("agent:claude".into(), args(&["-p", "--"]))
+        );
+
+        // On its own it is a fence with nothing behind it.
+        assert_eq!(chose(&["--"], None), ("agent:claude".into(), vec![]));
+    }
+
+    // --- abeam's own two words --------------------------------------------
+
+    #[test]
+    fn the_two_reserved_words_are_answered_rather_than_hosted() {
+        for word in ["+help", "+HELP", "+Help"] {
+            assert!(
+                matches!(parse_with(&args(&[word]), None), Ok(Cli::Help)),
+                "{word} is abeam's help"
+            );
+        }
+        for word in ["+version", "+VERSION", "+Version"] {
+            assert!(
+                matches!(parse_with(&args(&[word]), None), Ok(Cli::Version)),
+                "{word} is abeam's version"
+            );
+        }
+
+        // Answered before the default is looked at, so a default nothing can
+        // start cannot swallow the question.
+        assert!(matches!(
+            parse_with(
+                &args(&["+help", "extra"]),
+                Some("abeam-no-such-agent".into())
+            ),
+            Ok(Cli::Help)
+        ));
+
+        // Two words, and the set stays two. `+h` and `+V` are not short forms
+        // of these: a short form is one more name that can never be a program,
+        // bought with two keystrokes of a command nobody types twice.
+        assert_eq!(chose(&["+h"], None), ("program:h".into(), vec![]));
+        assert_eq!(chose(&["+V"], None), ("program:V".into(), vec![]));
+        // Nor is a word that merely begins with one.
+        assert_eq!(chose(&["+helper"], None), ("program:helper".into(), vec![]));
+
+        // The dashed spellings are the agent's now, which is the whole change,
+        // and this is the assertion that fails if anyone puts them back.
+        for flag in ["-h", "--help", "-V", "--version"] {
+            assert!(
+                matches!(parse_with(&args(&[flag]), None), Ok(Cli::Host { .. })),
+                "{flag} belongs to the agent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sigil_with_nothing_behind_it_is_a_sentence_rather_than_the_default() {
+        // The other half of the blank rule, going the other way on purpose. An
+        // unset variable is a default that should not be there; a typed `+` is
+        // a request, and answering a request for nothing by starting the
+        // default agent hands the arguments after it to a program nobody named.
+        for typed in ["+", "+ ", "+   ", "+\t"] {
+            let refused =
+                parse_with(&args(&[typed]), None).expect_err("a bare sigil is not a program");
+            assert!(refused.contains('+'), "got: {refused}");
+            // What used to come out, and what a reader could do nothing with.
+            assert!(
+                !refused.contains("was not found on PATH"),
+                "the old non-answer is back: {refused}"
+            );
+        }
+
+        // Especially with arguments after it, which is where defaulting would
+        // do real damage.
+        assert!(parse_with(&args(&["+", "--resume"]), None).is_err());
+        // A default that is set makes no difference — the token is what was
+        // asked for, and it asked for nothing.
+        assert!(parse_with(&args(&["+"]), Some("copilot".into())).is_err());
+
+        // Behind the fence, and anywhere but the front, it is an argument like
+        // any other: there is no sigil there to be empty.
+        assert_eq!(
+            chose(&["--", "+"], None),
+            ("agent:claude".into(), args(&["+"]))
+        );
+        assert_eq!(
+            chose(&["-p", "+"], None),
+            ("agent:claude".into(), args(&["-p", "+"]))
+        );
+    }
+
+    // --- the refusal that keeps the old command line honest ----------------
+
+    #[test]
+    fn a_first_word_that_used_to_select_is_refused_rather_than_quietly_reread() {
+        // Every name in the table, because this refusal has to grow with it:
+        // the hazard is precisely a name abeam itself once treated as a
+        // selection, and a new agent brings a new one.
+        for agent in AGENTS {
+            let refused = parse_with(&args(&[agent.name, "agent"]), None)
+                .expect_err("a name that used to select is not silently rewritten");
+
+            // Both readings, named. Somebody has just typed a line that was
+            // right for years, and without this they would be reading the
+            // agent's complaint about an argument on a screen that never
+            // mentions abeam.
+            assert!(refused.contains("used to host"), "got: {refused}");
+            assert!(refused.contains(agent.name), "got: {refused}");
+
+            // ...and both ways out, each of them this line plus one word. They
+            // are asserted as whole phrases because either half alone would
+            // pass by accident.
+            assert!(
+                refused.contains(&format!("`abeam +{} agent`", agent.name)),
+                "the way to host it is missing from: {refused}"
+            );
+            assert!(
+                refused.contains(&format!("`abeam -- {} agent`", agent.name)),
+                "the way to mean the word is missing from: {refused}"
+            );
+
+            // Case-insensitively, because the table is: somebody typing `abeam
+            // Claude` is the same person making the same mistake.
+            let shouted = agent.name.to_uppercase();
+            assert!(parse_with(&args(&[shouted.as_str()]), None).is_err());
+            // With nothing after it, which is the commonest way to arrive here
+            // — it is what the old README said to type.
+            assert!(parse_with(&args(&[agent.name]), None).is_err());
+            // And whatever the default is. This is a fixed lookup on the token
+            // rather than a question about what would otherwise have run.
+            assert!(parse_with(&args(&[agent.name]), Some("pwsh".into())).is_err());
+        }
+
+        // Only the table, and never `PATH`. A word that is not in it is an
+        // argument like any other however much it looks like a program, which
+        // is what makes this answer the same on every machine — a refusal that
+        // depended on what was installed would accept a command line here and
+        // reject it on a build server.
+        assert_eq!(
+            chose(&["claude-code"], None),
+            ("agent:claude".into(), args(&["claude-code"]))
+        );
+        assert_eq!(
+            chose(&[EVERY_MACHINE], None),
+            ("agent:claude".into(), args(&[EVERY_MACHINE])),
+            "a program that is certainly installed is still just a word here"
+        );
+
+        // Behind the sigil it is a selection again, and behind the fence it is
+        // a word. Those are the two escapes the message names, and they have to
+        // do what it says they do.
+        assert_eq!(
+            chose(&["+claude", "agent"], None),
+            ("agent:claude".into(), args(&["agent"]))
+        );
+        assert_eq!(
+            chose(&["--", "claude", "agent"], None),
+            ("agent:claude".into(), args(&["claude", "agent"]))
+        );
+    }
+
+    // --- the default ------------------------------------------------------
+
+    #[test]
+    fn abeam_agent_names_what_to_host_and_a_plus_token_overrides_it() {
         // It may name an agent...
         assert_eq!(
             chose(&[], Some("copilot")),
@@ -665,17 +1058,30 @@ mod tests {
             (format!("program:{A_PATH}"), vec![])
         );
 
-        // Overridden by anything typed, whichever kind each of them is.
+        // The sentence this change bought. A default that applies to a command
+        // line with arguments on it is a default worth setting; before this,
+        // `--resume` was an unrecognised abeam flag and naming Copilot meant a
+        // positional that then shadowed everything after it.
         assert_eq!(
-            chose(&["claude"], Some("copilot")),
+            chose(&["--resume"], Some("copilot")),
+            ("agent:copilot".into(), args(&["--resume"]))
+        );
+        assert_eq!(
+            chose(&["-p", "fix the tests"], Some(A_PATH)),
+            (format!("program:{A_PATH}"), args(&["-p", "fix the tests"]))
+        );
+
+        // Overridden by a `+` token, whichever kind each of them is.
+        assert_eq!(
+            chose(&["+claude"], Some("copilot")),
             ("agent:claude".into(), vec![])
         );
         assert_eq!(
-            chose(&["powershell"], Some("copilot")),
-            ("program:powershell".into(), vec![])
+            chose(&["+pwsh"], Some("copilot")),
+            ("program:pwsh".into(), vec![])
         );
         assert_eq!(
-            chose(&["copilot", "--resume"], Some("claude")),
+            chose(&["+copilot", "--resume"], Some("claude")),
             ("agent:copilot".into(), args(&["--resume"]))
         );
 
@@ -686,95 +1092,11 @@ mod tests {
         assert_eq!(chose(&[], Some("")), ("agent:claude".into(), vec![]));
         assert_eq!(chose(&[], Some("   ")), ("agent:claude".into(), vec![]));
         assert_eq!(chose(&[], Some("\t")), ("agent:claude".into(), vec![]));
-    }
-
-    #[test]
-    fn a_typed_name_that_is_nothing_is_a_sentence_rather_than_the_default() {
-        // The other half of the same rule, going the other way on purpose. An
-        // unset variable is a default that should not be there; a typed
-        // argument is a request, and answering a request for nothing by
-        // starting the default agent hands the arguments after it to a program
-        // nobody named.
-        for typed in ["", " ", "   ", "\t"] {
-            let refused =
-                parse_with(&args(&[typed]), None).expect_err("an empty name is not a program");
-            assert!(refused.contains("empty"), "got: {refused}");
-            // What used to come out, and what a reader could do nothing with.
-            assert!(
-                !refused.contains("was not found on PATH"),
-                "the old non-answer is back: {refused}"
-            );
-        }
-
-        // Especially with arguments after it, which is where defaulting would
-        // do real damage.
-        assert!(parse_with(&args(&["", "--resume"]), None).is_err());
-        // Behind the fence too: `--` ends abeam's flags, it does not make a
-        // blank token into a program name.
-        assert!(parse_with(&args(&["--", "  "]), None).is_err());
-        // A default that is set makes no difference either — the argument is
-        // what was asked for, and it asked for nothing.
-        assert!(parse_with(&args(&[""]), Some("copilot".into())).is_err());
-
-        // ...and a blank *after* the selector belongs to the child, untouched.
-        // An empty argument is an ordinary thing for a program to be sent.
+        // ...and it is unset with arguments on the line too, rather than
+        // swallowing them into a program nobody named.
         assert_eq!(
-            chose(&["claude", "", "-p"], None),
-            ("agent:claude".into(), args(&["", "-p"]))
-        );
-    }
-
-    // --- abeam's own two flags --------------------------------------------
-
-    #[test]
-    fn help_and_version_are_answered_rather_than_spawned() {
-        // The papercut this fixes: `abeam --help` used to reach
-        // `CreateProcessW` as a program called `--help`.
-        for flag in ["--help", "-h"] {
-            assert!(
-                matches!(parse_with(&args(&[flag]), None), Ok(Cli::Help)),
-                "{flag} is help"
-            );
-        }
-        for flag in ["--version", "-V"] {
-            assert!(
-                matches!(parse_with(&args(&[flag]), None), Ok(Cli::Version)),
-                "{flag} is the version"
-            );
-        }
-        // Answered before the selector is even looked at, so a default that
-        // does not exist cannot swallow the question.
-        assert!(matches!(
-            parse_with(
-                &args(&["--help", "copilot"]),
-                Some("abeam-no-such-agent".into())
-            ),
-            Ok(Cli::Help)
-        ));
-    }
-
-    #[test]
-    fn an_unrecognised_flag_is_a_sentence_rather_than_a_spawn() {
-        let refused = parse_with(&args(&["--colour"]), None).expect_err("not an abeam flag");
-        assert!(refused.contains("--colour"), "got: {refused}");
-        // Naming the flags that do exist is the whole job: without them this is
-        // an error message that leaves you guessing.
-        assert!(refused.contains("--help"), "got: {refused}");
-        assert!(refused.contains("--version"), "got: {refused}");
-        // "`--help` contains `--`" would pass this by accident, so it is the
-        // whole phrase: the way out for a program whose name starts with a dash
-        // is the one thing an unrecognised-flag message is likely to be about.
-        assert!(
-            refused.contains("Put `--` first"),
-            "the way to name a dashed program is missing from: {refused}"
-        );
-
-        // Before the program, which is the only place abeam reads flags.
-        assert!(parse_with(&args(&["-x", "claude"]), None).is_err());
-        // ...and after it, it is not abeam's to complain about.
-        assert_eq!(
-            chose(&["claude", "--colour"], None),
-            ("agent:claude".into(), args(&["--colour"]))
+            chose(&["--resume"], Some("")),
+            ("agent:claude".into(), args(&["--resume"]))
         );
     }
 
@@ -784,13 +1106,16 @@ mod tests {
         for agent in AGENTS {
             assert!(
                 help.contains(agent.name),
-                "{} is missing from --help",
+                "{} is missing from +help",
                 agent.name
             );
         }
         assert!(help.contains("ABEAM_AGENT"), "the override has to be in it");
         assert!(help.contains("F1"), "the keys live behind F1, not here");
-        assert!(help.contains("--help") && help.contains("--version"));
+        // abeam's own two words, in the spelling that reaches them. A help text
+        // still offering `--help` would be documenting the agent's flag as
+        // abeam's, which is the exact confusion this rule removed.
+        assert!(help.contains("+help") && help.contains("+version"));
         // Short, because this is a terminal user interface and not a CLI with
         // fifty options. A page that scrolls is a page nobody reads.
         assert!(help.lines().count() < 30, "the help has grown a scrollbar");
@@ -874,8 +1199,11 @@ mod tests {
             refused.contains("`abeam-test-two` is installed"),
             "got: {refused}"
         );
+        // With the sigil, because the sentence has to be the command to type
+        // and `abeam abeam-test-two` is no longer that command — it would send
+        // the name to the agent that is missing.
         assert!(
-            refused.contains("`abeam abeam-test-two` would host it"),
+            refused.contains("`abeam +abeam-test-two` would host it"),
             "the sentence has to be the command to type: {refused}"
         );
     }

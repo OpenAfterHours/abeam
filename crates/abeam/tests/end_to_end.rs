@@ -65,6 +65,15 @@ const DEADLINE: Duration = Duration::from_secs(20);
 /// killed. Named absolutely on Unix, exactly as `panes::shell`'s own suite
 /// names it, so that a failure here is a fact about abeam and not about the
 /// runner's `PATH`.
+///
+/// It is the program's *name*, without the `+` that asks abeam to host it, and
+/// the two call sites below add the sigil themselves. That is the shape the
+/// assertions want: the command line now belongs to the agent, so `+` is the
+/// only way left to name a program to host — while the border still reads the
+/// name that was typed with the sigil stripped, which is what every assertion
+/// about the left title is checking. One constant that means "the program"
+/// keeps those two facts from being written as one string that is right for
+/// neither.
 #[cfg(windows)]
 const HOSTED: &str = "cmd.exe";
 #[cfg(unix)]
@@ -243,7 +252,7 @@ impl Drop for Dir {
 fn abeam(dir: &Dir) -> PtySession {
     PtySession::spawn(
         PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
-            .arg(HOSTED)
+            .arg(format!("+{HOSTED}"))
             .cwd(&dir.0)
             // The command view would otherwise search: `pwsh` on Windows, whose
             // banner and startup time vary by machine, and `$SHELL` on Unix,
@@ -415,7 +424,7 @@ fn a_shell_planted_in_the_repository_is_not_what_alt_s_runs() {
     plant(&dir);
 
     let mut cfg = PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
-        .arg(HOSTED)
+        .arg(format!("+{HOSTED}"))
         .cwd(&dir.0)
         // The bare name, which is the only spelling that asks the question this
         // test is about: an absolute one is abeam being told exactly what to
