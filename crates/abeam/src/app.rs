@@ -19,7 +19,7 @@
 //! wire between them is here, in [`App::pump`].
 
 use std::io::{BufWriter, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,9 @@ use crate::pane::{Focus, Pane};
 use crate::panes::{
     DiagPane, FrameStats, GitPane, QueuePane, RightView, ShellPane, TerminalPane, ViewerPane,
 };
-use crate::watch::Watch;
+use crate::paths;
+use crate::watch::{Change, Watch};
+use crate::workspace::{self, Worktree};
 
 pub type Tui = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
@@ -83,6 +85,20 @@ const READINESS_EVERY: Duration = Duration::from_millis(250);
 /// it — it updates rows that are already on screen — so the only cost of being
 /// late is a status a few seconds stale.
 const ROSTER_EVERY: Duration = Duration::from_secs(3);
+
+/// How often `git worktree list` is asked what worktrees exist.
+///
+/// Slower again than the roster, because nothing waits on it. The list decides
+/// how watcher events are routed, and the thing that changes it is somebody
+/// running `git worktree add` — which happens a few times a day, in another
+/// terminal, and is worth learning about in ten seconds rather than in one.
+///
+/// The first pass runs it immediately all the same. Until it answers, abeam
+/// knows about exactly one workspace and routes every change to it, which is
+/// the old behaviour and therefore the old bug; ten seconds of that at startup
+/// would be ten seconds of a neighbouring agent's writes landing in this
+/// window before the fix switched on.
+const WORKTREES_EVERY: Duration = Duration::from_secs(10);
 
 /// Why the loop woke up.
 enum Wake {
@@ -255,6 +271,17 @@ pub struct App {
     readiness_at: Instant,
     /// When the background-agent roster was last asked for.
     roster_at: Instant,
+    /// When `git worktree list` was last asked for.
+    worktrees_at: Instant,
+    /// Every worktree of the repository on screen, as git last described them.
+    ///
+    /// Held here rather than in a pane because it is not any one pane's: it is
+    /// what [`App::route`] uses to decide whose change a watcher event was, and
+    /// the watcher is the shell's. Empty until the first discovery answers, and
+    /// empty for ever on a machine with no git — both of which route exactly as
+    /// abeam did before this existed, because [`App::workspace_roots`] puts the
+    /// agent's own root in the list whatever git said.
+    worktrees: Vec<Worktree>,
     /// Whether the user has typed something at the agent that they have not
     /// submitted.
     ///
@@ -272,10 +299,30 @@ pub struct App {
     /// thread per loop iteration behind itself.
     roster_running: bool,
     dispatch_running: bool,
+    worktrees_running: bool,
     /// Something has been dispatched at least once, so the roster is worth
     /// asking for. Sticky, and the reason a session that only ever uses the
     /// first mode never starts a `claude agents` process.
     dispatched_any: bool,
+    /// The worktree list has been asked for at least once, so the roster is
+    /// worth asking for on its account too. Sticky, for the same reason
+    /// [`dispatched_any`](Self::dispatched_any) is.
+    ///
+    /// Two flags rather than one, and not because they are hard to tell apart.
+    /// `claude agents --json` is a *process*, and the rule the older flag was
+    /// written to keep is that a session which never uses a feature never
+    /// starts it. Occupancy — who is working in which worktree — needs the same
+    /// roster, so the honest change is a second reason to want it, not the
+    /// deletion of the first: `dispatched_any || worktrees_wanted`, where
+    /// dropping the gate outright would have started that process in every
+    /// session abeam has ever run.
+    ///
+    /// Nothing sets this yet. The half of this work that puts a worktree list
+    /// on screen is what asks, and the gate is written now rather than then
+    /// because a gate added after the thing it guards is a gate somebody has to
+    /// notice is missing. [`App::roster_is_wanted`] is the whole of it and has
+    /// a test.
+    worktrees_wanted: bool,
     /// A sent prompt is sitting in the composer, waiting for the `Enter` that
     /// submits it on the next pass. See [`App::pump_queue`].
     submit_pending: bool,
@@ -290,6 +337,10 @@ pub struct App {
 enum Work {
     Roster(Vec<crate::agentstate::Session>),
     Dispatched(Result<crate::dispatch::Started>),
+    /// What `git worktree list` said. Never an error: `crate::workspace`
+    /// answers a failure with an empty list, because there is nothing here that
+    /// could act on the difference — no git and no worktrees route identically.
+    Worktrees(Vec<Worktree>),
 }
 
 impl App {
@@ -357,12 +408,19 @@ impl App {
             // waiting a quarter second to find out what it is looking at.
             readiness_at: Instant::now() - READINESS_EVERY,
             roster_at: Instant::now() - ROSTER_EVERY,
+            // And far enough back that the first pass asks git, for the reason
+            // [`WORKTREES_EVERY`] gives: until it answers, every neighbouring
+            // worktree's writes land in this window.
+            worktrees_at: Instant::now() - WORKTREES_EVERY,
+            worktrees: Vec::new(),
             draft_open: false,
             work_tx,
             work_rx,
             roster_running: false,
             dispatch_running: false,
+            worktrees_running: false,
             dispatched_any: false,
+            worktrees_wanted: false,
             submit_pending: false,
             root,
             agent: agent.to_string(),
@@ -657,20 +715,7 @@ impl App {
         if let Some(change) = self.watch.as_ref().map(Watch::drain)
             && !change.is_empty()
         {
-            if change.worktree {
-                // Coalescing is the pane's, and it is deliberate: a burst of
-                // saves costs one extra refresh rather than one per file.
-                self.git.request_refresh();
-            }
-            for path in change.markdown {
-                // Queued, never shown from here. The viewer takes it up on the
-                // frame it is actually drawn, so nothing pulls the pane out
-                // from under someone reading git.
-                self.viewer.follow(path);
-            }
-            // The queue changed even if no pane's content did: the border's
-            // unread mark is drawn from it.
-            redraw = true;
+            redraw |= self.route(change);
         }
 
         // Enter in the git view. Draining unconditionally matters — a request
@@ -686,6 +731,111 @@ impl App {
 
         redraw |= self.pump_queue();
         redraw
+    }
+
+    /// Hand one batch of watcher news to the panes that own it, and to no
+    /// others.
+    ///
+    /// One recursive watch covers the agent's root, and Claude Code makes git
+    /// worktrees inside that root and runs other agents in them. So a batch is
+    /// not automatically about the workspace on screen: before this, every file
+    /// a neighbouring agent wrote in `<root>/.claude/worktrees/other` refreshed
+    /// this window's git pane and pulled that agent's scratch markdown into
+    /// this window's reader, with nothing saying where it came from.
+    ///
+    /// The rule is `crate::workspace`'s and the argument for it is there:
+    /// **innermost ownership**. A path belongs to the longest known root that
+    /// contains it, and a pane takes it only when that root is the one the pane
+    /// is on. A prefix test cannot do this — a nested worktree's paths really
+    /// do begin with the outer root, which is the whole of why the naive fix
+    /// fixes nothing.
+    ///
+    /// **Nothing here is unconditional any more, and that is the second half of
+    /// the change.** A batch used to earn a frame merely by being non-empty;
+    /// now a neighbouring agent's churn must cost nothing at all, or the fix
+    /// would trade a wrong refresh for a wasted one. A frame re-renders the
+    /// agent's entire screen — the discipline `tick_panes` and `crate::pane`
+    /// already keep.
+    fn route(&mut self, change: Change) -> bool {
+        let roots = self.workspace_roots();
+        // The workspace the right pane is looking at. The agent's own root
+        // today, because nothing re-roots the panes yet; the half of this work
+        // that adds `set_root` is what makes this a variable rather than a
+        // clone of one line above it. Named all the same, because the routing
+        // question is "is this workspace the one on screen" and writing
+        // `self.root` twice would hide that they are two different facts that
+        // currently agree.
+        let at = self.root.clone();
+        let mine = |path: &Path| {
+            workspace::owner(&roots, path).is_some_and(|owner| paths::same_dir(owner, &at))
+        };
+
+        let mut redraw = false;
+
+        // An overflowed batch threw away the paths that would have answered
+        // this, so it is taken as "assume everything changed" — which is what
+        // every pane assumed before any of them could tell one workspace from
+        // another. Refreshing on somebody else's branch switch costs one
+        // `git status`; not refreshing on our own costs a pane that is quietly
+        // wrong until its two-second poll catches up.
+        if change.overflowed || change.changed.iter().any(|path| mine(path)) {
+            // Coalescing is the pane's, and it is deliberate: a burst of
+            // saves costs one extra refresh rather than one per file.
+            self.git.request_refresh();
+            redraw = true;
+        }
+
+        for path in change.markdown {
+            if !mine(&path) {
+                continue;
+            }
+            // Queued, never shown from here. The viewer takes it up on the
+            // frame it is actually drawn, so nothing pulls the pane out
+            // from under someone reading git.
+            self.viewer.follow(path);
+            // The queue changed even if no pane's content did: the border's
+            // unread mark is drawn from it.
+            redraw = true;
+        }
+
+        redraw
+    }
+
+    /// Every workspace root abeam knows about, for [`workspace::owner`] to pick
+    /// between.
+    ///
+    /// The agent's own root is first and is in the list unconditionally, which
+    /// is what makes every failure of discovery harmless. No git on the
+    /// machine, a directory that is not a repository, a git too old for the
+    /// `-z` this parser needs: each of those leaves `worktrees` empty, and a
+    /// list holding only the agent's root routes every watched path to the pane
+    /// exactly as abeam did before any of this. The fix degrades to the bug it
+    /// fixes, and never to a watcher that has silently stopped.
+    ///
+    /// It is also usually a duplicate — git names the main worktree too — and
+    /// deliberately not deduplicated. The two spellings differ on Windows
+    /// (`C:\…` here, `C:/…` from git), `owner` is answering with whichever it
+    /// picked, and the caller compares that answer with `paths::same_dir`
+    /// rather than `==`. Deduplicating would mean choosing which spelling wins,
+    /// which is a decision with no right answer and no need to be made.
+    fn workspace_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(self.worktrees.len() + 1);
+        roots.push(self.root.clone());
+        roots.extend(self.worktrees.iter().map(|worktree| worktree.root.clone()));
+        roots
+    }
+
+    /// Whether anything wants the background-agent roster enough to pay for the
+    /// process that produces it.
+    ///
+    /// A named predicate rather than two conditions in an `if`, because what it
+    /// is protecting is not obvious from either of them: `crate::agentstate`'s
+    /// roster starts `claude agents --json`, and the rule is that a session
+    /// which never uses a feature never starts it. See
+    /// [`worktrees_wanted`](Self::worktrees_wanted) for why there are two
+    /// reasons now and why neither replaced the other.
+    fn roster_is_wanted(&self) -> bool {
+        self.dispatched_any || self.worktrees_wanted
     }
 
     /// The queue's two wires out, and the results of both coming back.
@@ -747,9 +897,12 @@ impl App {
             redraw = true;
         }
 
-        // Only while there is something dispatched to report on. A session
-        // that never uses the second mode never starts this process.
-        if !self.roster_running && self.dispatched_any && self.roster_at.elapsed() >= ROSTER_EVERY {
+        // Only while something wants it. A session that never dispatches and
+        // never opens the worktree list never starts this process.
+        if !self.roster_running
+            && self.roster_is_wanted()
+            && self.roster_at.elapsed() >= ROSTER_EVERY
+        {
             self.roster_running = true;
             self.roster_at = Instant::now();
             let tx = self.work_tx.clone();
@@ -758,6 +911,28 @@ impl App {
                 let _ = tx.send(Work::Roster(
                     crate::agentstate::roster(&root).unwrap_or_default(),
                 ));
+            });
+        }
+
+        // A sibling of the block above rather than of anything in this
+        // function's subject, and it is here because this is where the worker
+        // channel is started and drained: "one at a time, and not on this
+        // thread" is a rule that is only visible if the calls it governs are
+        // written together.
+        //
+        // Ungated, unlike the roster. It costs one `git worktree list` every
+        // ten seconds, which is a read of `.git/worktrees` and no network, no
+        // index and no lock — and unlike the roster, something *does* depend on
+        // the answer: [`App::route`] cannot tell a nested worktree from the
+        // repository until git has said which is which, and until then every
+        // neighbouring agent's writes land in this window.
+        if !self.worktrees_running && self.worktrees_at.elapsed() >= WORKTREES_EVERY {
+            self.worktrees_running = true;
+            self.worktrees_at = Instant::now();
+            let tx = self.work_tx.clone();
+            let root = self.root.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(Work::Worktrees(crate::workspace::discover(&root)));
             });
         }
 
@@ -775,6 +950,15 @@ impl App {
                     self.dispatched_any |= outcome.is_ok();
                     self.queue.note_dispatched(outcome);
                     redraw = true;
+                }
+                Work::Worktrees(found) => {
+                    self.worktrees_running = false;
+                    self.worktrees = found;
+                    // No redraw, deliberately. Nothing on screen is drawn from
+                    // this list yet — it only changes where the *next* batch of
+                    // watcher events is routed — so claiming a frame for it
+                    // would be a full re-render of the agent's screen every ten
+                    // seconds, for ever, to show nobody anything.
                 }
             }
         }
@@ -1732,7 +1916,11 @@ mod tests {
         assert!(fx.app.submit_pending, "nothing owes the agent an Enter");
 
         assert!(fx.app.pump_queue(), "the submit is worth a frame too");
-        assert_eq!(keys_sent(&fx), 1, "the Enter that submits it never went out");
+        assert_eq!(
+            keys_sent(&fx),
+            1,
+            "the Enter that submits it never went out"
+        );
         assert!(!fx.app.submit_pending);
 
         // And nothing is owed after that, or the queue would type a bare
@@ -2545,6 +2733,293 @@ mod tests {
         release.kind = KeyEventKind::Release;
         app.handle_event(Event::Key(release)).unwrap();
         assert_eq!(app.right_view, RightView::Git);
+    }
+
+    // --- whose change was that ---------------------------------------------
+
+    /// A worktree of the fixture's repository, made as a real directory.
+    ///
+    /// Real, and not a `PathBuf` built out of literals, because the whole
+    /// subject is what a path looks like coming back from a filesystem: the
+    /// separators are the platform's, the case is whatever the disk kept, and
+    /// a fixture written from the code cannot be wrong about those in the same
+    /// direction the code is wrong. `git worktree list` is not run here —
+    /// `crate::workspace` proves that end against a real repository, and
+    /// re-proving it would make this a test of git rather than of routing.
+    fn worktree_at(fx: &Fixture, rel: &str) -> Worktree {
+        let root = fx.dir.path().join(rel);
+        std::fs::create_dir_all(&root).expect("create the worktree directory");
+        worktree(root, rel.rsplit('/').next().unwrap_or(rel))
+    }
+
+    /// The repository itself, which `git worktree list` names alongside the
+    /// nested ones — so the routing list normally holds the agent's own root
+    /// twice, once as abeam spelled it and once as git did.
+    fn the_main_worktree(fx: &Fixture) -> Worktree {
+        worktree(fx.dir.path().to_path_buf(), "main")
+    }
+
+    fn worktree(root: PathBuf, branch: &str) -> Worktree {
+        Worktree {
+            root,
+            branch: Some(branch.to_string()),
+            head: None,
+            detached: false,
+            bare: false,
+        }
+    }
+
+    /// A real file at `rel`, and the batch a watcher would have made of it.
+    ///
+    /// Built directly rather than by waiting on a live watcher, because the
+    /// question here is what the *shell* does with a batch. `crate::watch`
+    /// proves that a real debouncer produces one, and a test that waited for
+    /// one would be timing the platform rather than reading the routing.
+    fn wrote(fx: &Fixture, rel: &str) -> Change {
+        let path = fx.dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("create");
+        std::fs::write(&path, b"# hello\n").expect("write");
+        Change {
+            markdown: if crate::watch::is_markdown(&path) {
+                vec![path.clone()]
+            } else {
+                Vec::new()
+            },
+            changed: vec![path],
+            overflowed: false,
+        }
+    }
+
+    #[test]
+    fn a_write_in_a_neighbouring_worktree_reaches_neither_pane() {
+        // The bug, from the shell's side. Claude Code makes worktrees under
+        // `.claude/worktrees/` inside the repository abeam is watching and runs
+        // other agents in them, so one recursive watch covers two people's
+        // work. `<root>/.claude/worktrees/other/NOTES.md` has `<root>` as a
+        // prefix — which is why routing by prefix fixes nothing — and it used
+        // to refresh this window's git pane and put that agent's scratch note
+        // in front of this window's reader.
+        let mut fx = app();
+        let mine = the_main_worktree(&fx);
+        let theirs = worktree_at(&fx, ".claude/worktrees/other");
+        fx.app.worktrees = vec![mine, theirs];
+
+        let change = wrote(&fx, ".claude/worktrees/other/NOTES.md");
+        assert!(
+            !fx.app.route(change),
+            "somebody else's work must not even cost a frame"
+        );
+        assert!(
+            !fx.app.viewer.has_pending(),
+            "the reader was handed another agent's document"
+        );
+
+        // ...and a source file in there is no different: it is the git pane
+        // this used to wake on every single write.
+        let change = wrote(&fx, ".claude/worktrees/other/src/lib.rs");
+        assert!(!fx.app.route(change));
+    }
+
+    #[test]
+    fn a_write_in_the_workspace_on_screen_still_reaches_both_panes() {
+        // The other half, and the one that makes the test above mean something:
+        // a routing rule that dropped everything would pass it. This is abeam's
+        // whole reason to exist — the agent writes a file and both panes
+        // already know — so it has to survive the fix intact.
+        let mut fx = app();
+        let mine = the_main_worktree(&fx);
+        let theirs = worktree_at(&fx, ".claude/worktrees/other");
+        fx.app.worktrees = vec![mine, theirs];
+
+        let change = wrote(&fx, "docs/DESIGN.md");
+        assert!(fx.app.route(change), "the reader has news to show");
+        assert!(fx.app.viewer.has_pending());
+    }
+
+    #[test]
+    fn a_repository_git_never_answered_about_routes_exactly_as_it_used_to() {
+        // Discovery fails on a machine with no git, in a directory that is not
+        // a repository, and on a git too old for the `-z` the parser needs. All
+        // three leave the list empty, and an empty list must degrade to the old
+        // behaviour rather than to a watcher that has silently stopped —
+        // "nothing is mine" is the one failure that looks exactly like the
+        // feature having been deleted.
+        let mut fx = app();
+        assert!(fx.app.worktrees.is_empty(), "nothing has discovered yet");
+
+        let change = wrote(&fx, "notes.md");
+        assert!(fx.app.route(change));
+        assert!(fx.app.viewer.has_pending());
+
+        // Including the paths that would have belonged to a nested worktree, if
+        // anything had known there was one.
+        let change = wrote(&fx, ".claude/worktrees/other/NOTES.md");
+        assert!(fx.app.route(change));
+    }
+
+    #[test]
+    fn a_batch_too_big_to_route_refreshes_rather_than_dropping_everything() {
+        // `git checkout` of a large branch overflows the batch, and an
+        // overflowed batch threw away the paths that would have said whose it
+        // was. Assuming it was ours costs one `git status`; assuming it was not
+        // costs a pane that is wrong until its own two-second poll notices.
+        let mut fx = app();
+        fx.app.worktrees = vec![worktree_at(&fx, ".claude/worktrees/other")];
+
+        let flood = Change {
+            markdown: Vec::new(),
+            changed: Vec::new(),
+            overflowed: true,
+        };
+        assert!(fx.app.route(flood), "the git pane was never told");
+    }
+
+    /// An `App` over a real git repository with a real nested worktree in it,
+    /// laid out exactly as Claude Code lays one out.
+    ///
+    /// Built before the `App` rather than after, because `App::new` starts the
+    /// watcher and there is no way to hand it a directory that grew a worktree
+    /// afterwards — which is also the shape of the bug: the worktree is there
+    /// first and the window opens into it.
+    ///
+    /// `None` when git is not on this machine. That is a skip rather than a
+    /// failure, and it is the only one in this file: everything else here needs
+    /// a pty and a child, which every machine has, and this needs a third-party
+    /// program that a minimal container may not. The one test that uses it says
+    /// so out loud rather than passing quietly.
+    fn app_in_a_repository_with_a_neighbour() -> Option<Fixture> {
+        let dir = TempDir::new("app-worktrees");
+        let root = dir.path();
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env("GIT_AUTHOR_NAME", "abeam")
+                .env("GIT_AUTHOR_EMAIL", "abeam@example.invalid")
+                .env("GIT_COMMITTER_NAME", "abeam")
+                .env("GIT_COMMITTER_EMAIL", "abeam@example.invalid")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+
+        std::fs::write(root.join("README.md"), b"# repo\n").expect("write");
+        if !git(&["init", "-q", "-b", "main", "."])
+            || !git(&["add", "-A"])
+            || !git(&["commit", "-qm", "first"])
+            || !git(&[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                ".claude/worktrees/other",
+            ])
+        {
+            return None;
+        }
+
+        let (program, args) = EXITS;
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let left = TerminalPane::spawn(program, &args, 20, 60).expect("spawn a child in a pty");
+        let app = App::new(
+            left,
+            root.to_path_buf(),
+            "claude",
+            crate::config::Opening::default(),
+        );
+        Some(Fixture { app, dir })
+    }
+
+    #[test]
+    fn a_real_watcher_over_a_real_worktree_hands_a_neighbours_writes_to_nobody() {
+        // Every other test here builds the `Change` it routes. This one builds
+        // nothing: a real repository on disk, a real `git worktree add` where
+        // Claude Code puts one, a real `notify` watch, and real files written
+        // into both trees. Each step of it belongs to somebody else — git
+        // decides how it spells the worktree path, the platform decides how
+        // `notify` spells the event — and a fixture cannot be wrong about those
+        // in the same direction the code is wrong, which is exactly what a
+        // fixture written from the code would do.
+        let Some(mut fx) = app_in_a_repository_with_a_neighbour() else {
+            panic!("this test needs git on PATH; without it the claim is untested");
+        };
+
+        // Discovery runs on a worker thread, and until it answers abeam knows
+        // about one workspace and routes everything to it — the old behaviour,
+        // and the old bug. Waiting for it here is not slack in the test; it is
+        // the window `WORKTREES_EVERY`'s first pass exists to keep short.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fx.app.worktrees.len() < 2 && Instant::now() < deadline {
+            fx.app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fx.app.worktrees.len(),
+            2,
+            "git never described the two worktrees"
+        );
+
+        // The neighbouring agent writes a document. Nothing may come of it.
+        let theirs = fx.dir.path().join(".claude/worktrees/other/THEIRS.md");
+        std::fs::write(&theirs, b"# not yours\n").expect("write");
+
+        // Several debounces, which is long enough that an event still on its
+        // way would have arrived.
+        let settle = Instant::now() + Duration::from_millis(1500);
+        let mut leaked = false;
+        while Instant::now() < settle {
+            leaked |= fx.app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !fx.app.viewer.has_pending(),
+            "another agent's document was put in front of the reader"
+        );
+        assert!(
+            !leaked,
+            "another agent's write cost this window a frame it had no news for"
+        );
+
+        // ...and the watcher was alive the whole time, which is the half that
+        // stops the assertions above from passing for the worst possible
+        // reason. The same write, one directory up, still reaches both panes.
+        let mine = fx.dir.path().join("MINE.md");
+        std::fs::write(&mine, b"# yours\n").expect("write");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.app.viewer.has_pending() && Instant::now() < deadline {
+            fx.app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            fx.app.viewer.has_pending(),
+            "the watcher never reported a write in the repository on screen"
+        );
+    }
+
+    #[test]
+    fn the_roster_process_starts_for_a_reason_or_not_at_all() {
+        // `crate::agentstate::roster` starts `claude agents --json`, and the
+        // rule it was gated with is that a session which never uses a feature
+        // never starts it. Occupancy in the worktree list needs the same
+        // roster, so the gate gained a second reason rather than losing the
+        // first — the failure being prevented is a process started in every
+        // session abeam has ever run, to fill in a column nobody opened.
+        //
+        // Asserted through the predicate rather than by pumping, deliberately:
+        // opening this gate for real starts that process, and no test in this
+        // crate starts an agent.
+        let mut fx = app();
+        assert!(!fx.app.roster_is_wanted(), "nothing has asked for anything");
+
+        fx.app.worktrees_wanted = true;
+        assert!(fx.app.roster_is_wanted());
+
+        let mut fx = app();
+        fx.app.dispatched_any = true;
+        assert!(fx.app.roster_is_wanted(), "the older reason still counts");
     }
 
     #[test]

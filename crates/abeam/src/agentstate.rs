@@ -1,4 +1,4 @@
-﻿//! What abeam can learn about the agent it is hosting, without asking it.
+//! What abeam can learn about the agent it is hosting, without asking it.
 //!
 //! The queue's whole difficulty is one question â€” *has the agent finished?* â€”
 //! and the honest answers available from a pty are all bad. Output quiescence
@@ -242,7 +242,7 @@ impl Session {
         // Case-insensitively, because what is being matched is Claude's own
         // vocabulary in a record it wrote and not a name on a filesystem â€”
         // where whether case folds is the platform's business and
-        // [`spelling`]'s, and on Unix the answer is that it does not. And
+        // [`crate::paths`]'s, and on Unix the answer is that it does not. And
         // without lowercasing a copy of a word it is only comparing.
         match self.status.as_deref() {
             Some(word) if word.eq_ignore_ascii_case("idle") => Readiness::Idle,
@@ -371,7 +371,10 @@ fn sessions_path_from(config: Option<PathBuf>, home: Option<PathBuf>) -> Option<
     // refusal of a relative program path.
     let dir = match config.filter(|dir| dir.is_absolute()) {
         Some(config) => config.join("sessions"),
-        None => home.filter(|dir| dir.is_absolute())?.join(".claude").join("sessions"),
+        None => home
+            .filter(|dir| dir.is_absolute())?
+            .join(".claude")
+            .join("sessions"),
     };
     Some(dir)
 }
@@ -611,11 +614,20 @@ impl Probe {
     /// carrying no `cwd` at all unmatchable by either: there is nothing in it
     /// to check, and an unchecked record is exactly the one this is here to
     /// refuse. Every record a real Claude writes has the field.
+    ///
+    /// The comparison itself is [`crate::paths`]'s rather than this module's,
+    /// and it moved there when a second question started needing the same
+    /// rule. A session's `cwd`, a watcher's event and a path out of
+    /// `git worktree list` are three spellings of the same kind of thing, and
+    /// on Windows the third arrives with forward slashes in it. Two modules
+    /// each keeping their own idea of when two spellings are one directory is
+    /// how they come to disagree about which repository is on screen, which is
+    /// a disagreement neither of them can see.
     fn is_here(&self, session: &Session) -> bool {
         session
             .cwd
             .as_deref()
-            .is_some_and(|cwd| same_dir(cwd, &self.root))
+            .is_some_and(|cwd| crate::paths::same_dir(cwd, &self.root))
     }
 
     /// Everything a record has to be before this probe will answer with it.
@@ -909,78 +921,6 @@ fn is_named_for_a_pid(path: &Path) -> bool {
         .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Whether two paths name the same directory, as far as comparing two spellings
-/// can tell.
-///
-/// The two sides arrive by different routes â€” abeam's from
-/// `std::env::current_dir`, Claude's from whatever its own process was handed â€”
-/// so they agree about the directory and not always about how to write it down.
-/// Which of those disagreements is still the same *place* is a fact about the
-/// filesystem underneath, and that is [`spelling`]'s question rather than this
-/// one's.
-///
-/// Comparing spellings rather than `fs::canonicalize`, on purpose:
-/// canonicalising touches the disk, answers on Windows with a `\\?\` path that
-/// then has to be undone, and would run once per file in the directory every
-/// time the queue asks whether it may send.
-fn same_dir(a: &Path, b: &Path) -> bool {
-    spelling(a) == spelling(b)
-}
-
-/// The one form of a path this module compares, for the platform it was built
-/// for.
-///
-/// There is no rule that is right on both, and the reason to insist on that
-/// rather than pick the more forgiving one is that the two mistakes cost
-/// different amounts. Windows folds case, reads `/` and `\` as one separator,
-/// and calls `C:\` and `C:` the same place; a comparison there that did none of
-/// those would refuse a record that is genuinely ours, and the queue would
-/// drain by hand for no reason anybody could see. Unix does none of the three.
-/// `/home/phil/Work` and `/home/phil/work` are two directories, `\` is
-/// an ordinary byte in a file name rather than a separator, and a rule that
-/// folded either of those would be declaring two different places equal â€” in
-/// the one function that decides whether a queued prompt may be typed into an
-/// agent. That mistake sends somebody's prompt to a session in another
-/// checkout, and it is not one they would see happen.
-///
-/// macOS is the awkward middle: its kernel distinguishes case and its default
-/// volume does not. It takes the strict reading with the rest of Unix, because
-/// being strict costs a queue that drains by hand and being loose costs the
-/// paragraph above.
-#[cfg(windows)]
-fn spelling(path: &Path) -> Vec<u8> {
-    path.to_string_lossy()
-        .replace('/', "\\")
-        // A trailing separator is a spelling and not a place. `C:\` and `C:`
-        // both come out as `C:`, which is the same directory either way.
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
-        .into_bytes()
-}
-
-#[cfg(unix)]
-fn spelling(path: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-
-    // Bytes rather than `to_string_lossy`, because a Unix path is bytes and not
-    // text: two different names that are not UTF-8 both come back from a lossy
-    // conversion as the same run of replacement characters, and this is the
-    // comparison where calling two different directories equal is the answer
-    // that costs something.
-    let bytes = path.as_os_str().as_bytes();
-    // One trailing slash, and never the last one. `/home/me/forge/` and
-    // `/home/me/forge` are one directory, so the first is a spelling rather
-    // than a reason to refuse a record â€” but `trim_end_matches` would take `/`
-    // itself down to the empty string, which is also what a record carrying an
-    // empty `cwd` comes out as. The root would then be equal to a record that
-    // names nowhere, in the function that decides whether a prompt may be
-    // typed, and a Claude running at `/` is not a hypothetical in a container.
-    match bytes {
-        [head @ .., b'/'] if !head.is_empty() => head.to_vec(),
-        _ => bytes.to_vec(),
-    }
-}
-
 /// What abeam says when there is no Claude to ask.
 ///
 /// A sentence, and only a sentence. There is a version of this that notices
@@ -1027,7 +967,8 @@ fn first_line(text: &str) -> String {
 /// straight. `RECORD` and `ROSTER` are captured output, so their Windows paths
 /// stay Windows paths on every platform â€” what they prove is that a string in
 /// the JSON reaches [`Session`] unaltered, and that is a fact about the parser.
-/// [`ROOT`] and [`ELSEWHERE`] are *places*, compared by [`same_dir`] under a
+/// [`ROOT`] and [`ELSEWHERE`] are *places*, compared by
+/// [`crate::paths::same_dir`] under a
 /// rule that differs by platform, so they are spelled for the platform running
 /// the test.
 #[cfg(test)]
@@ -1066,7 +1007,8 @@ mod tests {
     /// it â€” both as this platform writes a path.
     ///
     /// Every test that plants a record puts one of these in its `cwd`, and what
-    /// they are for is [`same_dir`], whose rule is not the same rule on the two
+    /// they are for is [`crate::paths::same_dir`], whose rule is not the same rule
+    /// on the two
     /// platforms. A Windows path planted on Linux would go through the
     /// case-sensitive comparison and pass, which is the shape of a test that
     /// runs everywhere and tests one thing in one place.
@@ -1192,7 +1134,7 @@ mod tests {
         assert_eq!(readiness(r#","state":"working""#), Readiness::Busy);
 
         // Case-insensitively, because this is Claude's vocabulary in a record
-        // rather than a path: [`spelling`] is the comparison in this module
+        // rather than a path: `crate::paths` holds the one comparison
         // that case matters to, and on Unix it is strict on purpose.
         assert_eq!(readiness(r#","status":"IDLE""#), Readiness::Idle);
         assert_eq!(readiness(r#","status":"Busy""#), Readiness::Busy);
@@ -1651,11 +1593,11 @@ mod tests {
         // directory and not always about how to write it down.
         //
         // Which of those disagreements is still the same place is the whole of
-        // what [`spelling`] decides, and the answer is different on the two
+        // what `crate::paths` decides, and the answer is different on the two
         // platforms. This test is written to invert with it, and that is
         // deliberate: a version of it that merely passed on both â€” the Windows
         // spellings, asserted to match everywhere â€” would have been testing
-        // nothing. It would go green against a `spelling` that lowercased a
+        // nothing. It would go green against a spelling rule that lowercased a
         // Linux path, which is the bug where a queued prompt is typed into the
         // session in `/home/phil/work` because the one on screen is
         // `/home/phil/Work`.

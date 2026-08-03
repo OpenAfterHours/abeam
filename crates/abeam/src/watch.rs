@@ -8,9 +8,31 @@
 //! It lives in the shell rather than in a pane for two reasons. One recursive
 //! watch of a repository root is enough — a second would double the OS-level
 //! event traffic for the same information. And the two consumers want different
-//! slices of the same stream: the viewer wants markdown paths, git wants to know
-//! only *that* something changed. Splitting one stream is the shell's job;
-//! neither pane can do it without knowing about the other.
+//! slices of the same stream: the viewer wants markdown paths, git wants to
+//! know which paths changed. Splitting one stream is the shell's job; neither
+//! pane can do it without knowing about the other.
+//!
+//! ## Why git is handed paths rather than a `bool`
+//!
+//! It used to be handed a `bool`, and the `bool` was a bug. Claude Code makes
+//! git worktrees *inside* the repository — `<root>/.claude/worktrees/<name>` —
+//! and runs other agents in them, so one recursive watch covers two working
+//! trees belonging to two different people. A batch that says only "something
+//! changed" cannot be routed, so every file a neighbouring agent wrote
+//! refreshed this window's git pane and pulled that agent's scratch markdown
+//! into this window's reader.
+//!
+//! The paths are therefore carried, and `crate::workspace` decides whose they
+//! are. That decision is deliberately *not* made here: this module knows one
+//! root — the one it was started on — and which of several workspaces a pane
+//! happens to be looking at is the shell's business, not the watcher's.
+//!
+//! Worth saying plainly, because the one-line fix is right there: **`.claude`
+//! is not in the noise list and must not be added to it.** It would close the
+//! bug this afternoon and blind abeam inside its own worktrees for ever — the
+//! panes are about to be re-rootable *into* those directories, and a watcher
+//! that never fires there is the feature deleted rather than fixed. Noise is
+//! for output nobody reads. `.claude/worktrees` is where the work is.
 //!
 //! ## What is filtered, and where
 //!
@@ -81,31 +103,95 @@ pub fn in_noise(root: &Path, path: &Path) -> bool {
         .any(|c| NOISE.contains(&c))
 }
 
-/// One batch of "something happened", already split for its two readers.
+/// How many distinct paths one drained batch will carry before it gives up on
+/// carrying them.
+///
+/// A `git checkout` of a large branch is thousands of paths inside one
+/// debounce, and both lists here are deduplicated by scanning themselves — the
+/// same retain-then-push that keeps the *last* mention last. That is free at
+/// the size of an agent writing files and quadratic at the size of a branch
+/// switch, on the debouncer's own thread. Past this many the list has also
+/// stopped being worth anything: nobody routes ten thousand paths one at a
+/// time to decide whether to run one `git status`.
+///
+/// So the cap is a statement about what the batch is *for* rather than a
+/// memory limit. Under it, the batch says exactly what changed. Over it, it
+/// says [`Change::overflowed`], which every reader is expected to take as
+/// "assume everything changed" — the answer the panes gave unconditionally
+/// before any of them could tell one workspace from another.
+const MAX_PATHS: usize = 1024;
+
+/// One batch of "something happened", already split for its readers.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Change {
     /// Markdown the viewer should follow, in the order it was last mentioned.
     pub markdown: Vec<PathBuf>,
-    /// Something under the worktree changed, so git's answer is stale. True for
-    /// source files too — most of what an agent writes is not markdown, and the
-    /// git pane cares about all of it.
-    pub worktree: bool,
+    /// Every non-noise path in the batch, deduplicated, last mention last.
+    ///
+    /// The paths and not just the fact of them, because the shell has to decide
+    /// *whose* change each one is: with two git worktrees inside one watched
+    /// root, a bare "something changed" cannot tell the agent's own repository
+    /// from a neighbouring agent's — see `crate::workspace`. This used to be a
+    /// `bool`, and that `bool` was the bug.
+    ///
+    /// `markdown` is a subset of this, so anything asking "was there any news
+    /// at all" asks this one.
+    pub changed: Vec<PathBuf>,
+    /// The batch went past [`MAX_PATHS`] and the list below it is therefore
+    /// incomplete. Read it as "assume everything changed": a reader that routes
+    /// by path must fall back to refreshing whatever it is showing, because the
+    /// paths that would have said otherwise were the ones dropped.
+    pub overflowed: bool,
 }
 
 impl Change {
+    /// Something under a worktree changed, so git's answer is stale. True for
+    /// source files too — most of what an agent writes is not markdown, and the
+    /// git pane cares about all of it.
+    ///
+    /// A method rather than the field it used to be, and kept at all rather
+    /// than folded into `changed.is_empty()` at the call sites, because it is
+    /// the question three tests below are really asking and the answer has to
+    /// go on including an overflowed batch that kept none of its paths.
+    pub fn worktree(&self) -> bool {
+        self.overflowed || !self.changed.is_empty()
+    }
+
     pub fn is_empty(&self) -> bool {
-        !self.worktree && self.markdown.is_empty()
+        !self.worktree() && self.markdown.is_empty()
     }
 
     /// Fold another batch in. A rename fires under both names and a save fires
     /// more than once even after debouncing, so only the last mention of a path
     /// decides its place in the order.
     fn absorb(&mut self, other: Change) {
-        self.worktree |= other.worktree;
+        self.overflowed |= other.overflowed;
+        for path in other.changed {
+            self.note_changed(&path);
+        }
         for path in other.markdown {
             self.markdown.retain(|p| p != &path);
             self.markdown.push(path);
         }
+    }
+
+    /// Record one changed path, and say whether the list still knows about it.
+    ///
+    /// The answer is what keeps `markdown` a subset of `changed`: a path the
+    /// cap turned away is not one the viewer should be offered either, since
+    /// nothing downstream could work out whose it was.
+    fn note_changed(&mut self, path: &Path) -> bool {
+        // A path already in the list costs nothing to move, so the cap is
+        // measured in *distinct* paths. An editor saving one file forty times
+        // is one path, and must not be mistaken for a branch switch.
+        let known = self.changed.iter().any(|seen| seen == path);
+        if !known && self.changed.len() >= MAX_PATHS {
+            self.overflowed = true;
+            return false;
+        }
+        self.changed.retain(|seen| seen != path);
+        self.changed.push(path.to_path_buf());
+        true
     }
 }
 
@@ -122,8 +208,15 @@ fn classify<I: IntoIterator<Item = PathBuf>>(root: &Path, paths: I) -> Change {
         // whatever someone is reading with "no such file" the moment an agent
         // tidies up a scratch note, and a rename fires under both names so
         // which one won would come down to the order the debouncer listed them.
-        change.worktree = true;
-        if is_markdown(&path) && path.is_file() {
+        //
+        // Asked before the path is recorded, because `is_file` is a syscall and
+        // the answer decides nothing about `changed` — keeping it here means
+        // one stat per event rather than one per event that survives the cap.
+        let is_document = is_markdown(&path) && path.is_file();
+        if !change.note_changed(&path) {
+            continue;
+        }
+        if is_document {
             change.markdown.retain(|p| p != &path);
             change.markdown.push(path);
         }
@@ -250,15 +343,22 @@ mod tests {
         // The asymmetry is the whole point of splitting the stream: git wants
         // every write, the viewer wants the ones a human would read.
         let fx = Fixture::new("watch-source");
-        let change = fx.classify([fx.touch("src/main.rs")]);
-        assert!(change.worktree);
+        let source = fx.touch("src/main.rs");
+        let change = fx.classify([source.clone()]);
+        assert!(change.worktree());
         assert!(change.markdown.is_empty());
+        // ...and git is told *which* file, because that is what decides whose
+        // worktree it was in.
+        assert_eq!(change.changed, [source]);
     }
 
     #[test]
     fn a_cargo_build_reaches_neither_pane() {
         let fx = Fixture::new("watch-build");
-        let change = fx.classify([fx.touch("target/debug/abeam.exe"), fx.touch("target/doc/x.md")]);
+        let change = fx.classify([
+            fx.touch("target/debug/abeam.exe"),
+            fx.touch("target/doc/x.md"),
+        ]);
         assert!(change.is_empty(), "build output must not wake anything");
     }
 
@@ -279,12 +379,21 @@ mod tests {
         // happened to list them in.
         let fx = Fixture::new("watch-deleted");
         let moved_to = fx.touch("docs/NOTES.md");
-        let change = fx.classify([fx.gone("NOTES.md"), moved_to.clone()]);
-        assert!(change.worktree, "something moved; git's answer is stale");
-        assert_eq!(change.markdown, [moved_to], "only the surviving name");
+        let gone = fx.gone("NOTES.md");
+        let change = fx.classify([gone.clone(), moved_to.clone()]);
+        assert!(change.worktree(), "something moved; git's answer is stale");
+        assert_eq!(
+            change.markdown,
+            std::slice::from_ref(&moved_to),
+            "only the surviving name"
+        );
+        // Both names reach git, and they have to: a rename out of one worktree
+        // and into another is two workspaces' news, and dropping the name that
+        // no longer exists would lose one of them.
+        assert_eq!(change.changed, [gone, moved_to]);
 
         let change = fx.classify([fx.gone("TODO.md")]);
-        assert!(change.worktree);
+        assert!(change.worktree());
         assert!(change.markdown.is_empty(), "nothing to open");
         assert!(!change.is_empty(), "git still has to hear about it");
     }
@@ -296,11 +405,90 @@ mod tests {
         // writing now.
         let fx = Fixture::new("watch-merge");
         let (first, second) = (fx.touch("first.md"), fx.touch("second.md"));
+        let source = fx.touch("src/lib.rs");
         let mut acc = fx.classify([first.clone()]);
-        acc.absorb(fx.classify([fx.touch("src/lib.rs")]));
+        acc.absorb(fx.classify([source.clone()]));
         acc.absorb(fx.classify([second.clone()]));
-        assert_eq!(acc.markdown, [first, second]);
-        assert!(acc.worktree);
+        assert_eq!(acc.markdown, [first.clone(), second.clone()]);
+        assert!(acc.worktree());
+        // The same fold, on the list the routing reads. A batch merged into
+        // another must not lose the workspace the first one was about.
+        assert_eq!(acc.changed, [first.clone(), source, second.clone()]);
+
+        // And a path mentioned again by a later batch keeps one place in the
+        // order — its latest — in both lists at once.
+        acc.absorb(fx.classify([first.clone()]));
+        assert_eq!(acc.markdown, [second.clone(), first.clone()]);
+        assert_eq!(acc.changed.len(), 3, "three files, however often written");
+        assert_eq!(acc.changed.last(), Some(&first));
+    }
+
+    #[test]
+    fn a_branch_switch_gives_up_on_the_list_rather_than_on_the_news() {
+        // A `git checkout` of a large branch is thousands of paths in one
+        // debounce, and both lists deduplicate by scanning themselves. Past the
+        // cap the batch stops trying to say *which* files and says only that it
+        // cannot — which is the answer every pane acted on before any of them
+        // could tell one workspace from another, so nothing is missed by it.
+        let fx = Fixture::new("watch-flood");
+        let flood: Vec<PathBuf> = (0..MAX_PATHS + 50)
+            .map(|n| fx.gone(&format!("src/file{n}.rs")))
+            .collect();
+        let change = fx.classify(flood);
+
+        assert!(change.overflowed, "the cap never bit");
+        assert_eq!(change.changed.len(), MAX_PATHS, "and it bit exactly there");
+        assert!(change.worktree(), "git must still refresh");
+        assert!(!change.is_empty());
+
+        // An overflowed batch that kept none of its paths is still news. The
+        // shell's routing reads `overflowed` on its own, so this is the shape
+        // that must not report itself as nothing having happened.
+        let empty_but_flooded = Change {
+            markdown: Vec::new(),
+            changed: Vec::new(),
+            overflowed: true,
+        };
+        assert!(empty_but_flooded.worktree());
+        assert!(!empty_but_flooded.is_empty());
+    }
+
+    #[test]
+    fn one_file_saved_a_thousand_times_is_one_file() {
+        // The cap counts distinct paths, not events. An editor with autosave on
+        // and a compiler watching it can produce this, and a batch that
+        // overflowed on it would throw away a list it could easily have kept.
+        let fx = Fixture::new("watch-resaved");
+        let one = fx.touch("notes.md");
+        let change = fx.classify(std::iter::repeat_n(one.clone(), MAX_PATHS * 2));
+        assert!(!change.overflowed);
+        assert_eq!(change.changed, std::slice::from_ref(&one));
+        assert_eq!(change.markdown, [one]);
+    }
+
+    #[test]
+    fn the_viewer_is_never_offered_a_path_git_was_not_told_about() {
+        // `markdown` is a subset of `changed`, and the shell relies on it: a
+        // document whose path was dropped by the cap is one whose workspace
+        // nothing downstream could work out, so following it would put another
+        // agent's scratch note in front of the reader — the very bug the paths
+        // are carried to fix.
+        let fx = Fixture::new("watch-subset");
+        let mut paths: Vec<PathBuf> = (0..MAX_PATHS)
+            .map(|n| fx.gone(&format!("src/file{n}.rs")))
+            .collect();
+        paths.push(fx.touch("late.md"));
+        let change = fx.classify(paths);
+
+        assert!(change.overflowed);
+        assert!(
+            change.markdown.is_empty(),
+            "a document past the cap must not be followed"
+        );
+        assert!(
+            change.markdown.iter().all(|p| change.changed.contains(p)),
+            "markdown is a subset of changed"
+        );
     }
 
     /// The one test with a real watcher in it. Everything above calls
@@ -327,11 +515,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
 
-        assert!(seen.worktree, "git was never told anything changed");
+        assert!(seen.worktree(), "git was never told anything changed");
         assert_eq!(
             seen.markdown.last().map(|p| p.file_name()),
             Some(Some(std::ffi::OsStr::new("note.md"))),
             "the viewer was never handed the document"
+        );
+        // The path git is given is an absolute one under the root that was
+        // watched, which is the whole premise of routing it: `crate::workspace`
+        // is asked which root contains it, and a relative path is contained by
+        // nothing.
+        assert!(
+            seen.changed.iter().all(|p| p.starts_with(&root)),
+            "notify reported something outside the watched root: {:?}",
+            seen.changed
         );
     }
 }
