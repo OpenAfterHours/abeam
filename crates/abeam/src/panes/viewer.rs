@@ -120,7 +120,10 @@ enum State {
     Doc(Doc),
     /// A path that could not be read. Kept rather than discarded so `r` has
     /// something to retry and the title can say which file went wrong.
-    Failed { path: PathBuf, why: LoadError },
+    Failed {
+        path: PathBuf,
+        why: LoadError,
+    },
 }
 
 pub struct ViewerPane {
@@ -150,6 +153,31 @@ pub struct ViewerPane {
 
     /// A file the watcher noticed, waiting for the pane to be on screen.
     pending: Option<PathBuf>,
+    /// A document was taken up inside [`Pane::render`], so the title the shell
+    /// drew for this frame is a document behind the body under it.
+    ///
+    /// The shell renders the border — and asks this pane for its title — before
+    /// it renders the pane, so the frame on which a pending document is first
+    /// shown carries the *previous* state's title: `files`, over a page with a
+    /// document on it. Every later frame is right, which is why this went years
+    /// without being noticed. What makes it a bug rather than a cosmetic skew is
+    /// that there is no promise of a later frame. `crate::app` draws when
+    /// something asks it to, and a pane that changed its own state during a
+    /// render has asked nobody.
+    ///
+    /// It surfaced on Linux, and only once `crate::watch` stopped reporting
+    /// reads as writes: the events that used to arrive from abeam opening this
+    /// very document kept the loop drawing, so the title corrected itself on the
+    /// noise the pane itself generated. Take the noise away and a `sh` sitting
+    /// idle at a prompt produces nothing else to draw for, and the wrong title
+    /// stays on screen for the rest of the session.
+    ///
+    /// Answered on the next [`Pane::tick`], which is what "this pane wants to be
+    /// redrawn" already means everywhere else — rather than by moving the take
+    /// into `tick`, because being drawn is the only signal this pane gets that
+    /// it is the view on screen, and that is the whole reason the take is where
+    /// it is.
+    owed: bool,
     /// Markdown under the root, newest first. `Tab` walks it.
     recent: Vec<PathBuf>,
     recent_ix: usize,
@@ -179,6 +207,7 @@ impl ViewerPane {
             dirty: true,
             scroll,
             pending: None,
+            owed: false,
             recent: Vec::new(),
             recent_ix: 0,
             scan,
@@ -432,7 +461,8 @@ impl ViewerPane {
         // This is not an extra layout: it is the one the next frame was going
         // to do, moved earlier by a few microseconds.
         self.ensure_layout(self.laid_out);
-        self.scroll.measure(self.lines.len(), self.scroll.viewport());
+        self.scroll
+            .measure(self.lines.len(), self.scroll.viewport());
         let to = was
             .saturating_mul(self.scroll.max())
             .checked_div(before)
@@ -661,6 +691,9 @@ impl Pane for ViewerPane {
         // exactly that reason.
         if let Some(path) = self.pending.take() {
             self.show(path);
+            // The border above this rect was drawn from the state that existed
+            // a moment ago, which is no longer the state under it. See `owed`.
+            self.owed = true;
         }
 
         // The column is reserved whether or not the bar is drawn: deciding per
@@ -669,8 +702,7 @@ impl Pane for ViewerPane {
         let text_width = inner.width - scroll::bar_width(inner.width);
 
         self.ensure_layout(text_width as usize);
-        self.scroll
-            .measure(self.lines.len(), inner.height as usize);
+        self.scroll.measure(self.lines.len(), inner.height as usize);
 
         let start = self.scroll.offset;
         let end = (start + inner.height as usize).min(self.lines.len());
@@ -686,7 +718,10 @@ impl Pane for ViewerPane {
     }
 
     fn tick(&mut self) -> bool {
-        let mut changed = false;
+        // A document taken up during the last render, whose title never made it
+        // onto the screen the body did. Claimed first and unconditionally, so it
+        // is owed exactly one frame however the rest of this goes.
+        let mut changed = std::mem::take(&mut self.owed);
 
         // The walk answers once, then the receiver is dropped.
         if let Some(found) = self.scan.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -1017,13 +1052,20 @@ mod tests {
         let mut pane = scrollable(&dir);
         let total = pane.lines.len();
 
-        assert_eq!(pane.handle_key(key(KeyCode::Char('k'))).unwrap(), Handled::No);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('k'))).unwrap(),
+            Handled::No
+        );
         assert_eq!(pane.scroll.offset, 0, "already at the top");
 
         pane.handle_key(key(KeyCode::Char('j'))).unwrap();
         assert_eq!(pane.scroll.offset, 1);
         pane.handle_key(key(KeyCode::Char(' '))).unwrap();
-        assert_eq!(pane.scroll.offset, 1 + 9, "a page keeps one line of overlap");
+        assert_eq!(
+            pane.scroll.offset,
+            1 + 9,
+            "a page keeps one line of overlap"
+        );
         pane.handle_key(ctrl('d')).unwrap();
         assert_eq!(pane.scroll.offset, 15);
 
@@ -1222,6 +1264,47 @@ mod tests {
     }
 
     #[test]
+    fn taking_a_document_up_mid_frame_asks_for_the_frame_that_shows_its_title() {
+        // The shell asks this pane for its title and draws the border *before*
+        // it renders the pane, so the frame that first shows a pending document
+        // carries the title of the pane that had none: `files`, over a page with
+        // a document on it. Every later frame is right — and nothing promises a
+        // later frame, because a pane that changed its own state inside a render
+        // has asked nobody to draw again.
+        //
+        // It reached CI as a twenty-second timeout waiting for a title that was
+        // never going to arrive, on the one platform where nothing else was
+        // producing frames: a `sh` idle at a prompt, once `crate::watch` stopped
+        // reporting abeam's own reads as writes. Until then the pane was rescued
+        // by the events it generated by opening the document.
+        let dir = TempDir::new("view-owed");
+        let path = dir.write("fresh.md", b"# fresh\n");
+        let mut pane = quiet(dir.path());
+        pane.pending = Some(path.clone());
+
+        // Nothing is owed before the render that changes anything.
+        assert!(!pane.tick(), "a quiet pane asks for nothing");
+
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+
+        // The title the shell just drew and the body under it disagree, which is
+        // the state this frame has to be followed out of.
+        assert!(
+            pane.title().contains("fresh.md"),
+            "the pane is showing the document now: {}",
+            pane.title()
+        );
+        assert!(
+            pane.tick(),
+            "the frame that shows this title was never asked for"
+        );
+        // Exactly one, so an idle pane does not redraw for ever.
+        assert!(!pane.tick(), "one frame is owed, not a stream of them");
+    }
+
+    #[test]
     fn holding_r_down_does_not_start_a_walk_per_repeat_tick() {
         // The console emits a key event per auto-repeat tick, ~30 a second, and
         // the shell drains the whole batch before drawing. Starting a fresh
@@ -1341,7 +1424,10 @@ mod tests {
             .unwrap();
 
         assert!(pane.path().is_none(), "the document view is untouched");
-        assert!(pane.has_pending(), "and the shell can still mark the border");
+        assert!(
+            pane.has_pending(),
+            "and the shell can still mark the border"
+        );
         // No border to mark while the list is the thing showing, so the pane
         // says it itself.
         assert!(pane.title().starts_with("◆ "), "{}", pane.title());
@@ -1520,7 +1606,10 @@ mod tests {
         pane.show(&path);
         laid(&mut pane, 40, 10);
 
-        assert_eq!(pane.handle_key(key(KeyCode::Char('t'))).unwrap(), Handled::Yes);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('t'))).unwrap(),
+            Handled::Yes
+        );
         let lines = laid(&mut pane, 40, 10);
         // The source, gutter and all: the markers the rendering consumed are
         // back, and they are numbered.
@@ -1541,7 +1630,10 @@ mod tests {
         let path = dir.write("main.rs", b"fn main() {}\n");
         let mut pane = quiet(dir.path());
         pane.show(&path);
-        assert_eq!(pane.handle_key(key(KeyCode::Char('t'))).unwrap(), Handled::No);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('t'))).unwrap(),
+            Handled::No
+        );
         assert!(!pane.raw, "and the pane's idea of raw is unchanged");
 
         // Nor is there anything to toggle on a screen with no document on it.
