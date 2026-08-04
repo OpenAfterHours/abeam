@@ -435,9 +435,13 @@ both rather than exactly serving both. The vocabulary itself: `j`/`k` and
 arrows for a line, `space`/`b` and PgDn/PgUp for a page,
 `Ctrl+D`/`Ctrl+U` for a half page, `g`/`G` and Home/End for the ends,
 `Tab`/`Shift+Tab` for the selection, `Enter` to open, `r` to refresh. `t` swaps
-rendered markdown for its source; in the file list, `/` finds a file anywhere
-under the root and `Backspace` goes up a directory. `Esc` or `q` hands focus
-back to the agent.
+rendered markdown for its source, and `Backspace` climbs a directory in the file
+list. Three keys search, and they ask three different questions rather than one
+question three ways: `/` in the file list is *which file is called this*, `/` in
+the document is *where is it on this page* — `n` and `N` walk the matches — and
+`f`, from either of them, is *which files say this*. Only the third reads the
+disk, and it is the only one of the three whose box waits for `Enter` rather
+than narrowing as you type. `Esc` or `q` hands focus back to the agent.
 
 `w` is the one key in that vocabulary that is not about reading: in the git view
 it opens the repository's worktrees, `Enter` there points the right pane at the
@@ -498,6 +502,69 @@ of the pane by the key that means "never mind" is the worst thing a filter box
 can do. The list is the second half of the never-switch-under-you rule: a
 document arriving from the watcher waits while you are walking a tree, exactly
 as it waits behind the git view.
+
+`/` in the document is the second question — where is it on this page — and it
+is a different matcher from the one in the list, deliberately. A path is matched
+as a subsequence, because typing `capv` to reach
+`crates/abeam/src/panes/viewer.rs` is how anyone who has used a fuzzy finder
+expects to get there. Prose is not: a subsequence over a paragraph matches
+nearly every paragraph, so the answer is every row and the reader has been
+handed noise dressed as results. Plain substring here, and smart case —
+case-insensitive until the query contains a capital, which needs no key to turn
+on and no explaining when it fires. `n` and `N` walk the matches and wrap round.
+The query sits in the title beside the position rather than in a row of its own,
+so the layout and the scroll arithmetic the pane already depends on do not move
+to make room for it. `Enter` shuts the box and keeps the marks, which is the
+state somebody reading is in; `Esc` does the same, a second `Esc` clears them,
+and only a third hands focus back. A search with nothing marked skips the middle
+press, so the border names what *this* press does rather than where the sequence
+ends.
+
+`f` — from the document or from the file list — is the third question, which
+files say this, and the only one of the three that reads the disk to answer. Its
+box does nothing at all while you type and runs on `Enter`. That is the one
+place this pane behaves unlike itself and it is deliberate: the other two boxes
+answer from something already in memory, where this one reads every file under
+the root, so a box that ran per keystroke would sweep the repository for `n`,
+`ne` and `nee` before you had finished typing `needle` and throw all three
+answers away. The empty list says so in words, because a box that visibly does
+nothing is otherwise indistinguishable from one that is broken. What comes back
+is a selectable list of path, line number and the line the match is on, filling
+as the sweep goes rather than arriving all at once at the end; `Enter` opens
+that file with the document search already looking for the same phrase, at the
+match that row counted, which is what makes the two one feature rather than two
+that happen to rhyme. It does not walk the tree again — the startup walk's list
+is shared, since a second gitignore walk would double the cost of startup to
+re-derive what the first one had in its hand — so it inherits that walk's caps,
+reads at most the first half-megabyte of any file, keeps at most a screenful of
+matches from each, and stops at a total. Every one of those is visible when it
+is hit: a count that is a prefix of the truth is written `137+` rather than
+`137`, and the per-file cap is named outright as `· 18 files cut`, because it is
+the only one of the four whose remedy is a key already on screen — what it left
+out is in files the list did reach, and `Enter` on any row of one of them shows
+all of them.
+
+**The two searches do not agree about what a match is, and the pane says so
+rather than hiding it.** `f` matches the lines in a file; `/` matches the rows
+the pane drew, which is what lets one search serve rendered prose, its source
+and a highlighted `.rs` without the markdown renderer having to grow a second
+output — rendering reflows and drops syntax, so no offset into the file means
+the same thing on both sides of `t`, and a mapping is what searching the source
+would have needed. Those are the same text for most files and not for all. A
+line too wide for the pane is wrapped, so a match that straddles the break is
+one the drawn page does not have; that is not a markdown problem, and dragging
+the pane narrower is enough to reach it in a plain source file. In rendered
+markdown the source syntax is not on the page at any width, so `**` cannot be
+found there at all. So a page with no match for the phrase names the way out
+that is true for the body in front of you — `· t for source` on rendered
+markdown, `· widen if a wrap split it` on anything else — and a result that
+lands on a different match from the one you chose says `· not the 3rd` rather
+than a confident `2/2` about a question nobody asked. Retiring the gap needs
+rows grouped by the source line they came from: `source_lines` knows that
+grouping and `markdown::render` does not, so it is either a second output from
+the renderer or a rule true of one body form and not the other. It is written
+down in `crates/abeam/src/panes/viewer/search.rs` rather than half-done, because
+half of it is the inconsistency and not the fix.
 
 **shell** — `Alt+S`, and the reason it is here rather than in another window:
 `git branch`, `uv run ruff format`, `cargo test`, run in the directory abeam was
@@ -737,13 +804,14 @@ cargo clippy --workspace --all-targets
 Working, and used. Not finished.
 
 **Done.** The pty host layer, proven by a spike that ran a real Claude session
-against it on 2026-08-01. All three right-hand views, the file list and the find
-under it, the rendered/source toggle, and the watcher driving what it should.
-Focus, zoom, help, the diagnostics view, and the literal-next escape hatch.
-Agent selection and the launcher underneath it. The Unix port, in the sense that
-the whole workspace builds, tests and lints clean for both
-`x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see "Platforms" for
-the sense in which it is not done. 379 tests on Windows, and
+against it on 2026-08-01. All four right-hand views, the file list, the
+rendered/source toggle, the watcher driving what it should, and the three
+searches under the reader — a file by its name, a phrase on the page, a phrase
+in every file under the root. Focus, zoom, help, the diagnostics view, and the
+literal-next escape hatch. Agent selection and the launcher underneath it. The
+Unix port, in the sense that the whole workspace builds, tests and lints clean
+for both `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see
+"Platforms" for the sense in which it is not done. 568 tests on Windows, and
 `clippy --all-targets` clean on both.
 
 Two of those changed Windows behaviour on the way past, and both are worth
@@ -1159,6 +1227,22 @@ work, on either platform.
   layout in a release build, measured — and going over that is visible: the
   pane says where it stopped. Highlighting gives up above 64 KiB and shows
   plain text. A slow network share can still stall the frame that opens a file.
+- **The document search cannot always reach what the repository search found.**
+  `f` matches the lines in a file and `/` matches the rows the pane drew, and
+  those are the same text for most files and not for all: a line too wide for
+  the pane is wrapped, and a match straddling the break is not on the drawn page
+  at all. It is reachable in a plain source file by dragging the pane narrower,
+  and no width fixes it in rendered markdown, where the source syntax is not on
+  the page at all. Neither is silent — the page names the remedy its own body
+  form has, `t` or the width, and a result that lands on a neighbouring match
+  says `· not the 3rd` rather than a confident `2/2` — but naming a cost is not
+  the same as paying it. Retiring it means grouping rows by the source line they
+  came from, which `source_lines` knows and `markdown::render` does not, so it
+  is either a second output from the renderer or a rule true of one body form
+  and not the other, and an inconsistency between the two forms is worse than
+  one honest rule that costs something.
+  `crates/abeam/src/panes/viewer/search.rs` has the argument, written down
+  rather than half-done.
 - **The reader is the only pane that paints its own background.** `F3` gives it
   a light or a dark page — with a matching syntax theme, since base16-ocean.dark
   on a white page is washed out — and that is what makes one key enough in a
