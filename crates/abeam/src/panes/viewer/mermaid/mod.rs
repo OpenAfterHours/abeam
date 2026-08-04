@@ -31,6 +31,33 @@
 //! because the source is always *true*, and a diagram missing an edge is worse
 //! than one nobody drew. That is the single rule this module is built around.
 //!
+//! ## What is coloured, and what is not
+//!
+//! Two families are drawn by two sets of code, and a reader looking at one
+//! document containing both must not be able to tell. So the palette is
+//! assigned by *role* here, once, rather than by each drawer for itself:
+//!
+//! - **text** — node labels, participant names, edge labels, message captions,
+//!   note text — is [`Theme::fg`], the body colour. All of it. It is what the
+//!   reader came to read, and an edge label is not chrome because it is short.
+//! - **structure** — box frames, lifelines, connectors, block gutters, the
+//!   rules under a heading row — is [`Theme::dim`]. Every connector, whatever
+//!   its stroke: solid, dotted and thick are told apart by their *glyphs*
+//!   (`─`, `┄`, `━`), never by their colour, because colour alone is not a
+//!   signal every reader receives. That rule is `theme`'s, and it is the same
+//!   reason a link here is underlined as well as blue.
+//! - **a severed or destructive end** — `--x` in a flowchart, `-x` in a
+//!   sequence diagram — is [`Theme::danger`], and is the glyph `╳` in both.
+//!   The two grammars spell one concept and it is drawn one way.
+//! - **a keyword the diagram did not get from the document** — `loop`, `alt`,
+//!   `opt`, and the marker on an edge cut to break a cycle — is
+//!   [`Theme::special`], because it is abeam speaking rather than the author.
+//!
+//! Nothing here names a colour of its own. The pane paints its own background
+//! (see `viewer::theme`), so an ANSI name resolved against the terminal's own
+//! profile lands on it unreadably; there is a test asserting every span a
+//! diagram emits is coloured from the palette above.
+//!
 //! ## Width
 //!
 //! `render` is given the columns it may use and every row it returns is at most
@@ -48,7 +75,6 @@ use crate::text::wrap::spans_width;
 
 mod flow;
 mod lex;
-mod outline;
 mod seq;
 #[cfg(test)]
 mod tests;
@@ -60,16 +86,31 @@ mod tests;
 /// the width twice and getting it wrong once.
 pub type Rows = Vec<Vec<Span<'static>>>;
 
-/// Past this the source is shown instead. Not a memory bound — a quarter of a
-/// megabyte of mermaid is a *generated* diagram, and there is no width at which
-/// a four-hundred-node graph is a thing anybody reads on a terminal. The caps
-/// exist so the draw path cannot be handed a layout problem that takes longer
-/// than a keystroke; see `source::HIGHLIGHT_MAX_BYTES`, which is the same
-/// argument about the same frame.
+/// Past this the source is shown instead. Thirty-two kilobytes of mermaid is a
+/// *generated* diagram — hand-written ones in this repository's own docs run to
+/// a few hundred bytes — and it is the cheap check that stops the three below
+/// from having to be done on a megabyte of text first.
 const MAX_BYTES: usize = 32 * 1024;
+
 /// Nodes in a flowchart, or participants in a sequence diagram.
+///
+/// This is a *legibility* bound that the clock happens to sit well inside, and
+/// the two were measured rather than assumed. A graph at exactly these caps
+/// lays out in **4.7 ms** at forty columns and **3.8 ms** at eighty, in a
+/// release build on the machine this was written on; a sequence diagram at them
+/// costs 5.2 ms. Against `source::HIGHLIGHT_MAX_BYTES`, which is a 170 ms
+/// budget on this same frame, that is a rounding error — so the clock is not
+/// what sets these.
+///
+/// What sets them is that the same graph draws **668 rows**. A hundred and
+/// twenty-eight nodes is already fourteen screens of diagram, which is past the
+/// point where anyone is reading a picture, and the caps are held here so that
+/// raising them has to be argued from something other than "it is still fast".
+/// The row caps in `flow` are the same argument made about one drawing.
 pub(super) const MAX_NODES: usize = 128;
-/// Edges in a flowchart, or messages in a sequence diagram.
+/// Edges in a flowchart, or messages in a sequence diagram. Twice the nodes,
+/// because a diagram whose edges outnumber its nodes two to one is a mesh, and
+/// a mesh drawn in one column of connectors is not readable at any width.
 pub(super) const MAX_EDGES: usize = 256;
 
 /// Whether a fence's info string names a mermaid diagram.
@@ -89,9 +130,13 @@ pub fn is_mermaid(info: &str) -> bool {
 /// most of mermaid, by diagram type, and it is the fence the caller was going
 /// to render as code anyway.
 pub fn render(source: &str, width: usize, theme: &'static Theme) -> Option<Rows> {
-    // A single column can hold one character, which is not a diagram and is not
-    // an outline either. Declining here means the drawers below never have to
-    // reason about a width they cannot put an arrow in.
+    // Four is what the narrowest thing either drawer emits actually costs: the
+    // outline's bare form is `└─▶ ` before a single character of label, and the
+    // sequence list's is `1. `. Below that there is no row to put a diagram on,
+    // and declining here means neither drawer has to reason about a width it
+    // cannot put an arrow in. It is *not* the width at which they start
+    // drawing — both decline a good way above this when the longest word in the
+    // diagram would have to be broken in half to fit. See the module note.
     if width < 4 || source.len() > MAX_BYTES {
         return None;
     }
@@ -139,9 +184,9 @@ impl Kind {
         let mut words = header.split_whitespace();
         let keyword = words.next()?;
         // `graph TD;` and `flowchart LR` both reach here with the direction as
-        // the second word; mermaid also allows `graph TD;` with the first
-        // statement on the same line, which `lex::meaningful_lines` has
-        // already split apart.
+        // the second word. A header carrying its first statement behind a
+        // semicolon has already been split by the `lex::split_statements` call
+        // in `render`, so this only ever sees the keyword and the direction.
         match keyword.trim_end_matches(';') {
             "graph" | "flowchart" => {
                 let direction = words

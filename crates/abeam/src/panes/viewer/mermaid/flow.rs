@@ -42,15 +42,29 @@
 //! edge a reader is looking for in a retry loop and the alternative was routing
 //! it up the side of the drawing, which at forty columns crosses everything.
 //!
+//! ## What it does not do
+//!
+//! One barycentre pass orders each rank, which is enough for the crossings a
+//! hand-written diagram has and not enough for a complete bipartite one:
+//! `A-->D  B-->C  A-->C  B-->D` draws two identical `├──────┤` rules between
+//! its ranks, each corner merged into a riser already in that column, and a
+//! reader cannot tell which run ends where. Telling them apart needs a column
+//! of the drawing reserved per crossing rather than a row of the band, which is
+//! a different layout, not a tidier version of this one. It is left as it is,
+//! and written down here rather than found again.
+//!
+//! A node declared twice keeps the **last** text written for it, which is what
+//! mermaid's own `addVertex` does; see `Graph::statement`.
+//!
 //! ## When this gives up
 //!
 //! Two ways, and they mean different things:
 //!
-//! - **the outline** ([`super::outline`]) when the boxes will not fit the
-//!   width, when the drawing would run past [`ROW_CAP`] rows, when a word is
-//!   wider than the box it would go in, or when an edge label cannot be placed
-//!   without landing on top of another connector. Nothing is lost — the outline
-//!   says the same graph with the labels wrapped instead of boxed;
+//! - **the outline** ([`outline`]) when the boxes will not fit the width, when
+//!   the drawing would run past [`ROW_CAP`] rows, when a word is wider than the
+//!   box it would go in, or when an edge label cannot be placed without landing
+//!   on top of another connector. Nothing is lost — the outline says the same
+//!   graph with the labels wrapped instead of boxed;
 //! - **`None`** when a statement cannot be parsed at all, when the diagram holds
 //!   a `subgraph` or a `click` (both carry text this cannot draw, and the module
 //!   note's rule is that a partial drawing is never the answer), or when the
@@ -67,6 +81,11 @@ use unicode_width::UnicodeWidthStr;
 use super::{Direction, Rows, lex};
 use crate::panes::viewer::theme::Theme;
 use crate::text::wrap;
+
+/// The narrow fallback. A child of this module rather than a sibling of it,
+/// because that is what it is: no other diagram family has ever called it, and
+/// a file sitting beside `seq.rs` reads like machinery both of them share.
+mod outline;
 
 /// Most rows a *box* drawing may take before the outline is used instead.
 ///
@@ -112,7 +131,7 @@ pub fn render(
     if let Some(rows) = draw_boxes(&graph, &laid, direction, width, theme) {
         return Some(rows);
     }
-    super::outline::render(&graph, width, theme)
+    outline::render(&graph, width, theme)
 }
 
 /// The drawn diagram, or `None` for "not at this width" — which is a fallback
@@ -150,7 +169,7 @@ fn draw_boxes(
 /// A node's frame, after twelve mermaid shapes have been mapped onto the three
 /// a terminal can tell apart. See the module note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Frame {
+enum Frame {
     Process,
     Round,
     Decision,
@@ -178,13 +197,17 @@ pub(super) struct Node {
     /// What the box says. The id when the node was never given a shape, which
     /// is what `A --> B` means by `A`.
     pub label: String,
-    pub frame: Frame,
+    /// Private, and the only field here that is: the outline has no frames to
+    /// draw, and a shape nobody outside this file can read is a shape nobody
+    /// outside this file has to keep in step with `WRAPPERS`.
+    frame: Frame,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct Edge {
     pub from: usize,
     pub to: usize,
+    /// One line, always: see [`edge_label`].
     pub label: Option<String>,
     pub stroke: Stroke,
     /// The tip drawn at `to`.
@@ -248,6 +271,14 @@ impl Graph {
                 // later does not take the name back off. `A --> B` followed by
                 // `B[Stop]` is one node called Stop, and `B --> C` after that
                 // is still called Stop.
+                //
+                // Two shapes for one node is the case worth stating: the last
+                // one wins, and the first one's text is *not* on screen. That
+                // is deliberate rather than an oversight — mermaid's own
+                // `addVertex` overwrites too, so a reader's browser does not
+                // show it either, and a drawing that disagreed with the file's
+                // own renderer would be a worse kind of wrong than one that
+                // drops a word the author themselves overwrote.
                 if declared && let Some(node) = self.nodes.get_mut(at) {
                     node.label = label;
                     node.frame = frame;
@@ -368,8 +399,7 @@ fn merge_openers(split: Split) -> Split {
     while let Some(mut link) = links.next() {
         let text = groups.next().unwrap_or_default();
         if link.opener && let Some(mut closer) = links.next() {
-            let label = lex::label(&text);
-            closer.label = closer.label.or((!label.is_empty()).then_some(label));
+            closer.label = closer.label.or_else(|| edge_label(&text));
             // The opener carries the stroke — `-. text .-> B` is dotted from
             // its first two characters, and its closer says so too, but
             // `A == text --> B` is the sort of thing half-typed mermaid does.
@@ -462,7 +492,7 @@ fn link_at(chars: &[char], at: usize) -> Option<(Link, usize)> {
     let opener = length == 2 && head == Tip::None && tail == Tip::None;
 
     // `A -->|yes| B`.
-    let mut label = None;
+    let mut label: Option<String> = None;
     let mut j = i;
     while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
         j += 1;
@@ -471,8 +501,7 @@ fn link_at(chars: &[char], at: usize) -> Option<(Link, usize)> {
         && let Some(end) = chars.iter().skip(j + 1).position(|c| *c == '|')
     {
         let text: String = chars[j + 1..j + 1 + end].iter().collect();
-        let text = lex::label(&text);
-        label = (!text.is_empty()).then_some(text);
+        label = edge_label(&text);
         i = j + end + 2;
     }
 
@@ -486,6 +515,23 @@ fn link_at(chars: &[char], at: usize) -> Option<(Link, usize)> {
         },
         i,
     ))
+}
+
+/// What an edge label says, on the one row an edge label has.
+///
+/// `lex::label` decodes a `<br>` to the line break the author wrote and leaves
+/// the decision about honouring it to whoever draws it — see its note. This is
+/// that decision, made once, for every place a flowchart draws an edge label:
+/// **a break becomes a space**. A node label gets as many lines as its box has
+/// room for, but an edge label is written along a connector, into a run
+/// measured in cells, and there is no second row under a run to put anything
+/// on. Made here rather than at the three drawing sites because a `\n` that
+/// reached any one of them would be measured as nothing and drawn as a cell:
+/// the label overflowed its reservation and landed on somebody else's line.
+fn edge_label(raw: &str) -> Option<String> {
+    let text = lex::label(raw).replace('\n', " ");
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 fn is_line(c: Option<&char>) -> bool {
@@ -841,13 +887,18 @@ const RIGHT: u8 = 8;
 /// What a cell is, which is the only thing its colour depends on. Held per
 /// cell rather than per span so that the run-coalescing at the end is the one
 /// place a style is chosen, and a crossing cannot end up half one colour.
+///
+/// There is no separate ink for an edge label: the module note assigns the
+/// palette by role, and a label is text whether it is inside a box or written
+/// along a run — "an edge label is not chrome because it is short".
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ink {
     Blank,
     Frame,
     Text,
     Line,
-    Label,
+    /// A severed end — `--x`, and only that. See the module note.
+    Severed,
 }
 
 struct Canvas {
@@ -855,6 +906,9 @@ struct Canvas {
     cols: usize,
     cell: Vec<char>,
     ink: Vec<Ink>,
+    /// Zero-width characters, held against the cell of the character they
+    /// modify rather than given a cell of their own. See [`Canvas::write`].
+    marks: HashMap<usize, String>,
 }
 
 impl Canvas {
@@ -864,6 +918,7 @@ impl Canvas {
             cols,
             cell: vec![' '; rows * cols],
             ink: vec![Ink::Blank; rows * cols],
+            marks: HashMap::new(),
         }
     }
 
@@ -874,6 +929,10 @@ impl Canvas {
         let at = row * self.cols + col;
         self.cell[at] = ch;
         self.ink[at] = ink;
+        // Whatever was in this cell is gone, including anything that was
+        // hanging off it. A mark left behind would be a character from a label
+        // that is no longer on screen.
+        self.marks.remove(&at);
     }
 
     fn free(&self, row: usize, col: usize, line: char) -> bool {
@@ -891,25 +950,61 @@ impl Canvas {
         }
     }
 
-    /// Text, one *cell* at a time rather than one character.
+    /// Text, one *glyph* at a time.
     ///
-    /// An ideograph is two cells wide and the grid is measured in cells, so the
-    /// second cell is claimed by a marker that emits nothing. Without it a
-    /// four-ideograph label would be laid into four cells, drawn into eight,
-    /// and every box to its right would be in the wrong column — which is the
-    /// bug `str::len` is wrong about twice over.
+    /// Not one character at a time, and not one cell at a time either, because
+    /// a glyph is reliably neither. `unicode_width` measures `👨‍👩‍👦` as two
+    /// cells and its five characters as six; it measures `⚠️` as two cells and
+    /// its two characters as one. Everything else here measures *strings* —
+    /// the box is sized from `str::width`, the pane bound is checked with it —
+    /// so a drawing that advanced by characters disagreed with its own layout
+    /// in both directions: the family emoji was written over the box border it
+    /// had been sized inside, and the warning sign ran a cell past the pane.
+    ///
+    /// So the text is cut into the pieces the measurement is defined on (see
+    /// [`clusters`]) and each piece advances by its own measured width. The
+    /// cell holds the first character of the piece and the rest hangs off it in
+    /// `marks`, which is what keeps a combining mark out of the next
+    /// character's cell — where the next character used to overwrite it, and
+    /// `नमस्ते` came out as `नमसत`.
     fn write(&mut self, row: usize, col: usize, text: &str, ink: Ink) {
         let mut at = col;
-        for ch in text.chars() {
-            let wide = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
-            if at + wide > self.cols {
-                return;
+        let mut base = None;
+        // A mark before anything it could modify. Rare, and it still has to be
+        // emitted, so it is carried until there is a cell to hang it on.
+        let mut pending = String::new();
+
+        for cluster in clusters(text) {
+            let wide = cluster.width();
+            if wide == 0 {
+                pending.push_str(&cluster);
+                continue;
             }
-            self.put(row, at, ch, ink);
+            if at + wide > self.cols {
+                break;
+            }
+            let mut chars = cluster.chars();
+            let Some(first) = chars.next() else { continue };
+            self.put(row, at, first, ink);
             for skip in 1..wide {
                 self.put(row, at + skip, TAKEN, ink);
             }
+            let rest: String = std::mem::take(&mut pending) + &chars.collect::<String>();
+            if !rest.is_empty() && row < self.rows {
+                self.marks.insert(row * self.cols + at, rest);
+            }
+            base = Some(at);
             at += wide;
+        }
+
+        if !pending.is_empty() {
+            let owner = base.unwrap_or(col);
+            if row < self.rows && owner < self.cols {
+                self.marks
+                    .entry(row * self.cols + owner)
+                    .or_default()
+                    .push_str(&pending);
+            }
         }
     }
 
@@ -918,9 +1013,11 @@ impl Canvas {
         let mut out = Rows::new();
         for row in 0..self.rows {
             let base = row * self.cols;
+            // A cell holding nothing but a combining mark still measures zero
+            // and still has to be emitted, so it counts as written.
             let end = (0..self.cols)
                 .rev()
-                .find(|&c| self.cell[base + c] != ' ')
+                .find(|&c| self.cell[base + c] != ' ' || self.marks.contains_key(&(base + c)))
                 .map_or(0, |c| c + 1);
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut run = String::new();
@@ -935,6 +1032,9 @@ impl Canvas {
                 }
                 ink = here;
                 run.push(self.cell[base + col]);
+                if let Some(marks) = self.marks.get(&(base + col)) {
+                    run.push_str(marks);
+                }
             }
             if !run.is_empty() {
                 spans.push(Span::styled(run, style(ink, theme)));
@@ -945,6 +1045,49 @@ impl Canvas {
     }
 }
 
+/// One glyph and everything that belongs to it, so that the widths of the
+/// pieces add up to the width of the whole.
+///
+/// Four things join the character before them, and each one is a case where
+/// `str::width` and the sum of `char::width` disagree — which is to say, each
+/// one is a way a drawing could be laid out to one size and drawn at another:
+///
+/// - anything of zero width: a combining mark, a zero-width space, and the
+///   variation selector that turns `⚠` into `⚠️` and one cell into two;
+/// - whatever follows a zero-width joiner, which is what makes one family
+///   emoji out of three people;
+/// - a skin-tone modifier, which is two cells of its own and none in context;
+/// - the second half of a regional indicator pair, which is a flag.
+///
+/// Anything unicode-width learns to join later that is not in this list costs
+/// a drawing some empty cells inside a box. Anything it learns to *widen* would
+/// cost a row, which is why the variation selector is here.
+fn clusters(text: &str) -> Vec<String> {
+    /// Skin-tone modifiers.
+    const TONES: std::ops::RangeInclusive<char> = '\u{1f3fb}'..='\u{1f3ff}';
+    /// The letters flags are spelled with, always in pairs.
+    const FLAGS: std::ops::RangeInclusive<char> = '\u{1f1e6}'..='\u{1f1ff}';
+
+    let mut out: Vec<String> = Vec::new();
+    let mut joiner = false;
+    let mut half_a_flag = false;
+    for ch in text.chars() {
+        let joins = unicode_width::UnicodeWidthChar::width(ch) == Some(0)
+            || joiner
+            || TONES.contains(&ch)
+            || (half_a_flag && FLAGS.contains(&ch));
+        match out.last_mut() {
+            Some(last) if joins => last.push(ch),
+            _ => out.push(ch.to_string()),
+        }
+        joiner = ch == '\u{200d}';
+        half_a_flag = FLAGS.contains(&ch) && !joins;
+    }
+    out
+}
+
+/// The palette, by role, exactly as the module note assigns it. Nothing in here
+/// picks a colour anywhere else.
 fn style(ink: Ink, theme: &'static Theme) -> ratatui::style::Style {
     use ratatui::style::Style;
     match ink {
@@ -952,13 +1095,12 @@ fn style(ink: Ink, theme: &'static Theme) -> ratatui::style::Style {
         // colour for a space is one more thing to keep in step with the theme.
         Ink::Blank => Style::default(),
         // The frame and the connectors are chrome — the pane's own voice, the
-        // same argument `markdown` makes for a code gutter. What the reader is
-        // there to read is the text inside.
+        // same argument `markdown` makes for a code gutter. Every stroke, at
+        // one colour: solid, dotted and thick are told apart by their glyphs.
         Ink::Frame | Ink::Line => Style::default().fg(theme.dim),
+        // All of it, node labels and edge labels alike.
         Ink::Text => Style::default().fg(theme.fg),
-        // An edge label is the one piece of text that would otherwise be lost
-        // in the chrome around it.
-        Ink::Label => Style::default().fg(theme.accent),
+        Ink::Severed => Style::default().fg(theme.danger),
     }
 }
 
@@ -1206,10 +1348,19 @@ impl<'a> Plan<'a> {
         if graph.nodes.iter().any(|n| longest_word(&n.label) > limit) {
             return None;
         }
+        // How wide the frame around `content` cells of text comes out. Odd on
+        // the minor axis for the reason `minor_len` gives below.
+        let frame = |content: usize| {
+            if vertical {
+                (content + 4) | 1
+            } else {
+                content + 4
+            }
+        };
         let text: Vec<Vec<String>> = graph
             .nodes
             .iter()
-            .map(|node| wrap_label(&node.label, limit))
+            .map(|node| fit_label(&node.label, limit, |content| frame(content) <= width))
             .collect();
         let size: Vec<(usize, usize)> = text
             .iter()
@@ -1426,7 +1577,7 @@ impl<'a> Plan<'a> {
         // a junction is a property of the cell, not of whichever edge reached
         // it last.
         let mut joints: HashMap<(usize, usize), (u8, Stroke, bool)> = HashMap::new();
-        let mut tips: Vec<(usize, usize, char)> = Vec::new();
+        let mut tips: Vec<(usize, usize, char, Ink)> = Vec::new();
         let along = if self.vertical { UP | DOWN } else { LEFT | RIGHT };
         let sideways = if self.vertical { LEFT | RIGHT } else { UP | DOWN };
 
@@ -1486,15 +1637,15 @@ impl<'a> Plan<'a> {
 
             let (row, col) = self.cell(major(entry), to);
             let two_way = edge.tail != Tip::None;
-            tips.push((row, col, pen.tip(head, two_way, ahead)));
+            tips.push((row, col, pen.tip(head, two_way, ahead), tip_ink(head)));
         }
 
         for (&(row, col), &(ways, stroke, mixed)) in &joints {
             let stroke = if mixed { Stroke::Solid } else { stroke };
             canvas.put(row, col, Pen::of(stroke).joint(stroke, ways), Ink::Line);
         }
-        for (row, col, glyph) in tips {
-            canvas.put(row, col, glyph, Ink::Line);
+        for (row, col, glyph, ink) in tips {
+            canvas.put(row, col, glyph, ink);
         }
 
         // Labels last, and only once every connector in the band is down. A
@@ -1518,7 +1669,7 @@ impl<'a> Plan<'a> {
                 (0..text.width()).all(|n| canvas.free(row, col + n, pen.across))
             });
             let (row, col) = placed?;
-            canvas.write(row, col, text, Ink::Label);
+            canvas.write(row, col, text, Ink::Text);
         }
         Some(())
     }
@@ -1577,6 +1728,18 @@ impl<'a> Plan<'a> {
             leg(turn + 1, entry, to);
         }
         spots
+    }
+}
+
+/// A tip is chrome like the rest of the connector, with one exception the
+/// module note names: `--x` is a severed end, and it is drawn in `danger` here
+/// and in a sequence diagram's `-x` alike, because the two grammars spell one
+/// concept. `--o` is not that concept — a circle end is a state, not a break —
+/// so it stays with the line it ends.
+fn tip_ink(tip: Tip) -> Ink {
+    match tip {
+        Tip::Cross => Ink::Severed,
+        _ => Ink::Line,
     }
 }
 
@@ -1670,7 +1833,33 @@ pub(super) fn longest_word(text: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// A node's label, wrapped to the widest box this will draw.
+/// A node's label, wrapped as wide as it can be and still fit its frame in the
+/// pane.
+///
+/// Greedy wrapping is not monotonic in the room it is given: one more column
+/// can put one more word on the first line and cost the box two. Wrapping at
+/// the widest allowed room and taking what came out therefore made the
+/// *drawing* non-monotonic too — `A[a really quite long label on one node]`
+/// boxed at eleven columns and fell back to the outline at twelve, so widening
+/// the pane made the answer worse. Narrowing until the frame fits is what makes
+/// "does this draw as boxes?" a question whose answer only improves as the pane
+/// grows. It stops at the longest word, which is the width below which wrapping
+/// would start breaking words in half; `Plan::of` has already refused a diagram
+/// with a word wider than that.
+fn fit_label(label: &str, limit: usize, fits: impl Fn(usize) -> bool) -> Vec<String> {
+    let floor = longest_word(label).max(1);
+    let mut room = limit;
+    loop {
+        let lines = wrap_label(label, room);
+        let widest = lines.iter().map(|line| line.width()).max().unwrap_or(0);
+        if room <= floor || fits(widest) {
+            return lines;
+        }
+        room -= 1;
+    }
+}
+
+/// A node's label, wrapped to a given number of cells.
 fn wrap_label(label: &str, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     // The break `lex` decoded from `<br>` is honoured: it is a line the author
@@ -1698,20 +1887,22 @@ fn wrap_label(label: &str, limit: usize) -> Vec<String> {
 fn back_rows(graph: &Graph, laid: &Layered, width: usize, theme: &'static Theme) -> Rows {
     let dim = ratatui::style::Style::default().fg(theme.dim);
     let text = ratatui::style::Style::default().fg(theme.fg);
-    let mark = ratatui::style::Style::default().fg(theme.accent);
+    // The `↩` is abeam saying the layout had to cut this edge, which is not
+    // something the document said. The module note gives that its own colour.
+    let mark = ratatui::style::Style::default().fg(theme.special);
     let mut out = Rows::new();
     for (e, edge) in graph.edges.iter().enumerate() {
         if !laid.back[e] {
             continue;
         }
         let mut spans = vec![
-            Span::styled("↩ ", dim),
+            Span::styled("↩ ", mark),
             Span::styled(graph.nodes[edge.from].label.clone(), text),
             Span::styled(" ─", dim),
         ];
         if let Some(label) = &edge.label {
             spans.push(Span::styled(" ", dim));
-            spans.push(Span::styled(label.clone(), mark));
+            spans.push(Span::styled(label.clone(), text));
             spans.push(Span::styled(" ─", dim));
         }
         spans.push(Span::styled("▶ ", dim));
@@ -1730,6 +1921,7 @@ fn back_rows(graph: &Graph, laid: &Layered, width: usize, theme: &'static Theme)
 mod tests {
     use super::super::tests::{assert_fits, assert_keeps, draw};
     use super::*;
+    use crate::panes::viewer::theme::Mode;
 
     /// A body with its header already taken off, so the parser can be tested
     /// without going through the drawing.
@@ -2084,6 +2276,125 @@ mod tests {
         assert!(!drawn("graph TD\n  A --> B\n", 20).iter().any(|r| r.contains('↕')));
     }
 
+    #[test]
+    fn a_combining_mark_is_not_eaten_by_the_letter_after_it() {
+        // A mark is zero cells wide and belongs in the cell of the character it
+        // modifies. Advancing a cell for it let the next character overwrite
+        // it, which turned नमस्ते into नमसत — a `Some` whose text is not the
+        // author's, which is the one outcome the module note forbids.
+        for word in [
+            "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}", // नमस्ते: virama and two vowel signs
+            "e\u{301}te\u{301}",                              // NFD Latin
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f466}", // one family, not three people
+            "\u{26a0}\u{fe0f}",                               // an emoji presentation selector
+        ] {
+            let rows = draw(&format!("graph TD\n  A[{word} here] --> B\n"), 40).expect("drew");
+            assert!(rows.join("\n").contains(word), "mangled: {rows:?}");
+            assert_fits(&rows, 40, "a combining mark");
+        }
+    }
+
+    #[test]
+    fn a_glyph_that_is_not_one_character_takes_the_cells_it_is_measured_at() {
+        // Every one of these is a string whose width is not the sum of its
+        // characters' widths, in one direction or the other. The box is sized
+        // by the first measure and drawn by the second, so a disagreement is a
+        // box with a hole in its border or a row past the edge of the pane —
+        // both of which this drew before `clusters` existed.
+        for text in [
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f466}", // six characters, two cells
+            "\u{26a0}\u{fe0f}",                               // one character, two cells
+            "\u{1f1ec}\u{1f1e7}",                             // a flag is a pair
+            "\u{1f44d}\u{1f3fd}",                             // and a skin tone is not extra
+            "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}", // नमस्ते
+            "\u{e01}\u{e34}",                                 // Thai above-vowel
+            "\u{5d0}\u{5b7}",                                 // Hebrew with niqqud
+        ] {
+            let rows = drawn(&format!("graph TD\n  A[{text}]\n"), 40);
+            assert_fits(&rows, 40, text);
+            assert!(rows.join("").contains(text), "{text:?} was mangled: {rows:?}");
+            // One box, so every row of the drawing is the same box: a border
+            // that does not line up is a cell the text took and nobody counted.
+            let widths: Vec<usize> = rows.iter().map(|row| row.width()).collect();
+            assert!(
+                widths.windows(2).all(|pair| pair[0] == pair[1]),
+                "{text:?} drew a ragged box: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_break_in_an_edge_label_never_reaches_a_row() {
+        // An edge label has one row to sit on, so `<br/>` is a space in it —
+        // see `edge_label`. A `\n` that reached a drawer would be measured as
+        // nothing and drawn as a cell, and the label would land one cell past
+        // the reservation it was checked against, on somebody else's line.
+        for (src, width) in [
+            ("graph TD\n  A -->|first<br/>second| B\n", 40),
+            ("graph RL\n  A[\u{1f600}] -->|<br/>| B[subgraph]\n", 32),
+            ("graph TD\n  B{Choice}\n  B -->|ye<br/>s| C[Do it]\n  B -->|no| D[Stop]\n", 15),
+            ("graph TD\n  A --> B\n  B -- one<br/>two --> A\n", 30),
+        ] {
+            let rows = draw(src, width).expect("drew");
+            assert!(
+                !rows.iter().any(|row| row.contains('\n')),
+                "{src:?} at {width}: {rows:?}"
+            );
+            assert_fits(&rows, width, src);
+        }
+        // The break is a space, not a deletion: both halves are still there.
+        let rows = draw("graph TD\n  A -->|first<br/>second| B\n", 40).expect("drew");
+        assert_keeps(&rows, &["first second"], "a broken edge label");
+    }
+
+    #[test]
+    fn a_node_declared_twice_says_what_mermaid_says_it_says() {
+        // The last text written wins, which is what mermaid's own `addVertex`
+        // does — so a reader's browser shows `second` too. Deliberate rather
+        // than an oversight: a drawing that disagreed with the file's own
+        // renderer would be a worse failure than one that drops a word the
+        // author themselves overwrote.
+        let graph = parse("A[first] --> B\nA[second] --> C").expect("parses");
+        assert_eq!(graph.nodes[0].label, "second");
+        assert!(drawn("graph TD\n  A[first] --> B\n  A[second] --> C\n", 40)[1].contains("second"));
+    }
+
+    // --- colour ----------------------------------------------------------
+
+    #[test]
+    fn the_palette_is_spent_the_way_the_module_note_assigns_it() {
+        let theme = Mode::Dark.theme();
+        let colour = |rows: &Rows, needle: &str| {
+            rows.iter()
+                .flatten()
+                .find(|span| span.content.contains(needle))
+                .unwrap_or_else(|| panic!("nothing drew {needle:?}"))
+                .style
+                .fg
+        };
+
+        let body = ["A[Start] -->|yes| B[Stop]".to_string()];
+        let rows = render(Direction::Down, &body, 40, theme).expect("drew");
+        // Text is text wherever it is written: a label on a run is not chrome
+        // because it is short.
+        assert_eq!(colour(&rows, "Start"), Some(theme.fg));
+        assert_eq!(colour(&rows, "yes"), Some(theme.fg));
+        // Structure recedes, at every stroke.
+        assert_eq!(colour(&rows, "┌"), Some(theme.dim));
+        assert_eq!(colour(&rows, "▼"), Some(theme.dim));
+
+        // A severed end is the one exception, and it is `╳` in both families.
+        let rows = render(Direction::Down, &["A --x B".to_string()], 20, theme).expect("drew");
+        assert_eq!(colour(&rows, "╳"), Some(theme.danger));
+        // ...and a circle end is not that concept.
+        let rows = render(Direction::Down, &["A --o B".to_string()], 20, theme).expect("drew");
+        assert_eq!(colour(&rows, "●"), Some(theme.dim));
+
+        // The marker on a cut edge is abeam speaking, not the author.
+        let rows = render(Direction::Down, &["A --> A".to_string()], 20, theme).expect("drew");
+        assert_eq!(colour(&rows, "↩"), Some(theme.special));
+    }
+
     // --- cycles ----------------------------------------------------------
 
     #[test]
@@ -2144,6 +2455,45 @@ mod tests {
                 "    └─ no  ─▶ Stop",
             ]
         );
+    }
+
+    #[test]
+    fn a_pane_that_can_hold_the_longest_word_draws_something() {
+        // The floor the sweeps below are measured against. Without it they pass
+        // by drawing nothing at every width, which is the way a width sweep
+        // fails silently. Eight columns is `Choice` plus the two cells the
+        // outline's narrowest connector costs.
+        let src = "graph TD\n  A[Start] --> B{Choice}\n  B -->|yes| C[Do it]\n  B -->|no| D[Stop]\n";
+        for width in 8..=60 {
+            assert!(draw(src, width).is_some(), "declined at {width}");
+        }
+        for width in 4..8 {
+            assert!(draw(src, width).is_none(), "drew a broken word at {width}");
+        }
+    }
+
+    #[test]
+    fn one_more_column_of_pane_never_takes_the_boxes_away() {
+        // Greedy wrapping is not monotonic in the room it is given, so the
+        // widest wrap is not always the one whose box fits — `fit_label`
+        // narrows until it does. Before that, this drew boxes at eleven columns
+        // and gave up at twelve, so widening the pane made the answer worse.
+        //
+        // What this asserts is the single-box case, which is the one that was
+        // wrong. A rank of several boxes can still cross the threshold either
+        // way, because there the packing and not the frame is what does not
+        // fit; see the note on `fit_label`.
+        let src = "graph TD\n  A[a really quite long label on one node] --> B[short]\n";
+        let mut boxed = None;
+        for width in 4..=60 {
+            let drew = draw(src, width).is_some_and(|rows| rows.iter().any(|r| r.contains('┌')));
+            match boxed {
+                Some(first) => assert!(drew, "boxes at {first} but not at {width}"),
+                None if drew => boxed = Some(width),
+                None => {}
+            }
+        }
+        assert_eq!(boxed, Some(11));
     }
 
     #[test]

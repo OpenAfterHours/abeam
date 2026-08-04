@@ -1,5 +1,10 @@
 //! The flowchart a pane is too narrow to draw, written as an indented outline.
 //!
+//! The flowchart's, and nothing else's. `seq` has its own narrow form — a
+//! numbered list of messages — because the two families are narrow in different
+//! ways, and nothing here is shared with it beyond `wrap`. That is why this
+//! lives under `flow/` rather than beside it.
+//!
 //! The same argument `markdown::emit_table_as_records` makes about a grid: at
 //! forty columns a four-cell-wide box is not a diagram, it is a puzzle, and the
 //! reader is better served by the data laid out plainly than by a picture of it
@@ -13,12 +18,19 @@
 //!     └─ no  ─▶ Stop
 //! ```
 //!
-//! This is the fallback that must never itself fail. Labels wrap across the
-//! full width here rather than being sized into a box, the indent is clamped
-//! the way `markdown` clamps a nested list's, and the connector has three forms
-//! — aligned label, plain arrow, bare marker — chosen by measuring, so that
-//! there is no width from four columns up at which a flowchart parses and then
-//! produces nothing.
+//! This is the fallback that must not fail for the reason the boxes did.
+//! Labels wrap across the full width here rather than being sized into a box,
+//! the indent is clamped the way `markdown` clamps a nested list's, and the
+//! connector has three forms — aligned label, plain arrow, bare marker — chosen
+//! by measuring rather than by a threshold picked by eye.
+//!
+//! There is one thing it cannot wrap its way out of, and it is not a width: a
+//! *word* wider than the row it is given comes out in halves, and half a word
+//! is not the word. So `Choice` in an eight-column pane is an outline and in a
+//! seven-column one is `None` — the source, which is always true. That floor is
+//! a property of the document, not of the pane, and it is the reason the module
+//! note's "no width at which a flowchart produces nothing" is not quite the
+//! rule; see `cramped` in [`render`].
 //!
 //! ## The tree is a tree, so a node is drawn once
 //!
@@ -33,8 +45,8 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 use unicode_width::UnicodeWidthStr;
 
-use super::Rows;
-use super::flow::{Graph, Stroke, Tip, longest_word};
+use super::{Graph, Stroke, Tip, longest_word};
+use crate::panes::viewer::mermaid::Rows;
 use crate::panes::viewer::theme::Theme;
 use crate::text::wrap::{self, spans_width};
 
@@ -46,11 +58,22 @@ const STEP: usize = 4;
 /// stops advancing and the structure comes from the connectors alone — the
 /// same trade `markdown::prefixes` makes with `CRAMPED`, for the same reason:
 /// a document that is all structure must not spend the whole pane saying so.
-const KEEP: usize = 10;
+/// Twelve, which is `markdown::CRAMPED` and `seq::CRAMPED`: three places now
+/// agree on where a terminal stops having room for decoration, and a fourth
+/// number would just be a fourth opinion.
+const KEEP: usize = 12;
+
+/// `├─ ` before a label and ` ─▶ ` after it — the branch, a dash, a space, the
+/// space and dash on the other side, the tip, and the space before the text.
+const ALIGNED_CHROME: usize = 7;
+/// `├─▶ `: branch, dash, tip, space.
+const PLAIN_CHROME: usize = 4;
+/// `▶ `: the tip and the space, and no room for anything else.
+const BARE_CHROME: usize = 2;
 
 /// Rows past which even the outline gives up and the source is shown.
 ///
-/// The caps in [`super`] already bound the graph; this bounds the *rendering*
+/// The caps in `mermaid` already bound the graph; this bounds the *rendering*
 /// of one, which a four-column pane can multiply by the wrap factor of a long
 /// label. Declining rather than truncating, because a truncated outline is the
 /// fourth outcome the module note rules out, and at a thousand rows the fence's
@@ -143,11 +166,13 @@ impl Outline<'_> {
             if !matches!(form, Form::Aligned(_))
                 && let Some(label) = &label
             {
-                content.push(Span::styled(format!(" ({label})"), self.accent()));
+                content.push(Span::styled(format!(" ({label})"), self.body()));
             }
             if known {
                 // Already written out above, with its own subtree under it.
-                content.push(Span::styled(" ↩", self.dim()));
+                // abeam speaking rather than the author, so it is marked the
+                // way the module note marks that: `Theme::special`.
+                content.push(Span::styled(" ↩", self.mark()));
             }
             self.emit(content, &first, &rest);
 
@@ -192,9 +217,17 @@ impl Outline<'_> {
                 widest = widest.max(label.width());
             }
         }
-        if widest > 0 && indent + widest + 7 + bare <= self.width {
+        // Never zero, whatever the labels measure. A label of `<br/>`, or of a
+        // zero-width space, is a row whose every word is nothing cells wide,
+        // and taking that at face value accepted a prefix exactly as wide as
+        // the pane — which left no room for the ` ↩` this cannot yet know is
+        // coming, and `wrap`'s own floor of one cell then put it past the edge.
+        // One cell is what that marker costs and what a wrapper needs.
+        let (bare, joined) = (bare.max(1), joined.max(1));
+
+        if widest > 0 && indent + widest + ALIGNED_CHROME + bare <= self.width {
             Form::Aligned(widest)
-        } else if indent + 4 + joined <= self.width {
+        } else if indent + PLAIN_CHROME + joined <= self.width {
             Form::Plain
         } else {
             Form::Bare
@@ -222,6 +255,11 @@ impl Outline<'_> {
             Tip::Cross => '╳',
             Tip::None => dash,
         };
+        // The tip is a span of its own so that a severed end can be `danger`
+        // while the line into it stays `dim`, which is the module note's rule
+        // and the one place in a connector where colour carries meaning.
+        let tip = Span::styled(tip.to_string(), self.tip_style(edge.head));
+        let space = Span::styled(" ", self.dim());
         let corner = if last { '└' } else { '├' };
         // The last child closes its branch, so nothing below it continues the
         // line — which is what makes the indent readable as a tree at all.
@@ -235,41 +273,54 @@ impl Outline<'_> {
                 let head = match edge.label.as_deref() {
                     Some(label) => vec![
                         Span::styled(format!("{trunk}{corner}{dash} "), self.dim()),
-                        Span::styled(label.to_string(), self.accent()),
+                        Span::styled(label.to_string(), self.body()),
                         Span::styled(
-                            format!("{} {dash}{tip} ", " ".repeat(widest - label.width())),
+                            format!("{} {dash}", " ".repeat(widest - label.width())),
                             self.dim(),
                         ),
+                        tip,
+                        space,
                     ],
                     // An unlabelled edge in a labelled fan keeps the width and
                     // spends it on line rather than on space, so the column of
-                    // arrowheads survives.
-                    None => vec![Span::styled(
-                        format!(
-                            "{trunk}{corner}{dash}{}{dash}{tip} ",
-                            dash.to_string().repeat(widest + 2)
+                    // arrowheads survives. The run stands in for the label and
+                    // for the space either side of it.
+                    None => vec![
+                        Span::styled(
+                            format!(
+                                "{trunk}{corner}{dash}{}{dash}",
+                                dash.to_string().repeat(widest + 2)
+                            ),
+                            self.dim(),
                         ),
-                        self.dim(),
-                    )],
+                        tip,
+                        space,
+                    ],
                 };
+                // Everything the first line spent except the branch character,
+                // which the continuation draws instead of a space.
                 let rest = vec![Span::styled(
-                    format!("{trunk}{branch}{}", " ".repeat(widest + 6)),
+                    format!("{trunk}{branch}{}", " ".repeat(widest + ALIGNED_CHROME - 1)),
                     self.dim(),
                 )];
                 (head, rest)
             }
             // `├─▶ `, and the label joins the text as `Do it (yes)`.
             Form::Plain => (
+                vec![
+                    Span::styled(format!("{trunk}{corner}{dash}"), self.dim()),
+                    tip,
+                    space,
+                ],
                 vec![Span::styled(
-                    format!("{trunk}{corner}{dash}{tip} "),
+                    format!("{trunk}{branch}{}", " ".repeat(PLAIN_CHROME - 1)),
                     self.dim(),
                 )],
-                vec![Span::styled(format!("{trunk}{branch}   "), self.dim())],
             ),
             // Nothing left but the fact that this is an edge.
             Form::Bare => (
-                vec![Span::styled(format!("{tip} "), self.dim())],
-                vec![Span::styled("  ", self.dim())],
+                vec![tip, space],
+                vec![Span::styled(" ".repeat(BARE_CHROME), self.dim())],
             ),
         }
     }
@@ -293,19 +344,37 @@ impl Outline<'_> {
         );
     }
 
+    /// A node's label, as a span. A `<br>` the author wrote is a space here:
+    /// the outline's own wrapping is what decides where this label breaks, and
+    /// honouring both would leave a two-word row in a column of full ones. An
+    /// *edge* label has already had the same decision made for it, in
+    /// `flow::edge_label`, because it has one row to sit on either way.
     fn text(&self, label: &str) -> Span<'static> {
-        // A `<br>` the author wrote is a space here: the outline's own wrapping
-        // is what decides where this label breaks, and honouring both would
-        // leave a two-word row in the middle of a column of full ones.
-        Span::styled(label.replace('\n', " "), Style::default().fg(self.theme.fg))
+        Span::styled(label.replace('\n', " "), self.body())
     }
 
+    /// Everything the reader came to read: node labels and edge labels alike.
+    fn body(&self) -> Style {
+        Style::default().fg(self.theme.fg)
+    }
+
+    /// The tree, the arrows and the dashes — structure, at every stroke.
     fn dim(&self) -> Style {
         Style::default().fg(self.theme.dim)
     }
 
-    fn accent(&self) -> Style {
-        Style::default().fg(self.theme.accent)
+    /// abeam speaking rather than the author: the `↩` on a node already drawn.
+    fn mark(&self) -> Style {
+        Style::default().fg(self.theme.special)
+    }
+
+    /// A severed end is the one tip that is not chrome. See the module note in
+    /// `mermaid`: `--x` here and `-x` in a sequence diagram are one concept.
+    fn tip_style(&self, head: Tip) -> Style {
+        match head {
+            Tip::Cross => Style::default().fg(self.theme.danger),
+            _ => self.dim(),
+        }
     }
 }
 
@@ -319,9 +388,9 @@ fn adjacency(graph: &Graph) -> Vec<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::lex;
-    use super::super::tests::{assert_fits, assert_keeps, flatten};
     use super::*;
+    use crate::panes::viewer::mermaid::lex;
+    use crate::panes::viewer::mermaid::tests::{assert_fits, assert_keeps, draw, flatten};
     use crate::panes::viewer::theme::Mode;
 
     /// A flowchart body — the header is the caller's business — laid out as an
@@ -471,6 +540,30 @@ mod tests {
                 "                └─▶ f",
             ]
         );
+    }
+
+    #[test]
+    fn a_zero_width_label_does_not_overflow_the_outline() {
+        // `<br/>` alone is a label whose every word measures zero cells, so
+        // `form` believed `└─▶ ` left room and the ` ↩` went past the edge.
+        let rows = draw("graph TD\n  A[<br/>] --> A\n", 4).expect("drew");
+        assert_fits(&rows, 4, "zero-width label at 4");
+
+        let src = "graph TD\n  P[<br/>] --> A[<br/>]\n  \
+                   Q[aaaaaaaaaaaaaaaaa] -->|aaaaaaaaaaaaa| A\n";
+        assert_fits(&draw(src, 20).expect("drew"), 20, "aligned overflow at 20");
+
+        let rows = draw("graph TD\n  A[\u{200b}] --> B[\u{200b}]\n  B --> A\n", 4).expect("drew");
+        assert_fits(&rows, 4, "zero-width space at 4");
+    }
+
+    #[test]
+    fn a_pane_that_can_hold_the_longest_word_draws_something() {
+        // The floor the sweep below is measured against: without it, a drawer
+        // that stopped drawing entirely would pass every width in it.
+        for width in 8..=60 {
+            assert!(try_outline(CHOICE, width).is_some(), "declined at {width}");
+        }
     }
 
     #[test]

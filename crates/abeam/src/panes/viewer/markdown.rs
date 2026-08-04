@@ -1094,11 +1094,20 @@ sequenceDiagram
   W->>V: file changed
 ```
 ";
-        let out = text(&render(md, 40, Mode::Dark));
-        assert!(out[0].contains('┌'), "{out:?}");
-        assert!(out.iter().any(|l| l.contains("Watcher")));
-        assert!(out.iter().any(|l| l.contains("file changed")));
-        assert!(out.iter().any(|l| l.contains('▶')));
+        assert_eq!(
+            text(&render(md, 40, Mode::Dark)),
+            [
+                "┌─────────┐    ┌─────────┐",
+                "│ Watcher │    │ Viewer  │",
+                "└────┬────┘    └────┬────┘",
+                "     │              │",
+                "     │ file changed │",
+                "     ├──────────────▶",
+                "┌────┴────┐    ┌────┴────┐",
+                "│ Watcher │    │ Viewer  │",
+                "└─────────┘    └─────────┘",
+            ]
+        );
     }
 
     #[test]

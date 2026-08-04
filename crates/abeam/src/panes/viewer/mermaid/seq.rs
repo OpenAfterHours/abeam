@@ -25,13 +25,15 @@
 //! broken across two label rows is a word the reader has to reassemble, and the
 //! premise of this module is that the drawing is at least as readable as the
 //! source it replaced. That is also the gate at the end of [`render`] — every
-//! word of every label is checked to still be on screen intact, and a drawing
-//! that lost one is thrown away in favour of the list, or the list in favour of
-//! `None`. It is a check rather than a width formula because the ways a word
-//! can go missing (a note clipped at the pane edge, a block label too long for
-//! its frame, a caption centred over too short a span) are several, and one
-//! assertion that catches all of them beats four arithmetic rules that each
-//! catch one.
+//! word of every label has to still be on screen as a *whole token*, and a
+//! drawing that lost one is thrown away in favour of the list, or the list in
+//! favour of `None`. Whole token, not "appears somewhere": see [`keeps`], where
+//! the difference is the gate working and the gate being satisfied by `no`
+//! turning up inside `Note`. It is a check rather than a width formula because
+//! the ways a word can go missing (a note clipped at the pane edge, a block
+//! label too long for its frame, a caption centred over too short a span) are
+//! several, and one assertion that catches all of them beats four arithmetic
+//! rules that each catch one.
 //!
 //! ## Why a cell grid rather than strings
 //!
@@ -42,14 +44,27 @@
 //! would mean splicing by byte offset into text that may be ideographs, and the
 //! bug that costs — half a wide glyph left behind after something was stamped
 //! over its other half — is precisely the bug that makes a row measure right
-//! and print wrong. [`Cell::Tail`] is that failure made unrepresentable.
+//! and print wrong. [`Cell::Tail`] is that failure made unrepresentable, and
+//! [`Row::marks`] is the other half of the same problem: a combining mark is
+//! *zero* cells and belongs on the character before it, not in a cell of its
+//! own and not on the floor.
 //!
 //! Tried and rejected: putting the message text *on* the arrow run rather than
 //! above it. It reads well in a wide pane and collapses in a narrow one,
 //! because the run can then never be shorter than the text — nothing wraps, and
 //! the first sentence-long message pushes the diagram past any pane there is.
+//!
+//! ## Colour
+//!
+//! None of it is decided here. The palette is assigned by role in [`super`],
+//! for both diagram families at once, so that a document containing a flowchart
+//! and a sequence diagram does not read as two pieces of software: text is the
+//! body colour, every connector is `dim` whatever its stroke, a severed end is
+//! `╳` in `danger`, and a keyword abeam supplies is `special`. What is decided
+//! here is only which of those roles a thing *is* — and the one judgement in it
+//! is that a participant's name is text, not chrome.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -60,9 +75,11 @@ use crate::panes::viewer::theme::Theme;
 use crate::text::wrap::wrap_spans;
 
 /// Blank columns between two participant boxes that nothing else has pushed
-/// apart. One, not two: the boxes already have a space of padding inside their
-/// own borders, so `┐ ┌` reads as two boxes, and every column saved here is a
-/// column of message text that does not have to wrap.
+/// apart. Counted as blank *cells*, the way `flow::GAP` counts them, and it has
+/// to be at least one: two boxes whose borders touch draw as `┐┌`, which at
+/// forty columns reads as one wide box with a seam rather than as two
+/// participants. One is enough, because each box already carries a space of
+/// padding inside its own border.
 const GAP: usize = 1;
 /// Columns to the right of a lifeline that a self-message's hook needs.
 const SELF_HOOK: usize = 3;
@@ -70,6 +87,20 @@ const SELF_HOOK: usize = 3;
 /// same floor `markdown` calls `CRAMPED`, for the same reason: past it the
 /// indent is eating the text it exists to organise.
 const CRAMPED: usize = 12;
+
+/// Most rows the lifelines may take before the list is drawn instead.
+///
+/// `flow::ROW_CAP` is the same number for the same reason, and this is that
+/// argument applied to a conversation: a diagram three screens tall has stopped
+/// being a diagram, and the list says the same exchange in a row or two per
+/// message. Not a clock bound — the caps in [`super`] are what keep the layout
+/// itself cheap — but the two work together, because the drawing is not built
+/// twice and the list is reached without paying for a third layout.
+const ROW_CAP: usize = 240;
+/// ...and where the list itself gives up, matching `outline`'s own cap. Past
+/// this there is no rendering left that beats the source: a thousand rows of
+/// numbered messages is a transcript, and the transcript was the fence.
+const LIST_CAP: usize = 1000;
 
 /// Blocks that open and are closed by `end`.
 const BLOCKS: [&str; 7] = ["loop", "alt", "opt", "par", "critical", "break", "rect"];
@@ -89,7 +120,7 @@ pub fn render(body: &[String], width: usize, theme: &'static Theme) -> Option<Ro
     {
         return Some(rows);
     }
-    let rows = as_list(&diagram, width, theme);
+    let rows = as_list(&diagram, width, theme)?;
     keeps(&rows, &words).then_some(rows)
 }
 
@@ -207,14 +238,36 @@ impl Diagram {
     }
 }
 
-/// Whether every word is still on screen, unbroken.
+/// Whether every word is still on screen, whole.
+///
+/// Whole is the load-bearing part, and it is why this compares *tokens* rather
+/// than asking whether the drawing contains the word somewhere. Containment
+/// passes on an accident — `no` is inside `Note`, `end` is inside `friend`,
+/// `and` is inside `command`, and all three of those words are collected by
+/// [`Diagram::words`] from block keywords this module writes itself. A gate
+/// that can be satisfied by a coincidence is a gate that ships a clipped
+/// drawing, and this one decides lifelines → list → `None`.
+///
+/// Every glyph this draws is separated from text by a space (see the box and
+/// frame drawing), with one exception: the list glues the `:` or `,` that
+/// follows a participant's name onto the name, because the wrapper breaks
+/// between spans as readily as between words and a row consisting of one colon
+/// is a row. So a token is also offered with that punctuation taken back off.
 fn keeps(rows: &Rows, words: &[String]) -> bool {
     let text = rows
         .iter()
         .map(|row| row.iter().map(|s| s.content.as_ref()).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n");
-    words.iter().all(|word| text.contains(word.as_str()))
+    let mut seen: HashSet<&str> = HashSet::new();
+    for token in text.split_whitespace() {
+        seen.insert(token);
+        let bare = token.trim_end_matches([',', ':']);
+        if bare != token && !bare.is_empty() {
+            seen.insert(bare);
+        }
+    }
+    words.iter().all(|word| seen.contains(word.as_str()))
 }
 
 // --- arrows --------------------------------------------------------------
@@ -262,9 +315,11 @@ const ARROWS: [(&str, Stroke, Head, bool); 10] = [
 ];
 
 impl Arrow {
-    /// The run between the two lifelines. Two glyphs rather than one dimmed and
-    /// one not, because a dotted reply and a solid call have to be tellable
-    /// apart in a screenshot, in monochrome, at a glance.
+    /// The run between the two lifelines. Two glyphs rather than two colours,
+    /// which is the module note's rule and not a preference: a dotted reply and
+    /// a solid call have to be tellable apart in a screenshot, in monochrome,
+    /// and by a reader who does not receive hue. So both runs are `dim` — see
+    /// [`Arrow::ink`] — and the glyph carries the whole distinction.
     fn line(self) -> char {
         match self.stroke {
             Stroke::Solid => '─',
@@ -285,7 +340,11 @@ impl Arrow {
             (Head::Filled, false) => '◀',
             (Head::Open, true) => '>',
             (Head::Open, false) => '<',
-            (Head::Cross, _) => '✗',
+            // `╳`, the box-drawing cross, and not the dingbat `✗` that reads the
+            // same in a proportional font: `flow` draws `--x` with this one, the
+            // two grammars are spelling a single concept, and a reader with both
+            // diagrams in one document must not see two.
+            (Head::Cross, _) => '╳',
         }
     }
 
@@ -315,13 +374,23 @@ impl Arrow {
         out
     }
 
-    fn colour(self, theme: &'static Theme) -> Color {
-        match (self.head, self.stroke) {
-            // A cross is the one arrow that means something went wrong, and it
-            // is the one arrow a reader should find without looking for it.
-            (Head::Cross, _) => theme.danger,
-            (_, Stroke::Dotted) => theme.dim,
-            (_, Stroke::Solid) => theme.fg,
+    /// The run, and the junction it leaves from. A connector is structure and
+    /// is `dim` at every stroke: the module note assigns the palette by role
+    /// exactly so that a reader cannot tell which of the two drawers is on
+    /// screen, and an earlier version of this painted solid runs in the body
+    /// colour, which made hue carry the solid/dotted difference a second time
+    /// and made a diagram of solid calls the loudest thing on the page.
+    fn ink(self, theme: &'static Theme) -> Color {
+        theme.dim
+    }
+
+    /// The tip, which is the one part of an arrow that is allowed to shout. A
+    /// cross is the arrow that means something went wrong, and it is the one a
+    /// reader should find without having to look for it.
+    fn tip_ink(self, theme: &'static Theme) -> Color {
+        match self.head {
+            Head::Cross => theme.danger,
+            _ => theme.dim,
         }
     }
 }
@@ -334,7 +403,6 @@ fn parse(body: &[String]) -> Option<Diagram> {
     // `(next number, step)` while `autonumber` is on.
     let mut counter: Option<(usize, usize)> = None;
     let mut open: Vec<&'static str> = Vec::new();
-    let mut messages = 0usize;
 
     for raw in body {
         let line = raw.trim();
@@ -350,6 +418,19 @@ fn parse(body: &[String]) -> Option<Diagram> {
             // source, which says it exactly.
             "create" | "destroy" | "box" | "link" | "links" | "properties" => return None,
 
+            // One keyword, one drawing. Mermaid draws `actor` as a stick figure
+            // and `participant` as a box, and that difference does not survive
+            // the trip to a character grid: the figure is three strokes and a
+            // head, so it is either four rows of header on every diagram that
+            // contains one actor, or a single glyph — `☺`, `웃` — whose width a
+            // terminal is free to disagree about, in a layout counted in cells.
+            // It is also the one mermaid distinction that changes nothing else:
+            // not the ordering, not the lifeline, not a single arrow. What it
+            // says — that this participant is a person — the *name* already
+            // says. So both draw as a box, and `actor` is accepted rather than
+            // declined, because declining over a synonym would cost the reader
+            // the whole diagram. (`flow` makes the same trade, louder: twelve
+            // node shapes onto three frames.)
             "participant" | "actor" => {
                 let (id, alias) = split_alias(rest);
                 actor(&mut d, &mut ids, id, alias)?;
@@ -420,10 +501,6 @@ fn parse(body: &[String]) -> Option<Diagram> {
                     d.events.push(Event::Note(note));
                 } else {
                     let message = message(&mut d, &mut ids, line, &mut counter)?;
-                    messages += 1;
-                    if messages > MAX_EDGES {
-                        return None;
-                    }
                     d.events.push(Event::Message(message));
                 }
             }
@@ -441,7 +518,30 @@ fn parse(body: &[String]) -> Option<Diagram> {
     if d.actors.is_empty() && d.events.is_empty() && d.title.is_none() {
         return None;
     }
-    Some(d)
+    // Checked after parsing rather than while, matching `flow::Graph::parse`:
+    // the caps are about the size of the layout problem, and a statement is not
+    // one of anything — `participant A` adds a column and no band, `autonumber`
+    // adds neither.
+    //
+    // A *band* is anything that claims vertical space of its own: a message, a
+    // note, and each block or section that opens a frame — the `end` closing
+    // one is implied by the block it closes and needs no count of its own.
+    // Counting only messages left the two shapes that are not messages
+    // unbounded, and thirty kilobytes of `Note over A:` is legal mermaid that
+    // took four times the layout budget of a diagram sitting at both caps at
+    // once. The bands are what the row count is made of, so the bands are what
+    // is counted.
+    let bands = d
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Message(_) | Event::Note(_) | Event::Open(..) | Event::Section(..)
+            )
+        })
+        .count();
+    (d.actors.len() <= MAX_NODES && bands <= MAX_EDGES).then_some(d)
 }
 
 /// `(first word, the rest)`.
@@ -485,9 +585,9 @@ fn actor(
         }
         return Some(at);
     }
-    if d.actors.len() >= MAX_NODES {
-        return None;
-    }
+    // No cap here: `parse` applies it once, at the end, for the reason written
+    // there. The input is bounded to `super::MAX_BYTES` long before this, so
+    // what grows in between cannot get away from us.
     d.actors.push(shown);
     ids.insert(id.to_string(), d.actors.len() - 1);
     Some(d.actors.len() - 1)
@@ -515,8 +615,15 @@ fn message(
     // which is how mermaid itself orders undeclared participants.
     let from = actor(d, ids, left, None)?;
     let to = actor(d, ids, target, None)?;
+    // Saturating, not wrapping and not a refusal. `autonumber 18446744073709551615`
+    // is two lines from any document, and both alternatives are worse than a
+    // counter that stops: wrapping numbers the next message `0.`, which is a
+    // lie the reader has no way to see through, and declining throws away every
+    // participant, note and block in the file over a decoration on a caption
+    // whose *text* is the content. Two messages numbered alike at the top of
+    // `usize` mislead nobody — nobody reads that as an ordinal.
     let number = counter.map(|(next, step)| {
-        *counter = Some((next + step, step));
+        *counter = Some((next.saturating_add(step), step));
         next
     });
     Some(Message {
@@ -617,11 +724,23 @@ enum Cell {
     Tail,
 }
 
-struct Row(Vec<Cell>);
+struct Row {
+    cells: Vec<Cell>,
+    /// Combining marks, each held against the cell whose character it modifies.
+    ///
+    /// Beside the grid rather than in it, because a `Cell` is `Copy` and one
+    /// row in a thousand carries a mark: a diagram written in Latin should not
+    /// pay a `String` per cell so that `नमस्ते` can be drawn. Empty is the
+    /// overwhelmingly common case and costs one capacity check.
+    marks: Vec<(usize, char)>,
+}
 
 impl Row {
     fn new(width: usize) -> Self {
-        Row(vec![Cell::Blank; width])
+        Row {
+            cells: vec![Cell::Blank; width],
+            marks: Vec::new(),
+        }
     }
 
     /// Stamp one character, clipping anything that would run past the end. The
@@ -630,15 +749,15 @@ impl Row {
     /// one that overflows the pane, which nothing would.
     fn put(&mut self, x: usize, ch: char, style: Style) {
         let w = ch.width().unwrap_or(0);
-        if w == 0 || x + w > self.0.len() {
+        if w == 0 || x + w > self.cells.len() {
             return;
         }
         for at in x..x + w {
             self.erase(at);
         }
-        self.0[x] = Cell::Ch(ch, style);
+        self.cells[x] = Cell::Ch(ch, style);
         if w == 2 {
-            self.0[x + 1] = Cell::Tail;
+            self.cells[x + 1] = Cell::Tail;
         }
     }
 
@@ -646,20 +765,29 @@ impl Row {
     /// was straddling it. Leaving the orphan behind is how a row that measured
     /// correctly prints one cell wrong.
     fn erase(&mut self, x: usize) {
-        match self.0.get(x) {
+        match self.cells.get(x) {
             Some(Cell::Tail) => {
                 if x > 0 {
-                    self.0[x - 1] = Cell::Blank;
+                    self.blank(x - 1);
                 }
-                self.0[x] = Cell::Blank;
+                self.blank(x);
             }
             Some(Cell::Ch(ch, _)) => {
-                if ch.width() == Some(2) && x + 1 < self.0.len() {
-                    self.0[x + 1] = Cell::Blank;
+                if ch.width() == Some(2) && x + 1 < self.cells.len() {
+                    self.blank(x + 1);
                 }
-                self.0[x] = Cell::Blank;
+                self.blank(x);
             }
             _ => {}
+        }
+    }
+
+    /// Empty one cell, marks and all. A mark belongs to the character it was
+    /// written against, so it goes when that character does.
+    fn blank(&mut self, x: usize) {
+        self.cells[x] = Cell::Blank;
+        if !self.marks.is_empty() {
+            self.marks.retain(|(at, _)| *at != x);
         }
     }
 
@@ -668,21 +796,47 @@ impl Row {
     /// own `else` rule would break the frame open at exactly the row that says
     /// what the frame is.
     fn under(&mut self, x: usize, ch: char, style: Style) {
-        if matches!(self.0.get(x), Some(Cell::Blank)) {
+        if matches!(self.cells.get(x), Some(Cell::Blank)) {
             self.put(x, ch, style);
         }
     }
 
+    /// Stamp a string, one cell per column of display width.
+    ///
+    /// A zero-width character — a combining mark, and Devanagari and Hebrew are
+    /// full of them — is *appended to the cell of the character it modifies*
+    /// rather than given a cell or dropped. Dropping is what this did first,
+    /// and it was not a lost-content bug because `keeps` caught it — but it
+    /// caught it by throwing the lifelines away, so `A->>B: नमस्ते there` fell to
+    /// the list while the identical Latin diagram drew boxes. `flow` attaches
+    /// too; two families disagreeing about one input is a bug even when both
+    /// answers are defensible.
     fn puts(&mut self, x: usize, text: &str, style: Style) {
         let mut at = x;
+        let mut base: Option<usize> = None;
         for ch in text.chars() {
-            self.put(at, ch, style);
-            at += ch.width().unwrap_or(0);
+            match ch.width().unwrap_or(0) {
+                // A mark with nothing before it modifies nothing. It is dropped,
+                // `keeps` notices, and the drawing steps down a layout — which
+                // is the right answer for text that begins mid-grapheme.
+                0 => {
+                    if let Some(cell) = base
+                        && matches!(self.cells.get(cell), Some(Cell::Ch(..)))
+                    {
+                        self.marks.push((cell, ch));
+                    }
+                }
+                w => {
+                    self.put(at, ch, style);
+                    base = Some(at);
+                    at += w;
+                }
+            }
         }
     }
 
     fn fill(&mut self, from: usize, to: usize, ch: char, style: Style) {
-        for at in from..=to.min(self.0.len().saturating_sub(1)) {
+        for at in from..=to.min(self.cells.len().saturating_sub(1)) {
             self.put(at, ch, style);
         }
     }
@@ -691,16 +845,16 @@ impl Row {
         // Trailing blanks are a row of spaces the pane would have to paint and
         // the tests would have to spell out.
         let end = self
-            .0
+            .cells
             .iter()
             .rposition(|c| !matches!(c, Cell::Blank))
             .map_or(0, |at| at + 1);
-        self.0.truncate(end);
+        self.cells.truncate(end);
 
         let mut out: Vec<Span<'static>> = Vec::new();
         let mut text = String::new();
         let mut style = Style::default();
-        for cell in self.0 {
+        for (col, cell) in self.cells.into_iter().enumerate() {
             let (ch, next) = match cell {
                 Cell::Tail => continue,
                 // A blank has no colour of its own, so it neither continues a
@@ -713,6 +867,11 @@ impl Row {
             }
             style = next;
             text.push(ch);
+            // Marks ride with their base character, and add no width: a cell
+            // still measures one column with three of them on it.
+            for (_, mark) in self.marks.iter().filter(|(at, _)| *at == col) {
+                text.push(*mark);
+            }
         }
         if !text.is_empty() {
             out.push(Span::styled(text, style));
@@ -779,7 +938,10 @@ impl Spacing {
         let mut x = vec![0usize; n];
         x[0] = pad + if notes { self.lead } else { 0 } + self.half[0];
         for j in 1..n {
-            let mut at = x[j - 1] + self.half[j - 1] + GAP + self.half[j];
+            // The next box opens on the cell after the previous box's right
+            // edge, plus `GAP` blank ones — hence the `+ 1`, which is that
+            // first cell and is the difference between `┐┌` and `┐ ┌`.
+            let mut at = x[j - 1] + self.half[j - 1] + 1 + GAP + self.half[j];
             for &(i, need) in &self.messages[j] {
                 at = at.max(x[i] + need);
             }
@@ -977,7 +1139,11 @@ fn lifelines(d: &Diagram, width: usize, theme: &'static Theme) -> Option<Rows> {
     c.boxes(d, &plan, true);
     c.events(d, &plan);
     c.boxes(d, &plan, false);
-    Some(c.rows.into_iter().map(Row::spans).collect())
+    // Height is the one dimension nothing above measures: the caps in `super`
+    // bound how many bands there are, but a note wraps into as many rows as it
+    // likes and the width search will happily buy a narrow cap with rows. Past
+    // `ROW_CAP` the list says the same conversation in a fraction of them.
+    (c.rows.len() <= ROW_CAP).then(|| c.rows.into_iter().map(Row::spans).collect())
 }
 
 impl Canvas {
@@ -1026,7 +1192,11 @@ impl Canvas {
     /// knows which column is which.
     fn boxes(&mut self, d: &Diagram, plan: &Plan, top: bool) {
         let dim = self.dim();
-        let name = Style::new().fg(self.theme.accent);
+        // The name is text, so it is the body colour — the frame around it is
+        // the part that recedes. See the module note: the palette is assigned
+        // by role for both families at once, and a participant name is not a
+        // different kind of thing from a node label.
+        let name = Style::new().fg(self.theme.fg);
         let mut upper = Row::new(self.grid);
         let mut middle = Row::new(self.grid);
         let mut lower = Row::new(self.grid);
@@ -1100,7 +1270,10 @@ impl Canvas {
 
     fn message(&mut self, m: &Message, caption: &[String], plan: &Plan) {
         let text = Style::new().fg(self.theme.fg);
-        let ink = Style::new().fg(m.arrow.colour(self.theme));
+        let ink = Style::new().fg(m.arrow.ink(self.theme));
+        // Only the tip is allowed a colour of its own, and only when the arrow
+        // is one that severs — see [`Arrow::tip_ink`].
+        let tip = Style::new().fg(m.arrow.tip_ink(self.theme));
         let (from, to) = (plan.x[m.from], plan.x[m.to]);
 
         if m.from == m.to {
@@ -1117,7 +1290,7 @@ impl Canvas {
             self.rows[out].put(from, '├', ink);
             self.rows[out].fill(from + 1, end.saturating_sub(1), m.arrow.line(), ink);
             self.rows[out].put(end, '┐', ink);
-            self.rows[back].put(from, m.arrow.tip(false), ink);
+            self.rows[back].put(from, m.arrow.tip(false), tip);
             self.rows[back].fill(from + 1, end.saturating_sub(1), m.arrow.line(), ink);
             self.rows[back].put(end, '┘', ink);
             if m.toggle == Some(false) {
@@ -1145,10 +1318,10 @@ impl Canvas {
         row.fill(lo + 1, hi.saturating_sub(1), m.arrow.line(), ink);
         if rightward {
             row.put(lo, m.arrow.tail(true), ink);
-            row.put(hi, m.arrow.tip(true), ink);
+            row.put(hi, m.arrow.tip(true), tip);
         } else {
             row.put(hi, m.arrow.tail(false), ink);
-            row.put(lo, m.arrow.tip(false), ink);
+            row.put(lo, m.arrow.tip(false), tip);
         }
         if m.toggle == Some(false) {
             self.toggle(m.from, false);
@@ -1164,7 +1337,12 @@ impl Canvas {
     /// off the edge of the pane would be a bug.
     fn note(&mut self, n: &Note, plan: &Plan) {
         let dim = self.dim();
-        let ink = Style::new().fg(self.theme.warn);
+        // Body colour, like every other piece of text here. A note used to be
+        // drawn in `warn` — mermaid's notes are yellow — but `warn` is this
+        // palette's attention colour, and a design document where every note is
+        // shouting is a document whose actual warnings have nowhere left to go.
+        // The box already says it is a note.
+        let ink = Style::new().fg(self.theme.fg);
         let left = plan.pad;
         let right = self.grid.saturating_sub(1 + plan.pad);
         let room = (right + 1).saturating_sub(left);
@@ -1288,12 +1466,14 @@ impl Canvas {
 /// Everything the drawing carries is still here — the cast, the arrow kinds,
 /// the notes, the block labels — with structure carried by indentation instead
 /// of by frames. It always fits, because every row is wrapped to the pane.
-fn as_list(d: &Diagram, width: usize, theme: &'static Theme) -> Rows {
+fn as_list(d: &Diagram, width: usize, theme: &'static Theme) -> Option<Rows> {
     let dim = Style::new().fg(theme.dim);
-    let name = Style::new().fg(theme.accent);
+    // Names, message text, note text and block labels are all text, and all
+    // the body colour. What is dimmed here is only the scaffolding this layout
+    // adds and the document never wrote: the row numbers, `Note over`, and the
+    // `activate` a lifeline drawing would have said with a thicker line.
     let body = Style::new().fg(theme.fg);
     let key = Style::new().fg(theme.special);
-    let note = Style::new().fg(theme.warn);
 
     let mut out: Rows = Vec::new();
     let push = |out: &mut Rows, depth: usize, spans: Vec<Span<'static>>| {
@@ -1323,11 +1503,7 @@ fn as_list(d: &Diagram, width: usize, theme: &'static Theme) -> Rows {
         );
     }
     if !d.actors.is_empty() {
-        push(
-            &mut out,
-            0,
-            vec![Span::styled(d.actors.join(", "), name)],
-        );
+        push(&mut out, 0, vec![Span::styled(d.actors.join(", "), body)]);
     }
 
     let label = |at: usize| -> String {
@@ -1348,12 +1524,21 @@ fn as_list(d: &Diagram, width: usize, theme: &'static Theme) -> Rows {
                     false => (format!("{}:", label(m.to)), Some(m.text.clone())),
                 };
                 let mut spans = vec![
-                    Span::styled(format!("{}. ", m.number.unwrap_or(nth)), dim),
-                    Span::styled(label(m.from), name),
+                    // The document's own number when `autonumber` dealt one —
+                    // that is content and reads as content; this layout's index
+                    // otherwise, which is scaffolding and recedes.
+                    Span::styled(
+                        format!("{}. ", m.number.unwrap_or(nth)),
+                        if m.number.is_some() { body } else { dim },
+                    ),
+                    Span::styled(label(m.from), body),
                     Span::raw(" "),
-                    Span::styled(m.arrow.token(), Style::new().fg(m.arrow.colour(theme))),
+                    // One span for the whole token, at the tip's colour: the
+                    // wrapper breaks between spans, and an arrow split across
+                    // two rows says nothing at all.
+                    Span::styled(m.arrow.token(), Style::new().fg(m.arrow.tip_ink(theme))),
                     Span::raw(" "),
-                    Span::styled(to, name),
+                    Span::styled(to, body),
                 ];
                 if let Some(text) = colon {
                     spans.push(Span::raw(" "));
@@ -1371,11 +1556,11 @@ fn as_list(d: &Diagram, width: usize, theme: &'static Theme) -> Rows {
                     true => label(n.over.0),
                     false => format!("{}, {}", label(n.over.0), label(n.over.1)),
                 };
-                let mut spans = vec![Span::styled(where_, dim), Span::styled(who, name)];
+                let mut spans = vec![Span::styled(where_, dim), Span::styled(who, body)];
                 if !n.text.is_empty() {
-                    spans.push(Span::styled(":", name));
+                    spans.push(Span::styled(":", body));
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled(n.text.clone(), note));
+                    spans.push(Span::styled(n.text.clone(), body));
                 }
                 push(&mut out, depth, spans);
             }
@@ -1398,25 +1583,34 @@ fn as_list(d: &Diagram, width: usize, theme: &'static Theme) -> Rows {
             }
             Event::Close => {
                 depth = depth.saturating_sub(1);
-                push(&mut out, depth, vec![Span::styled("end", dim)]);
+                // The same colour its `loop` got. `end` is the other half of
+                // one keyword, and colouring the halves differently is the sort
+                // of seam a reader notices without being able to say why.
+                push(&mut out, depth, vec![Span::styled("end", key)]);
             }
             Event::Toggle(who, on) => {
                 let word = if *on { "activate " } else { "deactivate " };
                 push(
                     &mut out,
                     depth,
-                    vec![Span::styled(word, dim), Span::styled(label(*who), name)],
+                    vec![Span::styled(word, dim), Span::styled(label(*who), body)],
                 );
             }
         }
     }
-    out
+    // Past here the list has stopped being a summary of the diagram and become
+    // a transcript of it — and the transcript is the fence, which the caller
+    // still has and which is never wrong.
+    (out.len() <= LIST_CAP).then_some(out)
 }
 
 #[cfg(test)]
 mod tests {
+    use ratatui::text::Span;
+
     use super::super::tests::{assert_fits, assert_keeps, draw};
     use super::super::{MAX_EDGES, MAX_NODES};
+    use super::{ROW_CAP, Rows, keeps};
 
     /// The drawing, or a failure that names the input rather than the line.
     fn rows(src: &str, width: usize) -> Vec<String> {
@@ -1462,16 +1656,16 @@ mod tests {
         assert_eq!(
             arrows,
             [
-                "  ├────┤", // `->`     solid, no head
-                "  ├┄┄┄┄┤", // `-->`    dotted, no head
-                "  ├────▶", // `->>`    solid, arrowhead
-                "  ├┄┄┄┄▶", // `-->>`   dotted, arrowhead
-                "  ├────✗", // `-x`     solid, cross
-                "  ├┄┄┄┄✗", // `--x`    dotted, cross
-                "  ├────>", // `-)`     solid, open
-                "  ├┄┄┄┄>", // `--)`    dotted, open
-                "  ◀────▶", // `<<->>`  a head at both ends
-                "  ◀┄┄┄┄▶", // `<<-->>` the same, dotted
+                "  ├─────┤", // `->`     solid, no head
+                "  ├┄┄┄┄┄┤", // `-->`    dotted, no head
+                "  ├─────▶", // `->>`    solid, arrowhead
+                "  ├┄┄┄┄┄▶", // `-->>`   dotted, arrowhead
+                "  ├─────╳", // `-x`     solid, cross — the box-drawing one
+                "  ├┄┄┄┄┄╳", // `--x`    dotted, cross
+                "  ├─────>", // `-)`     solid, open
+                "  ├┄┄┄┄┄>", // `--)`    dotted, open
+                "  ◀─────▶", // `<<->>`  a head at both ends
+                "  ◀┄┄┄┄┄▶", // `<<-->>` the same, dotted
             ]
         );
     }
@@ -1490,15 +1684,15 @@ mod tests {
         assert_eq!(
             rows(src, 40),
             [
-                "┌───────┐┌───┐",
-                "│ Bravo ││ A │",
-                "└───┬───┘└─┬─┘",
-                "    │      │",
-                "    │  hi  │",
-                "    ◀──────┤",
-                "┌───┴───┐┌─┴─┐",
-                "│ Bravo ││ A │",
-                "└───────┘└───┘",
+                "┌───────┐ ┌───┐",
+                "│ Bravo │ │ A │",
+                "└───┬───┘ └─┬─┘",
+                "    │       │",
+                "    │  hi   │",
+                "    ◀───────┤",
+                "┌───┴───┐ ┌─┴─┐",
+                "│ Bravo │ │ A │",
+                "└───────┘ └───┘",
             ]
         );
     }
@@ -1605,23 +1799,23 @@ mod tests {
         assert_eq!(
             rows(src, 24),
             [
-                "  ┌───┐┌───┐",
-                "  │ A ││ B │",
-                "  └─┬─┘└─┬─┘",
-                "    │    │",
-                "╭───┼────┼───╮",
-                "│ loop a     │",
-                "│ label far  │",
-                "│ too long   │",
-                "│ to sit on  │",
-                "│ its own    │",
-                "│ rule       │",
-                "│   │ x  │   │",
-                "│   ├────▶   │",
-                "╰───┼────┼───╯",
-                "  ┌─┴─┐┌─┴─┐",
-                "  │ A ││ B │",
-                "  └───┘└───┘",
+                "  ┌───┐ ┌───┐",
+                "  │ A │ │ B │",
+                "  └─┬─┘ └─┬─┘",
+                "    │     │",
+                "╭───┼─────┼───╮",
+                "│ loop a      │",
+                "│ label far   │",
+                "│ too long    │",
+                "│ to sit on   │",
+                "│ its own     │",
+                "│ rule        │",
+                "│   │  x  │   │",
+                "│   ├─────▶   │",
+                "╰───┼─────┼───╯",
+                "  ┌─┴─┐ ┌─┴─┐",
+                "  │ A │ │ B │",
+                "  └───┘ └───┘",
             ]
         );
     }
@@ -1701,7 +1895,7 @@ mod tests {
     #[test]
     fn a_title_sits_over_the_drawing_rather_than_over_the_pane() {
         let drawn = rows("sequenceDiagram\n  title A day\n  A->>B: x\n", 30);
-        assert_eq!(drawn[0], "  A day");
+        assert_eq!(drawn[0], "   A day");
         // `title: text` is written in the wild as often as `title text`.
         let colon = rows("sequenceDiagram\n  title: A day\n  A->>B: x\n", 30);
         assert_eq!(colon, drawn);
@@ -1752,14 +1946,14 @@ mod tests {
         assert_eq!(
             rows("sequenceDiagram\n  A->>B:\n", 20),
             [
-                "┌───┐┌───┐",
-                "│ A ││ B │",
-                "└─┬─┘└─┬─┘",
-                "  │    │",
-                "  ├────▶",
-                "┌─┴─┐┌─┴─┐",
-                "│ A ││ B │",
-                "└───┘└───┘",
+                "┌───┐ ┌───┐",
+                "│ A │ │ B │",
+                "└─┬─┘ └─┬─┘",
+                "  │     │",
+                "  ├─────▶",
+                "┌─┴─┐ ┌─┴─┐",
+                "│ A │ │ B │",
+                "└───┘ └───┘",
             ]
         );
     }
@@ -1767,8 +1961,8 @@ mod tests {
     #[test]
     fn the_lifelines_give_way_to_a_numbered_list_the_column_before_they_would_not_fit() {
         let src = "sequenceDiagram\n  A->>B: x\n";
-        assert_eq!(rows(src, 10)[0], "┌───┐┌───┐");
-        assert_eq!(rows(src, 9), ["A, B", "1. A ─▶", "  B: x"]);
+        assert_eq!(rows(src, 11)[0], "┌───┐ ┌───┐");
+        assert_eq!(rows(src, 10), ["A, B", "1. A ─▶ B:", "  x"]);
     }
 
     #[test]
@@ -1923,5 +2117,139 @@ mod tests {
             .map(|i| format!("  A->>B: m{i}\n"))
             .collect::<String>();
         assert!(draw(&format!("sequenceDiagram\n{loud}"), 60).is_none());
+    }
+
+    #[test]
+    fn notes_and_blocks_are_counted_against_the_cap_the_way_messages_are() {
+        // Every one of these claims vertical space, so every one of them is a
+        // band. Counting only messages left two thirds of the grammar able to
+        // ask for an unbounded layout: thirty kilobytes of `Note over A:` is
+        // legal mermaid and used to cost four times what a diagram sitting at
+        // both caps costs.
+        let notes = (0..MAX_EDGES + 1)
+            .map(|i| format!("  Note over A: n{i}\n"))
+            .collect::<String>();
+        assert!(draw(&format!("sequenceDiagram\n{notes}"), 60).is_none());
+
+        let blocks = (0..MAX_EDGES + 1)
+            .map(|i| format!("  loop b{i}\n  end\n"))
+            .collect::<String>();
+        assert!(draw(&format!("sequenceDiagram\n{blocks}"), 60).is_none());
+
+        // ...and they are counted *together*, or a diagram simply spends its
+        // budget in whichever currency is not being watched.
+        let mixed = (0..MAX_EDGES / 2 + 1)
+            .map(|i| format!("  A->>B: m{i}\n  Note over A: n{i}\n"))
+            .collect::<String>();
+        assert!(draw(&format!("sequenceDiagram\n{mixed}"), 60).is_none());
+
+        // One under the cap still draws, so the cap is a cap and not a ban.
+        let ok = (0..MAX_EDGES)
+            .map(|i| format!("  Note over A: n{i}\n"))
+            .collect::<String>();
+        assert!(draw(&format!("sequenceDiagram\n{ok}"), 60).is_some());
+    }
+
+    #[test]
+    fn a_drawing_taller_than_three_screens_becomes_the_list_instead() {
+        // `ROW_CAP` is about the shape of the answer rather than the clock:
+        // past it the lifelines have stopped being a picture, and the list says
+        // the same conversation in one row per message.
+        let long = (0..150)
+            .map(|i| format!("  A->>B: m{i}\n"))
+            .collect::<String>();
+        let drawn = rows(&format!("sequenceDiagram\n{long}"), 60);
+        assert!(drawn.len() <= ROW_CAP, "{} rows", drawn.len());
+        assert_eq!(drawn[0], "A, B", "should have fallen to the list");
+        assert!(drawn.iter().any(|row| row.contains("m149")));
+    }
+
+    #[test]
+    fn autonumber_at_the_top_of_usize_does_not_overflow() {
+        // Two lines of any document reach this. Saturating rather than
+        // declining: the number is a decoration on a caption whose text is the
+        // content, and throwing the diagram away over a counter would cost the
+        // reader everything else in the file.
+        let src = "sequenceDiagram\n  autonumber 18446744073709551615\n  A->>B: x\n  B->>A: y\n";
+        let drawn = rows(src, 60);
+        assert_keeps(&drawn, &["x", "y"], "either side of the counter stopping");
+        assert!(drawn.iter().any(|row| row.contains("18446744073709551615")));
+
+        // A start `usize` cannot hold is a different thing, and is refused
+        // where it is read rather than papered over.
+        assert!(draw("sequenceDiagram\n  autonumber 99999999999999999999\n  A->>B: x\n", 60).is_none());
+        assert!(draw("sequenceDiagram\n  autonumber 1 18446744073709551615\n  A->>B: x\n  B->>A: y\n", 60).is_some());
+    }
+
+    #[test]
+    fn a_participant_and_an_actor_draw_the_same_way() {
+        // Mermaid draws `actor` as a stick figure. On a character grid that is
+        // either four rows of header or a glyph whose width a terminal is free
+        // to disagree about, and it changes nothing else about the diagram —
+        // see the argument where the two keywords are read. What must not
+        // happen is `actor` being declined, so this pins the equivalence.
+        let boxes = rows("sequenceDiagram\n  participant V as Viewer\n  A->>V: hi\n", 40);
+        let stick = rows("sequenceDiagram\n  actor V as Viewer\n  A->>V: hi\n", 40);
+        assert_eq!(boxes, stick);
+        assert!(boxes[1].contains("Viewer"));
+    }
+
+    #[test]
+    fn a_combining_mark_rides_on_the_character_it_modifies() {
+        // Devanagari and Hebrew are full of zero-width marks. Dropping them
+        // lost no content — the gate caught it — but it caught it by falling to
+        // the list, so the same diagram drew boxes in Latin and a list in
+        // Hindi. `flow` attaches them too.
+        let src = "sequenceDiagram\n  A->>B: नमस्ते there\n";
+        let drawn = rows(src, 40);
+        assert_eq!(drawn[0], "┌───┐        ┌───┐", "should still be lifelines");
+        assert_keeps(&drawn, &["नमस्ते", "there"], "a caption with marks in it");
+        assert_fits(&drawn, 40, "a caption with marks in it");
+        // The marks cost no cells: they are in the row as characters and not in
+        // its width, which is the whole of what "attached" means here.
+        let caption = drawn
+            .iter()
+            .find(|row| row.contains("नमस्ते"))
+            .expect("the caption is on some row");
+        assert!(
+            caption.chars().count() > unicode_width::UnicodeWidthStr::width(caption.as_str()),
+            "{caption:?} spent a cell on a mark"
+        );
+    }
+
+    #[test]
+    fn a_word_hiding_inside_a_longer_one_does_not_satisfy_the_gate() {
+        // The gate decides lifelines → list → `None`, so a spurious pass is a
+        // clipped drawing shipping. `no` is inside `Note`, `end` is inside
+        // `friend`, and both of those words are ones this module writes itself.
+        let drawn: Rows = vec![vec![Span::raw("│ Note over friend │")]];
+        assert!(keeps(&drawn, &["Note".to_string(), "friend".to_string()]));
+        assert!(!keeps(&drawn, &["no".to_string()]));
+        assert!(!keeps(&drawn, &["end".to_string()]));
+        assert!(!keeps(&drawn, &["frien".to_string()]));
+
+        // The one glue this module applies to a word is the list's `:` and `,`
+        // after a name, and the gate has to see through exactly that much.
+        let listed: Rows = vec![vec![Span::raw("1. A ─▶ Bob: hi")], vec![Span::raw("X, Y")]];
+        for word in ["Bob", "hi", "X", "Y"] {
+            assert!(keeps(&listed, &[word.to_string()]), "{word:?}");
+        }
+    }
+
+
+
+    #[test]
+    fn every_glyph_the_drawing_uses_is_one_cell_wide() {
+        // The layout is counted in cells, so a glyph a terminal draws in two
+        // would shear every row it appears in. The arrowheads and `╳` are the
+        // risk — all East Asian Ambiguous — and this is the assertion that
+        // records which set was checked.
+        for glyph in "─│┄┃┌┐└┘┬┴├┤┼╭╮╰╯▶◀><╳".chars() {
+            assert_eq!(
+                unicode_width::UnicodeWidthChar::width(glyph),
+                Some(1),
+                "{glyph:?} is not one cell"
+            );
+        }
     }
 }

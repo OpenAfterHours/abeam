@@ -199,7 +199,15 @@ fn a_diagram_past_the_caps_is_shown_as_source_rather_than_laid_out() {
         .collect::<String>();
     assert!(draw(&format!("graph TD\n{many_edges}"), 60).is_none());
 
-    let huge = "graph TD\n".to_string() + &"  A --> B\n".repeat(MAX_BYTES);
+    // The byte cap, isolated from the two above it: two nodes and one edge, so
+    // nothing here is over `MAX_NODES` or `MAX_EDGES` and size is the only
+    // thing that can decline it. Written the obvious way — `repeat(MAX_BYTES)`
+    // of one statement — this test stayed green with the byte check deleted,
+    // because 32 768 copies of one edge is 128 times over the edge cap and
+    // *that* was what had been failing it.
+    let padding = " ".repeat(MAX_BYTES);
+    let huge = format!("graph TD\n  A[a{padding}] --> B\n");
+    assert!(huge.len() > MAX_BYTES);
     assert!(draw(&huge, 60).is_none());
 }
 
