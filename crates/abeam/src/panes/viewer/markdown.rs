@@ -19,8 +19,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use super::source;
 use super::theme::{Mode, Theme};
+use super::{mermaid, source};
 use crate::text::wrap::{self, pad_to, spans_width};
 
 /// Two cells, so nested quotes stay legible without a separator.
@@ -529,16 +529,31 @@ impl Renderer {
         // Fences arrive with a trailing newline that is fence syntax, not a
         // blank line the author wrote.
         let body = text.strip_suffix('\n').unwrap_or(text);
+        // Taken before either branch draws, because it consumes the pending
+        // list marker and the marker may only be spent once.
+        let (pfirst, prest) = self.prefixes();
+        let avail = self.width.saturating_sub(spans_width(&prest));
+
+        // A mermaid fence is the one fenced language whose source is not the
+        // point of it, so it is drawn rather than reproduced — when it can be.
+        // `mermaid::render` declines every diagram type it does not draw and
+        // every one it cannot fit, and declining lands here, in the code block
+        // the fence has always had.
+        if mermaid::is_mermaid(lang)
+            && let Some(rows) = mermaid::render(body, avail, self.theme)
+        {
+            return self.emit_diagram(rows, &pfirst, &prest);
+        }
+
         let rows = if dim_all {
             source::plain(body, self.theme.dim())
         } else {
             source::highlight_code(body, lang, self.mode)
         };
 
-        let (pfirst, prest) = self.prefixes();
         // The gutter is the only thing marking the block's extent, so it is the
         // last decoration to go — but at eight usable columns it has to.
-        let gutter = self.width.saturating_sub(spans_width(&prest)) >= 8;
+        let gutter = avail >= 8;
 
         for (i, row) in rows.into_iter().enumerate() {
             let mut first = if i == 0 { pfirst.clone() } else { prest.clone() };
@@ -549,6 +564,25 @@ impl Renderer {
             }
             self.out
                 .extend(wrap::hard_wrap(row, self.width, &first, &cont));
+        }
+        self.need_blank = true;
+    }
+
+    /// A drawn diagram, which gets no code gutter.
+    ///
+    /// The gutter exists to mark where a code block starts and stops, and box
+    /// art already says that about itself — while two of the cells it would
+    /// cost are two the drawing was measured for and is now short of. The
+    /// outline fallback goes without one for the same reason: its arrows are
+    /// not going to be mistaken for a bullet list.
+    fn emit_diagram(&mut self, rows: mermaid::Rows, pfirst: &[Span<'static>], prest: &[Span<'static>]) {
+        for (i, row) in rows.into_iter().enumerate() {
+            let first = if i == 0 { pfirst.to_vec() } else { prest.to_vec() };
+            // Hard-wrapped as insurance rather than as layout. `mermaid` was
+            // given the column count and commits to it, so a row that overflows
+            // is a bug in there — this is what keeps such a bug inside the pane
+            // while the tests are what find it.
+            self.out.extend(wrap::hard_wrap(row, self.width, &first, prest));
         }
         self.need_blank = true;
     }
@@ -960,6 +994,12 @@ mod tests {
 let x = 1;
 ```
 
+```mermaid
+graph TD
+  A[one] --> B{two}
+  B -->|yes| C[three]
+```
+
 tail";
 
     #[test]
@@ -978,6 +1018,107 @@ tail";
         // width, loops on it, or indexes past it.
         for width in 1..8 {
             assert!(!render(KITCHEN_SINK, width, Mode::Dark).is_empty());
+        }
+    }
+
+    const FLOWCHART: &str = "\
+```mermaid
+graph TD
+  A[Watch the tree] --> B{Markdown?}
+  B -->|yes| C[Render it]
+  B -->|no| D[Refresh git]
+```
+";
+
+    #[test]
+    fn a_mermaid_fence_is_drawn_rather_than_reproduced() {
+        // The whole point of the module: this fence used to arrive as four
+        // lines of source behind a code gutter.
+        let out = text(&render(FLOWCHART, 60, Mode::Dark));
+        assert_eq!(
+            out,
+            [
+                "     ┌─────────────────┐",
+                "     │ Watch the tree  │",
+                "     └────────┬────────┘",
+                "              ▼",
+                "        ╔═══════════╗",
+                "        ║ Markdown? ║",
+                "        ╚═════╤═════╝",
+                "      ╭──yes──┤",
+                "      │       ╰──no───╮",
+                "      ▼               ▼",
+                "┌───────────┐  ┌─────────────┐",
+                "│ Render it │  │ Refresh git │",
+                "└───────────┘  └─────────────┘",
+            ]
+        );
+        // No code gutter, which the rows above say by where they start: a
+        // gutter would have pushed every one of them two cells right. Not
+        // asserted as "no line begins with `│ `" — a box's own left wall is
+        // that exact string, which is the trap this note exists to mark.
+        assert!(out.iter().any(|l| l.starts_with('┌')));
+    }
+
+    #[test]
+    fn a_diagram_the_pane_is_too_narrow_for_becomes_an_outline() {
+        // The same fallback tables already make: at this width the boxes would
+        // be four cells of frame around two of text.
+        let out = text(&render(FLOWCHART, 24, Mode::Dark));
+        assert_eq!(out[0], "Watch the tree");
+        assert_eq!(out[1], "└─▶ Markdown?");
+        assert!(out.iter().any(|l| l.contains("yes")));
+        assert!(out.iter().any(|l| l.contains("Refresh")));
+        assert_fits(&render(FLOWCHART, 24, Mode::Dark), 24);
+    }
+
+    #[test]
+    fn a_mermaid_fence_this_cannot_draw_keeps_the_code_block_it_had() {
+        // Most of mermaid, by diagram type. Declining has to land exactly where
+        // it always did — source, gutter and all — or the reader loses the
+        // diagram rather than merely not seeing it drawn.
+        let md = "```mermaid\npie title Votes\n  \"yes\" : 10\n```\n";
+        assert_eq!(
+            text(&render(md, 40, Mode::Dark)),
+            ["│ pie title Votes", "│   \"yes\" : 10"]
+        );
+    }
+
+    #[test]
+    fn a_sequence_diagram_draws_its_lifelines() {
+        let md = "\
+```mermaid
+sequenceDiagram
+  participant W as Watcher
+  participant V as Viewer
+  W->>V: file changed
+```
+";
+        assert_eq!(
+            text(&render(md, 40, Mode::Dark)),
+            [
+                "┌─────────┐    ┌─────────┐",
+                "│ Watcher │    │ Viewer  │",
+                "└────┬────┘    └────┬────┘",
+                "     │              │",
+                "     │ file changed │",
+                "     ├──────────────▶",
+                "┌────┴────┐    ┌────┴────┐",
+                "│ Watcher │    │ Viewer  │",
+                "└─────────┘    └─────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_diagram_inside_a_list_item_indents_under_its_bullet() {
+        // The reason `mermaid` returns rows and the prefixes stay here: a
+        // diagram is a block like any other and hangs under its marker.
+        let md = "- step:\n\n  ```mermaid\n  graph LR\n    a --> b\n  ```\n";
+        let out = text(&render(md, 40, Mode::Dark));
+        assert_eq!(out[0], "• step:");
+        for line in &out[2..] {
+            assert!(line.starts_with("  "), "{line:?} is not indented");
         }
     }
 

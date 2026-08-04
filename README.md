@@ -483,9 +483,25 @@ after this is the whole of that.
 
 **files** — read-only markdown and source, and a way to reach any of it.
 Markdown is rendered, not shown as source: headings, lists, tables, quotes, GFM
-alerts, footnotes, and syntax-highlighted fenced code. `t` swaps that for the
-source it was rendered from, highlighted and numbered like any other file, and
-back. Source files get highlighting and a line-number gutter. Everything is
+alerts, footnotes, syntax-highlighted fenced code, and mermaid diagrams. `t`
+swaps that for the source it was rendered from, highlighted and numbered like
+any other file, and back.
+
+A ` ```mermaid ` fence is the one of those that is *redrawn* rather than
+styled, and it is here because it was the conspicuous hole: syntect has no
+grammar for mermaid, so the block came out verbatim and uncoloured, and nobody
+writes `A --> B` to be read as `A --> B`. Two families are drawn, in
+box-drawing characters, for the width the pane happens to be —
+`graph`/`flowchart` in all four directions, and `sequenceDiagram`. A pane too
+narrow for boxes gets the same diagram as an indented outline, or a sequence
+diagram as a numbered list of its messages — the same trade a table too wide for
+the pane already makes when it gives up its grid and goes out one field per
+line: at forty columns a four-cell-wide box is not a diagram, it is a puzzle. Anything else — every other diagram type, a `subgraph`,
+a node spelled in syntax this does not know — keeps the code block it has always
+had, and `t` still reaches the source, which is the only way to read a diagram
+abeam declined to draw. What never happens is the fourth thing: a drawing with
+an edge missing from it. The source is always true, and a diagram that has
+quietly lost a node is worse than one nobody drew. Source files get highlighting and a line-number gutter. Everything is
 pre-wrapped to the pane's exact width and scrolled by physical row, so
 jump-to-end lands where you asked. On startup it opens the newest markdown under
 the root; after that it follows what gets written. If something arrives while
@@ -757,6 +773,9 @@ crates/abeam/src/workspace.rs      the worktrees of the repository, and which of
                                    and the argument for it live here.
 crates/abeam/src/paths.rs          when two spellings are one directory, and the
                                    one spelling everything starts from
+crates/abeam/src/panes/viewer/mermaid/   a diagram on a character grid, or an
+                                   honest refusal to draw one. `mod.rs` holds
+                                   the rule both families answer to.
 crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
 docs/conpty-findings.md   what the spike learned. Read before touching the pty.
 docs/keymap.md            the keybinding collision audit
@@ -811,7 +830,8 @@ in every file under the root. Focus, zoom, help, the diagnostics view, and the
 literal-next escape hatch. Agent selection and the launcher underneath it. The
 Unix port, in the sense that the whole workspace builds, tests and lints clean
 for both `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see
-"Platforms" for the sense in which it is not done. 568 tests on Windows, and
+"Platforms" for the sense in which it is not done. Mermaid flowcharts and
+sequence diagrams, drawn rather than shown as source. 648 tests on Windows, and
 `clippy --all-targets` clean on both.
 
 Two of those changed Windows behaviour on the way past, and both are worth
@@ -893,6 +913,42 @@ been run on Linux at all, against anything. Do that before trusting it with real
 work, on either platform.
 
 **Not done, and known.**
+
+- **Most of mermaid, by diagram type, is still shown as source.** Two families
+  are drawn — `graph`/`flowchart` and `sequenceDiagram` — and `stateDiagram`,
+  `classDiagram`, `erDiagram`, `gantt`, `pie`, `mindmap`, `journey`,
+  `quadrantChart`, `gitGraph` and the rest are not. Nothing is lost when one
+  arrives: it renders exactly as every mermaid fence did before this existed,
+  which is why the two were worth doing without the other nine. `stateDiagram`
+  is the obvious next one, because it is a labelled graph and would reuse the
+  flowchart's layout wholesale rather than needing its own.
+- **A `subgraph` declines the whole diagram**, and so does `click`. Both carry
+  text — a group's title, a URL — and there is no drawing of them here that
+  keeps it, so under the rule the module is built around the fence keeps its
+  source rather than showing a flattened graph with the grouping silently gone.
+  This is the gap most likely to be met in practice, because a `subgraph` is how
+  anyone draws a diagram with two halves. Also declined: mermaid 11's
+  `A@{ shape: … }` node syntax and its `@{…}` edge form, which is newly written
+  mermaid and so the second most likely to be met.
+- **`actor` is drawn as a box, exactly like `participant`.** Mermaid draws a
+  stick figure; a terminal has one cell to do it in and no glyph whose width
+  every terminal agrees on. The name in the box already says which one it is,
+  and nothing else in mermaid depends on the distinction, so it is accepted and
+  drawn rather than declined.
+- **Two edges that cross between the same pair of ranks cannot be told apart.**
+  `A --> D`, `B --> C`, `A --> C`, `B --> D` draws two identical horizontal
+  rules whose corners merge into the risers already in those columns, and a
+  reader cannot recover which run belongs to which target. The ordering pass
+  removes the simple crossing, so it takes that four-edge shape to see it.
+  Fixing it means reserving a *column* of the drawing per crossing rather than a
+  row of the band — a different layout, not a tidier version of this one — and
+  the diagram is not wrong meanwhile, only unrecoverable at that one join.
+- **A flowchart declines below the width of its own longest word.** The pane
+  can be narrow enough that a diagram which parses draws nothing, and the fence
+  falls back to source. That floor is a property of the document rather than of
+  the pane: `Choice` is six cells, so no amount of arranging fits it into four,
+  and breaking it in half to make it fit would be the one thing this is not
+  allowed to do. It is why the outline exists and where even the outline stops.
 
 - **`abeam bash` is a prompt now, and nothing says so.** This document used to
   advertise `abeam bash`, `abeam powershell` and "anything else on `PATH`", and
@@ -1226,14 +1282,23 @@ work, on either platform.
   per frame. The only bound on it is the 512 KiB read cap — about 210 ms of
   layout in a release build, measured — and going over that is visible: the
   pane says where it stopped. Highlighting gives up above 64 KiB and shows
-  plain text. A slow network share can still stall the frame that opens a file.
+  plain text. A mermaid fence is laid out on that same path and has caps of its
+  own — 32 KiB of source, 128 nodes, 256 edges, and a row count past which the
+  drawing stops being a drawing — and those are set by legibility rather than by
+  the clock: a graph at exactly the caps lays out in 4.7 ms, against the 170 ms
+  that constant above it is a budget for, and draws 668 rows, which is fourteen
+  screens. Past any of them the fence stays source. A slow network share can
+  still stall the frame that opens a file.
 - **The document search cannot always reach what the repository search found.**
   `f` matches the lines in a file and `/` matches the rows the pane drew, and
   those are the same text for most files and not for all: a line too wide for
   the pane is wrapped, and a match straddling the break is not on the drawn page
   at all. It is reachable in a plain source file by dragging the pane narrower,
   and no width fixes it in rendered markdown, where the source syntax is not on
-  the page at all. Neither is silent — the page names the remedy its own body
+  the page at all. A drawn mermaid diagram is the sharpest case of that same
+  rule: a node label wrapped inside its own box is not one run of text on any
+  row, and the mermaid source `f` matched is not on the page in any form, so
+  `t` rather than the width is the whole remedy there. Neither is silent — the page names the remedy its own body
   form has, `t` or the width, and a result that lands on a neighbouring match
   says `· not the 3rd` rather than a confident `2/2` — but naming a cost is not
   the same as paying it. Retiring it means grouping rows by the source line they
