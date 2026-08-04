@@ -149,14 +149,19 @@ half page · `g`/`G`, Home/End — ends · `Tab`/`Shift+Tab` — next/prev item 
 `Enter` — open · `r` — refresh · `Esc`/`q` — back to the agent, which is what
 the border says.
 
-The files view adds `t` — rendered markdown or its source — and, in the file
-list, `/` to find a file anywhere under the root and `Backspace` or `-` to climb
-a directory. The queue view adds `i` to write an item, `a` to arm or disarm
-sending, `d` to delete one, `m` to switch an item between being typed into the
-live session and being dispatched as its own background agent, and `Enter` to
-do the selected one now. None of these collides with the vocabulary above, and
-none can reach the agent: the right pane has to be focused for any of them to
-be seen.
+The files view adds `t` — rendered markdown or its source — `Backspace` or `-`
+to climb a directory in the file list, and three searches: `/` finds a file
+anywhere under the root while the list is up and a phrase on the page while a
+document is, `n` and `N` walk that document's matches, and `f` reads every file
+under the root for a phrase. The queue view adds `i` to write an item, `a` to
+arm or disarm sending, `d` to delete one, `m` to switch an item between being
+typed into the live session and being dispatched as its own background agent,
+and `Enter` to do the selected one now. None of these collides with the
+vocabulary above, and none can reach the agent: the right pane has to be focused
+for any of them to be seen. That exemption is stated once rather than argued
+beside each key, and the place is the module doc at the top of `keys.rs`:
+*intercept* means what `global` claims before any pane is offered a key, and
+`global` returns `None` for every bare printable one of these.
 
 Inside the queue's composer, `Enter` commits the item and `Ctrl+Enter` or
 `Alt+Enter` puts a newline in it instead — and the first of that pair is a
@@ -175,11 +180,17 @@ can learn — the same argument that moved focus off `Alt+←`/`Alt+→` for eve
 agent rather than making it conditional on which one was running, and it costs
 very much less to honour here.
 
-Two of them are claimed *conditionally*, which is the thing to keep straight.
-While a find is open the query eats every printable key, so `j`, `k`, `g`, `G`,
-`b`, `q` and `r` are text rather than commands, the selection moves on the
-arrows and `Ctrl+N`/`Ctrl+P`, and `Esc` closes the find instead of leaving the
-pane. That is why `Alt+J` and friends reach a pane through `Pane::scroll_key`
+Most of them are claimed *conditionally*, which is the thing to keep straight.
+While a box is open the query eats every printable key, so `j`, `k`, `g`, `G`,
+`b`, `q`, `r` and `f` are text rather than commands, the arrows and
+`Ctrl+N`/`Ctrl+P` step whatever is behind it — a selection in the two lists, the
+matches in a document — and `Esc` closes the box instead of leaving the pane.
+There are three such boxes in the files view now — the file list's find, the
+document's search and the repository sweep's — and they take keys the same way
+on purpose. They differ in one place worth stating because it looks like a
+fault: the first two answer on every keystroke, and the sweep's does nothing at
+all until `Enter`, because it reads every file under the root. That is why
+`Alt+J` and friends reach a pane through `Pane::scroll_key`
 carrying the bare `Down`/`Up`/`PageDown`/`PageUp` a focused pane would have
 seen, rather than the letters: a glance at the pane must never be able to type
 into it.

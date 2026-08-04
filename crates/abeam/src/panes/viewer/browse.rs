@@ -36,9 +36,10 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -47,10 +48,11 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::DEFAULT_VIEWPORT;
+use super::list::Cursor;
 use super::theme;
 use crate::pane::Handled;
-use crate::scroll::{self, Scroll};
-use crate::text::{block, clip_line};
+use crate::scroll;
+use crate::text::{block, clip_line, plural};
 use crate::watch::in_noise;
 
 /// How many entries one directory listing will hold.
@@ -97,6 +99,21 @@ pub enum Outcome {
     Open(PathBuf),
 }
 
+/// What a [`Cursor`] did, in the vocabulary the pane speaks.
+///
+/// `Handled::No` becomes `Ignored` and not `Moved`. Getting that backwards
+/// costs a frame — the agent's whole screen — for a key that changed nothing,
+/// which is the mapping [`Outcome`] exists to keep honest.
+impl From<Handled> for Outcome {
+    fn from(handled: Handled) -> Self {
+        if handled.is_yes() {
+            Outcome::Moved
+        } else {
+            Outcome::Ignored
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// The way back up. Always the first row, and never anywhere else.
@@ -122,7 +139,10 @@ struct Find {
     query: String,
     /// Indices into [`Browser::index`], best first.
     hits: Vec<usize>,
-    sel: usize,
+    /// Where the reader is in `hits`. Its own cursor rather than a row borrowed
+    /// from the listing's, so that closing the find puts them back on the row
+    /// they were on when they opened it. See [`Browser::shown`].
+    cursor: Cursor,
 }
 
 pub struct Browser {
@@ -146,15 +166,21 @@ pub struct Browser {
     /// halves of one pane disagreeing about the page colour is the one thing
     /// this must not do.
     theme: theme::Mode,
-    sel: usize,
-    scroll: Scroll,
-    /// The selection moved, or the list changed, since the last frame. See
-    /// [`Browser::reveal`].
-    follow: bool,
+    /// Where the reader is in `entries`, and what the two lists' shared view is
+    /// parked on while the listing is the one on screen. See [`Browser::shown`].
+    listing: Cursor,
     find: Option<Find>,
     /// Every file under the root, root-relative with `/` separators. Handed
     /// over by the worker walk.
-    index: Vec<String>,
+    ///
+    /// Shared rather than owned, because it is the same list [`super::grep`]
+    /// sweeps and the same list the pane hands to the grep's worker thread —
+    /// at `files::MAX_FILES` that is twenty thousand strings, and there is no
+    /// version of this where any of the three wants a private copy of them.
+    /// The `Arc` is also what makes a query safe to answer late: a walk that
+    /// lands mid-sweep replaces this pointer and leaves the worker holding the
+    /// list it started on, rather than one that has changed under its indices.
+    index: Arc<[String]>,
     /// Whether that walk has answered. An empty index means two different
     /// things before and after it does, and only one of them is "no match".
     indexed: bool,
@@ -166,12 +192,6 @@ pub struct Browser {
 
 impl Browser {
     pub fn new(root: PathBuf) -> Self {
-        let mut scroll = Scroll::default();
-        // Seeded for the same reason `ViewerPane` seeds its own: keys can be
-        // drained in the same batch as the `Alt+E` that opened the list, before
-        // any frame has said how tall the pane is, and a page measured against
-        // a viewport of zero is a page of one row.
-        scroll.measure(0, DEFAULT_VIEWPORT);
         Self {
             dir: root.clone(),
             root,
@@ -179,11 +199,13 @@ impl Browser {
             cut: false,
             listed: false,
             theme: theme::Mode::default(),
-            sel: 0,
-            scroll,
-            follow: false,
+            // Seeded with a height for the same reason `ViewerPane` seeds its
+            // own scroll with one: keys can be drained in the same batch as the
+            // `Alt+E` that opened the list, before any frame has said how tall
+            // the pane is.
+            listing: Cursor::new(DEFAULT_VIEWPORT),
             find: None,
-            index: Vec::new(),
+            index: Arc::from(Vec::new()),
             indexed: false,
             aligned: None,
             read_at: None,
@@ -225,7 +247,7 @@ impl Browser {
 
     /// The worker walk answered. Replaces the find index, keeping the reader on
     /// the row they had chosen if it survived the new walk.
-    pub fn set_index(&mut self, files: Vec<String>) {
+    pub fn set_index(&mut self, files: Arc<[String]>) {
         let keep = self.hit_path();
         self.index = files;
         self.indexed = true;
@@ -239,13 +261,33 @@ impl Browser {
         self.find.is_some()
     }
 
-    /// Close any find without opening anything. Leaving the list entirely is
-    /// one of the ways a query ends: coming back to a stale one is never what
-    /// the next `Alt+E` means.
+    /// Close any find without opening anything, and show the reader the row
+    /// they were on before it. Leaving the list entirely is one of the ways a
+    /// query ends: coming back to a stale one is never what the next `Alt+E`
+    /// means.
     pub fn cancel_find(&mut self) {
-        if self.find.take().is_some() {
-            self.reveal();
+        if self.close_find() {
+            self.listing.reveal();
         }
+    }
+
+    /// Drop the find and take the view back from it, reporting whether there
+    /// was one to drop.
+    ///
+    /// Separate from [`Browser::cancel_find`] for `open_hit`, which is about to
+    /// park the listing on a directory of its own choosing and has no use for a
+    /// reveal onto where the listing used to be.
+    fn close_find(&mut self) -> bool {
+        let Some(find) = self.find.take() else {
+            return false;
+        };
+        // The hits borrowed the window onto the rows when they opened over the
+        // listing, and the listing is about to be what is looking through it
+        // again. Handed back rather than left behind, because a `Scroll` that
+        // sat out the find is a frame behind on how tall the pane is, and the
+        // next key is answered before that frame.
+        self.listing.take_view(&find.cursor);
+        true
     }
 
     pub fn title(&self) -> String {
@@ -276,15 +318,9 @@ impl Browser {
 
     pub fn render(&mut self, f: &mut Frame, inner: Rect) {
         let rows = self.rows();
-        let height = inner.height as usize;
-        // A pane that just got shorter can have left the selection below the
-        // fold, and `Scroll::measure` only clamps the offset — it never looks
-        // at what is selected. Treated as a move for exactly that reason.
-        let resized = height != self.scroll.viewport();
-        self.scroll.measure(rows, height);
-        if std::mem::take(&mut self.follow) || resized {
-            self.scroll_into_view();
-        }
+        // The one moment the row count and the pane's height are both known,
+        // which is why the cursor is told here and nowhere else.
+        self.shown_mut().measure(rows, inner.height as usize);
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -292,10 +328,11 @@ impl Browser {
         // The scrollbar takes a column from the text rather than sitting on
         // top of it: an elided name is worse than a narrower one.
         let text_w = inner.width - scroll::bar_width(inner.width);
+        let offset = self.shown().scroll.offset;
         let lines: Vec<Line> = if rows == 0 {
             block(self.nothing(), text_w as usize, self.theme.theme().dim())
         } else {
-            (self.scroll.offset..rows)
+            (offset..rows)
                 .take(inner.height as usize)
                 .map(|i| self.line(i, text_w as usize))
                 .collect()
@@ -308,7 +345,7 @@ impl Browser {
                 ..inner
             },
         );
-        self.scroll.render_bar(f, inner);
+        self.shown().scroll.render_bar(f, inner);
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
@@ -327,32 +364,18 @@ impl Browser {
     /// follows two methods down, and the reason `Pane::scroll_key` exists at
     /// all.
     pub fn scroll_view(&mut self, key: KeyEvent) -> Handled {
-        self.scroll.key(key).unwrap_or(Handled::No)
+        self.shown_mut().scroll.key(key).unwrap_or(Handled::No)
     }
 
+    /// The wheel and the left button, both of them [`Cursor`]'s — a click on a
+    /// row that is not there declines, the same answer `git.rs` gives for a
+    /// click on a row that is not a file.
     pub fn mouse(&mut self, ev: &MouseEvent) -> Outcome {
-        if let Some(handled) = self.scroll.mouse(ev) {
-            return if handled.is_yes() {
-                Outcome::Moved
-            } else {
-                Outcome::Ignored
-            };
-        }
-        match ev.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let row = self.scroll.offset + ev.row as usize;
-                // Below the last row there is nothing to choose, the same
-                // answer `git.rs` gives for a click on a row that is not a
-                // file. Snapping the selection to the end of the list instead
-                // would mean a click on the empty half of a short pane
-                // silently re-aiming `Enter`.
-                if row >= self.rows() {
-                    return Outcome::Ignored;
-                }
-                self.select(row)
-            }
-            _ => Outcome::Ignored,
-        }
+        let rows = self.rows();
+        self.shown_mut()
+            .mouse(rows, ev)
+            .unwrap_or(Handled::No)
+            .into()
     }
 
     /// A pasted path, which only a find has anywhere to put. Pasting something
@@ -382,31 +405,22 @@ impl Browser {
 
     // --- keys -------------------------------------------------------------
 
-    /// The scroll vocabulary of `crate::scroll`, spelled out again rather than
-    /// delegated to it, because here it moves a *selection* and not an offset.
-    /// `Scroll::key` measures `G` against the last screenful, which is the
-    /// right answer for a document and the wrong one for a list — `End` has to
-    /// land on the last entry, not on the first entry of the last page.
+    /// Everything that only moves the selection is [`Cursor::key`]'s, so that
+    /// the F1 table is one table rather than one per list. What is left here is
+    /// what a *directory* means by a key, which no cursor could know.
     fn list_key(&mut self, key: KeyEvent) -> Outcome {
+        let rows = self.rows();
+        if let Some(handled) = self.shown_mut().key(rows, key) {
+            return handled.into();
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let page = self.page() as isize;
-        let half = self.half() as isize;
 
         match key.code {
-            KeyCode::Char('d') if ctrl => self.step(half),
-            KeyCode::Char('u') if ctrl => self.step(-half),
             // Ctrl+letter is the agent's everywhere else in the program, so the
-            // rest must not fall into the plain-letter arms below.
+            // rest must not fall into the plain-letter arms below. `Cursor::key`
+            // hands them back rather than declining them itself, precisely so
+            // that this is a decision and not an omission.
             KeyCode::Char(_) if ctrl => Outcome::Ignored,
-
-            KeyCode::Char('j') | KeyCode::Down => self.step(1),
-            KeyCode::Char('k') | KeyCode::Up => self.step(-1),
-            KeyCode::Char(' ') | KeyCode::PageDown => self.step(page),
-            KeyCode::Char('b') | KeyCode::PageUp => self.step(-page),
-            KeyCode::Char('g') | KeyCode::Home => self.select(0),
-            KeyCode::Char('G') | KeyCode::End => self.select(usize::MAX),
-            KeyCode::Tab => self.wrap(1),
-            KeyCode::BackTab => self.wrap(-1),
 
             KeyCode::Enter => self.enter(),
             // `-` as well as Backspace: it is one key rather than a reach, and
@@ -416,7 +430,7 @@ impl Browser {
                 self.find = Some(Find {
                     query: String::new(),
                     hits: Vec::new(),
-                    sel: 0,
+                    cursor: Cursor::over(&self.listing),
                 });
                 self.refilter(None);
                 Outcome::Moved
@@ -434,10 +448,17 @@ impl Browser {
     /// selection moves on the arrows and on `Ctrl+N`/`Ctrl+P` here: those are
     /// the two shapes a reader already has in their fingers for a filter box,
     /// and neither of them can be a letter of a filename.
+    ///
+    /// So this table is spelled out rather than handed to [`Cursor::key`], and
+    /// the difference is deliberate rather than drift: a box that takes typing
+    /// cannot also read `j` as "down". It is the one exception, and it is the
+    /// reason `Cursor::key` is a flavour of the vocabulary and not the whole of
+    /// it. The half-page and paging keys still agree with it, because an open
+    /// query is not a reason for a documented key to go quietly dead.
     fn find_key(&mut self, key: KeyEvent) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let page = self.page() as isize;
-        let half = self.half() as isize;
+        let page = self.shown().page() as isize;
+        let half = self.shown().half() as isize;
 
         match key.code {
             // Cancels the find and stays in the list. Only an Esc with nothing
@@ -445,8 +466,7 @@ impl Browser {
             // thrown out of the pane by the key that means "never mind" is the
             // single most annoying thing a filter box can do.
             KeyCode::Esc => {
-                self.find = None;
-                self.reveal();
+                self.cancel_find();
                 Outcome::Moved
             }
             KeyCode::Enter => self.open_hit(),
@@ -474,8 +494,7 @@ impl Browser {
                     // Backspacing past the start of the query leaves the find.
                     // Those keystrokes came from opening it, so undoing the
                     // last one should undo the first.
-                    self.find = None;
-                    self.reveal();
+                    self.cancel_find();
                 } else {
                     self.refilter(None);
                 }
@@ -494,7 +513,7 @@ impl Browser {
     }
 
     fn enter(&mut self) -> Outcome {
-        let Some(entry) = self.entries.get(self.sel) else {
+        let Some(entry) = self.entries.get(self.listing.sel) else {
             return Outcome::Ignored;
         };
         let (kind, path) = (entry.kind, entry.path.clone());
@@ -539,7 +558,7 @@ impl Browser {
         // never means "the same query again". Leaving the listing on the
         // opened file means Esc out of the document lands somewhere related to
         // where the reader just was.
-        self.find = None;
+        self.close_find();
         let dir = path
             .parent()
             .map(Path::to_path_buf)
@@ -553,11 +572,16 @@ impl Browser {
     fn open_dir(&mut self, dir: &Path, select: Option<&Path>) {
         self.dir = dir.to_path_buf();
         (self.entries, self.cut) = list(&self.root, &self.dir, MAX_ENTRIES);
-        self.sel = select
+        self.listing.sel = select
             .and_then(|want| self.entries.iter().position(|e| e.path == want))
             .unwrap_or(0);
-        self.scroll.to(0);
-        self.reveal();
+        // The row is the listing's; the view is whichever list is being drawn.
+        // Splitting them matters because `align_to` is public and a find can be
+        // open over the listing when it arrives: parking the listing's view
+        // there would leave the hits scrolled away from the row the reader is
+        // actually on, with nothing set to bring it back on the next frame.
+        self.shown_mut().scroll.to(0);
+        self.shown_mut().reveal();
     }
 
     /// `r`, with the guard a synchronous walk on the UI thread has to have.
@@ -585,14 +609,16 @@ impl Browser {
         if entries == self.entries && cut == self.cut {
             return false;
         }
-        let keep = self.entries.get(self.sel).map(|e| e.path.clone());
+        let keep = self.entries.get(self.listing.sel).map(|e| e.path.clone());
         self.entries = entries;
         self.cut = cut;
-        self.sel = keep
+        self.listing.sel = keep
             .and_then(|want| self.entries.iter().position(|e| e.path == want))
-            .unwrap_or(self.sel)
+            .unwrap_or(self.listing.sel)
             .min(self.entries.len().saturating_sub(1));
-        self.reveal();
+        // The listing's row, but the view of whatever is on screen — the same
+        // split as `open_dir`, and for the same reason.
+        self.shown_mut().reveal();
         true
     }
 
@@ -608,21 +634,24 @@ impl Browser {
         let sel = keep
             .and_then(|keep| hits.iter().position(|&i| self.index[i] == keep))
             .unwrap_or(0);
-        // Back to the top only when the selection went there too. A walk
-        // landing under an open find must not re-park the *view* any more than
-        // it may re-park the choice.
-        if sel == 0 {
-            self.scroll.to(0);
-        }
         if let Some(find) = self.find.as_mut() {
+            // Back to the top only when the selection went there too. A walk
+            // landing under an open find must not re-park the *view* any more
+            // than it may re-park the choice.
+            if sel == 0 {
+                find.cursor.scroll.to(0);
+            }
             find.hits = hits;
-            find.sel = sel;
+            find.cursor.sel = sel;
+            find.cursor.reveal();
         }
-        self.reveal();
     }
 
     // --- selection --------------------------------------------------------
 
+    /// How many rows the list on screen has — `entries` or `hits` — and the
+    /// number every cursor move has to be handed. Why the cursor is not told
+    /// once and left to remember is [`super::list`]'s argument.
     fn rows(&self) -> usize {
         match &self.find {
             Some(find) => find.hits.len(),
@@ -630,97 +659,41 @@ impl Browser {
         }
     }
 
-    fn cursor(&self) -> usize {
+    /// The cursor being drawn: the hits while a find is open, the listing
+    /// otherwise.
+    ///
+    /// Every method that moves a selection or a view has to choose between this
+    /// and [`Browser::listing`], and the two are not interchangeable — `Esc` out
+    /// of a find comes back to a row this one is not on. Why there are two of
+    /// them, and one view between them, is [`super::list`]'s argument.
+    fn shown(&self) -> &Cursor {
         match &self.find {
-            Some(find) => find.sel,
-            None => self.sel,
+            Some(find) => &find.cursor,
+            None => &self.listing,
+        }
+    }
+
+    fn shown_mut(&mut self) -> &mut Cursor {
+        match &mut self.find {
+            Some(find) => &mut find.cursor,
+            None => &mut self.listing,
         }
     }
 
     fn step(&mut self, delta: isize) -> Outcome {
-        let n = self.rows();
-        if n == 0 {
-            return Outcome::Ignored;
-        }
-        let to = (self.cursor() as isize + delta).clamp(0, n as isize - 1);
-        self.select(to as usize)
-    }
-
-    /// Tab wraps where `j` stops. With one screenful of files, Tab from the
-    /// last entry back to the first is what a reader means by it; `j` at the
-    /// bottom is someone who has arrived at the bottom.
-    fn wrap(&mut self, delta: isize) -> Outcome {
-        let n = self.rows() as isize;
-        if n == 0 {
-            return Outcome::Ignored;
-        }
-        self.select((((self.cursor() as isize + delta) % n + n) % n) as usize)
+        let rows = self.rows();
+        self.shown_mut().step(rows, delta).into()
     }
 
     fn select(&mut self, to: usize) -> Outcome {
-        let n = self.rows();
-        if n == 0 {
-            return Outcome::Ignored;
-        }
-        let to = to.min(n - 1);
-        if to == self.cursor() {
-            // Nothing moved, so nothing was acted on. Reporting otherwise
-            // spends a frame — the agent's whole screen included — on a key that
-            // could not do anything.
-            return Outcome::Ignored;
-        }
-        match self.find.as_mut() {
-            Some(find) => find.sel = to,
-            None => self.sel = to,
-        }
-        self.reveal();
-        Outcome::Moved
-    }
-
-    /// The selection has moved, or the list under it has changed.
-    ///
-    /// Scrolled into view twice, and the second time is the one that has to be
-    /// there. Here, on the numbers the last frame left behind, so a burst of
-    /// keys drained before the next frame pages from roughly the right place.
-    /// And again in `render`, because `Scroll` is told the row count by a frame
-    /// and by nothing else: climbing out of a one-file directory into a
-    /// four-hundred-entry one leaves it believing the list is one row long, so
-    /// it clamps the offset to zero and the selected row is off screen with
-    /// nothing left to bring it back.
-    ///
-    /// Deliberately *not* done on every frame. The wheel is allowed to move the
-    /// view away from the selection, and a frame that dragged it back would
-    /// make scrolling by wheel impossible.
-    fn reveal(&mut self) {
-        self.follow = true;
-        self.scroll_into_view();
-    }
-
-    /// Bring the selected row into view without recentring — a list that jumps
-    /// under you is harder to read than one that scrolls by a line.
-    fn scroll_into_view(&mut self) {
-        let row = self.cursor();
-        let page = self.scroll.viewport().max(1);
-        if row < self.scroll.offset {
-            self.scroll.to(row);
-        } else if row >= self.scroll.offset + page {
-            self.scroll.to(row + 1 - page);
-        }
-    }
-
-    fn page(&self) -> usize {
-        // One row of overlap, the same as everywhere else that pages.
-        self.scroll.viewport().saturating_sub(1).max(1)
-    }
-
-    fn half(&self) -> usize {
-        (self.scroll.viewport() / 2).max(1)
+        let rows = self.rows();
+        self.shown_mut().select(rows, to).into()
     }
 
     /// The selected match, as the index spells it.
     fn hit_path(&self) -> Option<String> {
         let find = self.find.as_ref()?;
-        self.index.get(*find.hits.get(find.sel)?).cloned()
+        self.index.get(*find.hits.get(find.cursor.sel)?).cloned()
     }
 
     // --- drawing ----------------------------------------------------------
@@ -734,7 +707,7 @@ impl Browser {
         // Every row is clipped here and nowhere else. A pane that overflows its
         // rect corrupts the frame rather than merely looking wrong.
         let mut spans = clip_line(Line::from(spans), w).spans;
-        if i != self.cursor() {
+        if i != self.shown().sel {
             return Line::from(spans);
         }
         // Padded to the full width, or the highlight would stop at the end of
@@ -896,10 +869,6 @@ fn hit_spans(rel: &str, t: &theme::Theme) -> Vec<Span<'static>> {
     }
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
-    if n == 1 { one } else { many }.to_string()
-}
-
 /// Case-insensitive ordering, without allocating.
 ///
 /// `README.md` and `readme.md` belong next to each other in a list a person
@@ -1050,6 +1019,7 @@ fn subseq(hay: &[char], needle: &[char]) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+    use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1085,7 +1055,8 @@ mod tests {
     /// produced for the same tree, and a viewport as if a frame had been drawn.
     fn browser(dir: &TempDir, index: &[&str]) -> Browser {
         let mut b = Browser::new(dir.path().to_path_buf());
-        b.set_index(index.iter().map(|s| (*s).to_string()).collect());
+        let index: Vec<String> = index.iter().map(|s| (*s).to_string()).collect();
+        b.set_index(index.into());
         b.align_to(None);
         viewport(&mut b, 10);
         b
@@ -1095,7 +1066,10 @@ mod tests {
     /// is a key rather than a drawing.
     fn viewport(b: &mut Browser, height: usize) {
         let rows = b.rows();
-        b.scroll.measure(rows, height);
+        // The cursor a frame would have measured, which is not always the
+        // listing's: a helper that always measured that one would go quietly
+        // inert the moment it were used after a `/`.
+        b.shown_mut().scroll.measure(rows, height);
     }
 
     /// Draw for real. The only way to exercise what `render` does with the row
@@ -1119,8 +1093,8 @@ mod tests {
 
     fn selected(b: &Browser) -> String {
         match &b.find {
-            Some(find) => b.index[find.hits[find.sel]].clone(),
-            None => b.entries[b.sel].label.clone(),
+            Some(find) => b.index[find.hits[find.cursor.sel]].clone(),
+            None => b.entries[b.listing.sel].label.clone(),
         }
     }
 
@@ -1221,17 +1195,20 @@ mod tests {
         assert_eq!(labels(&b), ["..", "three.md"]);
 
         assert!(moved(b.key(key(KeyCode::Backspace))));
-        assert_eq!(b.entries[b.sel].label, "c/", "landed back on where it was");
+        assert_eq!(
+            b.entries[b.listing.sel].label, "c/",
+            "landed back on where it was"
+        );
 
         // `-` is the same key by another name, and Enter on `..` is a third.
         b.select(3);
         b.enter();
         assert!(moved(b.key(key(KeyCode::Char('-')))));
-        assert_eq!(b.entries[b.sel].label, "d/");
+        assert_eq!(b.entries[b.listing.sel].label, "d/");
         b.enter();
         b.select(0);
         assert!(moved(b.enter()));
-        assert_eq!(b.entries[b.sel].label, "d/");
+        assert_eq!(b.entries[b.listing.sel].label, "d/");
     }
 
     #[test]
@@ -1260,10 +1237,11 @@ mod tests {
         draw(&mut b, 40, 20);
         assert_eq!(selected(&b), "d399/", "back on the directory just left...");
         assert!(
-            b.sel >= b.scroll.offset && b.sel < b.scroll.offset + 20,
+            b.listing.sel >= b.listing.scroll.offset
+                && b.listing.sel < b.listing.scroll.offset + 20,
             "...and on screen: row {} in a window of 20 starting at {}",
-            b.sel,
-            b.scroll.offset
+            b.listing.sel,
+            b.listing.scroll.offset
         );
     }
 
@@ -1279,14 +1257,17 @@ mod tests {
         draw(&mut b, 40, 20);
         b.key(key(KeyCode::End));
         draw(&mut b, 40, 20);
-        assert!(b.sel >= b.scroll.offset && b.sel < b.scroll.offset + 20);
+        assert!(
+            b.listing.sel >= b.listing.scroll.offset
+                && b.listing.sel < b.listing.scroll.offset + 20
+        );
 
         draw(&mut b, 40, 6);
         assert!(
-            b.sel >= b.scroll.offset && b.sel < b.scroll.offset + 6,
+            b.listing.sel >= b.listing.scroll.offset && b.listing.sel < b.listing.scroll.offset + 6,
             "row {} is outside the window of 6 at {}",
-            b.sel,
-            b.scroll.offset
+            b.listing.sel,
+            b.listing.scroll.offset
         );
     }
 
@@ -1327,9 +1308,9 @@ mod tests {
         assert!(ignored(b.key(key(KeyCode::Char('j')))));
         // ...but Tab wraps, so it is never a dead key.
         assert!(moved(b.key(key(KeyCode::Tab))));
-        assert_eq!(b.sel, 0);
+        assert_eq!(b.listing.sel, 0);
         assert!(moved(b.key(key(KeyCode::BackTab))));
-        assert_eq!(b.sel, 1);
+        assert_eq!(b.listing.sel, 1);
     }
 
     /// The list's half of `scroll.rs`'s equivalent test. The F1 overlay is one
@@ -1346,32 +1327,50 @@ mod tests {
         assert_eq!(b.rows(), 100);
 
         b.key(key(KeyCode::Char('j')));
-        assert_eq!(b.sel, 1);
+        assert_eq!(b.listing.sel, 1);
         b.key(key(KeyCode::Down));
-        assert_eq!(b.sel, 2);
+        assert_eq!(b.listing.sel, 2);
         b.key(key(KeyCode::Char(' ')));
-        assert_eq!(b.sel, 2 + 9, "a page keeps one row of overlap");
+        assert_eq!(b.listing.sel, 2 + 9, "a page keeps one row of overlap");
         b.key(key(KeyCode::Char('b')));
-        assert_eq!(b.sel, 2);
+        assert_eq!(b.listing.sel, 2);
         b.key(key(KeyCode::PageDown));
-        assert_eq!(b.sel, 11);
+        assert_eq!(b.listing.sel, 11);
         b.key(key(KeyCode::PageUp));
-        assert_eq!(b.sel, 2);
+        assert_eq!(b.listing.sel, 2);
         b.key(ctrl('d'));
-        assert_eq!(b.sel, 7);
+        assert_eq!(b.listing.sel, 7);
         b.key(ctrl('u'));
-        assert_eq!(b.sel, 2);
+        assert_eq!(b.listing.sel, 2);
         b.key(key(KeyCode::Char('k')));
-        assert_eq!(b.sel, 1);
+        assert_eq!(b.listing.sel, 1);
 
         b.key(key(KeyCode::Char('G')));
-        assert_eq!(b.sel, 99, "G reaches the last entry, not the last page");
+        assert_eq!(
+            b.listing.sel, 99,
+            "G reaches the last entry, not the last page"
+        );
         b.key(key(KeyCode::Char('g')));
-        assert_eq!(b.sel, 0);
+        assert_eq!(b.listing.sel, 0);
         b.key(key(KeyCode::End));
-        assert_eq!(b.sel, 99);
+        assert_eq!(b.listing.sel, 99);
         b.key(key(KeyCode::Home));
-        assert_eq!(b.sel, 0);
+        assert_eq!(b.listing.sel, 0);
+    }
+
+    #[test]
+    fn ctrl_and_a_letter_is_the_agents_even_where_the_bare_letter_is_ours() {
+        // The keys that move a selection are `Cursor::key`'s and the keys that
+        // mean something to a directory are this file's, which puts the guard
+        // against Ctrl+letter and the arm for `r` in different modules. A
+        // `Ctrl+R` arriving at `r` would walk the directory on the thread that
+        // pumps the agent's pty, for a chord aimed at the agent.
+        let dir = tree("browse-ctrl", &["a.md", "b.md"]);
+        let mut b = browser(&dir, &[]);
+        for c in ['r', 'c', 'g', 'G', 'j', 'k', 'b', '-'] {
+            assert!(ignored(b.key(ctrl(c))), "Ctrl+{c} is not the list's");
+        }
+        assert_eq!(b.listing.sel, 0, "and none of them moved anything");
     }
 
     #[test]
@@ -1384,9 +1383,11 @@ mod tests {
         viewport(&mut b, 3);
 
         b.key(key(KeyCode::End));
-        assert!(b.sel >= b.scroll.offset && b.sel < b.scroll.offset + 3);
+        assert!(
+            b.listing.sel >= b.listing.scroll.offset && b.listing.sel < b.listing.scroll.offset + 3
+        );
         b.key(key(KeyCode::Char('g')));
-        assert_eq!(b.scroll.offset, 0);
+        assert_eq!(b.listing.scroll.offset, 0);
     }
 
     #[test]
@@ -1405,19 +1406,19 @@ mod tests {
         draw(&mut b, 40, 3);
 
         assert_eq!(b.scroll_view(key(KeyCode::Down)), Handled::Yes);
-        assert_eq!(b.scroll.offset, 1);
-        assert_eq!(b.sel, 0, "the selection did not follow the view");
+        assert_eq!(b.listing.scroll.offset, 1);
+        assert_eq!(b.listing.sel, 0, "the selection did not follow the view");
         assert_eq!(b.scroll_view(key(KeyCode::PageDown)), Handled::Yes);
-        assert_eq!(b.sel, 0);
+        assert_eq!(b.listing.sel, 0);
         assert_eq!(b.scroll_view(key(KeyCode::Up)), Handled::Yes);
-        assert_eq!(b.sel, 0);
+        assert_eq!(b.listing.sel, 0);
 
         // ...and a frame drawn afterwards leaves the view where the glance put
         // it, or scrolling without focus would be impossible.
-        let was = b.scroll.offset;
+        let was = b.listing.scroll.offset;
         assert!(was > 0);
         draw(&mut b, 40, 3);
-        assert_eq!(b.scroll.offset, was);
+        assert_eq!(b.listing.scroll.offset, was);
     }
 
     #[test]
@@ -1431,11 +1432,11 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert!(moved(b.mouse(&click(1))));
-        assert_eq!(b.sel, 1);
+        assert_eq!(b.listing.sel, 1);
         // The empty half of a short pane. Snapping to the last row here would
         // silently re-aim Enter.
         assert!(ignored(b.mouse(&click(7))));
-        assert_eq!(b.sel, 1);
+        assert_eq!(b.listing.sel, 1);
     }
 
     #[test]
@@ -1638,7 +1639,10 @@ mod tests {
 
         assert!(moved(b.key(key(KeyCode::Esc))));
         assert!(!b.finding(), "the find is gone");
-        assert_eq!(b.sel, 1, "and the list is exactly where it was left");
+        assert_eq!(
+            b.listing.sel, 1,
+            "and the list is exactly where it was left"
+        );
 
         assert!(
             ignored(b.key(key(KeyCode::Esc))),
@@ -1680,21 +1684,21 @@ mod tests {
         // `j` would be "down" in the list and is a letter here.
         b.key(key(KeyCode::Char('j')));
         assert_eq!(hits(&b).len(), 3);
-        assert_eq!(b.cursor(), 0);
+        assert_eq!(b.shown().sel, 0);
 
         b.key(key(KeyCode::Down));
-        assert_eq!(b.cursor(), 1);
+        assert_eq!(b.shown().sel, 1);
         b.key(ctrl('n'));
-        assert_eq!(b.cursor(), 2);
+        assert_eq!(b.shown().sel, 2);
         b.key(ctrl('p'));
-        assert_eq!(b.cursor(), 1);
+        assert_eq!(b.shown().sel, 1);
         b.key(key(KeyCode::Up));
-        assert_eq!(b.cursor(), 0);
+        assert_eq!(b.shown().sel, 0);
         // ...and the half-page keys the overlay promises still work in here.
         b.key(ctrl('d'));
-        assert_eq!(b.cursor(), 2);
+        assert_eq!(b.shown().sel, 2);
         b.key(ctrl('u'));
-        assert_eq!(b.cursor(), 0);
+        assert_eq!(b.shown().sel, 0);
     }
 
     #[test]
@@ -1732,7 +1736,7 @@ mod tests {
         // related to where the reader just was rather than back at the root.
         assert!(!b.finding());
         assert_eq!(b.here(), "docs/");
-        assert_eq!(b.entries[b.sel].label, "design.md");
+        assert_eq!(b.entries[b.listing.sel].label, "design.md");
     }
 
     #[test]
@@ -1751,25 +1755,71 @@ mod tests {
         draw(&mut b, 40, 10);
         let chosen = selected(&b);
         assert_eq!(chosen, "f39.md");
-        assert!(b.scroll.offset > 0, "the view had to scroll to show it");
+        assert!(
+            b.shown().scroll.offset > 0,
+            "the view had to scroll to show it"
+        );
         // Where the chosen row sits *on screen*, which is what a reader would
         // notice moving. The row index itself is allowed to shift, because a
         // walk that found a new file sorting above this one moves everything
         // below it down by one.
-        let row_on_screen = b.cursor() - b.scroll.offset;
+        let row_on_screen = b.shown().sel - b.shown().scroll.offset;
 
         let mut grown = names.clone();
         grown.push("brand-new.md".to_string());
         grown.sort();
-        b.set_index(grown);
+        b.set_index(grown.into());
         draw(&mut b, 40, 10);
 
         assert_eq!(selected(&b), chosen, "still on the file they had chosen");
         assert_eq!(
-            b.cursor() - b.scroll.offset,
+            b.shown().sel - b.shown().scroll.offset,
             row_on_screen,
             "and it did not move on screen either"
         );
+    }
+
+    #[test]
+    fn lining_the_listing_up_while_a_find_is_open_parks_the_list_on_screen() {
+        // `align_to` re-parks the listing, and the pane only ever calls it with
+        // the listing on screen — the way out of the list cancels the find
+        // first. Nothing in here enforces that, and the call does two things
+        // that belong to different cursors: it chooses a row in the *listing*,
+        // and it parks the view of whatever is *drawn*. Doing both to the
+        // listing leaves the hits scrolled away from the row the reader is on,
+        // with `follow` unset on the only cursor that could have rescued it.
+        let names: Vec<String> = (0..60).map(|i| format!("f{i:02}.md")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let dir = tree("find-align", &["docs/design.md"]);
+        let mut b = browser(&dir, &refs);
+
+        b.key(key(KeyCode::Char('/')));
+        draw(&mut b, 40, 5);
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..4 {
+            b.mouse(&wheel);
+        }
+        draw(&mut b, 40, 5);
+        assert!(b.shown().scroll.offset > 0, "the wheel took the hits down");
+        assert_eq!(b.shown().sel, 0, "and left the chosen hit where it was");
+
+        b.align_to(Some(&dir.path().join("docs").join("design.md")));
+        assert_eq!(
+            b.shown().scroll.offset,
+            0,
+            "the list being drawn is the one that gets parked"
+        );
+
+        // ...and the view the listing takes back on the way out is that one,
+        // not an offset stranded in the find.
+        b.key(key(KeyCode::Esc));
+        assert_eq!(b.listing.scroll.offset, 0);
+        assert_eq!(b.entries[b.listing.sel].label, "design.md");
     }
 
     #[test]
@@ -1782,7 +1832,7 @@ mod tests {
         b.key(key(KeyCode::Char('/')));
         assert!(b.nothing().contains("Still walking"), "{}", b.nothing());
 
-        b.set_index(Vec::new());
+        b.set_index(Arc::from(Vec::new()));
         assert!(b.nothing().contains("No file matches"), "{}", b.nothing());
     }
 
