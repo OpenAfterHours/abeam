@@ -23,6 +23,14 @@ use crate::watch::{in_noise, is_markdown};
 
 /// Stop walking after this many entries. A monorepo's worth of gitignored
 /// noise is not worth a second of a worker thread.
+///
+/// Reaching it is reported, in [`Scan::cut`], and that is not tidiness: this
+/// cap counts *entries the walk visited*, while [`MAX_FILES`] counts files it
+/// kept, and `in_noise` filters between the two. A tree with a large
+/// un-gitignored `node_modules` therefore exhausts this while yielding almost
+/// no files — so a reader looking at a short list and a small count has no way
+/// to tell a complete answer from a truncated one, and `super::grep` reads this
+/// same list and would report a definite count over a walk that stopped early.
 const MAX_ENTRIES: usize = 50_000;
 
 /// How much of the sorted markdown result to keep. Nobody tabs through two
@@ -39,6 +47,10 @@ const KEEP: usize = 200;
 /// by typing three letters anyway. Past the cap the walk keeps whatever it saw
 /// first, deliberately: there is no ranking that could be applied here — not
 /// age, not depth — that a reader would recognise as "the ones it kept".
+///
+/// `super::grep` reads this same list and so inherits the cap without being
+/// able to see it, which is why reaching it is reported in [`Scan::cut`]
+/// alongside the walk's own.
 const MAX_FILES: usize = 20_000;
 
 /// What one walk of the root answers with.
@@ -48,6 +60,15 @@ pub struct Scan {
     /// Every file under the root, as [`rel`] spells them, sorted by name. The
     /// find index.
     pub files: Vec<String>,
+    /// The traversal stopped at [`MAX_ENTRIES`], or the index at [`MAX_FILES`],
+    /// so `files` is a prefix of what is there rather than the whole of it.
+    ///
+    /// One flag for the two caps because the reader's position is the same
+    /// under either: what they are looking at is short, and nothing they type
+    /// will lengthen it. Neither is visible from `files` alone — `MAX_ENTRIES`
+    /// counts entries rather than files, so a walk can be cut with the list
+    /// nowhere near full.
+    pub cut: bool,
 }
 
 /// Walk `root`, gitignore-aware. Returns immediately; the answer arrives on
@@ -62,19 +83,24 @@ pub fn spawn_scan(root: PathBuf) -> Receiver<Scan> {
     rx
 }
 
-fn scan(root: &Path) -> Scan {
+/// One walk, on whichever thread asked. `spawn_scan` is the only caller that
+/// is not a test — and the tests that use it are not all in this file: the
+/// repository search is defined by what this list contains, so its own suite
+/// asserts against the real walk rather than a hand-written list that could
+/// quietly stop resembling one.
+pub(super) fn scan(root: &Path) -> Scan {
     let mut markdown: Vec<(SystemTime, PathBuf)> = Vec::new();
     let mut files: Vec<String> = Vec::new();
     // `ignore` reads .gitignore for us, which is the difference between a file
     // list and a list of build artefacts.
-    let walk = ignore::WalkBuilder::new(root)
+    let mut walk = ignore::WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
         .git_global(true)
         .parents(true)
         .build();
 
-    for entry in walk.take(MAX_ENTRIES).flatten() {
+    for entry in walk.by_ref().take(MAX_ENTRIES).flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -96,6 +122,13 @@ fn scan(root: &Path) -> Scan {
         markdown.push((modified, path.to_path_buf()));
     }
 
+    // Asked rather than inferred from a count. `take(MAX_ENTRIES)` leaves the
+    // walk on exactly the entry it stopped before, so one more pull is the
+    // difference between "there was more" and "it happened to end there" — and
+    // a tree of exactly fifty thousand entries is otherwise reported as
+    // truncated for ever.
+    let cut = files.len() >= MAX_FILES || walk.next().is_some();
+
     markdown.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     markdown.truncate(KEEP);
     // Sorted here, on the worker, because an empty query shows the index as it
@@ -105,6 +138,7 @@ fn scan(root: &Path) -> Scan {
     Scan {
         recent: markdown.into_iter().map(|(_, p)| p).collect(),
         files,
+        cut,
     }
 }
 
@@ -231,5 +265,33 @@ mod tests {
         // Root-relative, `/`-separated, sorted, and without the build output.
         assert_eq!(found.files, ["plan.md", "src/main.rs"]);
         assert_eq!(found.recent.len(), 1, "the markdown list is unchanged");
+        assert!(!found.cut, "a tree this size is not a truncated answer");
+    }
+
+    #[test]
+    fn a_walk_that_stopped_early_says_so_where_it_can_be_seen() {
+        // Neither cap is visible from the list itself, and `MAX_ENTRIES` is the
+        // one that hides best: it counts entries the walk *visited*, while
+        // `in_noise` filters afterwards — so a tree can exhaust it and yield
+        // almost nothing, and a reader would see a short list with no sign that
+        // anything was left out. `super::grep` reports a count over this list
+        // and would call it definite.
+        let dir = TempDir::new("scan-cut");
+        for i in 0..6 {
+            dir.write(&format!("f{i}.md"), b"# x\n");
+        }
+        // The root itself is an entry, so a limit of three reaches at most two
+        // files and there is provably more behind it.
+        let mut walk = ignore::WalkBuilder::new(dir.path()).build();
+        let visited: Vec<_> = walk.by_ref().take(3).collect();
+        assert_eq!(visited.len(), 3);
+        assert!(
+            walk.next().is_some(),
+            "asked rather than inferred: one more pull is what makes `cut` true"
+        );
+
+        // ...and the real walk over a small tree is not cut, which is the half
+        // a test of the cap alone would never have checked.
+        assert!(!scan(dir.path()).cut);
     }
 }

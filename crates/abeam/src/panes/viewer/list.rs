@@ -8,9 +8,10 @@
 //! the first.
 //!
 //! The viewer's directory listing is not the only list of its kind. The find
-//! over the whole repository is a second, in the same pane and behind the same
-//! keys, and a pane that grew a third would otherwise grow a third copy of
-//! this. Copies of it do not fail loudly: what goes wrong is `End` landing on
+//! over file names is a second and the results of a search over their contents
+//! are a third, all in the same pane and behind the same keys — and each of
+//! them would otherwise have been a copy of this. Copies of it do not fail
+//! loudly: what goes wrong is `End` landing on
 //! the first row of the last page instead of the last row, or a page that keeps
 //! no row of overlap, or a selection that stops being brought back on screen
 //! when the window is dragged narrower. Each of those is a key that half works,
@@ -25,32 +26,50 @@
 //! removed it.
 //!
 //! It is not the only flavour a list can want. A type-to-filter box takes every
-//! printable key as text, so the viewer's find spells out a shorter table of
-//! its own beside this one — a different table for a stated reason, which is a
-//! different thing from the same table written twice.
+//! printable key as text, so the two find boxes in the viewer — over file names
+//! in [`super::browse`], over file *contents* in [`super::grep`] — each spell
+//! out a shorter table beside this one.
+//!
+//! Two of them, which is worth being exact about now that it is not one. What
+//! they share with this table is the half a filter box cannot take: the paging
+//! and half-paging keys, which go on meaning what the F1 overlay says because
+//! an open query is not a reason for a documented key to go quietly dead. What
+//! they hold separately is the rest, because in a box `j` is a letter — and
+//! they hold it *identically*, so it is now the same table written twice rather
+//! than a different table for a stated reason. That is real duplication and it
+//! is the visible kind: both are a dozen lines in plain sight, both are covered
+//! by their own tests, and the failure this module was created to prevent is
+//! the silent kind. It is left alone deliberately rather than overlooked.
 //!
 //! ## The rows belong to the caller
 //!
 //! Every method that can move takes the row count as an argument rather than
-//! the cursor keeping one. The two lists in the viewer are two different `Vec`s
-//! and either can be replaced underneath the reader — by a directory re-read,
-//! by a background walk that finished. A count cached here would be a third
-//! copy to keep in step with them, and the frame that noticed it had drifted
-//! would be the one that had already drawn a selection past the end of a list.
+//! the cursor keeping one. The three lists in the viewer are three different
+//! `Vec`s and any of them can be replaced underneath the reader — by a
+//! directory re-read, by a background walk that finished. The results list is
+//! the sharpest case and it arrived last: rows are appended to it *by a worker
+//! thread between frames*, so a count cached here would be a copy going stale
+//! several times a second, and the frame that noticed would be the one that had
+//! already drawn a selection past the end of a list.
 //!
-//! ## A cursor each, one view between them
+//! ## A cursor each, and a view that travels between two of the three
 //!
 //! Two lists in one pane are two cursors, because the row chosen in the listing
 //! has to survive a find opening over it and closing again: that is the whole
 //! difference between `Esc` meaning "never mind" and `Esc` meaning "start
 //! over".
 //!
-//! They are not two views. How tall the pane is can only be learned from a
-//! frame, and a second `Scroll` starting from nothing believes the pane is zero
-//! rows tall — so the first `PageDown` after `/`, drained from the same batch
-//! of keys and answered before any frame, would move by a single row. So the
-//! view travels rather than being copied: [`Cursor::over`] takes it up and
-//! [`Cursor::take_view`] brings it back down.
+//! The listing and its find are not two views. How tall the pane is can only be
+//! learned from a frame, and a second `Scroll` starting from nothing believes
+//! the pane is zero rows tall — so the first `PageDown` after `/`, drained from
+//! the same batch of keys and answered before any frame, would move by a single
+//! row. So the view travels rather than being copied: [`Cursor::over`] takes it
+//! up and [`Cursor::take_view`] brings it back down.
+//!
+//! The results list does **not** take part in that. It is a separate view of
+//! the pane rather than a list raised over another one, so it starts from
+//! [`Cursor::new`] and the same guessed viewport `Browser::new` uses — which is
+//! what that guess is for, and is why `new` takes one at all.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 

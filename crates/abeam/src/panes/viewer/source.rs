@@ -134,7 +134,15 @@ fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.split('\n')
 }
 
-fn expand_tabs(line: &str) -> String {
+/// Tabs to spaces, at [`TAB`] stops.
+///
+/// Every row the viewer draws goes through this, and so must every row
+/// `super::grep` draws: a `\t` written into a terminal cell is not a character
+/// the cell can hold, and `unicode_width` measures it as nothing at all, so a
+/// preview of a line from a Makefile would be a row whose drawn width and
+/// measured width disagree. Shared rather than repeated, so the two cannot
+/// settle on different tab stops and show the same line two ways.
+pub(super) fn expand_tabs(line: &str) -> String {
     if !line.contains('\t') {
         return line.to_string();
     }

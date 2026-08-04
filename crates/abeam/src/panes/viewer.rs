@@ -42,21 +42,47 @@
 //! case; a *different* document ends it, because the hits are that document's
 //! rows and the count was never true of any other.
 //!
-//! ## Two things to look at, one pane
+//! The results of a repository search are the fourth, and they are held back
+//! for both of the reasons above at once. Somebody comparing forty matches is
+//! using the pane as surely as somebody walking a tree; and the row they are
+//! about to press `Enter` on would be replaced, mid-reach, by a document they
+//! did not ask for.
 //!
-//! [`Mode`] is the document or the list. `Alt+E` — [`ViewerPane::toggle_browse`]
-//! — moves between them in both directions, and `Enter` on a file moves one
-//! way, because a list that stayed up after you chose something would need a
-//! second key to show you what you chose. Nothing else changes the mode; in
-//! particular the watcher cannot, which is the rule above. They are the same
-//! reading position from either end: the list is how a file is reached, the
-//! document is what the list is for. The list itself lives in [`browse`],
-//! because a selectable, filterable directory tree is a pane's worth of code on
-//! its own and this file is long enough. What being *in* a list means — which
-//! row is chosen, and keeping it on screen — is [`list`], one level down again:
-//! the directory listing and the find over the repository are two lists in that
-//! one pane, and the bookkeeping they share is the part that goes subtly wrong
-//! when it is written twice.
+//! ## Three things to look at, one pane
+//!
+//! [`Mode`] is the document, the list, or the results of a search over every
+//! file under the root. `Alt+E` — [`ViewerPane::toggle_browse`] — moves between
+//! the first two in both directions, and `Enter` on a file moves one way,
+//! because a list that stayed up after you chose something would need a second
+//! key to show you what you chose. They are the same reading position from
+//! either end: the list is how a file is reached, the document is what the list
+//! is for.
+//!
+//! The results are a layer over whichever of those two raised them, which is
+//! why they are the mode that carries something back — [`Back`]. `f` opens
+//! them, `Esc` closes them onto the view they were opened from, and `Alt+E`
+//! peels them off and then means exactly what it has always meant. Nothing else
+//! changes the mode; in particular the watcher cannot, which is the rule above.
+//!
+//! They have one property the other two do not, and it is the genuinely new
+//! risk in this pane: **the rows of the results list arrive from another
+//! thread, between frames.** The document and the file list only ever change
+//! because something on this thread changed them. A list that grows underneath
+//! a reader is the same hazard as a file arriving underneath one, one level
+//! down — and the answer is the same shape. `grep::absorb` appends and touches
+//! the cursor with nothing at all, so the row under the selection stays the row
+//! that was under it; [`list::Cursor`] carries the argument for why reacting to
+//! each batch would pin the view and take the wheel away. That one line is what
+//! holds it, which is why it is pointed at from here.
+//!
+//! The list itself lives in [`browse`] and the search in [`grep`], because a
+//! selectable, filterable directory tree is a pane's worth of code on its own,
+//! a worker thread that reads the repository is another, and this file is long
+//! enough. What being *in* a list means — which row is chosen, and keeping it on
+//! screen — is [`list`], one level down again: the directory listing, the find
+//! over file names and the results of a search over their contents are three
+//! lists in that one pane, and the bookkeeping they share is the part that goes
+//! subtly wrong when it is written three times.
 //!
 //! ## Where the work happens
 //!
@@ -64,6 +90,15 @@
 //!
 //! - the gitignore-aware walk that builds the recency list and the find index
 //!   runs on its own thread and reports through a channel `tick` polls,
+//! - the sweep that answers `f` — reading every file the walk found, looking for
+//!   a phrase — is the largest piece of work this pane can start and none of it
+//!   is here. It runs on a long-lived thread of [`grep`]'s, reports in batches
+//!   through a second channel the same `tick` drains, and is abandoned mid-file
+//!   when the query is superseded. What bounds it is four caps, three of which
+//!   it inherits: `files::MAX_ENTRIES` and `files::MAX_FILES` decide how much
+//!   repository it can see, `load::MAX_BYTES` how much of each file, and
+//!   `grep::MAX_HITS` how much it may report. It is also the reason `f` waits
+//!   for `Enter` where `/` does not,
 //! - the watcher is the shell's, on `notify`'s thread behind a debouncer,
 //! - layout — parse, highlight, wrap — happens once per `(file, width)` pair
 //!   and is cached, because `render` runs on every keystroke the agent sees,
@@ -93,9 +128,18 @@
 //! character, length)` — already in the unit the pane scrolls by — and rendered
 //! markdown, raw markdown and a highlighted source file are all just rows. What
 //! that costs, and why the alternative does not exist, is [`search`]'s argument.
+//!
+//! And it is what [`grep`] has to be reconciled with. A search over files on
+//! disk knows a *line*; this pane scrolls by *row*, and for rendered markdown
+//! the two are not relatable at all. So `Enter` on a result carries an ordinal
+//! rather than a position — the third match in that file is looked for again as
+//! the third match on the page — and when the page turns out to have fewer, the
+//! reader is told rather than parked at the top. See [`ViewerPane::show_at`]
+//! and [`ViewerPane::missed`].
 
 mod browse;
 mod files;
+mod grep;
 mod list;
 mod load;
 mod markdown;
@@ -104,6 +148,7 @@ mod source;
 mod theme;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use anyhow::Result;
@@ -119,6 +164,7 @@ use crate::scroll::{self, Scroll};
 use crate::text::{self, wrap};
 use browse::Browser;
 use files::Scan;
+use grep::Grep;
 use load::{LoadError, Loaded};
 use search::{Margin, Search};
 
@@ -129,10 +175,41 @@ const DEFAULT_VIEWPORT: usize = 20;
 /// not worth it in a squeezed one.
 const LINE_NUMBER_MIN_WIDTH: usize = 30;
 
-/// Which of the two things the pane is showing. See the module doc.
+/// Which of the three things the pane is showing. See the module doc.
+#[derive(Clone, Copy)]
 enum Mode {
     Doc,
     Browse,
+    /// The search over every file under the root. Raised by `f` over either of
+    /// the other two, and it remembers which — `Esc` out of it has to put the
+    /// reader back where they pressed the key, and dropping somebody who was
+    /// walking a directory into a document instead is the same yank the whole
+    /// pane is built to avoid.
+    Results {
+        back: Back,
+    },
+}
+
+/// Which of the two settled modes the results were raised over.
+///
+/// A second enum rather than a boxed `Mode`, because there are exactly two
+/// answers and they are the two modes that are *not* the results: a `Mode`
+/// inside a `Mode` would make `Results { back: Results { .. } }` representable,
+/// and the thing it would mean is a pane that has to be `Esc`d out of twice
+/// through a state nothing on screen ever showed.
+#[derive(Clone, Copy)]
+enum Back {
+    Doc,
+    Browse,
+}
+
+impl Back {
+    fn mode(self) -> Mode {
+        match self {
+            Back::Doc => Mode::Doc,
+            Back::Browse => Mode::Browse,
+        }
+    }
 }
 
 enum Body {
@@ -163,6 +240,12 @@ pub struct ViewerPane {
     state: State,
     mode: Mode,
     browse: Browser,
+    /// The search over every file under the root, and the list of what it
+    /// found. Beside [`ViewerPane::browse`] rather than inside it, because it
+    /// is a third view of the pane rather than a second view of the file list:
+    /// its rows are places in files and not files, and `Enter` on one of them
+    /// does something no row of the file list can ask for.
+    grep: Grep,
 
     /// Markdown shown as the source it was rendered from. A property of the
     /// *pane* and not of the document, deliberately: `t` is a decision about
@@ -195,6 +278,30 @@ pub struct ViewerPane {
     /// is the single place that rebuilds one, which is why it is also the single
     /// place that refinds the other.
     search: Option<Search>,
+    /// A phrase this pane is looking for in this document and cannot show, with
+    /// the ordinal that was asked for.
+    ///
+    /// Not a [`Search`], and that is the point of it. A shut search with nothing
+    /// marked is the one state this pane refuses to hold — see
+    /// [`ViewerPane::settle_search`] — because `Esc` would then have a stage
+    /// with nothing on screen to explain it. This is a line of title and not a
+    /// stage: `Esc` does not see it, and it is dropped by the next document, by
+    /// `/`, and by the `t` it names. `t` is the one key that *acts* on it, in
+    /// [`ViewerPane::toggle_raw`], and [`ViewerPane::revive_search`] is what
+    /// turns it back into a search when the document starts containing the
+    /// phrase again.
+    ///
+    /// Two things produce it and the reader cannot tell them apart, which is
+    /// right, because the sentence is the same. A query they typed that matches
+    /// nothing. And `Enter` on a repository result, which opens a file and asks
+    /// for that file's *n*th match — an ordinal counted over rows the grep never
+    /// saw. Rendering markdown drops `**`, the URL behind a link and the
+    /// backticks around code; and in *any* body a line wider than the pane is
+    /// hard-broken, so a match straddling the break is one `f` reports and this
+    /// search cannot find. Either way the reader would otherwise land at the top
+    /// of a file they chose for a phrase, with the phrase nowhere on screen and
+    /// nothing saying why.
+    missed: Option<(String, usize)>,
 
     scroll: Scroll,
 
@@ -246,6 +353,7 @@ impl ViewerPane {
         scroll.measure(0, DEFAULT_VIEWPORT);
         Self {
             browse: Browser::new(root.clone()),
+            grep: Grep::new(root.clone()),
             root,
             state: State::Empty,
             mode: Mode::Doc,
@@ -256,6 +364,7 @@ impl ViewerPane {
             margin: Margin::default(),
             dirty: true,
             search: None,
+            missed: None,
             scroll,
             pending: None,
             owed: false,
@@ -281,6 +390,7 @@ impl ViewerPane {
         self.theme = self.theme.flipped();
         self.dirty = true;
         self.browse.set_theme(self.theme);
+        self.grep.set_theme(self.theme);
     }
 
     /// Start on a chosen palette, before anything has been drawn.
@@ -309,6 +419,7 @@ impl ViewerPane {
             // setting that did nothing.
             self.dirty = true;
             self.browse.set_theme(mode);
+            self.grep.set_theme(mode);
         }
     }
 
@@ -336,6 +447,23 @@ impl ViewerPane {
     pub fn set_root(&mut self, root: PathBuf) {
         self.browse = Browser::new(root.clone());
         self.browse.set_theme(self.theme);
+        // Rebuilt wholesale for the same reason and with one more of its own:
+        // every row it holds is a path under the root that is going away, the
+        // query it ran was about that tree, and the sweep that produced them
+        // may still be reading it. Replacing the whole thing drops the request
+        // channel, which is what ends that thread — where a `set_root` would
+        // have to remember to bump the generation *and* clear the rows *and*
+        // re-point the worker, and the one it forgot would be silent.
+        self.grep = Grep::new(root.clone());
+        self.grep.set_theme(self.theme);
+        // A list of places in a tree that is no longer on screen is not a list
+        // to leave somebody looking at. The mode is otherwise left alone —
+        // somebody who was walking a directory is put in the new root's
+        // directory, which is what `Browser::new` has just arranged.
+        if let Mode::Results { back } = self.mode {
+            self.mode = back.mode();
+        }
+        self.missed = None;
         self.root = root.clone();
         self.state = State::Empty;
         self.pending = None;
@@ -424,6 +552,9 @@ impl ViewerPane {
             // same line this branch already draws for the reader's place, which
             // is why it is drawn here and not in a second condition.
             self.search = None;
+            // The notice is about a phrase and a document together, and one of
+            // the two has just been replaced.
+            self.missed = None;
             if let Some(ix) = self.recent.iter().position(|p| *p == path) {
                 self.recent_ix = ix;
             }
@@ -452,6 +583,61 @@ impl ViewerPane {
         self.dirty = true;
     }
 
+    /// Open a file at a match a repository search found in it: `Enter` on a
+    /// result, and the only caller.
+    ///
+    /// **The one route allowed past `show`'s rule that a different document
+    /// ends the search.** That rule is right for every other caller — the hits
+    /// are the old document's rows and the count in the title was never true of
+    /// the new one — and it is right *here* too, which is why the search is
+    /// replaced rather than carried across. What survives is the reader's
+    /// question, and it survives as a new search over the new document's rows,
+    /// which is the only form of it that can be true. Written as "clear, then
+    /// seed" rather than as a condition inside `show`, so that the exception is
+    /// a line somebody can see at the call site instead of a branch every other
+    /// caller has to be read past.
+    ///
+    /// An *ordinal* and not a line number, because the grep read the file's
+    /// logical lines and this pane is about to lay out physical rows. Rendered
+    /// markdown makes the gap obvious; a `.rs` hides it until a line is wider
+    /// than the pane, and then the two disagree there too. See
+    /// [`grep::Hit::ordinal`], [`ViewerPane::missed`] for what the reader is
+    /// told when they do, and [`search`]'s module doc for the change that would
+    /// retire the disagreement.
+    ///
+    /// A file that cannot be read is not seeded at all, and that is not a
+    /// shortcut. `build` turns an unreadable path into rows of the pane's *own
+    /// voice* — "no such file — it may have been renamed or deleted", "Tab for
+    /// the next markdown file" — and a seed resolved against those would open on
+    /// `a.txt · unreadable · /file · 1/2`, having found the reader's phrase
+    /// twice in the apology for not having their file. The reader's own `/` may
+    /// search that screen, deliberately and since Phase 1, because they can see
+    /// what they are searching; a seed is the pane searching on their behalf for
+    /// something it was told is in the *file*, and there is no file.
+    fn show_at(&mut self, path: PathBuf, query: String, ordinal: usize) {
+        self.show(path);
+        if self.reader_has_a_document() {
+            self.missed = None;
+            self.search = Some(Search::seeded(query, ordinal));
+        } else {
+            self.missed = Some((query, ordinal));
+        }
+        // The list has answered its question. Staying in it after `Enter` would
+        // mean pressing another key to see what was chosen — `browse`'s rule,
+        // one list along.
+        self.mode = Mode::Doc;
+        // Laid out here rather than at the next frame, so that the title the
+        // shell draws *for this frame* already knows whether the phrase is on
+        // the page. Not an extra layout: it is the one the next frame was going
+        // to do, moved earlier by a few microseconds, exactly as `toggle_raw`
+        // moves it. Skipped before the first frame, where there is no width to
+        // lay out for and `laid_out` would produce an empty document that every
+        // phrase is missing from.
+        if self.laid_out > 0 {
+            self.ensure_layout(self.laid_out);
+        }
+    }
+
     pub fn path(&self) -> Option<&Path> {
         match &self.state {
             State::Empty => None,
@@ -471,6 +657,17 @@ impl ViewerPane {
     /// Swap between the document and the file list. The seam a second `Alt+E`
     /// drives from the shell.
     pub fn toggle_browse(&mut self) {
+        // The results are peeled off first, and then `Alt+E` does what it has
+        // always done. It has meant "between the document and the file list"
+        // since before there was a third thing to be in, and a key that meant
+        // one of three things depending on which view happened to be up is a
+        // key nobody can press without looking. So `f` from the document and
+        // `Alt+E` leaves the document showing the list; `f` from the list and
+        // `Alt+E` leaves the list showing the document.
+        if let Mode::Results { back } = self.mode {
+            self.mode = back.mode();
+            self.grep.close_box();
+        }
         self.mode = match self.mode {
             Mode::Doc => {
                 // Open the list beside the document on screen. Whether that
@@ -497,7 +694,34 @@ impl ViewerPane {
                 self.browse.cancel_find();
                 Mode::Doc
             }
+            // Peeled off above, so this is the state the two lines up there
+            // exist to make unreachable rather than a case with an answer.
+            Mode::Results { back } => back.mode(),
         };
+    }
+
+    /// Leave the results, putting the reader back where `f` was pressed. `Esc`
+    /// with nothing left to close, and the only way out that is not `Alt+E` or
+    /// `Enter` on a row.
+    fn leave_results(&mut self) {
+        if let Mode::Results { back } = self.mode {
+            self.mode = back.mode();
+        }
+    }
+
+    /// `f`, from the document and from the file list.
+    ///
+    /// Pane-local, and exempt from the invariant at the top of `crate::keys`
+    /// for the reason stated there: it is only ever delivered to a focused pane
+    /// with the viewer showing, so no agent is listening for it. It is free in
+    /// both places it is bound — neither `crate::scroll`'s table, nor
+    /// `list::Cursor`'s, nor `browse`'s own arms, nor the document's claim it —
+    /// and in both of the boxes those two views can raise it is a letter,
+    /// because the box is asked first.
+    fn open_results(&mut self, back: Back) -> Handled {
+        self.mode = Mode::Results { back };
+        self.grep.open();
+        Handled::Yes
     }
 
     /// Is a find box open? The border and the paste route both ask, and both
@@ -515,6 +739,14 @@ impl ViewerPane {
     /// has never heard of.
     fn typing(&self) -> bool {
         matches!(self.mode, Mode::Doc) && self.search.as_ref().is_some_and(Search::typing)
+    }
+
+    /// Is the *repository* search's box open? The third of the same question,
+    /// mode-guarded like the other two and for the same reason: this box's
+    /// results outlive `Enter` on one of them, so the pane must not report a
+    /// box as open while a document is what is on screen.
+    fn grepping(&self) -> bool {
+        matches!(self.mode, Mode::Results { .. }) && self.grep.typing()
     }
 
     /// Rendered markdown, or the source it was rendered from.
@@ -538,6 +770,25 @@ impl ViewerPane {
         // as the toggle having lost their place rather than approximated it.
         let was = self.scroll.offset;
         let before = self.scroll.max();
+
+        // `t` is the key [`ViewerPane::missed`] names as the answer, and this is
+        // where it delivers on it: the search goes back, aimed at the same
+        // ordinal, so the reader arrives at the match rather than at a form they
+        // now have to search by hand for a phrase the pane already knows.
+        //
+        // In one direction only. The claim that makes this worth doing is that
+        // the source form provably contains the phrase — the grep matched the
+        // file's source text — and that claim runs rendered → source. Going the
+        // other way is towards the one form that may have rendered the phrase
+        // away entirely, so re-seeding there would be promising a match on the
+        // strength of an argument for the opposite move. The notice survives the
+        // trip instead, and is still true: `settle_search` will restate it, and
+        // the remedy it names changes with the form under it.
+        if !self.raw
+            && let Some((query, ordinal)) = self.missed.take()
+        {
+            self.search = Some(Search::seeded(query, ordinal));
+        }
 
         self.raw = !self.raw;
         self.dirty = true;
@@ -592,6 +843,26 @@ impl ViewerPane {
         }
     }
 
+    /// Fold what the results list did back into the pane.
+    fn absorb_result(&mut self, out: grep::Outcome) -> Handled {
+        match out {
+            grep::Outcome::Ignored => Handled::No,
+            grep::Outcome::Moved => Handled::Yes,
+            grep::Outcome::Leave => {
+                self.leave_results();
+                Handled::Yes
+            }
+            grep::Outcome::Open {
+                path,
+                query,
+                ordinal,
+            } => {
+                self.show_at(path, query, ordinal);
+                Handled::Yes
+            }
+        }
+    }
+
     // --- layout ----------------------------------------------------------
 
     /// Lay the document out for `width`, if it is not already.
@@ -620,8 +891,48 @@ impl ViewerPane {
             search.find(&self.lines, self.margin);
         }
         // A rebuild can leave an accepted search with nothing marked — a resize
-        // that hard-breaks the word, or the agent deleting it.
+        // that hard-breaks the word, or the agent deleting it — and this is
+        // where that becomes the notice in [`ViewerPane::missed`].
         self.settle_search();
+        self.revive_search();
+    }
+
+    /// The other half of [`ViewerPane::settle_search`]: a notice that has
+    /// stopped being true becomes a search again.
+    ///
+    /// Without it the notice is written once and never re-examined, because the
+    /// thing that would re-examine it — a `Search` and its `find` — is exactly
+    /// what `settle_search` took away. So widening the pane until the wrap that
+    /// split the phrase is gone, or `F3`, or `r`, or the agent putting the word
+    /// back, would leave `· no match` in the title over a document with the
+    /// match plainly on it. The pair is a cycle, and it is what makes the notice
+    /// self-maintaining rather than a snapshot of one layout.
+    ///
+    /// It costs one `matches` pass per rebuild while a notice is up — the same
+    /// pass a live search already pays for, and rebuilds are width changes and
+    /// reloads rather than frames.
+    ///
+    /// **The reveal is deliberately disarmed.** [`Search::seeded`] arms it,
+    /// because pressing `Enter` on a result is a reader asking to be taken
+    /// somewhere; arriving here is a *rebuild*, which is the one thing
+    /// `Search::find` refuses to move anybody for. Dragging a window would
+    /// otherwise scroll a reader who is fifty rows further on back to a match
+    /// they had finished with.
+    fn revive_search(&mut self) {
+        if self.search.is_some() || !self.reader_has_a_document() {
+            return;
+        }
+        let Some((query, at)) = self.missed.clone() else {
+            return;
+        };
+        let mut search = Search::seeded(query, at);
+        search.find(&self.lines, self.margin);
+        if search.hits().is_empty() {
+            return;
+        }
+        search.take_follow();
+        self.search = Some(search);
+        self.missed = None;
     }
 
     /// The rows, and how much of them is the pane's own margin rather than the
@@ -782,6 +1093,10 @@ impl ViewerPane {
     /// the first hit is looked for.
     fn open_search(&mut self) -> Handled {
         self.search = Some(Search::open(self.scroll.offset));
+        // A question of the reader's own supersedes the one the pane was
+        // carrying for them, and two `/`-prefixed phrases in one title would be
+        // two answers to one question.
+        self.missed = None;
         Handled::Yes
     }
 
@@ -793,30 +1108,58 @@ impl ViewerPane {
         self.settle_search();
     }
 
-    /// A closed search with nothing marked is not a state this pane has.
+    /// A closed search with nothing marked is not a state this pane has. It
+    /// becomes a [notice](ViewerPane::missed) instead.
     ///
-    /// That is what makes `Esc` three states rather than four. Shut with no
-    /// hits, the reader sees no highlighting at all, so an `Esc` that stopped
-    /// there would be a keypress eaten by a stage nothing on screen mentions —
-    /// the only clue would be a `· no match` in the title that may be minutes
-    /// old — and `exit_hint` could not describe it truthfully either.
+    /// The *search* going is what makes `Esc` three states rather than four.
+    /// Shut with no hits, the reader sees no highlighting at all, so an `Esc`
+    /// that stopped there would be a keypress eaten by a stage nothing on screen
+    /// mentions, and `exit_hint` could not describe it truthfully either.
     ///
-    /// Called from every route that can produce it, which is the part that
-    /// needs saying because `Esc` is only the first of them. `Esc` and `Enter`
-    /// close the box; `Alt+E` closes it on the way to the list; and
-    /// `ensure_layout` can take the last hit away from a search that was closed
-    /// minutes ago — a resize that hard-breaks the matched word across two
-    /// rows, or the agent rewriting the file without the word in it at all.
-    /// Guarding only where the state was first noticed would have left the
-    /// invariant true of that route and false of the others.
+    /// What was wrong with simply dropping it is the other half. The reader had
+    /// a query and a `· no match` in the title; a resize that hard-breaks the
+    /// matched word took the search away and the sentence explaining it with the
+    /// same keystroke, so the pane went from answering a question to silence
+    /// without anyone asking it to. The notice keeps the sentence and keeps
+    /// none of the machinery: no hits to be stale, no `Esc` stage, no `q` in a
+    /// box. [`ViewerPane::revive_search`] is what turns it back.
+    ///
+    /// Called from every route that can produce the state, which is the part
+    /// that needs saying because `Esc` is only the first of them. `Esc` and
+    /// `Enter` close the box; `Alt+E` closes it on the way to the list;
+    /// `ensure_layout` can take the last hit away from a search closed minutes
+    /// ago; and `Enter` on a repository result seeds one whose phrase this
+    /// document may not contain at all. Guarding only where the state was first
+    /// noticed would have left the invariant true of that route and false of the
+    /// others.
+    /// Is there a *document* under the rows, rather than the pane talking about
+    /// itself?
+    ///
+    /// The empty hint and the unreadable notice are rows like any other, and the
+    /// reader's own `/` searches them — deliberately, and since Phase 1, because
+    /// they can see what they are searching and a box with nothing in the title
+    /// to show for it is worst on exactly those two screens. A phrase the *pane*
+    /// is carrying on their behalf is a different thing: it was found in a file,
+    /// and the answer to "is it here" has to be about that file rather than
+    /// about the apology for not having it. Both places that carry one ask this,
+    /// so the seed and its revival cannot drift into disagreeing.
+    fn reader_has_a_document(&self) -> bool {
+        matches!(self.state, State::Doc(_))
+    }
+
     fn settle_search(&mut self) {
-        if self
-            .search
-            .as_ref()
-            .is_some_and(|s| !s.typing() && s.hits().is_empty())
-        {
-            self.search = None;
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        if search.typing() || !search.hits().is_empty() {
+            return;
         }
+        // The ordinal travels with the phrase, and it is not decoration: a seed
+        // that this form of the document could not honour is about to be offered
+        // `t`, and `t` has to ask the other form for the *same* match rather
+        // than for the first one.
+        self.missed = Some((search.query().to_string(), search.at()));
+        self.search = None;
     }
 
     fn step_hit(&mut self, forward: bool) -> Handled {
@@ -952,6 +1295,15 @@ impl ViewerPane {
 
 impl Pane for ViewerPane {
     fn title(&self) -> String {
+        // Same rule as the list one branch down, and the same `◆`: this pane is
+        // on screen and still holding a file back, so the shell has no border
+        // to mark and the pane says it itself. What releases the file here is
+        // `Esc` or `Alt+E` — whichever gets the reader out of the results —
+        // rather than one named key, which is why the mark is bare.
+        if matches!(self.mode, Mode::Results { .. }) {
+            let mark = if self.pending.is_some() { "◆ " } else { "" };
+            return format!("{mark}{}", self.grep.title());
+        }
         if matches!(self.mode, Mode::Browse) {
             // The one place this pane marks a pending file itself, and it has
             // to be: the shell draws `◆ Alt+E` only on the border of the view
@@ -982,19 +1334,39 @@ impl Pane for ViewerPane {
         // in a document, because those are the two screens somebody arrives at
         // without having asked to.
         //
-        // Rendered markdown is the one body with an answer to a miss worth
-        // spending columns on, and it goes on the miss rather than beside it:
-        // the commonest reason to find nothing in a rendering is that the thing
-        // was rendered away, and `t` is where it went.
+        // What to do about a phrase that is not on the page — and there is an
+        // answer for *every* body, which there was not when this only knew about
+        // markdown. `f` reports matches over a file's logical lines and this
+        // pane searches the physical rows they were wrapped into, so a line
+        // wider than the pane hides a match from `/` in a plain `.rs` exactly as
+        // rendering hides one in markdown. A notice naming no way out at all was
+        // the worse half of that: the reader is told the phrase is not here and
+        // given nothing to press.
+        //
+        // The remedy goes on the miss rather than beside it, and each body gets
+        // the one that is true of it. Rendered markdown names `t`, because the
+        // commonest reason to find nothing in a rendering is that the thing was
+        // rendered away and `t` is where it went. Everything else names the
+        // width, because a wrap is the only way a phrase the sweep found can be
+        // missing from the rows it was wrapped into.
         let miss = match &self.state {
             State::Doc(doc) if matches!(doc.body, Body::Markdown(_)) && !self.raw => {
                 " · t for source"
             }
+            State::Doc(_) => " · widen if a wrap split it",
             _ => "",
         };
-        let find = match &self.search {
-            Some(search) => format!(" · {}", search.label(miss)),
-            None => String::new(),
+        // Two things can be looking for a phrase in this document and only one
+        // of them is a `Search`. The other is a phrase `Enter` on a repository
+        // result sent the pane to find and the document could not show — see
+        // [`ViewerPane::missed`] — and it borrows this slot rather than growing
+        // one of its own, because it is the same sentence about the same
+        // question and the reader has no reason to care which of the two
+        // mechanisms is producing it.
+        let find = match (&self.search, &self.missed) {
+            (Some(search), _) => format!(" · {}", search.label(miss)),
+            (None, Some((query, _))) => format!(" · {}", search::no_match(query, miss)),
+            (None, None) => String::new(),
         };
         match &self.state {
             State::Empty => format!("{mark}files{find}"),
@@ -1055,6 +1427,17 @@ impl Pane for ViewerPane {
             return;
         }
 
+        // The third door, closed the same way. Somebody reading a list of
+        // matches is using the pane exactly as somebody walking a directory is,
+        // and here the yank would be sharper than either: the reader is part
+        // way through checking which of forty results is the one, and the row
+        // they were about to press `Enter` on would be replaced by a document
+        // they never asked for.
+        if matches!(self.mode, Mode::Results { .. }) {
+            self.grep.render(f, inner);
+            return;
+        }
+
         // Being drawn *is* the signal that this pane is the one on screen, and
         // it is the only such signal a pane gets. Auto-follow happens here for
         // exactly that reason — and, as in the list, being on screen is not
@@ -1107,10 +1490,43 @@ impl Pane for ViewerPane {
         // is owed exactly one frame however the rest of this goes.
         let mut changed = std::mem::take(&mut self.owed);
 
+        // Whatever the worker has found since the last frame. A `try_recv`
+        // drain and nothing else: this runs on the thread that pumps the agent's
+        // pty.
+        //
+        // Drained whatever the mode, so the channel never backs up and the list
+        // is complete when the reader comes back to it — but a frame is only
+        // owed when those rows are the thing on screen. `Enter` on a result
+        // leaves a sweep of twenty thousand files still running behind a
+        // document, and every batch of it would otherwise re-render the agent's
+        // whole screen for rows nobody can see, which is the cost `grep::Outcome`
+        // exists to keep honest.
+        //
+        // The sweep is not cancelled to achieve that, and the difference
+        // matters: cancelling would make the list permanently partial, so the
+        // `f` that brings the reader back would show an answer that stopped
+        // wherever they happened to press `Enter` — and the title has no honest
+        // way to say so, since nothing was capped. The harm is the frames; this
+        // is the frames.
+        changed |= self.grep.tick() && matches!(self.mode, Mode::Results { .. });
+
         // The walk answers once, then the receiver is dropped.
         if let Some(found) = self.scan.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.scan = None;
-            self.browse.set_index(found.files);
+            // One list, two readers and a worker. At `files::MAX_FILES` this is
+            // twenty thousand strings, and the `Arc` is what keeps it from
+            // being twenty thousand strings three times over — and what lets
+            // the grep's worker keep sweeping the list it started on while a
+            // later walk replaces it here.
+            let files: Arc<[String]> = found.files.into();
+            self.browse.set_index(Arc::clone(&files));
+            // The grep is told whether the walk saw the whole tree as well as
+            // what it found, because neither of the walk's own caps can be seen
+            // from the list: `files::MAX_ENTRIES` counts entries visited rather
+            // than files kept, so a truncated walk can hand over a short list
+            // that looks complete. A count over it would otherwise be a definite
+            // answer about a repository nothing finished reading.
+            self.grep.set_index(files, found.cut);
             self.recent = found.recent;
             self.recent_ix = 0;
             // Nothing has been asked for yet, so open the newest thing there
@@ -1128,10 +1544,27 @@ impl Pane for ViewerPane {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Handled> {
+        // The results own every key while they are up, for the reason the list
+        // does one branch down — and `f` is claimed here rather than delegated
+        // because it is the key that opened this view and the key that reopens
+        // its box, which is a fact about the pane's modes rather than about the
+        // grep.
+        if matches!(self.mode, Mode::Results { .. }) {
+            let out = self.grep.key(key);
+            return Ok(self.absorb_result(out));
+        }
+
         // The list owns every key while it is up, including the scroll ones:
         // there they move a selection rather than an offset, and a pane cannot
         // hand the same key to two vocabularies and hope.
         if matches!(self.mode, Mode::Browse) {
+            // Before the list is offered the key, and only while no box of its
+            // own is open — in there `f` is a letter of a filename, and the
+            // list is asked first about every other printable key for exactly
+            // that reason.
+            if !self.browse.finding() && bare(key, 'f') {
+                return Ok(self.open_results(Back::Browse));
+            }
             let out = self.browse.key(key);
             return Ok(self.absorb(out));
         }
@@ -1160,6 +1593,17 @@ impl Pane for ViewerPane {
         }
 
         let handled = match key.code {
+            // `Ctrl` plus a letter is the agent's everywhere in this program,
+            // and this is the arm that keeps it so. `crate::scroll::key` hands
+            // it *back* rather than declining it — deliberately, so that a
+            // pane's own table is where the decision gets made — and every
+            // plain-letter arm below would otherwise take it: `Ctrl+R` reloaded
+            // the document and started a gitignore walk of the repository, for
+            // a chord aimed at the agent. `browse.rs` and `list.rs` have said
+            // this since they were written; the document view had the same hole
+            // and no arm to close it.
+            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::No,
+
             KeyCode::Tab => self.step(true),
             KeyCode::BackTab => self.step(false),
             KeyCode::Char('t') => self.toggle_raw(),
@@ -1171,6 +1615,11 @@ impl Pane for ViewerPane {
             // `/`; `n` and `N` are only outside the box, where inside it they
             // are letters.
             KeyCode::Char('/') => self.open_search(),
+            // The third search, and the only one that reads the disk. `/` is
+            // this document, `f` is every file there is; the two sit next to
+            // each other on the same screen because the question a reader has
+            // is often the second one after the first has come up empty.
+            _ if bare(key, 'f') => self.open_results(Back::Doc),
             KeyCode::Char('n') => self.step_hit(true),
             KeyCode::Char('N') => self.step_hit(false),
             // The middle of the three states `Esc` passes through: the box is
@@ -1198,6 +1647,10 @@ impl Pane for ViewerPane {
     }
 
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
+        if matches!(self.mode, Mode::Results { .. }) {
+            let out = self.grep.mouse(ev);
+            return Ok(self.absorb_result(out));
+        }
         if matches!(self.mode, Mode::Browse) {
             let out = self.browse.mouse(ev);
             return Ok(self.absorb(out));
@@ -1221,6 +1674,12 @@ impl Pane for ViewerPane {
     /// focus round trip, so it must not quietly re-aim the `Enter` the reader
     /// presses when they get here. It moves the view alone.
     fn scroll_key(&mut self, key: KeyEvent) -> Result<Handled> {
+        // The results are a list, so the same rule again: `Down` in there moves
+        // the row `Enter` would open, and a glance from the other side of the
+        // window must not re-aim it.
+        if matches!(self.mode, Mode::Results { .. }) {
+            return Ok(self.grep.scroll_view(key));
+        }
         if matches!(self.mode, Mode::Browse) {
             return Ok(self.browse.scroll_view(key));
         }
@@ -1235,29 +1694,53 @@ impl Pane for ViewerPane {
         self.handle_key(key)
     }
 
-    /// Only while a query is being typed — into either box. Everything else
-    /// this pane does is a read; in a box `j` is a letter, and both things the
-    /// shell asks this for — where a paste goes, and whether leaving hands
-    /// focus back to the agent — turn on exactly that.
+    /// Only while a query is being typed — into any of the three boxes.
+    /// Everything else this pane does is a read; in a box `j` is a letter, and
+    /// both things the shell asks this for — where a paste goes, and whether
+    /// leaving hands focus back to the agent — turn on exactly that.
     fn takes_input(&self) -> bool {
-        self.finding() || self.typing()
+        self.finding() || self.typing() || self.grepping()
     }
 
-    /// Five answers, and the border has to be true in every one of them because
-    /// it is the only place the way out is written down. It names what *this*
-    /// press does, not where the sequence ends, which is what makes a
+    /// Seven answers, and the border has to be true in every one of them
+    /// because it is the only place the way out is written down. It names what
+    /// *this* press does, not where the sequence ends, which is what makes a
     /// three-press `Esc` describable one press at a time.
     ///
-    /// `Esc` in the list's find closes it and leaves you in the list, one press
-    /// short of the agent. In the document's box it closes the box and keeps
-    /// the hits — unless there are none to keep, where the same press ends the
-    /// search outright and saying `esc→hits` would be promising something that
-    /// is not there. With a file waiting it does something else again: closing
-    /// the box releases the file on the very next frame, and the document under
-    /// the hits is about to be a different one, so it names the file rather
-    /// than the hits. The `◆` this pane has already put in the title is what
-    /// makes that read.
+    /// The results, which are a layer over one of the other two views, are worth
+    /// three of the seven. `esc→results` closes their box onto the matches
+    /// behind it. With nothing behind it — the box has never been run — the same
+    /// press leaves the whole view, and where it leaves *to* is the half a
+    /// single answer could not have covered: `esc→list` when `f` was pressed in
+    /// the file list, `esc→page` when it was pressed in the document. Dropping
+    /// somebody who was walking a directory into a document instead is the yank
+    /// this pane exists to avoid, and the border must not promise it.
+    ///
+    /// `esc→page` and not `esc→document`, because `/` calls the document view
+    /// "the page" and the border has one vocabulary or it has none.
+    ///
+    /// The other four are older. `Esc` in the list's find closes it and leaves
+    /// you in the list, one press short of the agent. In the document's box it
+    /// closes the box and keeps the hits — unless there are none to keep, where
+    /// the same press ends the search outright and saying `esc→hits` would be
+    /// promising something that is not there. With a file waiting it does
+    /// something else again: closing the box releases the file on the very next
+    /// frame, and the document under the hits is about to be a different one, so
+    /// it names the file rather than the hits. The `◆` this pane has already put
+    /// in the title is what makes that read.
+    ///
+    /// A [notice](ViewerPane::missed) is deliberately not one of the seven. It
+    /// is a sentence in the title with no state behind it, so `Esc` passes
+    /// straight through it to the shell and the answer is `esc→agent` — which is
+    /// exactly what happens.
     fn exit_hint(&self) -> &'static str {
+        if let Mode::Results { back } = self.mode {
+            return match (self.grep.typing(), self.grep.has_results(), back) {
+                (true, true, _) => " · esc→results",
+                (_, _, Back::Browse) => " · esc→list",
+                (_, _, Back::Doc) => " · esc→page",
+            };
+        }
         if matches!(self.mode, Mode::Browse) {
             return if self.browse.finding() {
                 " · esc→list"
@@ -1284,6 +1767,10 @@ impl Pane for ViewerPane {
     /// agent's transcript is a likely way to reach a file; a phrase pasted out
     /// of it is a likely way to find where the agent got that phrase from.
     fn handle_paste(&mut self, text: &str) -> Result<Handled> {
+        if matches!(self.mode, Mode::Results { .. }) {
+            let out = self.grep.paste(text);
+            return Ok(self.absorb_result(out));
+        }
         if matches!(self.mode, Mode::Browse) {
             let out = self.browse.paste(text);
             return Ok(self.absorb(out));
@@ -1356,6 +1843,17 @@ fn source_lines(
     // which is what makes one number describe the whole layout.
     let gutter = if numbers { digits + 1 } else { 0 };
     (out, gutter)
+}
+
+/// A letter with nothing held down with it.
+///
+/// `Ctrl` plus a letter is the agent's everywhere in this program, and both
+/// `crate::scroll` and `list::Cursor` hand it back rather than declining it —
+/// so that the pane's own arms are where that gets decided rather than where it
+/// gets forgotten. `Alt+F` is Claude's `nextWord`, which `crate::keys` names as
+/// the collision that nearly shipped; it is not this pane's either.
+fn bare(key: KeyEvent, c: char) -> bool {
+    key.code == KeyCode::Char(c) && key.modifiers.is_empty()
 }
 
 fn empty_hint(width: usize, watching: bool, t: &theme::Theme) -> Vec<Line<'static>> {
@@ -1821,6 +2319,7 @@ mod tests {
         tx.send(Scan {
             recent: vec![dir.write("late.md", b"# late\n")],
             files: vec!["late.md".into()],
+            cut: false,
         })
         .unwrap();
         assert!(pane.tick(), "the in-flight walk still reports");
@@ -2059,7 +2558,8 @@ mod tests {
         std::fs::write(dir.path().join("docs").join("design.md"), b"# design\n").expect("write");
 
         let mut pane = quiet(dir.path());
-        pane.browse.set_index(vec!["docs/design.md".into()]);
+        pane.browse
+            .set_index(vec!["docs/design.md".to_string()].into());
         // Nothing in the document view can take text.
         assert_eq!(pane.handle_paste("docs/design.md").unwrap(), Handled::No);
 
@@ -2079,7 +2579,8 @@ mod tests {
         std::fs::write(dir.path().join("src").join("main.rs"), b"fn main() {}\n").expect("write");
 
         let mut pane = quiet(dir.path());
-        pane.browse.set_index(vec!["src/main.rs".into()]);
+        pane.browse
+            .set_index(vec!["src/main.rs".to_string()].into());
         pane.toggle_browse();
 
         for code in "/main".chars().map(KeyCode::Char) {
@@ -2870,6 +3371,629 @@ mod tests {
         assert!(pane.title().contains("/needle · 1/3"), "{}", pane.title());
     }
 
+    // --- searching every file ---------------------------------------------
+
+    /// A pane whose startup walk has landed, so the repository search has an
+    /// index to sweep.
+    ///
+    /// The walk is the real one, and deliberately: what `f` can find is defined
+    /// by what `files::scan` hands over — the gitignore, the noise list, the
+    /// twenty-thousand-file cap — and an index placed by hand here would be
+    /// asserting against a fixture rather than against the thing.
+    fn scanned(root: &Path) -> ViewerPane {
+        let mut pane = ViewerPane::new(root.to_path_buf());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while pane.scan.is_some() && std::time::Instant::now() < deadline {
+            pane.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(pane.scan.is_none(), "the walk never answered");
+        // Otherwise the next frame takes up whichever document the walk found
+        // newest, which is a race with every assertion below.
+        pane.pending = None;
+        pane
+    }
+
+    /// `f`, a phrase, `Enter`, and then wait for the sweep rather than assume a
+    /// schedule.
+    fn find_all(pane: &mut ViewerPane, q: &str) {
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('f'))).unwrap(),
+            Handled::Yes
+        );
+        for c in q.chars() {
+            pane.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !pane.grep.settled() && std::time::Instant::now() < deadline {
+            pane.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        pane.tick();
+        assert!(pane.grep.settled(), "the sweep never finished");
+    }
+
+    #[test]
+    fn f_opens_the_repository_search_from_the_document_and_from_the_list() {
+        // Both, because both are places somebody is when the question occurs to
+        // them — and `Esc` has to put them back in the one they left, rather
+        // than dropping a reader who was walking a directory into a document.
+        let dir = TempDir::new("view-f");
+        dir.write("plan.md", b"# plan\n");
+        let mut pane = scanned(dir.path());
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('f'))).unwrap(),
+            Handled::Yes
+        );
+        assert!(matches!(pane.mode, Mode::Results { back: Back::Doc }));
+        assert!(pane.takes_input(), "the box is open");
+        assert!(
+            pane.title().starts_with("all files · /"),
+            "{}",
+            pane.title()
+        );
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(matches!(pane.mode, Mode::Doc));
+
+        pane.toggle_browse();
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('f'))).unwrap(),
+            Handled::Yes
+        );
+        assert!(matches!(pane.mode, Mode::Results { back: Back::Browse }));
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(
+            matches!(pane.mode, Mode::Browse),
+            "back into the list, not into a document nobody asked for"
+        );
+    }
+
+    #[test]
+    fn f_is_a_letter_inside_every_box_it_could_have_been_a_key_in() {
+        // The claim `f` rests on is that it is free in both views it is bound
+        // in. It is not free in the boxes those views can raise — nothing is —
+        // and each of the three asks its box first for exactly that reason.
+        let dir = TempDir::new("view-f-letter");
+        dir.write("a.md", b"# a\n");
+
+        let mut pane = quiet(dir.path());
+        pane.show(dir.path().join("a.md"));
+        laid(&mut pane, 40, 10);
+        query(&mut pane, "f");
+        assert!(
+            matches!(pane.mode, Mode::Doc),
+            "f opened a view from inside the document's own box"
+        );
+        assert!(pane.title().contains("/f"), "{}", pane.title());
+
+        let mut pane = quiet(dir.path());
+        pane.toggle_browse();
+        pane.handle_key(key(KeyCode::Char('/'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        assert!(matches!(pane.mode, Mode::Browse));
+        assert!(pane.title().contains("/f"), "{}", pane.title());
+
+        // ...including its own.
+        let mut pane = quiet(dir.path());
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        assert!(pane.title().contains("/f"), "{}", pane.title());
+
+        // And Ctrl+F is the agent's, here as everywhere: `crate::scroll` hands
+        // Ctrl+letter back rather than declining it, so without a guard it
+        // would have fallen straight into the arm below.
+        let mut pane = quiet(dir.path());
+        assert_eq!(pane.handle_key(ctrl('f')).unwrap(), Handled::No);
+        assert!(matches!(pane.mode, Mode::Doc));
+    }
+
+    #[test]
+    fn enter_on_a_result_opens_the_file_and_lands_on_the_match() {
+        let dir = TempDir::new("view-result-open");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+        let body: String = (1..=60)
+            .map(|i| {
+                if i == 40 {
+                    "let needle = 1;\n".to_string()
+                } else {
+                    format!("let x{i} = 1;\n")
+                }
+            })
+            .collect();
+        std::fs::write(dir.path().join("src").join("main.rs"), body.as_bytes()).expect("write");
+
+        let mut pane = scanned(dir.path());
+        draw(&mut pane, 46, 10);
+        find_all(&mut pane, "needle");
+        assert!(pane.title().contains("· 1 match"), "{}", pane.title());
+
+        assert_eq!(pane.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
+        assert!(
+            matches!(pane.mode, Mode::Doc),
+            "the list answered its question"
+        );
+        assert!(
+            pane.path().unwrap().ends_with("main.rs"),
+            "{:?}",
+            pane.path()
+        );
+        // Not into a box. `Search::open` would have left one, and `q` in a box
+        // is a letter — a reader who pressed Enter on a result asked for a
+        // document.
+        assert!(!pane.takes_input(), "Enter dropped the reader into a box");
+
+        let hit = pane.search.as_ref().expect("the query came with it");
+        let row = hit.current().expect("and it found the match").row;
+        assert_eq!(row, 39, "line 40 of a source file is the fortieth row");
+        assert!(pane.title().contains("/needle · 1/1"), "{}", pane.title());
+
+        draw(&mut pane, 46, 10);
+        assert!(
+            row >= pane.scroll.offset && row < pane.scroll.offset + 10,
+            "row {row} was never scrolled to; offset {}",
+            pane.scroll.offset
+        );
+    }
+
+    #[test]
+    fn the_nth_match_of_a_file_is_the_one_that_opens() {
+        // What the ordinal is for. A file with four matches has one row per
+        // match in the list, and pressing Enter on the third has to land on the
+        // third — the pane cannot use the line number, because the rows it
+        // scrolls by are not the lines the sweep counted.
+        let dir = TempDir::new("view-result-nth");
+        dir.write(
+            "notes.txt",
+            b"needle one\nplain\nneedle two\nneedle three\n",
+        );
+        let mut pane = scanned(dir.path());
+        draw(&mut pane, 46, 10);
+        find_all(&mut pane, "needle");
+        assert!(pane.title().contains("· 3 matches"), "{}", pane.title());
+
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(pane.title().contains("/needle · 3/3"), "{}", pane.title());
+        assert_eq!(
+            pane.search.as_ref().unwrap().current().unwrap().row,
+            3,
+            "the third match is on the fourth line"
+        );
+    }
+
+    #[test]
+    fn a_match_the_rendering_dropped_is_reported_rather_than_silently_missed() {
+        // The documented imprecision, arriving. The sweep read the file's
+        // source and found four `**`; the document view renders that markdown,
+        // which eats every one of them. Landing the reader at the top of a file
+        // they chose for a phrase, with no phrase on screen and nothing saying
+        // why, is the failure this has to not be.
+        let dir = TempDir::new("view-result-miss");
+        dir.write("plan.md", b"# Plan\n\nDo **the thing** and **another**.\n");
+        let mut pane = scanned(dir.path());
+        draw(&mut pane, 46, 10);
+        find_all(&mut pane, "**");
+        assert!(pane.title().contains("· 4 matches"), "{}", pane.title());
+
+        // The second of that file's four.
+        pane.handle_key(key(KeyCode::Down)).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            pane.search.is_none(),
+            "a shut search with nothing marked is a stage Esc cannot describe"
+        );
+        assert!(
+            pane.title().contains("/** · no match · t for source"),
+            "{}",
+            pane.title()
+        );
+        assert_eq!(
+            pane.exit_hint(),
+            " · esc→agent",
+            "the notice grew an Esc stage of its own"
+        );
+
+        // `t` is the key the title named and this is it delivering: the form
+        // that does contain the phrase, at the ordinal that was asked for.
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('t'))).unwrap(),
+            Handled::Yes
+        );
+        assert!(pane.title().contains("/** · 2/4"), "{}", pane.title());
+        assert_eq!(pane.exit_hint(), " · esc→clear", "and it is a search again");
+    }
+
+    #[test]
+    fn a_file_arriving_while_the_results_are_up_waits_rather_than_taking_over() {
+        // The third door onto the same rule. Here the yank is sharper than in
+        // either of the other two: the row the reader is reaching for `Enter`
+        // on would be replaced by a document they never asked about.
+        let dir = TempDir::new("view-result-pending");
+        dir.write("a.md", b"# a\n");
+        let mut pane = quiet(dir.path());
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        let fresh = dir.write("fresh.md", b"# fresh\n");
+        pane.follow(fresh.clone());
+
+        draw(&mut pane, 40, 10);
+        assert!(pane.path().is_none(), "the document view is untouched");
+        assert!(
+            pane.has_pending(),
+            "and the shell can still mark the border"
+        );
+        // No border to mark while this pane is the one showing, so it says it
+        // itself — exactly as the list and the document's box do.
+        assert!(pane.title().starts_with("◆ "), "{}", pane.title());
+
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        draw(&mut pane, 40, 10);
+        assert_eq!(pane.path(), Some(fresh.as_path()));
+    }
+
+    #[test]
+    fn the_border_promises_the_key_that_esc_presses_in_all_three_views() {
+        let dir = TempDir::new("view-result-hint");
+        dir.write("a.md", b"# a\n");
+        let mut pane = quiet(dir.path());
+        assert_eq!(pane.exit_hint(), " · esc→agent");
+
+        // Raised over the document, with nothing behind the box: one press home.
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        assert!(pane.takes_input());
+        assert_eq!(pane.exit_hint(), " · esc→page");
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(matches!(pane.mode, Mode::Doc));
+        assert_eq!(pane.exit_hint(), " · esc→agent");
+
+        // With a query run, the box has something behind it and the press that
+        // shuts it is not the press that leaves.
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        for c in "needle".chars() {
+            pane.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(!pane.takes_input(), "Enter ran it and shut the box");
+        assert_eq!(pane.exit_hint(), " · esc→page");
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        assert_eq!(pane.exit_hint(), " · esc→results");
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(pane.exit_hint(), " · esc→page");
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(matches!(pane.mode, Mode::Doc));
+
+        // Raised over the list, the same two presses name the list.
+        pane.toggle_browse();
+        assert_eq!(pane.exit_hint(), " · esc→agent");
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        assert_eq!(pane.exit_hint(), " · esc→results");
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(pane.exit_hint(), " · esc→list");
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(matches!(pane.mode, Mode::Browse));
+        assert_eq!(pane.exit_hint(), " · esc→agent");
+    }
+
+    #[test]
+    fn alt_e_peels_the_results_off_and_then_means_what_it_always_meant() {
+        // Three views and one key that has always been about two of them. A key
+        // that meant one of three things depending on what happened to be up is
+        // a key nobody can press without looking first.
+        let dir = TempDir::new("view-result-alte");
+        dir.write("a.md", b"# a\n");
+        let mut pane = quiet(dir.path());
+
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        pane.toggle_browse();
+        assert!(matches!(pane.mode, Mode::Browse));
+        assert!(!pane.takes_input(), "a box nobody can see was still open");
+
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        pane.toggle_browse();
+        assert!(matches!(pane.mode, Mode::Doc));
+        assert!(!pane.takes_input());
+    }
+
+    /// A file whose one match sits across the hard break a 46-column pane puts
+    /// in it: 38 columns of padding, then the phrase.
+    ///
+    /// At 46 the pane keeps 45 for text and spends 4 of those on the line-number
+    /// gutter, so a row holds 41 characters of the file and `needle` starts at
+    /// 38 — `nee` on one row, `dle` on the next. The sweep reads the line and
+    /// finds it; the document search reads the rows and cannot.
+    fn split_across_a_wrap(dir: &TempDir) -> std::path::PathBuf {
+        let body = format!("{}needle\n", "x".repeat(38));
+        dir.write("wide.txt", body.as_bytes())
+    }
+
+    #[test]
+    fn a_match_a_wrap_split_is_a_miss_with_a_way_out_in_any_body() {
+        // The sharpest form of the documented imprecision, and the one that had
+        // no notice at all: `f` reports a match over the file's logical lines,
+        // the document searches the physical rows those were wrapped into, and
+        // in a plain `.txt` there is no `t` to offer. The reader was told the
+        // phrase is not here and given nothing to press.
+        let dir = TempDir::new("view-wrap-miss");
+        split_across_a_wrap(&dir);
+        let mut pane = scanned(dir.path());
+        draw(&mut pane, 46, 10);
+        find_all(&mut pane, "needle");
+        assert!(pane.title().contains("· 1 match"), "{}", pane.title());
+
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(
+            pane.search.is_none(),
+            "the row the sweep found is not a row this search can reach"
+        );
+        assert!(
+            pane.title()
+                .contains("/needle · no match · widen if a wrap split it"),
+            "the notice names no way out: {}",
+            pane.title()
+        );
+        // `t` is not that way out here and must not be advertised as one: there
+        // is no second form of a `.txt` to switch to, and the key declines.
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('t'))).unwrap(),
+            Handled::No
+        );
+    }
+
+    #[test]
+    fn a_notice_stops_being_shown_the_moment_it_stops_being_true() {
+        // Written once and never re-examined, the notice outlived its own
+        // subject: widening the pane until the wrap is gone puts the match
+        // plainly on screen with `· no match` still in the title. The thing that
+        // would have re-checked it is a `Search`, which is exactly what
+        // `settle_search` took away, so `revive_search` is the other half of
+        // that pair.
+        let dir = TempDir::new("view-wrap-revive");
+        split_across_a_wrap(&dir);
+        let mut pane = scanned(dir.path());
+        draw(&mut pane, 46, 10);
+        find_all(&mut pane, "needle");
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(pane.title().contains("· no match"), "{}", pane.title());
+        let was = pane.scroll.offset;
+
+        // Wide enough that the line no longer breaks.
+        draw(&mut pane, 90, 10);
+        assert!(
+            pane.title().contains("/needle · 1/1"),
+            "the notice outlived the wrap that caused it: {}",
+            pane.title()
+        );
+        assert!(pane.missed.is_none());
+        assert_eq!(
+            pane.scroll.offset, was,
+            "a drag is not the reader asking to be taken anywhere"
+        );
+
+        // ...and back again: the pair is a cycle, not a one-way door.
+        draw(&mut pane, 46, 10);
+        assert!(
+            pane.title().contains("/needle · no match"),
+            "{}",
+            pane.title()
+        );
+    }
+
+    #[test]
+    fn a_query_the_reader_typed_keeps_its_sentence_when_a_rebuild_empties_it() {
+        // The case Phase 1 left silent, and the reason the notice is not only
+        // for seeds. `Esc` on a miss used to drop the search *and* the sentence
+        // explaining it in one keystroke, so the pane went from answering a
+        // question to saying nothing without anybody asking it to.
+        let dir = TempDir::new("view-typed-miss");
+        let mut pane = quiet(dir.path());
+        pane.show(dir.write("a.md", b"# a\n\nnothing here\n"));
+        laid(&mut pane, 40, 10);
+
+        query(&mut pane, "haystack");
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(pane.search.is_none(), "the state Esc must not stop in");
+        assert!(
+            pane.title().contains("/haystack · no match"),
+            "the sentence went with the search: {}",
+            pane.title()
+        );
+        // And it is still not an `Esc` stage: the next press is the shell's.
+        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::No);
+        // A new question replaces it rather than stacking beside it.
+        query(&mut pane, "a");
+        assert!(!pane.title().contains("haystack"), "{}", pane.title());
+    }
+
+    #[test]
+    fn a_result_whose_file_has_gone_does_not_search_the_apology_for_it() {
+        // `build` turns an unreadable path into rows of the pane's own voice,
+        // and a seed resolved against those found the reader's phrase twice in
+        // "no such file — it may have been renamed or deleted" and "Tab for the
+        // next markdown file", then reported `1/2` as if it had opened their
+        // file at their match.
+        let dir = TempDir::new("view-result-gone");
+        let path = dir.write("a.txt", b"the file is here\n");
+        let mut pane = scanned(dir.path());
+        draw(&mut pane, 46, 10);
+        find_all(&mut pane, "file");
+        assert!(pane.title().contains("· 1 match"), "{}", pane.title());
+
+        std::fs::remove_file(&path).expect("remove");
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        draw(&mut pane, 46, 10);
+
+        assert!(pane.title().contains("unreadable"), "{}", pane.title());
+        assert!(
+            pane.search.is_none(),
+            "the pane's own voice was searched on the reader's behalf"
+        );
+        assert!(
+            pane.title().contains("/file · no match"),
+            "and the phrase they came for is still named: {}",
+            pane.title()
+        );
+    }
+
+    #[test]
+    fn landing_on_a_different_match_from_the_one_that_was_chosen_says_so() {
+        // Three matches in the file, two of them reachable on the page. Asking
+        // for the third clamps to the second — a real match of the right phrase,
+        // and *not the row the reader pressed Enter on*. `2/2` alone reads as a
+        // complete answer to a question they did not ask.
+        let dir = TempDir::new("view-result-clamp");
+        let body = format!("needle\nneedle\n{}needle\n", "x".repeat(38));
+        dir.write("three.txt", body.as_bytes());
+        let mut pane = scanned(dir.path());
+        draw(&mut pane, 46, 10);
+        find_all(&mut pane, "needle");
+        assert!(pane.title().contains("· 3 matches"), "{}", pane.title());
+
+        pane.handle_key(key(KeyCode::Char('G'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(
+            pane.title().contains("/needle · 2/2 · not the 3rd"),
+            "the reader was quietly put on a match they did not choose: {}",
+            pane.title()
+        );
+
+        // The first two rows are exact, and say nothing extra.
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        pane.handle_key(key(KeyCode::Char('g'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(pane.title().contains("/needle · 1/2"), "{}", pane.title());
+        assert!(!pane.title().contains("not the"), "{}", pane.title());
+    }
+
+    #[test]
+    fn a_sweep_running_behind_a_document_does_not_cost_the_agent_frames() {
+        // `Enter` on a result leaves the sweep running, which is right — the
+        // reader can come back to a complete list. What is not right is a frame
+        // per batch: `tick` reporting news re-renders the agent's whole screen
+        // for rows nobody can see.
+        let dir = TempDir::new("view-result-frames");
+        dir.write("a.txt", b"needle\n");
+        let mut pane = quiet(dir.path());
+        let (grep, mut post) = grep::Grep::detached(dir.path().to_path_buf());
+        pane.grep = grep;
+        pane.grep
+            .set_index(Arc::from(vec!["a.txt".to_string()]), false);
+
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        for c in "needle".chars() {
+            pane.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+
+        // While the rows are the thing on screen, a batch is news.
+        post(vec![grep::Hit {
+            path: "a.txt".into(),
+            line: 1,
+            start: 0,
+            len: 6,
+            text: "needle".into(),
+            ordinal: 0,
+        }]);
+        assert!(pane.tick(), "the list grew and nothing asked for a frame");
+        assert_eq!(pane.grep.found(), 1);
+
+        // Behind a document it is not, and the list still fills.
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(matches!(pane.mode, Mode::Doc));
+        post(vec![grep::Hit {
+            path: "a.txt".into(),
+            line: 2,
+            start: 0,
+            len: 6,
+            text: "needle".into(),
+            ordinal: 1,
+        }]);
+        assert!(
+            !pane.tick(),
+            "a batch nobody can see re-rendered the agent's screen"
+        );
+        assert_eq!(
+            pane.grep.found(),
+            2,
+            "the sweep was cancelled, so coming back shows a list that stopped \
+             wherever Enter happened to be pressed"
+        );
+    }
+
+    #[test]
+    fn a_walk_that_stopped_short_reaches_the_count_that_is_drawn_over_it() {
+        // The flag has to travel: neither of the walk's caps can be seen from
+        // the list it produces, so a count over a truncated walk would be a
+        // definite answer about a repository nothing finished reading.
+        let dir = TempDir::new("view-scan-cut");
+        let mut pane = quiet(dir.path());
+        let (tx, rx) = std::sync::mpsc::channel::<Scan>();
+        pane.scan = Some(rx);
+        tx.send(Scan {
+            recent: Vec::new(),
+            files: vec!["a.txt".into()],
+            cut: true,
+        })
+        .expect("the pane is listening");
+        assert!(pane.tick());
+
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+        for c in "zzz".chars() {
+            pane.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !pane.grep.settled() && std::time::Instant::now() < deadline {
+            pane.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        pane.tick();
+        assert!(
+            pane.title().contains("0+ matches"),
+            "a truncated walk produced a definite count: {}",
+            pane.title()
+        );
+    }
+
+    #[test]
+    fn the_help_table_names_the_key_that_opens_the_repository_search() {
+        // The F1 overlay is one table for the whole program and nothing catches
+        // a key that was added and never written down. This is that catch, for
+        // the one key this feature binds.
+        let (_, what) = crate::keys::HELP
+            .iter()
+            .find(|(k, _)| *k == "f")
+            .expect("f is bound but not in the F1 overlay");
+        assert!(what.contains("every file"), "{what}");
+    }
+
+    #[test]
+    fn what_the_walk_has_not_answered_yet_is_not_the_querys_fault() {
+        // Blaming the query for an index that does not exist sends the reader
+        // off to fix a query that was never wrong. `browse` drew this line
+        // first; a search that reads files has more of a wait to explain.
+        let dir = TempDir::new("view-result-early");
+        dir.write("a.md", b"# needle\n");
+        let mut pane = quiet(dir.path());
+        pane.handle_key(key(KeyCode::Char('f'))).unwrap();
+
+        let mut term = Terminal::new(TestBackend::new(46, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 46, 10)))
+            .unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Still walking"), "{screen}");
+    }
+
     // --- being pointed at another worktree ---------------------------------
 
     #[test]
@@ -3008,6 +4132,7 @@ mod tests {
             tx.send(Scan {
                 recent: vec![here.write("stale.md", b"# stale\n")],
                 files: vec!["stale.md".into()],
+                cut: false,
             })
             .is_err(),
             "the old walk still had somewhere to deliver its answer"

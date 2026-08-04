@@ -34,6 +34,17 @@ pub fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+/// `1 item`, `2 items`. Two panes count things in their titles and both said
+/// this; the second copy arrived in a change whose whole subject was that a
+/// matcher written twice is a matcher that drifts, which made it the obvious
+/// one to move.
+///
+/// Borrowed rather than allocated: every caller drops it straight into a
+/// `format!`, and a `String` here was one allocation per title per frame.
+pub fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}
+
 /// Something is wrong and the reader has to notice.
 pub fn err() -> Style {
     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -254,6 +265,13 @@ pub fn block(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_is_singular_and_everything_else_is_not() {
+        assert_eq!(plural(1, "item", "items"), "item");
+        assert_eq!(plural(0, "item", "items"), "items");
+        assert_eq!(plural(2, "match", "matches"), "matches");
+    }
 
     #[test]
     fn truncation_is_measured_in_cells_and_always_marked() {

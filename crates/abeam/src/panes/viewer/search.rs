@@ -79,6 +79,48 @@
 //! precisely because `char::to_lowercase` is not length-preserving. Here the
 //! offsets have to index the row as drawn, so the row cannot be rewritten
 //! before it is searched, and the folding moves into the comparison instead.
+//!
+//! ## One matcher, and the second caller it now has
+//!
+//! [`folded`] and [`next_match`] are the whole of what "matches" means, and
+//! [`super::grep`] — the search over every file under the root — calls them
+//! over the source lines of each file. They are factored out rather than
+//! written twice for the reason [`super::list`] gives about the key table: a
+//! phrase that `f` finds in a file and `/` then cannot find in that same file
+//! would leave the reader holding two ideas of what a match is, with neither of
+//! them written anywhere they could see. Smart case in one and not the other is
+//! the version of that bug nobody would ever guess at.
+//!
+//! What the two legitimately differ about is *what* they search, and the gap is
+//! wider than it first looks. The grep reads a file's **logical lines**; this
+//! reads the **physical rows** those lines were wrapped into. Rendered markdown
+//! makes that obvious — rendering reflows prose and drops syntax, so `**` is in
+//! one and not the other — but it is true of a plain `.rs` file too, and there
+//! it is invisible until it bites: a source line wider than the pane is
+//! hard-broken by `source_lines`, and a match straddling the break is a match
+//! `f` reports and `/` cannot find, *in the same file*. Widen the pane and it
+//! appears. See [the cost this module opens with](self#what-is-searched-and-why-it-is-the-rows);
+//! this is that same cost arriving from the repository search's side, and it is
+//! why `ViewerPane::missed` has to name a remedy for every body form rather
+//! than only for markdown.
+//!
+//! ## The known limitation, and the change that would retire it
+//!
+//! Both halves of that — the wrap-split miss, and `f` finding what `/` cannot —
+//! are one root cause: hits are indexed by physical row, so a match that spans
+//! two rows is not addressable at all. Grouping rows by the logical line they
+//! came from would fix both at once, and `source_lines` already knows that
+//! grouping because it wraps the lines itself.
+//!
+//! It is not done here, and the reason is `markdown::render`, which does not: a
+//! rendered paragraph is reflowed prose with no line it can point back at. So
+//! the change is either a second output from the markdown renderer or a rule
+//! that holds for source files and not for rendered ones — and an inconsistency
+//! between the two body forms is worse than one honest rule that costs
+//! something, because the reader can learn a rule and cannot learn an
+//! exception nothing on screen announces. Recorded rather than half-done, and
+//! recorded again in the one place a reader meets it, which is the notice in
+//! the title.
 
 use ratatui::text::Line;
 
@@ -138,6 +180,16 @@ pub struct Search {
     /// first one at or after the top. The query would walk backwards through
     /// the document, half a page per letter typed.
     anchor: usize,
+    /// The ordinal a *seed* asked for, when this search came from `Enter` on a
+    /// repository result rather than from a reader typing.
+    ///
+    /// `None` for every search opened with `/`, which has asked for no
+    /// particular match and so cannot be given the wrong one. When it is `Some`
+    /// and `at` has been clamped below it, the reader picked the fourth result
+    /// of a file and is standing on its second — a real match of their phrase,
+    /// but not the one they chose, and [`Search::label`] has to say so. Landing
+    /// somewhere reasonable is fine; claiming it is what was asked for is not.
+    want: Option<usize>,
     /// The hit under `at` has moved, or the rows beneath it were rebuilt. Read
     /// and cleared by the pane on the next frame, which is the only place that
     /// knows how tall the pane is and so the only place that can decide whether
@@ -157,12 +209,78 @@ impl Search {
             hits: Vec::new(),
             at: 0,
             anchor,
+            want: None,
             follow: false,
+        }
+    }
+
+    /// A search that is already accepted, aimed at the `ordinal`th match of a
+    /// query the reader typed somewhere else.
+    ///
+    /// `Enter` on a repository result is the only caller. It is not
+    /// [`Search::open`] with the query pushed into it, and the difference is
+    /// the whole of why this exists: `open` leaves `typing` set, and a reader
+    /// who pressed `Enter` on a result would land in a box where `q` is a
+    /// letter and `j` does not scroll, having asked for a document rather than
+    /// for a box.
+    ///
+    /// **`hits` is empty and cannot be otherwise.** Hits are indices into rows,
+    /// rows come from a layout, and a layout needs a width that only the next
+    /// frame knows. So this is a search that names a place it cannot yet point
+    /// at, and it stays that way until `ViewerPane::ensure_layout` calls
+    /// [`Search::find`]. Two things make that survivable and both are load
+    /// bearing: `find` only ever clamps `at` *downwards*, so the ordinal asked
+    /// for is still the ordinal reached when the document has that many
+    /// matches; and `find` does not aim, so nothing re-resolves the position
+    /// from the anchor and quietly discards the seed. The second was true
+    /// before this existed — Phase 1 took the aim-if-empty branch out of `find`
+    /// for its own reasons — and this depends on it.
+    ///
+    /// `follow` is set here rather than by the first `find`, because bringing
+    /// the hit on screen is exactly what the reader asked for by pressing
+    /// `Enter`, and `find` is deliberately silent about routes they did not
+    /// drive.
+    pub fn seeded(query: String, ordinal: usize) -> Self {
+        Self {
+            query,
+            typing: false,
+            hits: Vec::new(),
+            at: ordinal,
+            // Where the view is, which is the top of a document just opened.
+            // Nothing reads it until the reader scrolls, because a seeded
+            // search never calls `aim`.
+            anchor: 0,
+            want: Some(ordinal),
+            follow: true,
         }
     }
 
     pub fn typing(&self) -> bool {
         self.typing
+    }
+
+    /// What is being looked for, as the reader spelled it.
+    ///
+    /// The pane reads it back out in one place: a seed the document could not
+    /// honour is about to have its `Search` taken away by
+    /// `ViewerPane::settle_search`, and the phrase is what the title has left
+    /// to say. [`Search::label`] cannot answer that — it bakes in the `/` and
+    /// the count, and parsing a presentation string back into its parts is how
+    /// two things that must agree start disagreeing.
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Which match the reader is on, counting from zero.
+    ///
+    /// The ordinal rather than the [`Hit`], which is what [`Search::current`]
+    /// gives and what everything drawing the page wants. The pane wants this
+    /// one in the state where there is no hit to give: a seed that found
+    /// nothing still remembers the ordinal it was asked for, and `t` — the key
+    /// the title has just named as the answer — puts the same ordinal into the
+    /// form of the document that does contain the phrase.
+    pub fn at(&self) -> usize {
+        self.at
     }
 
     pub fn hits(&self) -> &[Hit] {
@@ -225,7 +343,17 @@ impl Search {
     /// the closest thing to a position that survives the rows being rebuilt.
     pub fn find(&mut self, lines: &[Line<'_>], margin: Margin) {
         self.hits = matches(lines, &self.query, margin);
-        self.at = self.at.min(self.hits.len().saturating_sub(1));
+        // Clamped only when there is something to clamp to, which is two
+        // improvements in one line. Forcing the ordinal to zero when nothing
+        // matched is *forgetting* the position rather than keeping it: for a
+        // seeded search it is the ordinal `Enter` on a result asked for, which
+        // `ViewerPane::missed` still needs after the hits have failed to
+        // appear; and for a reader-typed one it is the match they were on, so
+        // a drag that hard-breaks every hit and a drag back leaves them where
+        // they were instead of at the top.
+        if !self.hits.is_empty() {
+            self.at = self.at.min(self.hits.len() - 1);
+        }
     }
 
     /// Point at the first hit at or after the anchor, wrapping to the first hit
@@ -277,20 +405,64 @@ impl Search {
     /// the same fact and reads as a bug in the counter.
     ///
     /// `miss` is appended to that miss and nowhere else, so the caller can put
-    /// the answer where the question is being asked: in rendered markdown the
-    /// commonest reason for finding nothing is that the thing being looked for
-    /// was rendered away, and the caller is the only one that knows the body is
-    /// markdown. It costs the same columns as the `· rendered` sitting further
+    /// the answer where the question is being asked: the reason a phrase is not
+    /// on the page depends on what the page *is*, and the caller is the only one
+    /// that knows. It costs the same columns as the `· rendered` sitting further
     /// left, and it only ever appears when the columns are doing nothing else.
+    ///
+    /// There is a third state, and it is the one an earlier round argued did
+    /// not need saying. A [seeded](Search::seeded) search asks for a particular
+    /// match of a particular file; the page can hold fewer than that and still
+    /// hold some, and then [`Search::find`] clamps and the reader is standing on
+    /// a real match of their phrase that is *not the one they chose*. `2/2`
+    /// alone reads as a complete answer to a question they did not ask. The
+    /// remedy is not repeated here — the reader can see the matches that are
+    /// there, and `miss` is the sentence for a page with none.
     pub fn label(&self, miss: &str) -> String {
         if self.query.is_empty() {
             return "/".to_string();
         }
         match self.hits.len() {
-            0 => format!("/{} · no match{miss}", self.query),
-            n => format!("/{} · {}/{n}", self.query, self.at + 1),
+            0 => no_match(&self.query, miss),
+            n => {
+                let short = match self.want {
+                    Some(want) if want != self.at => format!(" · not the {}", nth(want + 1)),
+                    _ => String::new(),
+                };
+                format!("/{} · {}/{n}{short}", self.query, self.at + 1)
+            }
         }
     }
+}
+
+/// `1st`, `2nd`, `3rd`, `4th` — and `11th`, `12th`, `13th`, which is the whole
+/// reason this is not two lines.
+///
+/// A title is read rather than parsed, and "not the 4th" is the sentence a
+/// person would say. `#4` and `4` both read as a count of something, which is
+/// exactly what this is not: it is the row the reader pressed `Enter` on.
+fn nth(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+/// What a query that found nothing says.
+///
+/// Two things can be in that state and only one of them is a [`Search`]. The
+/// other is a phrase the pane was *sent* to find by `Enter` on a repository
+/// result and could not — where there is no search left to ask, because a shut
+/// search with nothing marked is the one state `ViewerPane::settle_search`
+/// refuses to hold. One phrasing here rather than a second one written out at
+/// the call site, so the reader cannot be told the same fact two ways depending
+/// on how they arrived at it.
+pub fn no_match(query: &str, miss: &str) -> String {
+    format!("/{query} · no match{miss}")
 }
 
 /// Every match of `query` in `lines`, in reading order.
@@ -328,10 +500,7 @@ fn matches(lines: &[Line<'_>], query: &str, margin: Margin) -> Vec<Hit> {
         // nothing.
         return Vec::new();
     }
-    // Smart case. One capital anywhere in the query is the reader saying they
-    // meant that capital: `Plan` finds the heading and not the fifty mentions
-    // of `plan`, and nothing had to be turned on to get it.
-    let fold = !needle.iter().any(|c| c.is_uppercase());
+    let fold = folded(&needle);
 
     let mut out = Vec::new();
     let mut hay: Vec<char> = Vec::new();
@@ -342,24 +511,73 @@ fn matches(lines: &[Line<'_>], query: &str, margin: Margin) -> Vec<Hit> {
         // pushed below are still counted from the start of the row, because
         // that is what draws the highlight.
         let from = if row < margin.rows { margin.width } else { 0 };
-        if hay.len() < from + needle.len() {
-            continue;
-        }
-        let mut at = from;
-        while at + needle.len() <= hay.len() {
-            if (0..needle.len()).all(|i| same(hay[at + i], needle[i], fold)) {
-                out.push(Hit {
-                    row,
-                    start: at,
-                    len: needle.len(),
-                });
-                at += needle.len();
-            } else {
-                at += 1;
-            }
-        }
+        out.extend(starts(&hay, &needle, from, fold).map(|start| Hit {
+            row,
+            start,
+            len: needle.len(),
+        }));
     }
     out
+}
+
+/// Smart case, decided once per query rather than once per character.
+///
+/// One capital anywhere in the query is the reader saying they meant that
+/// capital: `Plan` finds the heading and not the fifty mentions of `plan`, and
+/// nothing had to be turned on to get it. Both searches ask this, so a reader
+/// who has learned the rule in one has learned it in the other.
+pub fn folded(needle: &[char]) -> bool {
+    !needle.iter().any(|c| c.is_uppercase())
+}
+
+/// Every match of `needle` in `hay` from `from`, in order, as offsets into
+/// `hay`.
+///
+/// The primitive both searches are built from, and the *scan* rather than one
+/// step of it. That is the whole point of where the seam sits. Non-overlap —
+/// `aa` in `aaaa` is two matches and not three — is an invariant of this
+/// iterator and is enforced here, where a "find the next one from `at`"
+/// primitive could only have *asked* both callers to advance by `needle.len()`
+/// and hoped. It is not a cosmetic invariant: `grep::Hit::ordinal` is a count
+/// of these, `Enter` on a result asks the document to reach the same count, and
+/// a third caller advancing by one would silently make those two numbers mean
+/// different things.
+///
+/// What is left to the caller is where to *stop*, which is the one thing the
+/// two genuinely differ on: the document search takes every match of every row,
+/// while the repository grep stops a file at [`super::grep`]'s per-file cap and
+/// the whole sweep at its total. Folding those in would have made one caller
+/// pass `usize::MAX` for a bound the other needs.
+pub fn starts<'a>(
+    hay: &'a [char],
+    needle: &'a [char],
+    from: usize,
+    fold: bool,
+) -> impl Iterator<Item = usize> + 'a {
+    let mut at = from;
+    std::iter::from_fn(move || {
+        let start = next_match(hay, needle, at, fold)?;
+        // The stride *is* the non-overlap rule, and it lives here so that no
+        // caller can choose otherwise. An empty needle never gets here —
+        // `next_match` refuses it — so this cannot fail to advance.
+        at = start + needle.len();
+        Some(start)
+    })
+}
+
+/// Where `needle` next occurs in `hay` at or after `from`, or `None`.
+///
+/// Private, because on its own it is the shape that lets two callers disagree
+/// about what a match is. [`starts`] is what they share.
+fn next_match(hay: &[char], needle: &[char], from: usize, fold: bool) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    // Checked before the range is built rather than after: `hay.len() -
+    // needle.len()` is the last position a match can start at, and a `from`
+    // past it is an empty range rather than a wrapped subtraction.
+    (from..=hay.len() - needle.len())
+        .find(|&at| (0..needle.len()).all(|i| same(hay[at + i], needle[i], fold)))
 }
 
 fn same(a: char, b: char, fold: bool) -> bool {

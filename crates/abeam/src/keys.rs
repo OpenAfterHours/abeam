@@ -12,8 +12,11 @@
 //! [`global`] claims before anybody else is offered it. A key a **focused
 //! pane** handles is not interception — the agent is not listening, because the
 //! keystroke was never going to reach it whatever this file said. That is why
-//! the git view can have `w`, and the file reader `/`, `n` and `N`, on keys
-//! this table would never dare take. The boundary is not a convention: it is
+//! the git view can have `w`, and the file reader `t`, `r`, `/`, `f`, `n` and
+//! `N`, on keys this table would never dare take. The list is kept complete
+//! rather than illustrative, because the comments beside those keys point back
+//! at this sentence by name instead of re-deriving the exemption. The boundary
+//! is not a convention: it is
 //! held by `global` returning `None` for every bare printable key, and pinned
 //! by `plain_typing_is_never_a_global`. Stated here once, so a pane-local key
 //! does not have to re-derive its own exemption in a comment beside itself.
@@ -249,9 +252,19 @@ pub const HELP: &[(&str, &str)] = &[
     // the two halves of the window deliberately disagree about where they are.
     ("Enter (worktrees)", "point the right pane at that worktree"),
     ("t", "files: rendered markdown / its source"),
+    // The three searches are three questions, and the rows name them as
+    // questions: two keys that both ended "under the root" differed by five
+    // characters read at a glance, which is not a difference anyone reads.
     (
         "/",
-        "list: find a file under the root · document: search the page",
+        "which file is called this · where is it on this page · results: retype",
+    ),
+    // The one net row this feature adds. It is a bare letter for the reason `t`
+    // and `w` are: the *intercept* paragraph at the top of this file, which is
+    // about what `global` claims before a focused pane is offered anything.
+    (
+        "f",
+        "files: which files say this — reads every file under the root",
     ),
     ("n / N", "document: next / previous match, outside the box"),
     ("Backspace or -", "file list: up a directory"),
@@ -276,13 +289,18 @@ pub const HELP: &[(&str, &str)] = &[
     // `/`. Stating the rule once is this file's idiom and it is also the only
     // version a reader can hold: "in a box, letters are letters" covers the
     // keys that exist today and the ones added next.
+    // The box rule, stated once — and now carrying the one key in the feature
+    // that behaves unlike anything else in the program. The two filter boxes
+    // narrow as you type and `Enter` opens what is chosen; `f`'s box does
+    // nothing at all until `Enter`, because it reads every file under the root.
+    // A box that appears not to work is exactly what needs saying here.
     (
-        "(in a / box)",
-        "every letter is typed; arrows and Tab move, Esc leaves",
+        "(in a find box)",
+        "every letter is typed; arrows and Tab move, Esc leaves; f's box runs on Enter",
     ),
     (
         "Esc or q",
-        "back to the agent (a shell and a / box keep both; worktrees keep Esc)",
+        "back to the agent (a shell and a find box keep both; worktrees keep Esc)",
     ),
 ];
 

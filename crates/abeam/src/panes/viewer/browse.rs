@@ -36,6 +36,7 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -51,7 +52,7 @@ use super::list::Cursor;
 use super::theme;
 use crate::pane::Handled;
 use crate::scroll;
-use crate::text::{block, clip_line};
+use crate::text::{block, clip_line, plural};
 use crate::watch::in_noise;
 
 /// How many entries one directory listing will hold.
@@ -171,7 +172,15 @@ pub struct Browser {
     find: Option<Find>,
     /// Every file under the root, root-relative with `/` separators. Handed
     /// over by the worker walk.
-    index: Vec<String>,
+    ///
+    /// Shared rather than owned, because it is the same list [`super::grep`]
+    /// sweeps and the same list the pane hands to the grep's worker thread —
+    /// at `files::MAX_FILES` that is twenty thousand strings, and there is no
+    /// version of this where any of the three wants a private copy of them.
+    /// The `Arc` is also what makes a query safe to answer late: a walk that
+    /// lands mid-sweep replaces this pointer and leaves the worker holding the
+    /// list it started on, rather than one that has changed under its indices.
+    index: Arc<[String]>,
     /// Whether that walk has answered. An empty index means two different
     /// things before and after it does, and only one of them is "no match".
     indexed: bool,
@@ -196,7 +205,7 @@ impl Browser {
             // the pane is.
             listing: Cursor::new(DEFAULT_VIEWPORT),
             find: None,
-            index: Vec::new(),
+            index: Arc::from(Vec::new()),
             indexed: false,
             aligned: None,
             read_at: None,
@@ -238,7 +247,7 @@ impl Browser {
 
     /// The worker walk answered. Replaces the find index, keeping the reader on
     /// the row they had chosen if it survived the new walk.
-    pub fn set_index(&mut self, files: Vec<String>) {
+    pub fn set_index(&mut self, files: Arc<[String]>) {
         let keep = self.hit_path();
         self.index = files;
         self.indexed = true;
@@ -860,10 +869,6 @@ fn hit_spans(rel: &str, t: &theme::Theme) -> Vec<Span<'static>> {
     }
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
-    if n == 1 { one } else { many }.to_string()
-}
-
 /// Case-insensitive ordering, without allocating.
 ///
 /// `README.md` and `readme.md` belong next to each other in a list a person
@@ -1050,7 +1055,8 @@ mod tests {
     /// produced for the same tree, and a viewport as if a frame had been drawn.
     fn browser(dir: &TempDir, index: &[&str]) -> Browser {
         let mut b = Browser::new(dir.path().to_path_buf());
-        b.set_index(index.iter().map(|s| (*s).to_string()).collect());
+        let index: Vec<String> = index.iter().map(|s| (*s).to_string()).collect();
+        b.set_index(index.into());
         b.align_to(None);
         viewport(&mut b, 10);
         b
@@ -1762,7 +1768,7 @@ mod tests {
         let mut grown = names.clone();
         grown.push("brand-new.md".to_string());
         grown.sort();
-        b.set_index(grown);
+        b.set_index(grown.into());
         draw(&mut b, 40, 10);
 
         assert_eq!(selected(&b), chosen, "still on the file they had chosen");
@@ -1826,7 +1832,7 @@ mod tests {
         b.key(key(KeyCode::Char('/')));
         assert!(b.nothing().contains("Still walking"), "{}", b.nothing());
 
-        b.set_index(Vec::new());
+        b.set_index(Arc::from(Vec::new()));
         assert!(b.nothing().contains("No file matches"), "{}", b.nothing());
     }
 
