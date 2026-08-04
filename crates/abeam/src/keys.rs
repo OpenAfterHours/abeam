@@ -6,7 +6,19 @@
 //! doing the work: a binding is safe only if it is a no-op in *every* agent
 //! abeam can host, so gaining an agent can retire a key that was safe while
 //! there was only one. It has already retired one, and this file is where that
-//! shows. Every binding below was checked against Claude Code's own keymap, read
+//! shows.
+//!
+//! *Intercept* is doing work too, and it means exactly one thing: what
+//! [`global`] claims before anybody else is offered it. A key a **focused
+//! pane** handles is not interception — the agent is not listening, because the
+//! keystroke was never going to reach it whatever this file said. That is why
+//! the git view can have `w`, and the file reader `/`, `n` and `N`, on keys
+//! this table would never dare take. The boundary is not a convention: it is
+//! held by `global` returning `None` for every bare printable key, and pinned
+//! by `plain_typing_is_never_a_global`. Stated here once, so a pane-local key
+//! does not have to re-derive its own exemption in a comment beside itself.
+//!
+//! Every binding below was checked against Claude Code's own keymap, read
 //! out of its binary, and against GitHub Copilot CLI's, read from GitHub's
 //! published tables and from Ink's source. See `docs/keymap.md` for both
 //! inventories, and for how much weaker the second one is than the first.
@@ -237,14 +249,18 @@ pub const HELP: &[(&str, &str)] = &[
     // the two halves of the window deliberately disagree about where they are.
     ("Enter (worktrees)", "point the right pane at that worktree"),
     ("t", "files: rendered markdown / its source"),
-    ("/", "file list: find a file anywhere under the root"),
+    (
+        "/",
+        "list: find a file under the root · document: search the page",
+    ),
+    ("n / N", "document: next / previous match, outside the box"),
     ("Backspace or -", "file list: up a directory"),
     ("r", "refresh · queue: clear what has finished"),
-    // Pane-local, and exempt from the invariant at the top of this file for
-    // that reason: it is only ever delivered while the right pane has focus and
-    // the git view is showing, so no agent can be listening. It is not a fifth
-    // global view key — `Alt+W` is Claude's, and a fifth view spelled `F6`
-    // would be a key nobody groups with the other three.
+    // Not a fifth global view key: `Alt+W` is Claude's, and a fifth view
+    // spelled `F6` would be a key nobody groups with the other three. Why a
+    // bare letter is allowed at all is the *intercept* paragraph at the top of
+    // this file, stated there once rather than re-argued beside every key that
+    // relies on it.
     ("w", "git: the worktrees of this repository"),
     // The queue's own four. `space` is conspicuously not among them: it pages,
     // here as in every other pane, and arming moved to `a` rather than take a
@@ -255,9 +271,18 @@ pub const HELP: &[(&str, &str)] = &[
     ("a", "queue: arm / disarm sending to the agent"),
     ("d", "queue: delete the selected item"),
     ("m", "queue: switch an item between send and dispatch"),
+    // One row rather than a caveat on the three scroll rows above and the two
+    // letter rows below, all five of which stop being true one keystroke after
+    // `/`. Stating the rule once is this file's idiom and it is also the only
+    // version a reader can hold: "in a box, letters are letters" covers the
+    // keys that exist today and the ones added next.
+    (
+        "(in a / box)",
+        "every letter is typed; arrows and Tab move, Esc leaves",
+    ),
     (
         "Esc or q",
-        "back to the agent (a shell keeps both; the worktree list keeps Esc)",
+        "back to the agent (a shell and a / box keep both; worktrees keep Esc)",
     ),
 ];
 

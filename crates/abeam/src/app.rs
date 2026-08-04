@@ -1400,7 +1400,21 @@ impl App {
                 // kept in sync with what its `handle_key` actually did, and
                 // would be wrong for exactly the states that matter: a dead
                 // child, and a read-only pane with a filter box open.
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                // The bare keys only. `Ctrl+Q` is a chord aimed at whatever is
+                // hosted, and every read-only pane declines Ctrl+letter on
+                // purpose so that it reaches the child — so reading the code
+                // alone turned "the pane did not want this" into "the user is
+                // done with this pane" for a key they never pressed. It threw a
+                // reader out of an open filter box, which stayed open, still
+                // taking typing, with focus somewhere else.
+                //
+                // CONTROL and ALT by name rather than `modifiers.is_empty()`:
+                // some terminals report SHIFT for an uppercase letter, and `q`
+                // has to go on meaning `q` when it arrives that way.
+                let chord = key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                if !chord && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.focus = Focus::Left;
                     return Ok(Flow::redraw());
                 }
@@ -2914,6 +2928,34 @@ mod tests {
         // prompt in both the agents abeam knows, and abeam stealing it would be
         // unusable.
         app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Left);
+    }
+
+    #[test]
+    fn a_chord_the_right_pane_declined_is_not_the_user_saying_they_are_done() {
+        // `Ctrl+Q` is aimed at whatever is hosted, and every read-only pane
+        // declines Ctrl+letter on purpose so it gets there. Reading the code
+        // and not the modifiers turned that into "give focus back", which threw
+        // a reader out of an open filter box — a box that stayed open, still
+        // taking typing, with focus on the other side of the window.
+        let mut app = app();
+        screen(&mut app, 120, 24);
+        for chord in [
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL),
+        ] {
+            app.handle_key(key(KeyCode::F(5))).unwrap();
+            assert_eq!(app.focus, Focus::Right);
+            app.handle_key(chord).unwrap();
+            assert_eq!(app.focus, Focus::Right, "{chord:?} moved focus");
+        }
+
+        // Shift is not a chord. Some terminals report it for an uppercase
+        // letter, and `q` has to go on meaning `q` when it arrives that way.
+        app.handle_key(key(KeyCode::F(5))).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::SHIFT))
+            .unwrap();
         assert_eq!(app.focus, Focus::Left);
     }
 
