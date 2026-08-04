@@ -33,7 +33,11 @@
 //! reading position from either end: the list is how a file is reached, the
 //! document is what the list is for. The list itself lives in [`browse`],
 //! because a selectable, filterable directory tree is a pane's worth of code on
-//! its own and this file is long enough.
+//! its own and this file is long enough. What being *in* a list means — which
+//! row is chosen, and keeping it on screen — is [`list`], one level down again:
+//! the directory listing and the find over the repository are two lists in that
+//! one pane, and the bookkeeping they share is the part that goes subtly wrong
+//! when it is written twice.
 //!
 //! ## Where the work happens
 //!
@@ -67,6 +71,7 @@
 
 mod browse;
 mod files;
+mod list;
 mod load;
 mod markdown;
 mod source;
@@ -265,12 +270,13 @@ impl ViewerPane {
     ///
     /// The [`Browser`] is rebuilt wholesale rather than given a `set_root` of
     /// its own, and that is the shorter of two changes as well as the safer
-    /// one. `dir`, `entries`, `index`, `indexed`, `aligned`, `find`, `sel` and
-    /// `scroll` are every one of them relative to the root — a setter would have
-    /// to reset all eight, and the one it forgot would be silent. `aligned` is
-    /// the sharpest of them: [`Browser::align_to`] short-circuits when the
-    /// document has not changed, so a stale value would send the first `Alt+E`
-    /// in the new workspace back into a directory of the old one.
+    /// one. `dir`, `entries`, `index`, `indexed`, `aligned`, `find` and
+    /// `listing` are every one of them relative to the root — a setter would
+    /// have to reset all seven, and the one it forgot would be silent.
+    /// `aligned` is the sharpest of them: [`Browser::align_to`]
+    /// short-circuits when the document has not changed, so a stale value would
+    /// send the first `Alt+E` in the new workspace back into a directory of the
+    /// old one.
     ///
     /// The palette is carried over by hand, because it is the one thing here
     /// that is a decision about *reading* rather than a fact about the root —
