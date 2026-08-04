@@ -143,6 +143,7 @@ mod grep;
 mod list;
 mod load;
 mod markdown;
+mod mermaid;
 mod search;
 mod source;
 mod theme;
