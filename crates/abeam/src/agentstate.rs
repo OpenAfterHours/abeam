@@ -416,6 +416,13 @@ pub struct Probe {
     /// [`Probe::set_worktrees`] is where that separation is argued and where
     /// the three ways the other arrangement went wrong are written out.
     worktrees: Vec<PathBuf>,
+    /// Sessions abeam started itself, which are therefore never the session
+    /// abeam is *hosting*.
+    ///
+    /// [`Probe::disown`] is where this is argued. It is a list of `sessionId`s
+    /// rather than pids because a pid is reused and a `sessionId` abeam chose
+    /// is not.
+    disowned: Vec<String>,
 }
 
 /// A record that was positively the session abeam hosts, and which session it
@@ -457,6 +464,7 @@ impl Probe {
             spawned_at,
             found: None,
             worktrees: Vec::new(),
+            disowned: Vec::new(),
         }
     }
 
@@ -548,6 +556,69 @@ impl Probe {
         self.worktrees = worktrees;
     }
 
+    /// Never adopt this session, whatever else is true of its record.
+    ///
+    /// ## Why a second Claude in this directory is a hazard and not a curiosity
+    ///
+    /// `crate::ask` starts one. It is `claude -p` in streaming-JSON mode, it
+    /// reads and cannot write, and it exists to answer questions about the file
+    /// in the right pane. What it also does — verified, not assumed, on 2.1.222
+    /// — is write `~/.claude/sessions/<pid>.json` with **`"kind":"interactive"`**
+    /// and abeam's own `cwd`, started after abeam did.
+    ///
+    /// Read that against [`Probe::search`] and the problem is immediate: those
+    /// are the three facts the candidate filter tests for. A reader the *user*
+    /// started is admitted to the pool that decides whether the agent in the
+    /// left pane is idle, and [`Probe::search`]'s documented `or_else` — the one
+    /// that takes the newest record in the repository when clock skew leaves
+    /// nothing at or after `spawned_at` — is where it would win, because it is
+    /// always the newer of the two. The answer that comes back is that session's
+    /// `status`, and a reader between questions is `idle`.
+    ///
+    /// `Idle` is the one answer that lets `crate::panes::queue` type into the
+    /// left pane. So the failure is not "the ask pane reports the wrong state":
+    /// it is a queued prompt spliced into a mid-turn agent, on the strength of a
+    /// record belonging to a process abeam started itself. It is the fourth
+    /// entry in the list under [`Probe::set_worktrees`], arriving by a door that
+    /// list does not cover.
+    ///
+    /// ## Why the id, and not the pid
+    ///
+    /// abeam knows this child's pid, and the pid is the wrong key for the reason
+    /// this whole module keeps repeating: it is handed out again. A disowned pid
+    /// is a *future* Claude disowned by accident, and the direction that fails
+    /// in is `Unknown` for ever with nothing on screen saying why.
+    ///
+    /// The `sessionId` is not the operating system's to reuse. abeam chooses it
+    /// (`crate::ask::new_session_id`), passes it as `--session-id`, and the
+    /// child writes it into the record — so the key here is one abeam minted,
+    /// matched against a field only that child can be carrying. It is also the
+    /// only field that separates the two records at all: `kind`, `cwd` and
+    /// `startedAt` are the same shape for both.
+    ///
+    /// Consulted on **all three** paths — the pid shortcut, the candidate filter
+    /// and revalidation — because a rule that holds on two of them is a rule
+    /// that holds until the third one is the one that answers, which here is a
+    /// difference between install shapes rather than a rare case.
+    pub fn disown(&mut self, session_id: String) {
+        if !self.disowned.contains(&session_id) {
+            self.disowned.push(session_id);
+        }
+    }
+
+    /// Whether this record belongs to something abeam started for itself.
+    ///
+    /// A record carrying no `sessionId` is not ours by this test, and that is
+    /// the strict direction: the ids in [`Probe::disowned`] were all minted by
+    /// abeam, so a record with no id cannot be one of them, and treating an
+    /// absent field as a match would disown the first stranger it met.
+    fn is_disowned(&self, session: &Session) -> bool {
+        session
+            .session_id
+            .as_deref()
+            .is_some_and(|id| self.disowned.iter().any(|mine| mine == id))
+    }
+
     /// [`Probe::new`], over a directory handed in rather than looked up.
     ///
     /// The test seam for everything downstream of this module, and it exists
@@ -566,6 +637,7 @@ impl Probe {
             spawned_at,
             found: None,
             worktrees: Vec::new(),
+            disowned: Vec::new(),
         }
     }
 
@@ -714,8 +786,16 @@ impl Probe {
                 continue;
             }
             match record(&path) {
+                // `is_disowned` first, and it is the cheapest of the three, but
+                // that is not why it leads. A session abeam started for itself
+                // is not a weak candidate to be outranked further down — it is
+                // not a candidate, and the `or_else` below is precisely a place
+                // where a weak candidate wins. It has to leave here, not lose
+                // later.
                 Record::Read(session)
-                    if session.kind == Kind::Interactive && self.is_here(&session) =>
+                    if !self.is_disowned(&session)
+                        && session.kind == Kind::Interactive
+                        && self.is_here(&session) =>
                 {
                     candidates.push((path, session));
                 }
@@ -801,7 +881,8 @@ impl Probe {
     /// the same blind spot, so the memory is no worse than the thing it stands
     /// in for.
     fn is_mine(&self, session: &Session) -> bool {
-        self.is_here(session)
+        !self.is_disowned(session)
+            && self.is_here(session)
             && session.kind == Kind::Interactive
             && session.started_at.is_some_and(|at| at >= self.spawned_at)
     }
@@ -815,7 +896,8 @@ impl Probe {
     /// session in it is allowed to have moved since. [`Probe::set_worktrees`] is
     /// where the split between this and [`Probe::is_mine`] is argued.
     fn is_still_mine(&self, found: &Found, session: &Session) -> bool {
-        session.kind == Kind::Interactive
+        !self.is_disowned(session)
+            && session.kind == Kind::Interactive
             && session.started_at.is_some_and(|at| at >= self.spawned_at)
             && (self.is_here(session) || self.has_moved(found, session))
     }
@@ -1608,6 +1690,94 @@ mod tests {
         assert_eq!(kind_of(None), Kind::Other);
     }
 
+    // --- the reader abeam starts for itself -------------------------------
+
+    #[test]
+    fn a_session_abeam_started_itself_is_never_the_session_abeam_hosts() {
+        // `crate::ask` starts `claude -p` in this directory, and it writes an
+        // *interactive* record with our `cwd`, started after us â€” which is
+        // every fact the candidate filter tests for. Planted alone, so nothing
+        // else can be answering: if the disown is not consulted this is the
+        // only record there is, and `session()` returns it.
+        let dir = TempDir::new("agentstate-ask-alone");
+        plant(&dir, 99, ROOT, STARTED + 40, "idle");
+
+        let mut probe = probe(&dir, None, STARTED);
+        probe.disown("s-99".to_string());
+
+        assert!(
+            probe.session().is_none(),
+            "the reader abeam started was adopted as the session abeam hosts"
+        );
+        // And `Unknown` rather than `Idle` is the whole point: `Idle` is the
+        // answer that lets the queue type into the left pane.
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+    }
+
+    #[test]
+    fn the_fallback_that_takes_the_newest_record_cannot_take_a_disowned_one() {
+        // The documented `or_else` in `search`, which is where this would
+        // actually have bitten: our own record stamped a few milliseconds
+        // before `spawned_at` leaves the at-or-after filter with nothing, so
+        // the fallback takes `max_by_key(started_at)` â€” and the reader is
+        // always the newer of the two, because abeam starts it later by
+        // construction.
+        let dir = TempDir::new("agentstate-ask-newest");
+        plant(&dir, 46256, ROOT, STARTED - 5, "busy"); // ours, skewed early
+        plant(&dir, 99, ROOT, STARTED + 40, "idle"); // the reader, newer
+
+        // Without the disown the newest wins, and the answer is a wrong `Idle`
+        // about an agent that is mid-turn. Asserted rather than described, so
+        // that deleting the disown fails this test with the real symptom.
+        let mut naive = probe(&dir, None, STARTED);
+        assert_eq!(naive.readiness(), Readiness::Idle);
+
+        let mut ours = probe(&dir, None, STARTED);
+        ours.disown("s-99".to_string());
+        assert_eq!(
+            ours.session().and_then(|s| s.pid),
+            Some(46256),
+            "the fallback took the reader over the agent it was skewed past"
+        );
+        assert_eq!(ours.readiness(), Readiness::Busy);
+    }
+
+    #[test]
+    fn the_pid_shortcut_does_not_adopt_a_disowned_record_either() {
+        // The third door, and the one an npm install never uses â€” which is
+        // exactly why it needs its own test: a rule that holds on the two paths
+        // this machine happens to take is a rule nobody notices is missing from
+        // the third until somebody installs Claude the other way.
+        let dir = TempDir::new("agentstate-ask-pid");
+        plant(&dir, 99, ROOT, STARTED + 40, "idle");
+
+        let mut probe = probe(&dir, Some(99), STARTED);
+        probe.disown("s-99".to_string());
+
+        assert!(probe.session().is_none());
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+    }
+
+    #[test]
+    fn a_record_with_no_session_id_is_not_disowned_by_accident() {
+        // The strict direction. Every id in the disowned list was minted by
+        // abeam, so a record carrying none cannot be one of them â€” and treating
+        // an absent field as a match would disown the first stranger it met,
+        // which here would be the agent itself.
+        let dir = TempDir::new("agentstate-ask-nameless");
+        let record = format!(
+            r#"{{"pid":77,"cwd":{},"startedAt":{},"peerProtocol":1,"kind":"interactive","status":"idle"}}"#,
+            serde_json::to_string(ROOT).expect("a JSON string"),
+            STARTED + 10
+        );
+        dir.write("77.json", record.as_bytes());
+
+        let mut probe = probe(&dir, None, STARTED);
+        probe.disown("s-99".to_string());
+
+        assert_eq!(probe.readiness(), Readiness::Idle);
+    }
+
     #[test]
     fn a_record_that_is_there_and_will_not_parse_is_never_answered_for_by_a_neighbour() {
         // The whole point of refusing a record is to fail safe, and until this
@@ -2038,6 +2208,7 @@ mod tests {
             spawned_at: STARTED,
             found: None,
             worktrees: Vec::new(),
+            disowned: Vec::new(),
         };
         assert!(nowhere.session().is_none());
         assert_eq!(nowhere.readiness(), Readiness::Unknown);
