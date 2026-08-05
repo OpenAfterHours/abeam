@@ -142,11 +142,11 @@ mod files;
 mod grep;
 mod list;
 mod load;
-mod markdown;
+pub(crate) mod markdown;
 mod mermaid;
 mod search;
 mod source;
-mod theme;
+pub(crate) mod theme;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

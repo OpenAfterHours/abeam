@@ -1,3 +1,4 @@
+pub mod ask;
 pub mod diag;
 pub mod git;
 pub mod queue;
@@ -5,6 +6,7 @@ pub mod shell;
 pub mod terminal;
 pub mod viewer;
 
+pub use ask::{AskContext, AskPane};
 pub use diag::{DiagPane, FrameStats};
 pub use git::GitPane;
 pub use queue::QueuePane;
