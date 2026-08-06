@@ -1317,6 +1317,23 @@ impl App {
                 self.spaces[ix].ask.on_event(event);
             }
 
+            // Drained after the events and before the question, and both halves
+            // of that order matter. After the events, so that whatever the old
+            // child had already said still reaches the pane it is about to be
+            // cleared from rather than arriving in the new conversation. Before
+            // the question, because clearing and asking in one pass is the
+            // ordinary way to use this — finish with one file, `?` on another,
+            // `Ctrl+L`, type — and the question must go to the *new* child.
+            //
+            // Dropping the session is the whole of it. There is nothing to say
+            // down the pipe: `claude -p` has no "forget", and a conversation is
+            // ended by ending the process holding it. `Drop` closes stdin,
+            // kills and reaps; the next question starts a child with a new
+            // session id, disowned like any other.
+            if self.spaces[ix].ask.take_reset() {
+                self.spaces[ix].ask_session = None;
+            }
+
             if let Some(question) = self.spaces[ix].ask.take_question() {
                 // A session that has ended is not a session: a `claude -p`
                 // whose stdout has closed cannot be asked anything, and the
@@ -4887,6 +4904,51 @@ mod tests {
             Readiness::Idle,
             "the planted record is not the shape this test is about"
         );
+    }
+
+    #[test]
+    fn clearing_the_conversation_ends_the_child_holding_it() {
+        // What a reader is buying with `Ctrl+L` is not an empty pane, it is an
+        // empty *context*. Every turn is sent again with the next one, so
+        // somebody who has finished with one file and pressed `?` on another
+        // goes on paying for the first until the session itself ends — and a
+        // clear that emptied the pane and left the child running would hide
+        // that rather than fix it. So the assertion is about the session id:
+        // the next question must reach a child that was never told any of this.
+        let mut fx = app();
+        reading(&mut fx, a_reader_that_stays);
+
+        asked(&mut fx, "about this file");
+        fx.app.pump();
+        let first = session_id(&fx);
+
+        // The key, pressed at the pane the way somebody presses it.
+        fx.app.spaces[0]
+            .ask
+            .handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .expect("ctrl+l clears");
+        fx.app.pump();
+        assert!(
+            fx.app.spaces[0].ask_session.is_none(),
+            "the transcript was cleared and the child kept, which is the bill \
+             without the evidence"
+        );
+
+        asked(&mut fx, "about another one");
+        fx.app.pump();
+        assert_ne!(
+            session_id(&fx),
+            first,
+            "the new question went to the child still holding the old \
+             conversation"
+        );
+
+        // The new child is disowned like any other, and that is not asserted
+        // here on purpose: it happens because this goes through `start_ask`,
+        // which is the one non-test path that starts anything, and
+        // `a_reader_abeam_started_is_never_read_as_the_agent_going_idle` is
+        // where that line is held down. A second test of the same statement
+        // would be a second thing to update rather than a second guarantee.
     }
 
     #[test]

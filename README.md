@@ -721,12 +721,23 @@ and leaves it running; what ends it is quitting, and nothing is persisted, so
 `Alt+Q` and a crash lose the conversation equally and by design. Asking again
 after that starts a fresh reader, which the pane says on screen rather than
 letting you find out from an answer that has forgotten the question before it.
-And the bottom row says the thing nothing else on screen would: **this shares
-your quota with the agent in the left pane.** Same account, same limits, same
-money — the title carries what the session has cost so far, in three decimal
-places, because a trivial exchange is a few hundredths of a dollar and a title
-reporting `$0.00` over something that cost money is worse than one reporting
-nothing.
+`Ctrl+L` ends the conversation and starts a fresh one, and **it ends the child
+along with it** — which is the only version of that key worth having. What a
+long conversation costs is not the rows on screen: every turn is sent again as
+context with the next question, so the file you finished with half an hour ago
+is still being paid for. Clearing the pane and keeping the reader would have
+hidden that rather than fixed it. The composer keeps what you have typed and the
+attached file stays attached, because starting again about *this* file is what
+pressing `?` and then `Ctrl+L` means.
+
+The title carries what the session has cost so far, in three decimal places,
+because a trivial exchange is a few hundredths of a dollar and a title reporting
+`$0.00` over something that cost money is worse than one reporting nothing. What
+the pane does *not* do is warn you about it. It is the same Claude, on the same
+account, started by the same person — a standing caution about that would read
+as though abeam had found something alarming, and there is nothing alarming to
+find. The row along the bottom is spent on what a reader can act on instead: the
+tools the child actually got, and the key that ends the conversation.
 
 **pty diagnostics** (`F2`) — what the emulation layer is doing: alt-screen,
 application cursor, bracketed paste, mouse mode, byte counts, resize count, and
@@ -958,7 +969,7 @@ literal-next escape hatch. Agent selection and the launcher underneath it. The
 Unix port, in the sense that the whole workspace builds, tests and lints clean
 for both `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see
 "Platforms" for the sense in which it is not done. Mermaid flowcharts and
-sequence diagrams, drawn rather than shown as source. 749 tests on Windows, and
+sequence diagrams, drawn rather than shown as source. 752 tests on Windows, and
 `clippy --all-targets` clean on both.
 
 Two of those changed Windows behaviour on the way past, and both are worth
@@ -1291,12 +1302,15 @@ work, on either platform.
   than a longer kill. A native install and every Linux install are unaffected —
   there is no interpreter in between, and the process abeam holds is the one it
   kills.
-- **It spends the same quota as the agent, and nothing caps it.** Same account,
-  same rate limits, same money — a reader who thinks of the right-hand pane as
-  free finds out from a rate limit in the middle of the conversation that
-  matters. The pane says so on its opening screen and again on the row along its
-  bottom for the rest of the session, and its title carries what the session has
-  cost so far, which is disclosure rather than a defence. `--max-budget-usd`
+- **Nothing caps what it spends, and a long conversation costs more per
+  question than a short one.** It is the same account as the agent, which is
+  what anybody would expect and is not the part worth writing down. What is
+  worth writing down is the shape of the bill: context is re-sent with every
+  turn, so the tenth question in a conversation carries the nine before it and
+  costs accordingly. `Ctrl+L` is the whole of the answer abeam offers, and it is
+  a manual one — nothing clears the conversation for you when you move to
+  another file, and the title's running cost is disclosure rather than a
+  defence. `--max-budget-usd`
   exists and is not passed: a ceiling abeam picked would be a number nobody
   chose, and a ceiling in the config file is a decision worth making after
   somebody has seen what a day of this actually costs. Every workspace gets its

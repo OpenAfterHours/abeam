@@ -186,14 +186,20 @@ const AGENT: &str = "claude";
 /// for what a second question asked mid-answer does to the first.
 const WAITING: &str = "answering · enter waits · draft kept";
 
-/// The cost nothing else on screen would mention.
+/// How to start again, offered beside the tool list once there is something to
+/// start again *from*.
 ///
-/// Short because it shares a row with the tool list, and the tool list is the
-/// half a reader is looking for. At twenty-three cells the pair fits the
-/// forty-six columns a right pane is routinely given, where "shares your Claude
-/// subscription with the agent in the left pane" clipped itself in half and
-/// said nothing.
-const QUOTA: &str = "same quota as the agent";
+/// This row used to carry a warning that the pane spends the same quota as the
+/// agent, and it is gone because it was answering a question nobody asked: it
+/// is the same Claude, started by the same person, on the same account, and a
+/// standing caution about that reads as though abeam had found something to be
+/// alarmed about. The row is better spent on the thing a reader can act on.
+///
+/// Which is the same subject seen properly. The cost that is worth a row is not
+/// *that* answers cost money — it is that a conversation kept open goes on
+/// being re-sent as context, so the file you have finished with is still being
+/// paid for. That has a key, and the key is what the row now says.
+const CLEAR: &str = "ctrl+l clears";
 
 /// Where a question came from, attached before it is sent and drawn until it
 /// goes.
@@ -298,6 +304,24 @@ pub struct AskPane {
     /// `QueuePane::take_send_request`: a request left sitting fires late, at
     /// whatever unrelated moment next reads it.
     pending: Option<String>,
+    /// The reader has asked to start again, and the **child has to go with the
+    /// transcript**.
+    ///
+    /// This is the whole reason clearing is not just `entries.clear()`. What
+    /// costs money is not the rows on screen, it is the conversation the child
+    /// is holding: every turn is sent again as context on the next one, so a
+    /// reader who has finished with one file and pressed `?` on another goes on
+    /// paying for the first until the session itself ends. Emptying the pane
+    /// and keeping the child would clear the evidence and leave the bill.
+    ///
+    /// Drained by the app, which owns the child, for the reason [`pending`]
+    /// is — and the app drops the session rather than telling it anything,
+    /// because there is no "forget" on the other end of that pipe. The next
+    /// question starts a new child with a new session id, which is disowned
+    /// like any other.
+    ///
+    /// [`pending`]: AskPane::pending
+    reset: bool,
     /// The command the reader chose, drained by the app, which switches to the
     /// shell and types it **without a newline**.
     handoff: Option<String>,
@@ -409,6 +433,7 @@ impl AskPane {
             tools: None,
             ended: false,
             pending: None,
+            reset: false,
             handoff: None,
             commands: Vec::new(),
             skipped: 0,
@@ -454,6 +479,45 @@ impl AskPane {
     /// reporting somebody else's work.
     pub(crate) fn take_question(&mut self) -> Option<String> {
         self.pending.take()
+    }
+
+    /// Whether the reader has asked to start again, in which case the app must
+    /// drop the child as well as let this pane empty itself.
+    ///
+    /// Drained rather than read, so that a reset acted on once is not acted on
+    /// for ever — the same rule every other seam out of this pane follows.
+    pub(crate) fn take_reset(&mut self) -> bool {
+        std::mem::take(&mut self.reset)
+    }
+
+    /// Empty the conversation and ask for the child to go with it.
+    ///
+    /// What is *not* cleared is worth as much as what is. The composer keeps
+    /// what is in it, because clearing a conversation and clearing a
+    /// half-written question are two different intentions and only one of them
+    /// was expressed; and the attached context stays, because the reader
+    /// pressed `?` on a file and then asked to start again *about that file* —
+    /// throwing the attachment away would make the next question the one thing
+    /// they did not ask for.
+    ///
+    /// `tools` goes back to `None`, which draws as "no reader yet" rather than
+    /// as the list the last child reported. There is no child now, and a row
+    /// that kept saying `Read Grep Glob` would be describing a process that
+    /// does not exist — this pane's one standing rule is that the row is the
+    /// child's answer and never abeam's intention.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.commands.clear();
+        self.skipped = 0;
+        self.from_end = 0;
+        self.scanned = None;
+        self.tools = None;
+        self.ended = false;
+        self.handoff = None;
+        self.scroll = Scroll::default();
+        self.following = true;
+        self.reset = true;
+        self.bump();
     }
 
     /// A single-line command the reader chose to hand to the shell.
@@ -584,15 +648,13 @@ impl AskPane {
                 self.bump();
             }
             AskEvent::RateLimited(why) => {
-                // Worth its own entry rather than a colour on the title. It is
-                // the one thing that happens to this pane *because* it shares
-                // the agent's quota, which is the sentence along the bottom
-                // coming true.
-                self.note(format!(
-                    "rate limited: {why} This session and the agent in the left \
-                     pane draw on the same account, so waiting is the whole of \
-                     what there is to do."
-                ));
+                // Worth its own entry rather than a colour on the title,
+                // because it is the one message here a reader has to act on —
+                // and the action is to stop. Said plainly rather than as a
+                // caution about spending: it is the same account as the agent
+                // in the left pane, so this is news about the account rather
+                // than about this pane in particular.
+                self.note(format!("rate limited: {why}"));
             }
             AskEvent::Ended => {
                 if !self.ended {
@@ -909,11 +971,12 @@ impl AskPane {
              is the list it actually got — and it has no tool that can change a \
              file.\n\
              \n\
-             It is the **same account** as the agent in the left pane, so every \
-             answer here comes out of the same quota and costs the same money.\n\
-             \n\
              - `enter` sends what you have typed; `ctrl+enter` starts a new line \
              inside it.\n\
+             - `ctrl+l` ends the conversation and starts a fresh one. Worth \
+             doing when you move to another file: everything said so far is \
+             sent again as context on the next question, so a conversation left \
+             open is one you keep paying for.\n\
              - `tab` picks a command out of an answer, and `enter` on an empty \
              box types it into the shell **without running it**. A block of more \
              than one line, or one carrying a control character, is never \
@@ -1066,8 +1129,13 @@ impl AskPane {
             // intention wearing the child's clothes.
             _ => spans.push(Span::styled("no reader yet", t.dim())),
         }
-        spans.push(Span::styled(" · ", t.dim()));
-        spans.push(Span::styled(QUOTA, t.dim()));
+        // Only once there is a conversation to end. Offered over an empty pane
+        // it would be a key that does nothing, on the one screen whose job is
+        // to teach the pane — and the opening screen lists it there anyway.
+        if !self.entries.is_empty() {
+            spans.push(Span::styled(" · ", t.dim()));
+            spans.push(Span::styled(CLEAR, t.dim()));
+        }
         clip_line(Line::from(spans), w)
     }
 
@@ -1296,6 +1364,22 @@ impl Pane for AskPane {
         self.sync();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        // Before the scroll table and before the composer, because it is the
+        // one binding here that has to work in every state the pane can be in —
+        // mid-answer, with a draft, with nothing at all.
+        //
+        // `Ctrl+L` rather than a letter, for the reason every binding in this
+        // pane is modified: the composer is always live, so a bare `c` is a `c`.
+        // It is the key a terminal has meant "clear this" since `readline`, and
+        // `Ctrl+D`/`Ctrl+U` are already scroll here, so the modified space is
+        // where this pane's vocabulary lives anyway. Nothing of the hosted
+        // agent's is shadowed: this arrives only when the right pane has focus,
+        // which is the same exemption `w` in the git view has.
+        if ctrl && !alt && matches!(key.code, KeyCode::Char('l' | 'L')) {
+            self.clear();
+            return Ok(Handled::Yes);
+        }
 
         if let Some(handled) = self.scroll_only(key) {
             return Ok(handled);
@@ -1811,7 +1895,7 @@ mod tests {
     // --- the transcript ----------------------------------------------------
 
     #[test]
-    fn an_empty_pane_explains_itself_and_says_whose_quota_it_spends() {
+    fn an_empty_pane_explains_itself_without_warning_anybody_about_the_bill() {
         // A blank box is indistinguishable from a broken one, and this pane is
         // empty the first time anybody opens it.
         let mut p = live();
@@ -1821,13 +1905,90 @@ mod tests {
         // being split across two rows of a flattened buffer.
         let doc = p.source();
         assert!(doc.contains("can read this repository"), "{doc}");
-        assert!(doc.contains("same account"), "whose quota: {doc}");
         assert!(doc.contains("without running it"), "the promise: {doc}");
         assert!(doc.contains("nobody read"), "and why: {doc}");
+
+        // It is the same Claude, started by the same person, on the same
+        // account. A standing caution about that reads as though abeam had
+        // found something to be alarmed about, and there is nothing here to be
+        // alarmed about — so the word does not appear on this pane at all.
+        assert!(!doc.contains("quota"), "the pane is warning about the bill: {doc}");
         let text = screen(&mut p, 70, 24);
-        assert!(text.contains("quota"), "{text}");
+        assert!(!text.contains("quota"), "{text}");
+
+        // What *is* said about cost is the part somebody can act on: a
+        // conversation left open is re-sent as context and so goes on being
+        // paid for, and there is a key for that.
+        assert!(doc.contains("ctrl+l"), "the way to stop paying for it: {doc}");
         assert!(text.contains("Glob"), "{text}");
+        // Not offered over an empty pane, where it would do nothing.
+        assert!(!text.contains(CLEAR), "{text}");
         assert!(p.launch().is_some(), "it resolved something to start");
+    }
+
+    #[test]
+    fn clearing_ends_the_conversation_rather_than_only_the_rows_showing_it() {
+        // The point of the key. What costs money is the context the child is
+        // holding, not the rows on screen — every turn is sent again with the
+        // next one — so a clear that emptied the pane and kept the child would
+        // hide the evidence and leave the bill.
+        let mut p = live();
+        ask(&mut p, "what does this file do?");
+        answer(&mut p, "It parses `stream-json`.\n\n```sh\ncargo test ask\n```\n");
+        p.sync();
+        assert!(!p.entries.is_empty());
+        assert_eq!(p.commands, ["cargo test ask"]);
+        assert!(screen(&mut p, 70, 24).contains(CLEAR), "the key is offered");
+
+        assert_eq!(
+            p.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+                .expect("ctrl+l"),
+            Handled::Yes
+        );
+
+        assert!(p.entries.is_empty(), "the transcript survived the clear");
+        assert!(p.commands.is_empty(), "a command from the old answer is still offered");
+        assert!(
+            p.take_reset(),
+            "the pane cleared itself and left the child running, which is the \
+             one thing this key exists to prevent"
+        );
+        assert!(!p.take_reset(), "a reset acted on once is acted on once");
+
+        // The tool list goes back to unknown, because there is no child now and
+        // a row still reading `Read Grep Glob` would describe a process that
+        // does not exist.
+        assert!(p.tools.is_none());
+        assert!(screen(&mut p, 70, 24).contains("no reader yet"));
+    }
+
+    #[test]
+    fn clearing_keeps_the_draft_and_the_file_the_reader_attached() {
+        // Two intentions, and only one of them was expressed. Someone who has
+        // typed half a question and then decides to start the conversation
+        // afresh has not asked to lose what they typed — and they pressed `?`
+        // on a file, so starting again means starting again *about that file*.
+        let mut p = live();
+        ask(&mut p, "first");
+        answer(&mut p, "an answer");
+        p.sync();
+        p.attach(Some(AskContext {
+            label: "viewer.rs".to_string(),
+            path: PathBuf::from("/repo/crates/abeam/src/panes/viewer.rs"),
+        }));
+        for c in "half a question".chars() {
+            p.handle_key(key(KeyCode::Char(c))).expect("a letter");
+        }
+
+        p.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .expect("ctrl+l");
+
+        assert_eq!(p.composing, "half a question");
+        assert_eq!(
+            p.context.as_ref().map(|c| c.label.as_str()),
+            Some("viewer.rs")
+        );
+        assert!(p.entries.is_empty());
     }
 
     #[test]
@@ -1895,8 +2056,12 @@ mod tests {
         p.on_event(AskEvent::Broke("not JSON: <html>".to_string()));
         let doc = p.source();
         assert!(doc.contains("resets at 14:00"), "{doc}");
-        // ...and it says why a rate limit here is not a surprise.
-        assert!(doc.contains("same account"), "{doc}");
+        // Said plainly, and without a paragraph about whose account this is.
+        // A rate limit is news about the account rather than about this pane —
+        // it is the same one the agent in the left pane is using — and the
+        // reader is looking for when it lifts, which is the part the child
+        // said.
+        assert!(!doc.contains("quota"), "a lecture about the bill: {doc}");
         assert!(doc.contains("could not read a line"), "{doc}");
         let text = screen(&mut p, 70, 30);
         assert!(text.contains("14:00"), "and it is drawn: {text}");
@@ -2419,7 +2584,6 @@ mod tests {
         let text = screen(&mut p, 70, 12);
         assert!(text.contains("no reader yet"), "{text}");
         assert!(!text.contains("read-only"), "a claim with nothing behind it");
-        assert!(text.contains(QUOTA), "{text}");
 
         p.on_event(AskEvent::Ready {
             session_id: "1e6a7c40-0000-4000-8000-000000000001".to_string(),
@@ -2428,7 +2592,6 @@ mod tests {
         });
         let text = screen(&mut p, 70, 12);
         assert!(text.contains("Glob Grep Read"), "{text}");
-        assert!(text.contains(QUOTA), "the other half of the row: {text}");
         // What is *not* there is the point of showing the list at all.
         for forbidden in ["Write", "Edit", "Bash"] {
             assert!(!text.contains(forbidden), "{forbidden} is on screen: {text}");

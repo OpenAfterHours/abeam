@@ -342,6 +342,15 @@ pub const HELP: &[(&str, &str)] = &[
         "Enter (ask)",
         "send · with nothing typed, type the chosen command at the shell",
     ),
+    // Its own row rather than a clause on the one above, because what it does
+    // is not what a reader would guess from "clear": it ends the *session*, not
+    // the rows showing it. That is the whole point — a conversation left open
+    // is re-sent as context with every question, so the file you have finished
+    // with goes on being paid for until the child holding it is gone.
+    (
+        "Ctrl+L (ask)",
+        "end the conversation and start fresh — the child goes too",
+    ),
     // The parenthetical is an exhaustive list of the panes that deviate, which
     // is the only thing that makes it worth having, so a view that deviates has
     // to be added to it on the day it lands. The ask is the fourth: `q` is a
