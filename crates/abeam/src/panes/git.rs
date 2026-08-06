@@ -751,6 +751,19 @@ impl Pane for GitPane {
         }
 
         match key.code {
+            // `Ctrl` plus a letter is the agent's everywhere in this program,
+            // and this is the arm that keeps it so here. `crate::scroll::key`
+            // hands it *back* rather than declining it — deliberately, so that
+            // a pane's own table is where the decision gets made — and the
+            // plain-letter arms below would otherwise take it: `Ctrl+R` asked
+            // git for a fresh diff and `Ctrl+W` opened the worktree list, for
+            // chords aimed at the agent. The viewer's document view has the same
+            // arm, which is what makes the claim below about the two panes
+            // agreeing a true one.
+            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(Handled::No);
+            }
+
             KeyCode::Tab => self.select(1),
             KeyCode::BackTab => self.select(-1),
             KeyCode::Enter => self.open = self.openable_path().map(str::to_owned),
@@ -772,7 +785,11 @@ impl Pane for GitPane {
             // Ctrl and Alt are excluded by name rather than by
             // `modifiers.is_empty()`: `?` is a shifted key on most layouts, so
             // SHIFT arrives with it and must not disqualify it. The viewer's
-            // arm says the same thing the same way.
+            // arm says the same thing the same way. (The CONTROL half is
+            // already covered by the arm at the top of this match; naming it
+            // here keeps the two panes' rule readable as one rule rather than
+            // two that happen to agree — which is the viewer's own note,
+            // repeated because the two arms now really do agree.)
             KeyCode::Char('?')
                 if !key
                     .modifiers
@@ -2606,6 +2623,41 @@ mod tests {
             .collect();
         assert!(shown.contains("worker stopped"), "{shown}");
         assert!(!shown.contains("reading the repository"), "{shown}");
+    }
+
+    #[test]
+    fn ctrl_and_a_letter_is_the_agents_here_as_it_is_in_the_pane_next_door() {
+        // `crate::scroll::key` hands `Ctrl` plus a letter *back* rather than
+        // declining it, so a pane's own table is where the decision gets made —
+        // and this pane's plain-letter arms took it. `Ctrl+W` opened the
+        // worktree list and started a `claude agents --json` behind it, and
+        // `Ctrl+R` asked git for a fresh diff, both for chords the reader aimed
+        // at the agent. The viewer's document view has said this since it was
+        // written; this pane claimed parity with it and did not have it.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        for letter in ['w', 'r', 'a', 'e'] {
+            assert_eq!(
+                pane.handle_key(KeyEvent::new(
+                    KeyCode::Char(letter),
+                    KeyModifiers::CONTROL
+                ))
+                .unwrap(),
+                Handled::No,
+                "Ctrl+{letter} was eaten by the git pane"
+            );
+        }
+        assert!(
+            !pane.wants_worktrees(),
+            "a chord aimed at the agent opened the worktree list"
+        );
+
+        // The bare letters still work, which is what makes the arm a rule about
+        // the modifier rather than about the keys.
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('w'))).unwrap(),
+            Handled::Yes
+        );
+        assert!(pane.wants_worktrees());
     }
 
     // --- the worktree list -------------------------------------------------

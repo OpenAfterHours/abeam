@@ -42,11 +42,27 @@
 //!   `["Glob","Grep","Read"]` and nothing else. **That flag is the read-only
 //!   guarantee.** A permission mode is a mode; this is the tool list.
 //! - `--session-id` was accepted and echoed on every line.
+//! - **`total_cost_usd` is that turn's cost and not a running total**, which
+//!   matters because the pane both prints it per turn and adds them up for the
+//!   title, and those two are only both right on this reading. Two turns down
+//!   one stdin came back $0.0544 and $0.0589; a cumulative field would have
+//!   made the second ≈$0.113. `num_turns` resets with it — 3 then 2 on a
+//!   second run — so neither field describes the session. It is recorded here
+//!   because the name says the opposite and the company it keeps on the
+//!   `result` line says the opposite, so the next reader will doubt it too.
 //! - The child wrote `~/.claude/sessions/<pid>.json` with `"kind":"interactive"`
 //!   and abeam's own `cwd`. See the section below, which is the most important
 //!   thing in this file.
-//! - Hooks still ran. `--strict-mcp-config` is about MCP servers and does not
-//!   disable them.
+//! - **Hooks still ran.** `--strict-mcp-config` is about MCP servers and does
+//!   not disable them, and neither does a tool list: a hook is an arbitrary
+//!   shell command the session runs on its own events, gated by nothing on
+//!   [`AskSession::args`]'s list. That observation is what [`SETTING_SOURCES`]
+//!   was added for — the repository's own `.claude/settings.json` no longer
+//!   loads, so a checkout cannot configure the reader abeam started to read it.
+//!   The user's own hooks, in `~/.claude`, still run. The claim this module
+//!   makes is therefore "it has no tool that can change a file, and nothing the
+//!   *repository* configured runs in it", which is narrower than "nothing runs
+//!   in it" and is the true one.
 //!
 //! ## The read-only claim, tested by asking it to write
 //!
@@ -144,7 +160,8 @@ use crate::launch::Launch;
 
 pub use proto::{AskEvent, new_session_id};
 
-/// The tools the child is given, and the whole of the read-only claim.
+/// The tools the child is given, and the load-bearing half of the read-only
+/// claim.
 ///
 /// An allowlist over the built-in set: what is not named here does not exist
 /// for that session, so there is no `Write`, no `Edit`, no `Bash` to permit or
@@ -152,6 +169,14 @@ pub use proto::{AskEvent, new_session_id};
 /// one thing which must never drift — what authority a second agent is handed —
 /// is a line a test can assert against, exactly as `crate::dispatch` does for
 /// the authority *it* hands out.
+///
+/// **Not the whole of it, and saying so is the point of this paragraph.** A
+/// tool list governs what the model may ask for. It says nothing about what the
+/// session loads on the way up: the observations above record that hooks still
+/// ran, and a hook is an arbitrary shell command gated by no tool list at all.
+/// [`SETTING_SOURCES`] is what narrows that, and it narrows rather than closes
+/// it. The honest claim is the pair of them together, with the remainder named
+/// where the pair is assembled — see [`AskSession::args`].
 pub const TOOLS: &str = "Read,Grep,Glob";
 
 /// The permission posture this child starts in, which is not the load-bearing
@@ -181,6 +206,38 @@ const PERMISSION_MODE: &str = "plan";
 /// to edit somebody's repository.
 const DISALLOWED: &str = "Write,Edit,NotebookEdit,Bash";
 
+/// Whose settings this child loads, which is the flag that keeps a repository
+/// from configuring the reader abeam started to read it.
+///
+/// `user` and not `user,project`, so `.claude/settings.json` in the repository
+/// on screen — and `.claude/settings.local.json` beside it — do not load.
+/// **The reason is hooks.** A hook is an arbitrary shell command, run by the
+/// session on events like `PreToolUse`, and it is gated by *no* tool list:
+/// [`TOOLS`] can be honoured exactly, as it was observed to be, and a
+/// `SessionStart` hook still runs whatever it likes. Without this flag a
+/// checkout could put a command in a file and have abeam run it in a pane that
+/// tells the reader nothing here can change anything. `--strict-mcp-config`
+/// closes the same door for MCP servers and does not touch hooks; the module
+/// docs record `Hooks still ran` from the run that found this out.
+///
+/// **It narrows the claim rather than making it absolute, and that is worth
+/// reading twice.** The user's *own* hooks — the ones in `~/.claude` — still
+/// run, because `user` is exactly what is kept. That is the right side of the
+/// line to come down on: those are the reader's own settings, on the reader's
+/// own machine, which they configured and can inspect, and dropping them too
+/// would mean a pane that quietly ignores the machine it is running on. What is
+/// excluded is the half nobody chose: whatever happens to be committed in the
+/// repository somebody has just opened.
+///
+/// The flag itself was checked against a real Claude rather than taken from the
+/// help text, and that check is worth naming because of how it would fail: an
+/// argument this CLI did not accept would not degrade to a session with wider
+/// settings, it would be a child that refuses to start at all, and the pane
+/// would report a reader that never arrives. On 2.1.222 it is accepted —
+/// `system`/`init` came back with `["Glob","Grep","Read"]`, `mcp_servers`
+/// empty, and the turn answered normally.
+const SETTING_SOURCES: &str = "user";
+
 /// A live child, its pipes, and the reader threads draining them.
 pub struct AskSession {
     /// The id abeam chose and passed on the command line — **not** the one the
@@ -201,7 +258,18 @@ pub struct AskSession {
     /// any of the three ways a session ends: stdout closing, the channel
     /// disconnecting, or the child having exited. So it is at most one frame
     /// behind, and the frame it is behind by is the one that notices.
+    ///
+    /// **Four setters and not three.** [`AskSession::ask`] is the fourth: a
+    /// write that fails means the other end of the pipe has gone, and a session
+    /// that cannot be written to is over whatever the reader threads have got
+    /// round to saying. Enumerating three of them was how the guard on the reap
+    /// below came to look safe.
     live: bool,
+    /// How many times [`AskSession::poll`] has found the child gone and waited
+    /// on it. A test's only way to prove a reap happened, since a `Child` keeps
+    /// no note of it; the same seam `AskPane::builds` is for the frame path.
+    #[cfg(test)]
+    reaps: usize,
 }
 
 /// Which pipe a reader thread is draining.
@@ -289,6 +357,8 @@ impl AskSession {
             stdin: Some(stdin),
             events,
             live: true,
+            #[cfg(test)]
+            reaps: 0,
         })
     }
 
@@ -297,21 +367,31 @@ impl AskSession {
     /// authority handed to a second agent is the one thing here that must never
     /// drift, and this is what a test can hold still.
     ///
-    /// Ten flags, and only three of them are about authority. `-p` with the two
-    /// stream formats and `--include-partial-messages` are the shape — a
-    /// long-lived print-mode child, JSON in, JSON out, and the answer arriving
-    /// while it is being written rather than at the end. `--verbose` is not an
-    /// option there either: `--output-format stream-json` needs it under `-p`.
-    /// `--session-id` is the whole of §4 next door, and is what
-    /// `crate::agentstate` disowns.
+    /// Eleven flags, and five of them are about authority — which is a
+    /// correction rather than a count: this paragraph said "three" while the
+    /// one below it named a fourth, and there is now a fifth.
     ///
-    /// The three that decide what this child can do are [`TOOLS`],
-    /// [`PERMISSION_MODE`] and [`DISALLOWED`], and each has its own paragraph
-    /// where it is defined. `--strict-mcp-config` is the fourth thing worth
-    /// reading twice: `--tools` is an allowlist over the *built-in* set and
-    /// says nothing about MCP servers, so without it a user's configured
-    /// servers — a database, a deployment tool, a thing that posts messages —
-    /// would be loaded into a session abeam has told the reader is read-only.
+    /// The six that are not are the shape. `-p` with the two stream formats and
+    /// `--include-partial-messages` make a long-lived print-mode child, JSON in,
+    /// JSON out, with the answer arriving while it is being written rather than
+    /// at the end. `--verbose` is not an option there either: `--output-format
+    /// stream-json` needs it under `-p`. `--session-id` is the whole of §4 next
+    /// door, and is what `crate::agentstate` disowns.
+    ///
+    /// The five that decide what this child can do are [`TOOLS`],
+    /// [`PERMISSION_MODE`], [`DISALLOWED`], `--strict-mcp-config` and
+    /// [`SETTING_SOURCES`], and each has its own paragraph where it is defined.
+    /// The last two are the ones worth reading twice, because both close doors
+    /// a tool list does not reach. `--tools` is an allowlist over the *built-in*
+    /// set: it says nothing about MCP servers, so without `--strict-mcp-config`
+    /// a user's configured servers — a database, a deployment tool, a thing that
+    /// posts messages — would be loaded into a session abeam has told the reader
+    /// is read-only; and it says nothing about hooks, which are arbitrary shell
+    /// commands the session runs on its own events, so without
+    /// `--setting-sources` the repository on screen could configure the reader
+    /// abeam started to read it. **The user's own hooks still run**, by design —
+    /// see [`SETTING_SOURCES`] — so what this list buys is a narrower claim
+    /// rather than an absolute one.
     ///
     /// **There is no prompt on this list.** That is the difference between this
     /// module and `crate::dispatch`, where the last argument is the user's text
@@ -334,6 +414,8 @@ impl AskSession {
             "--permission-mode",
             PERMISSION_MODE,
             "--strict-mcp-config",
+            "--setting-sources",
+            SETTING_SOURCES,
             "--session-id",
             session_id,
             "--disallowedTools",
@@ -439,7 +521,22 @@ impl AskSession {
         // After the drain rather than before, so that the events a child
         // produced on its way out are never dropped in favour of the news that
         // it is gone.
-        if self.live && matches!(self.child.try_wait(), Ok(Some(_))) {
+        //
+        // **Unconditionally, and the `self.live &&` that used to be here is why
+        // this comment is longer than the line.** The drain above sets `live`
+        // false the moment `Ended` arrives, and `Ended` is sent when stdout
+        // closes — which is the same pass on which a child usually exits. So the
+        // guard skipped `try_wait` on exactly the pass where the wait was owed,
+        // and on every pass after it: measured at zero reaps across five hundred
+        // polls of a session whose child had gone. The line that claimed to
+        // prevent a zombie guaranteed one. `try_wait` on an already-waited child
+        // is a cached answer rather than a syscall, so the cost of asking after
+        // the session has ended is nothing.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            #[cfg(test)]
+            {
+                self.reaps += 1;
+            }
             self.live = false;
         }
         arrived
@@ -462,24 +559,36 @@ impl AskSession {
     /// one may belong to something else entirely. [`AskSession::session_id`] is
     /// the answer to that question.
     ///
-    /// `None` once the session is not live, for the second of those reasons: a
-    /// pid whose process has exited is a number that names whatever gets it
-    /// next.
-    // The one method on this type the wiring next door does not call, and it
-    // stays for the reason `crate::agentstate`'s `Wire` keeps the fields it
-    // parses ahead of a consumer: nothing abeam draws wants a pid today,
-    // `crate::agentstate` wants the *id* and says at length why the pid would
-    // be the wrong key, and this module's own tests are what a `Drop` that
-    // failed to kill anything would be caught by. Removing it would mean the
-    // next thing that needs to name this process re-deriving which of the two
-    // numbers is safe, which is exactly the question the doc above has already
-    // answered.
-    #[allow(
-        dead_code,
-        reason = "the honest handle on a child, tested ahead of a consumer"
-    )]
+    /// `None` once the session is not live — which is *nearly* "once the process
+    /// has exited" and is not the same sentence. `live` also goes false when
+    /// stdout closes and when the channel disconnects, and a child can close its
+    /// standard output and go on running. So this answers "is there still a
+    /// session whose pid means anything", and a `None` here is not evidence that
+    /// the process is gone. The direction it is wrong in is the safe one: it
+    /// stops naming the number slightly before the number stops naming this
+    /// process, rather than after.
+    // `#[cfg(test)]` because all three call sites are, and compiling it that way
+    // is what makes that true rather than asserted. It used to carry an `allow`
+    // and a claim of precedent from `crate::agentstate`'s `Wire`, which has no
+    // field held ahead of a consumer and no `allow` anywhere in the file — the
+    // comment was arguing from a thing that does not exist. What it is for is
+    // the `Drop` test, which needs a number to ask the operating system about
+    // after the session has been dropped.
+    #[cfg(test)]
     pub fn pid(&self) -> Option<u32> {
         self.live.then(|| self.child.id())
+    }
+
+    /// Has the child exited, asked of the operating system and of nothing else?
+    ///
+    /// For the one test next door that has to know a child has gone *without*
+    /// draining the channel that would say so — the whole subject there is what
+    /// happens on the pass where an `Ended` is still queued. It touches neither
+    /// `live` nor the reap count, so a test using it is not also arranging the
+    /// answer to the question it is asking.
+    #[cfg(test)]
+    pub fn exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     pub fn is_live(&self) -> bool {
@@ -752,6 +861,8 @@ mod tests {
                 "--permission-mode",
                 "plan",
                 "--strict-mcp-config",
+                "--setting-sources",
+                "user",
                 "--session-id",
                 "3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e",
                 "--disallowedTools",
@@ -759,13 +870,33 @@ mod tests {
             ])
         );
 
-        // The three constants the module documents, spelled once each so that
+        // The four constants the module documents, spelled once each so that
         // changing one is visibly changing that rather than editing a vector.
         let list = AskSession::args("x");
         assert_eq!(TOOLS, "Read,Grep,Glob");
         assert!(list.contains(&TOOLS.to_string()));
         assert!(list.contains(&PERMISSION_MODE.to_string()));
         assert!(list.contains(&DISALLOWED.to_string()));
+        assert!(list.contains(&SETTING_SOURCES.to_string()));
+
+        // The repository's own settings do not load, which is the half of the
+        // claim a tool list cannot make: a hook is an arbitrary shell command
+        // and no allowlist on this line gates one. `project` and `local` are
+        // named here rather than only `user` being asserted, because the way
+        // this regresses is somebody widening the value rather than deleting
+        // the flag.
+        let sources = list
+            .iter()
+            .position(|arg| arg == "--setting-sources")
+            .map(|at| list[at + 1].clone())
+            .expect("the flag that keeps a checkout from configuring the reader");
+        assert_eq!(sources, "user");
+        for whose in ["project", "local"] {
+            assert!(
+                !sources.split(',').any(|source| source == whose),
+                "`{whose}` settings load into a pane that says it can only read"
+            );
+        }
 
         // And the belt-and-braces claim, which is only worth anything if the
         // two lists really are disjoint: nothing that can change a file is on
@@ -1337,6 +1468,38 @@ mod tests {
         assert!(after.contains("has been closed"), "got: {after}");
         assert!(after.contains("new session"), "the way through: {after}");
         assert!(!session.is_live());
+    }
+
+    #[test]
+    fn a_child_that_has_gone_is_waited_on_rather_than_left_a_zombie() {
+        // The reap, which used to be guarded by `self.live` — and `live` is set
+        // false by the drain in the same call, on the very pass where the child
+        // has just gone. So `try_wait` was skipped on the pass that owed the
+        // wait and on every pass after it: measured at zero reaps across five
+        // hundred polls. A child that has exited and never been waited on is a
+        // zombie on Unix for as long as abeam runs, and the pane can sit on an
+        // ended session for the rest of the day.
+        let dir = TempDir::new("ask-reap");
+        let script = shim(&dir, "claude", &[says("bye")]);
+
+        let mut session = through(&script, dir.path());
+        wait_for(&mut session, "the shim to exit", |seen| {
+            any(seen, |event| matches!(event, AskEvent::Ended))
+        });
+        assert!(!session.is_live(), "the drain has already said it is over");
+
+        // Bounded rather than a single call, because `Ended` says stdout has
+        // closed and the process has a few instructions left to run after that.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.reaps == 0 && Instant::now() < deadline {
+            session.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            session.reaps > 0,
+            "the child was never waited on, which is the zombie the comment \
+             above that line claims it prevents"
+        );
     }
 
     #[test]

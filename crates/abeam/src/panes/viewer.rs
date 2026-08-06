@@ -1567,6 +1567,16 @@ impl Pane for ViewerPane {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Handled> {
+        // **`?` is inert in both of the two branches below, and the omission is
+        // deliberate rather than missed.** The document view answers `?` with
+        // "the file on screen"; a file *list* and a page of grep hits have a
+        // selection instead, and the selection moves — so a `?` there would have
+        // to decide between the row under the cursor and the search that
+        // produced it, and would be attaching something the reader has not
+        // opened. `Enter` opens the row, and then `?` means exactly one thing.
+        // The git pane's list is a different case and does take `?`: there the
+        // selection *is* the subject, because a diff has no second reading.
+        //
         // The results own every key while they are up, for the reason the list
         // does one branch down — and `f` is claimed here rather than delegated
         // because it is the key that opened this view and the key that reopens

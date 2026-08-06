@@ -552,6 +552,13 @@ struct Wire {
 /// default. Nothing about the config file is left in an odd state by choosing
 /// it, which is the whole of the test `Diag` fails.
 ///
+/// That last claim is upheld in `crate::app::App::new` and nowhere else, and it
+/// is worth naming the line because the obvious spelling of it is wrong:
+/// remembering the *opening* view as the one to put back makes `Esc` out of an
+/// ask that was opened from a config file call `set_right_view(Ask)`, which is
+/// the key that could never leave. `App::set_right_view` cannot cover it,
+/// because the first view of all never goes through a switch.
+///
 /// `files` rather than `viewer`, because that is what the pane is called
 /// everywhere a user meets it: the README's tour, the `F1` key list, the border.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
