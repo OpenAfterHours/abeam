@@ -4949,6 +4949,23 @@ mod tests {
             assert!(Instant::now() < deadline, "the shim never exited");
             std::thread::sleep(Duration::from_millis(10));
         }
+        // **The state this test is about only exists on one platform, and CI
+        // is what established that rather than anything anybody predicted.**
+        //
+        // `ask` clears `live` when the write fails, and whether it fails is the
+        // platform's answer and not abeam's: a write to a pipe whose reader has
+        // gone is `EPIPE` on Unix and is accepted into the buffer on Windows.
+        // The shim above prints one line and exits without ever reading, so by
+        // the time a second question is asked the reader is gone on both — and
+        // only Windows says nothing about it.
+        //
+        // So the hazard this whole fix exists for — a question typed, sent, and
+        // silently lost — is Windows-only. On Unix the same mistake was always
+        // loud. The assertion is twinned rather than relaxed, because a single
+        // one that passed everywhere would have to be the weaker of the two,
+        // and the weaker one is exactly the one that stops being about
+        // anything.
+        #[cfg(windows)]
         assert!(
             fx.app.spaces[0]
                 .ask_session
@@ -4956,6 +4973,16 @@ mod tests {
                 .is_some_and(AskSession::is_live),
             "nothing has polled yet, so the app still believes it is live — \
              which is the state this test is about"
+        );
+        #[cfg(unix)]
+        assert!(
+            !fx.app.spaces[0]
+                .ask_session
+                .as_ref()
+                .is_some_and(AskSession::is_live),
+            "on Unix the write to the dead pipe should already have failed \
+             loudly and cleared the flag — if this ever passes, the silent \
+             loss above is no longer Windows-only and the comment is wrong"
         );
 
         asked(&mut fx, "two");
