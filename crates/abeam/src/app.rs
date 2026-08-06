@@ -4729,6 +4729,34 @@ mod tests {
         crate::launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves")
     }
 
+    /// A reader that takes exactly one question and then leaves.
+    ///
+    /// The difference from [`a_reader_that_leaves`] is one line of shell and it
+    /// is the whole reason this exists. That one prints and exits at once, so
+    /// on Unix it is a **race against the first write**: `#!/bin/sh` printing a
+    /// line is gone in microseconds, and whether abeam's write to its standard
+    /// input lands before or after that is the scheduler's business. Losing the
+    /// race is `EPIPE`, which `AskSession::ask` reports by clearing `live` — so
+    /// the state a test wants to set up here, *child gone and abeam still
+    /// believing otherwise*, was there on some runs and not others. Two CI runs
+    /// disagreed about it in opposite directions, which is how it was found.
+    ///
+    /// Blocking on the read first removes the race rather than tolerating it:
+    /// the child cannot exit until it has taken the question, so the write
+    /// always lands, and the exit always follows it. Windows was never racy —
+    /// a write into a pipe buffer succeeds whether or not anybody is reading —
+    /// so this changes nothing there and makes the two platforms agree.
+    #[cfg(windows)]
+    fn a_reader_that_answers_one_and_leaves(dir: &TempDir) -> Launch {
+        let script = dir.write("abeam-once.cmd", b"@echo off\r\nset /p LINE=\r\n");
+        crate::launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves")
+    }
+    #[cfg(unix)]
+    fn a_reader_that_answers_one_and_leaves(dir: &TempDir) -> Launch {
+        let script = dir.write_exec("abeam-once", b"#!/bin/sh\nread -r LINE\n");
+        crate::launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves")
+    }
+
     /// Point the agent's own workspace at a reader that is not the machine's.
     ///
     /// Takes the *builder* rather than a `Launch`, because two of the three
@@ -4921,7 +4949,7 @@ mod tests {
         // succeed into a buffer on Windows, raising no error and putting no note
         // in the transcript. A question typed, sent, and silently lost.
         let mut fx = app();
-        reading(&mut fx, a_reader_that_leaves);
+        reading(&mut fx, a_reader_that_answers_one_and_leaves);
         asked(&mut fx, "one");
         fx.app.pump();
         let first = session_id(&fx);
@@ -4949,23 +4977,11 @@ mod tests {
             assert!(Instant::now() < deadline, "the shim never exited");
             std::thread::sleep(Duration::from_millis(10));
         }
-        // **The state this test is about only exists on one platform, and CI
-        // is what established that rather than anything anybody predicted.**
-        //
-        // `ask` clears `live` when the write fails, and whether it fails is the
-        // platform's answer and not abeam's: a write to a pipe whose reader has
-        // gone is `EPIPE` on Unix and is accepted into the buffer on Windows.
-        // The shim above prints one line and exits without ever reading, so by
-        // the time a second question is asked the reader is gone on both — and
-        // only Windows says nothing about it.
-        //
-        // So the hazard this whole fix exists for — a question typed, sent, and
-        // silently lost — is Windows-only. On Unix the same mistake was always
-        // loud. The assertion is twinned rather than relaxed, because a single
-        // one that passed everywhere would have to be the weaker of the two,
-        // and the weaker one is exactly the one that stops being about
-        // anything.
-        #[cfg(windows)]
+        // Nothing has polled, so the remembered answer is still the one from
+        // before the child left — which is the whole state under test. It holds
+        // on both platforms only because the shim consumes the question before
+        // exiting; see [`a_reader_that_answers_one_and_leaves`] for the race
+        // that made this assertion disagree with itself across two CI runs.
         assert!(
             fx.app.spaces[0]
                 .ask_session
@@ -4973,16 +4989,6 @@ mod tests {
                 .is_some_and(AskSession::is_live),
             "nothing has polled yet, so the app still believes it is live — \
              which is the state this test is about"
-        );
-        #[cfg(unix)]
-        assert!(
-            !fx.app.spaces[0]
-                .ask_session
-                .as_ref()
-                .is_some_and(AskSession::is_live),
-            "on Unix the write to the dead pipe should already have failed \
-             loudly and cleared the flag — if this ever passes, the silent \
-             loss above is no longer Windows-only and the comment is wrong"
         );
 
         asked(&mut fx, "two");
