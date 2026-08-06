@@ -48,6 +48,33 @@
 //! - Hooks still ran. `--strict-mcp-config` is about MCP servers and does not
 //!   disable them.
 //!
+//! ## The read-only claim, tested by asking it to write
+//!
+//! The list above says what the child was *given*. A second run, on the same
+//! day and with [`AskSession::args`]'s list exactly as it stands, asked it the
+//! other question: it was pointed at a throwaway directory holding one file and
+//! told to create a second one.
+//!
+//! It could not. The directory still held one file afterwards, and the child
+//! said so itself — "the only tools available this session are Glob, Grep and
+//! Read". `mcp_servers` came back `[]`, which is the half of `--strict-mcp-config`
+//! worth having: an MCP tool would arrive in `tools` as `mcp__server__tool` and
+//! nothing here filters that list, so the flag mattering is a fact to check
+//! rather than assume. It read the existing file correctly in the same session,
+//! so this is a session that reads and cannot write, rather than one that is
+//! merely broken.
+//!
+//! **One nuance, and it is the reason this paragraph is not shorter: the model
+//! still emitted a `Write` tool call.** Being given three tools did not stop it
+//! *asking* for a fourth; what stopped the file appearing is that nothing
+//! executed the call. So the guarantee is enforcement, not the model's
+//! cooperation — which is the right way round, and is why [`TOOLS`] rather than
+//! any prompt is what this module points at when it says "read-only". It also
+//! means abeam cannot see the attempt: `permission_denials` on the `result`
+//! line came back empty, so there is nothing here to show a reader and nothing
+//! to count. A pane that promised to report refused writes would be promising
+//! something this format does not carry.
+//!
 //! ## The session record, and the bug it would otherwise be
 //!
 //! A print-mode child is **indistinguishable from the hosted agent by `kind`**.
@@ -438,6 +465,19 @@ impl AskSession {
     /// `None` once the session is not live, for the second of those reasons: a
     /// pid whose process has exited is a number that names whatever gets it
     /// next.
+    // The one method on this type the wiring next door does not call, and it
+    // stays for the reason `crate::agentstate`'s `Wire` keeps the fields it
+    // parses ahead of a consumer: nothing abeam draws wants a pid today,
+    // `crate::agentstate` wants the *id* and says at length why the pid would
+    // be the wrong key, and this module's own tests are what a `Drop` that
+    // failed to kill anything would be caught by. Removing it would mean the
+    // next thing that needs to name this process re-deriving which of the two
+    // numbers is safe, which is exactly the question the doc above has already
+    // answered.
+    #[allow(
+        dead_code,
+        reason = "the honest handle on a child, tested ahead of a consumer"
+    )]
     pub fn pid(&self) -> Option<u32> {
         self.live.then(|| self.child.id())
     }

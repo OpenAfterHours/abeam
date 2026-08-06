@@ -36,7 +36,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -45,6 +45,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::pane::{Handled, Pane};
+use crate::panes::AskRequest;
 use crate::scroll::{self, Scroll};
 use crate::text::{clip, clip_line, dim, elide_left, err};
 use crate::workspace;
@@ -127,6 +128,9 @@ pub struct GitPane {
     /// move it out from under someone who is reading.
     sel_path: Option<String>,
     open: Option<String>,
+    /// `?` — the ask view, and the selected file to ask about if the selection
+    /// names one. Drained by the shell like [`open`](Self::open) is.
+    ask: Option<AskRequest>,
 
     scroll: Scroll,
 
@@ -201,6 +205,7 @@ impl GitPane {
             sel: 0,
             sel_path: None,
             open: None,
+            ask: None,
             scroll: Scroll::default(),
             mode: Mode::Status,
             worktrees: Vec::new(),
@@ -313,11 +318,35 @@ impl GitPane {
     /// right only at the top of the tree. The worker asks git once and every
     /// report carries the answer.
     pub fn take_open_request(&mut self) -> Option<PathBuf> {
-        let base = match &self.report {
+        let base = self.base().to_path_buf();
+        self.open.take().map(|p| base.join(p))
+    }
+
+    /// The file `?` was pressed on, if `?` has been pressed.
+    ///
+    /// Draining, and drained unconditionally, for
+    /// [`take_open_request`](Self::take_open_request)'s reason — this is the
+    /// same wire with a different destination. The `Some(None)` case is the
+    /// interesting one and [`AskRequest`] carries the argument for it: `?` on a
+    /// row that names nothing readable still opens the view, because there is
+    /// no other key that does.
+    pub fn take_ask_request(&mut self) -> Option<AskRequest> {
+        self.ask.take()
+    }
+
+    /// Where a porcelain path is resolved from.
+    ///
+    /// The repository top level git reported, and `self.root` only until it has
+    /// said: porcelain paths are relative to the worktree root, so joining them
+    /// onto the directory abeam happens to have been started in is right only
+    /// at the top of the tree. One function because two callers now need the
+    /// same answer, and two copies of it would be two chances to open a file in
+    /// the wrong tree with no error at all — the file it lands on exists.
+    fn base(&self) -> &Path {
+        match &self.report {
             Report::Ok(snap) => snap.toplevel.as_deref().unwrap_or(&self.root),
             _ => &self.root,
-        };
-        self.open.take().map(|p| base.join(p))
+        }
     }
 
     /// Stand in for the user pressing Enter on a row. Reaching the real path
@@ -732,6 +761,30 @@ impl Pane for GitPane {
             // never in front of the agent. `Alt+W` is Claude's and is not what
             // this is.
             KeyCode::Char('w') => self.open_worktrees(),
+            // `?` for the ask view, about the file under the selection. Free
+            // in both vocabularies this pane matches, and pane-local for `w`'s
+            // reason exactly: the *intercept* paragraph at the top of
+            // `crate::keys`, which is about what `global` claims before a
+            // focused pane is offered anything. There is no `Alt` spelling of
+            // this and there is not meant to be — a question about the file you
+            // are looking at is asked from where you are looking at it.
+            //
+            // Ctrl and Alt are excluded by name rather than by
+            // `modifiers.is_empty()`: `?` is a shifted key on most layouts, so
+            // SHIFT arrives with it and must not disqualify it. The viewer's
+            // arm says the same thing the same way.
+            KeyCode::Char('?')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                // The path, resolved here rather than at the drain, because
+                // what `?` meant is what was selected at the moment it was
+                // pressed — a refresh between the two can move the selection.
+                let base = self.base().to_path_buf();
+                let path = self.openable_path().map(|p| base.join(p));
+                self.ask = Some(AskRequest(path));
+            }
             // Esc and q fall through: the shell reads an unhandled one as
             // "give focus back to the agent".
             _ => return Ok(Handled::No),
@@ -2320,6 +2373,51 @@ mod tests {
             occupant: None,
             watched: true,
         }
+    }
+
+    #[test]
+    fn question_mark_offers_the_selected_file_and_opens_the_pane_either_way() {
+        // Pane-local for `w`'s reason — the *intercept* paragraph at the top of
+        // `crate::keys` — and drained like the open request beside it.
+        //
+        // The half worth writing a test for is the second one. `?` is the only
+        // key that reaches the ask view, so a `?` pressed over a repository
+        // with nothing changed in it has to open the pane with no context
+        // rather than doing nothing at all, and that is the whole reason
+        // `AskRequest` is a newtype over an `Option` and not an `Option`.
+        let (mut pane, _asks, answers) = detached(ONE);
+        assert_eq!(pane.take_ask_request().map(|r| r.0), None, "nothing asked");
+
+        // Nothing has been reported yet, so there is nothing selectable...
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('?'))).unwrap(),
+            Handled::Yes
+        );
+        let AskRequest(nothing) = pane.take_ask_request().expect("the view still opens");
+        assert_eq!(nothing, None);
+        assert!(
+            pane.take_ask_request().is_none(),
+            "a request left sitting fires late, at whatever unrelated moment \
+             next reads it"
+        );
+
+        // ...and once there is, the path is absolute and resolved against the
+        // toplevel git reported rather than the directory abeam was started in.
+        let first = _asks.recv().expect("the pane asks on construction");
+        answers
+            .send(Answer {
+                generation: first.generation,
+                report: a_report("main"),
+            })
+            .expect("the pane is listening");
+        assert!(pane.tick());
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+
+        pane.handle_key(key(KeyCode::Char('?'))).unwrap();
+        let AskRequest(path) = pane.take_ask_request().expect("a request");
+        let path = path.expect("a selected file is something to ask about");
+        assert!(path.is_absolute());
+        assert!(path.ends_with("dirty.rs"), "got: {}", path.display());
     }
 
     #[test]

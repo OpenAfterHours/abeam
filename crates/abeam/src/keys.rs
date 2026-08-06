@@ -275,6 +275,16 @@ pub const HELP: &[(&str, &str)] = &[
     // this file, stated there once rather than re-argued beside every key that
     // relies on it.
     ("w", "git: the worktrees of this repository"),
+    // The second key that opens a view without being in the `Alt` table, and
+    // it is pane-local for `w`'s reason rather than for a reason of its own:
+    // the *intercept* paragraph at the top of this file. A question about the
+    // file you are reading is asked from where you are reading it, so the key
+    // is only ever delivered to a focused pane and no agent is listening for
+    // it. `Esc` puts back whatever view it displaced, the way `F2` does.
+    (
+        "?",
+        "files, git: ask a second Claude about the file on screen",
+    ),
     // The queue's own four. `space` is conspicuously not among them: it pages,
     // here as in every other pane, and arming moved to `a` rather than take a
     // key out of the shared vocabulary this table promises three rows above.
@@ -297,6 +307,27 @@ pub const HELP: &[(&str, &str)] = &[
     (
         "(in a find box)",
         "every letter is typed; arrows and Tab move, Esc leaves; f's box runs on Enter",
+    ),
+    // The same rule, and the ask pane needs its own row rather than being
+    // folded into the one above because the box there is never *shut*. A find
+    // box is a state you leave; the ask's composer is the pane, so `j`, `k`,
+    // `g`, `G`, `space` and `b` are letters for the whole of the time you are
+    // in it and the three scroll rows near the top of this table are simply
+    // untrue there. Naming exactly what does scroll is the honest version:
+    // this table must not promise a key that types a letter.
+    (
+        "(in the ask)",
+        "letters are typed; arrows, PgUp/PgDn, Home/End, Ctrl+D/U scroll",
+    ),
+    // `Enter` has a row above for the three views where it opens something.
+    // Here it does two things and neither is running a command: it sends the
+    // question, or — with nothing typed — types the selected command at the
+    // shell **without submitting it**, which is the whole promise of the
+    // hand-off. `Tab` walks the offered commands, which is the same "next /
+    // previous item" the row above already means.
+    (
+        "Enter (ask)",
+        "send · with nothing typed, type the chosen command at the shell",
     ),
     (
         "Esc or q",

@@ -39,12 +39,14 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::agentstate::Probe;
-use crate::config::Opening;
+use crate::ask::{self, AskSession};
+use crate::config::{Opening, Theme};
 use crate::keys::{self, Action};
 use crate::layout as abeam_layout;
 use crate::pane::{Focus, Pane};
 use crate::panes::{
-    DiagPane, FrameStats, GitPane, QueuePane, RightView, ShellPane, TerminalPane, ViewerPane,
+    AskContext, AskPane, AskRequest, DiagPane, FrameStats, GitPane, QueuePane, RightView,
+    ShellPane, TerminalPane, ViewerPane,
 };
 use crate::paths;
 use crate::watch::{Change, Watch};
@@ -107,6 +109,18 @@ const ROSTER_EVERY: Duration = Duration::from_secs(3);
 /// `crate::workspace::is_evidence` is where both directions are written out,
 /// because that is the function a reader is standing in when it matters.
 const WORKTREES_EVERY: Duration = Duration::from_secs(10);
+
+/// How long a command handed from the ask pane to the shell waits for a shell
+/// that can take it.
+///
+/// A window rather than a single attempt, because the common case is a hand-off
+/// to a shell that does not exist yet: `Alt+S` has never been pressed, the view
+/// switch is what spawns the child, and `pwsh` takes a few hundred milliseconds
+/// to print a prompt and enable bracketed paste. Ten seconds is long enough for
+/// a cold PowerShell on a busy machine and short enough that a shell which is
+/// never going to ask — `cmd.exe` never does — says so while the reader still
+/// remembers pressing the key.
+const HANDOFF_WINDOW: Duration = Duration::from_secs(10);
 
 /// Why the loop woke up.
 enum Wake {
@@ -253,18 +267,61 @@ struct Space {
     /// processes grows with the number of workspaces somebody has typed in, and
     /// each of them holds abeam open at `Alt+Q` until it is finished with.
     shell: ShellPane,
+    /// The second Claude, one per workspace and here for the shell's reason
+    /// rather than by analogy with it.
+    ///
+    /// `crate::ask::AskSession::start` makes the workspace root the child's
+    /// working directory, and a running process cannot be moved to another one
+    /// — the same sentence three lines up, about a different child. It matters
+    /// more here than it looks: context is a *path* and the child is expected to
+    /// go and read it, so a reader still standing in the workspace you left
+    /// would resolve `crates/abeam/src/app.rs` against the wrong checkout and
+    /// answer confidently about somebody else's file.
+    ///
+    /// So the cost the shell already books is booked again, honestly and in the
+    /// same place. Switching workspaces with the ask up starts a *second*
+    /// `claude` on the next question, each one holding a conversation the other
+    /// has never heard of, and each one spending the same quota as the agent in
+    /// the left pane. Cold until asked, so a session that never presses `?`
+    /// never pays for any of it — which is a stronger version of the shell's
+    /// rule, because this pane is cold until a *question*, not until a frame.
+    ask: AskPane,
+    /// The child behind that pane, owned here rather than by the pane itself.
+    ///
+    /// `Pane::tick` may not block and starting a process does, so the pane holds
+    /// the answer to "is there a Claude at all" and the app holds the session —
+    /// the arrangement `crate::panes::ask`'s module docs describe from the other
+    /// side, and the same one `QueuePane` has with `crate::dispatch`.
+    ///
+    /// `None` until the first question. Replaced rather than revived once it has
+    /// ended: a `claude -p` that has closed its stdout is not a session that can
+    /// be asked anything, and the old one is dropped — which kills it — as the
+    /// new one takes its place.
+    ask_session: Option<AskSession>,
     /// Whether the one watcher can see it. False for a worktree outside the
     /// agent's root, which falls back to the git pane's own two-second poll.
     watched: bool,
 }
 
 impl Space {
-    fn new(root: PathBuf, label: String, watched: bool) -> Self {
+    fn new(root: PathBuf, label: String, watched: bool, agent: &str, theme: Theme) -> Self {
         Self {
             // Read per space rather than once and cloned, so that the answer is
             // the same one `App::new` would have given: it is a setting, and
             // reading it twice from the same process cannot disagree.
             shell: ShellPane::new(root.clone(), std::env::var("ABEAM_SHELL").ok()),
+            ask: {
+                let mut ask = AskPane::new(root.clone(), agent);
+                // Before the first frame, for `ViewerPane::set_theme`'s reason:
+                // this pane paints its own background and draws through the
+                // reader's renderer, whose colours are absolute RGB chosen
+                // against a known page. A workspace opened mid-session inherits
+                // the palette the session is already on rather than starting
+                // dark under a reader that is light.
+                ask.set_theme(theme);
+                ask
+            },
+            ask_session: None,
             root,
             label,
             watched,
@@ -397,6 +454,25 @@ pub struct App {
     /// A sent prompt is sitting in the composer, waiting for the `Enter` that
     /// submits it on the next pass. See [`App::pump_queue`].
     submit_pending: bool,
+    /// A command the ask pane handed over, and the moment abeam stops waiting
+    /// for the shell to be able to take it. See [`App::pump_ask`].
+    ///
+    /// The same shape as [`submit_pending`](Self::submit_pending) and for a
+    /// related reason, though not the same one: that flag waits because two
+    /// writes in consecutive passes would be one message, and this one waits
+    /// because a cold `ShellPane` spawns on the frame that draws it, so the
+    /// keystroke that asked for the hand-off arrives before there is anything
+    /// to hand it to. The deadline is carried rather than the start, so the one
+    /// arithmetic that decides whether to give up is done where the wait is
+    /// armed and not on every pass of the loop.
+    ask_command: Option<(String, Instant)>,
+    /// Light or dark, as the session is on it now.
+    ///
+    /// Held here rather than read back out of the reader, because two panes now
+    /// answer to it and `F3` has to move both. The reader's own copy is the
+    /// authority for the reader; this is what a workspace opened later is
+    /// started on, which the reader has no way to be asked for.
+    theme: Theme,
     /// The repository on screen, kept because the workers need it and they
     /// cannot borrow from the panes that were built with it.
     root: PathBuf,
@@ -460,6 +536,8 @@ impl App {
                 root.clone(),
                 workspace::dir_label(&root),
                 watch_started,
+                agent,
+                opening.theme,
             )],
             at: 0,
             queue: QueuePane::new(root.clone(), agent),
@@ -502,6 +580,8 @@ impl App {
             dispatched_any: false,
             worktrees_wanted: false,
             submit_pending: false,
+            ask_command: None,
+            theme: opening.theme,
             root,
             agent: agent.to_string(),
         }
@@ -533,6 +613,17 @@ impl App {
         &mut self.spaces[at].shell
     }
 
+    fn ask(&self) -> &AskPane {
+        &self.workspace().ask
+    }
+
+    /// The same, mutably, and by the same route as
+    /// [`shell_mut`](Self::shell_mut) for the same borrow reason.
+    fn ask_mut(&mut self) -> &mut AskPane {
+        let at = self.at;
+        &mut self.spaces[at].ask
+    }
+
     /// Is there a live child in *any* workspace's command view?
     ///
     /// Every one of them, not just the one on screen, because that is what
@@ -540,6 +631,26 @@ impl App {
     /// has since switched away from is exactly as alive as one in front of them,
     /// and `Alt+Q` killing it without asking is the decision abeam does not get
     /// to make on its own.
+    ///
+    /// **A live ask child is deliberately not counted here, and the omission is
+    /// the decision rather than an oversight.** There is now a second kind of
+    /// child in a `Space` and it would be a one-line change to add it, so the
+    /// reason it is not added is written where somebody would make that change.
+    /// What this question protects is work that cannot be got back: ending a
+    /// shell can kill somebody's `cargo build` or a half-finished `git rebase`,
+    /// and abeam does not get to make that call on their behalf. Ending a
+    /// reader loses a conversation — which is nothing this program was keeping
+    /// anyway, since nothing here is persisted across a restart by design, and
+    /// which the reader can start again by asking. Holding the door for it
+    /// would mean `Alt+Q` asking twice for the rest of the session because
+    /// somebody asked one question an hour ago, and a confirmation that fires
+    /// when nothing is at stake is a confirmation nobody reads when something
+    /// is.
+    ///
+    /// The child is still killed. `AskSession`'s `Drop` does it, and `App::run`
+    /// takes `self` by value — so leaving that function drops every `Space`,
+    /// every session in one, and closes the standard input a `claude -p` exits
+    /// on. See [`App::finish`], which is the last thing that runs before it.
     fn any_shell_live(&self) -> bool {
         self.spaces.iter().any(|space| space.shell.is_live())
     }
@@ -601,6 +712,13 @@ impl App {
     ///   still-running-invisibly, and switching away from it is a one-way trip
     ///   until the build finishes. That is the cost, and it is smaller than the
     ///   alternative.
+    ///
+    /// "A live child" means the *shell's*, and an ask session in a removed
+    /// workspace goes with it — killed by the `Drop` that runs as the `Space`
+    /// is dropped, along with whatever was said in it. The same trade
+    /// [`any_shell_live`](Self::any_shell_live) makes at quit, made here for
+    /// the same reason: a conversation is not work somebody cannot get back,
+    /// and a directory git has been told to forget is not a place to keep one.
     fn sync_workspaces(&mut self, found: &[Worktree]) {
         for worktree in found {
             let label = workspace::label_of(worktree);
@@ -616,9 +734,13 @@ impl App {
                     space.label = label;
                     space.watched = watched;
                 }
-                None => self
-                    .spaces
-                    .push(Space::new(worktree.root.clone(), label, watched)),
+                None => self.spaces.push(Space::new(
+                    worktree.root.clone(),
+                    label,
+                    watched,
+                    &self.agent,
+                    self.theme,
+                )),
             }
         }
 
@@ -839,13 +961,26 @@ impl App {
         // it is also the workspace on screen.
         let at = self.at;
         let mut shell_dirty = false;
+        let mut ask_dirty = false;
         for (ix, space) in self.spaces.iter_mut().enumerate() {
             let dirty = space.shell.tick();
+            // Every workspace's ask pane too, and on the same terms. It owes a
+            // frame for what [`App::pump_ask`] fed it a moment ago, and the
+            // flag has to be taken from the hidden ones as well or it would
+            // still be set the next time one of them is looked at — a redraw
+            // for news that has already been on screen for an hour.
+            let asked = space.ask.tick();
             if ix == at {
                 shell_dirty = dirty;
+                ask_dirty = asked;
             }
         }
         redraw |= shell_dirty && self.right_view == RightView::Shell;
+        // Same rule, and it costs nothing to keep: an answer streaming into a
+        // pane nobody is looking at must not re-render the agent's screen at
+        // the frame ceiling, and switching to the view redraws on the keystroke
+        // that switches.
+        redraw |= ask_dirty && self.right_view == RightView::Ask;
 
         // Unlike the shell's, this pane's news counts while it is hidden, and
         // it has to: the countdown before an automatic send is drawn in the
@@ -972,6 +1107,16 @@ impl App {
     /// same session ending, delayed by however long the shell was busy — and
     /// reporting it as a detach would throw away both the transcript `main`
     /// prints and the status code anything scripting abeam reads.
+    ///
+    /// **This is the last thing that runs while the children still exist.**
+    /// [`App::run`] takes `self` by value and every caller of it is
+    /// `App::new(…).run(…)` — so returning from `run` drops the `App`, the
+    /// `Vec<Space>` in it, and every `AskSession` a `Space` is holding. That
+    /// `Drop` closes the child's standard input first and then kills it, which
+    /// is the whole of why nothing is done here: a second, explicit teardown
+    /// would be a second thing to keep correct, and the one that already exists
+    /// also runs on the paths this function is never reached from — a `?` out
+    /// of `draw`, and a console that has gone.
     fn finish(&mut self) -> Outcome {
         match self.agent_exit.take() {
             Some((status, screen)) => Outcome::Exited { status, screen },
@@ -1035,8 +1180,222 @@ impl App {
             redraw = true;
         }
 
+        // `?`, from whichever of the two panes can ask. Both are drained every
+        // pass and neither is short-circuited past the other: `or_else` here
+        // would leave the reader's request sitting whenever git also had one,
+        // to fire at whatever unrelated moment next read it. Git wins the tie,
+        // which cannot happen — one keystroke goes to one focused pane — and is
+        // decided rather than left to argument order.
+        let from_git = self.git.take_ask_request();
+        let from_reader = self.viewer.take_ask_request();
+        if let Some(AskRequest(path)) = from_git.or(from_reader) {
+            self.ask_mut().attach(path.map(ask_context));
+            self.set_right_view(RightView::Ask);
+            // Focused, because asking a question means typing one. Asked of
+            // the layout rather than of the last frame for `Action::ShowShell`'s
+            // reason — `set_right_view` has just un-zoomed, so the pane that is
+            // about to exist does not exist yet.
+            if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                self.focus = Focus::Right;
+            }
+            redraw = true;
+        }
+
+        redraw |= self.pump_ask();
         redraw |= self.pump_queue();
         redraw
+    }
+
+    /// The ask panes' two wires: a question out to a child, everything the
+    /// child says back into the pane, and the one command a reader chose to
+    /// hand to the shell.
+    ///
+    /// **Every workspace, every pass, whether or not it is the one on screen** —
+    /// the rule `tick_panes` keeps for the shells and for the same reason. A
+    /// `poll` is what drains the reader threads and what reaps the child, so a
+    /// session behind a workspace nobody has switched back to would otherwise
+    /// accumulate a conversation nobody reads and a zombie nobody waits on.
+    /// Which of them earns a *frame* is still only the one on screen, and that
+    /// is decided in `tick_panes` rather than here.
+    fn pump_ask(&mut self) -> bool {
+        let mut redraw = false;
+
+        // The hand-off to the shell, in two passes, and the gap between them is
+        // the point rather than an artefact. `ShellPane` spawns its child on
+        // the frame that draws it, so a cold shell cannot receive anything on
+        // the pass that switches to it — the same defer `pump_queue` makes for
+        // the agent's `Enter`, for a different reason.
+        if self.ask_command.is_none()
+            && let Some(text) = self.take_ask_command()
+        {
+            self.ask_command = Some((text, Instant::now() + HANDOFF_WINDOW));
+            self.set_right_view(RightView::Shell);
+            // Focused, like `Alt+S`: a command line you have to press a second
+            // key to correct is not a command line, and the whole promise here
+            // is that the reader gets to read it before it runs.
+            if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                self.focus = Focus::Right;
+            }
+            redraw = true;
+        } else if let Some((text, deadline)) = self.ask_command.take() {
+            // Retried rather than attempted once, which is where this stops
+            // being `pump_queue`'s pattern. The agent's pty has been running
+            // for the whole session by the time anything is queued for it; a
+            // shell spawned two passes ago has not printed a prompt yet, and
+            // `send_command` refuses until the child has asked for bracketed
+            // paste — which for PSReadLine is a few hundred milliseconds after
+            // the process exists. One attempt would silently drop the command
+            // in the ordinary case.
+            if self.shell_mut().send_command(&text) {
+                redraw = true;
+            } else if Instant::now() < deadline {
+                // Waiting, and deliberately not a frame. This branch runs at
+                // the loop's own rate, and a redraw on each pass would
+                // re-render the agent's entire screen for as long as ten
+                // seconds to show a prompt that has not appeared yet.
+                self.ask_command = Some((text, deadline));
+            } else {
+                // Said, not swallowed. The two ways to arrive here are a shell
+                // that would not start at all — the pane on screen says so in
+                // its own words — and one that never asks for bracketed paste,
+                // which `cmd.exe` never does. Naming the command is what makes
+                // the sentence actionable: it is still on screen in the answer
+                // above, and typing it is the way through.
+                let at = self.at;
+                self.spaces[at].ask.note(format!(
+                    "the shell would not take `{text}`. A command is typed into \
+                     it as a paste, and a shell that has not asked for bracketed \
+                     paste — `cmd.exe` never does — is one abeam will not write \
+                     to unasked, because without that mode a newline in what it \
+                     wrote would submit. Type it there yourself, or start the \
+                     pane on a shell that asks."
+                ));
+                redraw = true;
+            }
+        }
+
+        for ix in 0..self.spaces.len() {
+            if let Some(question) = self.spaces[ix].ask.take_question() {
+                // A session that has ended is not a session: a `claude -p`
+                // whose stdout has closed cannot be asked anything, and the
+                // pane has already told the reader that asking again starts a
+                // fresh one that will not remember this conversation. Starting
+                // one here is that promise being kept.
+                let live = self.spaces[ix]
+                    .ask_session
+                    .as_ref()
+                    .is_some_and(AskSession::is_live);
+                if !live {
+                    // Dropped *before* the start rather than replaced by it,
+                    // and that ordering is a message rather than tidiness: a
+                    // start that fails would otherwise fall through to a write
+                    // down the dead pipe still sitting here, and the reader
+                    // would get two sentences about one failure — the second of
+                    // them about a session they had already been told was over.
+                    // Dropping it is also what reaps it.
+                    self.spaces[ix].ask_session = None;
+                    self.start_ask(ix);
+                }
+                // `None` only when the start above failed and has already said
+                // why, which is why there is no second message here.
+                if let Some(why) = match self.spaces[ix].ask_session.as_mut() {
+                    Some(session) => session.ask(&question).err(),
+                    None => None,
+                } {
+                    self.spaces[ix].ask.note(format!("{why:#}"));
+                }
+                redraw = true;
+            }
+
+            // Taken into a local first, because feeding an event borrows the
+            // pane beside the session it came out of.
+            let arrived = match self.spaces[ix].ask_session.as_mut() {
+                Some(session) => session.poll(),
+                None => Vec::new(),
+            };
+            for event in arrived {
+                self.spaces[ix].ask.on_event(event);
+            }
+        }
+
+        redraw
+    }
+
+    /// Start a child for one workspace's ask pane, and tell the probe to
+    /// disown it.
+    ///
+    /// **The `disown` below is the load-bearing line of this whole feature, and
+    /// it is one line away from a bug nobody would see happen.** The child
+    /// writes `~/.claude/sessions/<pid>.json` with `"kind":"interactive"` and
+    /// abeam's own `cwd`, started after abeam did — which is exactly the shape
+    /// `crate::agentstate::Probe::search` is looking for, and it is always the
+    /// *newer* of the two records, so the documented fallback that takes the
+    /// newest one when clock skew leaves nothing qualifying would take this.
+    /// The answer that comes back is a reader's, a reader between questions is
+    /// `idle`, and `Idle` is the one answer that lets `crate::panes::queue` type
+    /// a queued prompt into an agent that is mid-turn.
+    ///
+    /// It is done here, on the same statement as the spawn, and that ordering is
+    /// what makes it airtight rather than merely early: [`Probe`] is only ever
+    /// read from this thread, in [`poll_readiness`](Self::poll_readiness), so
+    /// there is no pass of the loop between the child existing and the probe
+    /// being told to ignore it. Moving it into `pump` a few lines below, or into
+    /// the pane, would open exactly that window.
+    ///
+    /// The id and not the pid, for the reason `crate::agentstate::Probe::disown`
+    /// gives at length: a pid is handed out again, and a disowned pid is a
+    /// future Claude disowned by accident.
+    fn start_ask(&mut self, ix: usize) {
+        let Some(launch) = self.spaces[ix].ask.launch().cloned() else {
+            // Unreachable through the pane: an ask with nothing to start takes
+            // no typing at all, so it has no way to produce a question. Said
+            // rather than ignored, because the alternative is a composer that
+            // accepts a question and answers nothing.
+            self.spaces[ix].ask.note(
+                "there is no Claude to ask, so this question has not gone \
+                 anywhere. The pane says which agent abeam is hosting and what \
+                 that costs; the question can still be asked of the session in \
+                 the left pane."
+                    .to_string(),
+            );
+            return;
+        };
+        let root = self.spaces[ix].root.clone();
+        match AskSession::start(&launch, &root, ask::new_session_id()) {
+            Ok(session) => {
+                self.probe.disown(session.session_id().to_string());
+                self.spaces[ix].ask_session = Some(session);
+            }
+            Err(why) => self.spaces[ix].ask.note(format!("{why:#}")),
+        }
+    }
+
+    /// The command a reader chose, if the workspace on screen is the one that
+    /// chose it.
+    ///
+    /// Every pane is drained and at most one answer is returned, which is the
+    /// two halves of one rule. Draining is `take_open_request`'s: a request left
+    /// sitting fires late, at whatever unrelated moment next reads it. Answering
+    /// only for the workspace on screen is because the shell it would be typed
+    /// into is that workspace's, and a command chosen in one checkout appearing
+    /// at a prompt in another is the wrong repository with no error at all.
+    ///
+    /// Only the on-screen pane can produce one anyway — `right_pane` is the
+    /// workspace's, and a key reaches a focused pane — so what is thrown away
+    /// here is a hand-off chosen in the same batch of events as a workspace
+    /// switch, which is one keystroke old and still on screen in the answer it
+    /// came from.
+    fn take_ask_command(&mut self) -> Option<String> {
+        let at = self.at;
+        let mut chosen = None;
+        for (ix, space) in self.spaces.iter_mut().enumerate() {
+            if let Some(text) = space.ask.take_command()
+                && ix == at
+            {
+                chosen = Some(text);
+            }
+        }
+        chosen
     }
 
     /// Hand one batch of watcher news to the panes that own it, and to no
@@ -1415,6 +1774,22 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
                 if !chord && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    // The ask view is somewhere you went *from* something, so
+                    // leaving it puts that something back — the `Diag`
+                    // displacement precedent, one view along, and the reason
+                    // `Ask` is left out of `last_workspace_view` above.
+                    //
+                    // Handing focus back without restoring the view is what
+                    // this line replaces, and it was the wrong half: `?` is
+                    // pressed while reading a file, and an `Esc` that left the
+                    // ask on screen would have cost the reader the document
+                    // they asked the question about. The pane's own `Esc`
+                    // clears a draft first and only falls through here on an
+                    // empty composer, so this is never the press that throws
+                    // away something typed.
+                    if self.right_view == RightView::Ask {
+                        self.set_right_view(self.last_workspace_view);
+                    }
                     self.focus = Focus::Left;
                     return Ok(Flow::redraw());
                 }
@@ -1498,7 +1873,28 @@ impl App {
             // dragging the reader into view to restyle it would be a surprise —
             // and the common case is pressing it while already looking at a
             // document from the left pane.
-            Action::ToggleReaderTheme => self.viewer.toggle_theme(),
+            //
+            // Two panes now, and the second one is not a widening of what this
+            // key means: the ask draws its answers through the reader's own
+            // markdown renderer, whose colours are absolute RGB chosen against
+            // a known page, and it paints that page itself. Left out, a reader
+            // in a light session would press `F3` and get one dark pane in the
+            // corner of an otherwise light window — which reads as a pane that
+            // has not been finished rather than as a setting with a scope.
+            // Every workspace's, because a palette that applied to the
+            // workspace on screen and not to the one next door is the same
+            // failure one switch later.
+            Action::ToggleReaderTheme => {
+                self.theme = match self.theme {
+                    Theme::Dark => Theme::Light,
+                    Theme::Light => Theme::Dark,
+                };
+                self.viewer.toggle_theme();
+                let theme = self.theme;
+                for space in &mut self.spaces {
+                    space.ask.set_theme(theme);
+                }
+            }
 
             Action::FocusLeft => self.focus = Focus::Left,
             Action::FocusRight => {
@@ -1753,9 +2149,10 @@ impl App {
         Line::from(spans)
     }
 
-    /// Switch views, remembering what F2 should put back. Only the two
-    /// workspace views are ever remembered, so F2 out of diagnostics can never
-    /// land back on diagnostics.
+    /// Switch views, remembering what a displaced view should put back. Only
+    /// the workspace views are ever remembered, so `F2` out of diagnostics can
+    /// never land back on diagnostics and `Esc` out of the ask can never land
+    /// back on the ask.
     fn set_right_view(&mut self, view: RightView) {
         // Asking for a view is asking to see it. Without this, every view key
         // is a dead key while zoomed, which is a worse surprise than the pane
@@ -1763,7 +2160,11 @@ impl App {
         self.zoom = false;
         let was_typing = self.focus == Focus::Right && self.right_pane().takes_input();
         self.right_view = view;
-        if view != RightView::Diag {
+        // Neither of the two displaceable views is remembered, and `Ask` is in
+        // this line for `Diag`'s reason rather than by analogy with it: both are
+        // reached from somewhere and both put that somewhere back, so a view
+        // that remembered itself would be a key that could never leave.
+        if view != RightView::Diag && view != RightView::Ask {
             self.last_workspace_view = view;
         }
         // Leaving a pane you were typing into for one you cannot type into
@@ -1784,6 +2185,7 @@ impl App {
             RightView::Shell => self.shell_mut(),
             RightView::Queue => &mut self.queue,
             RightView::Diag => &mut self.diag,
+            RightView::Ask => self.ask_mut(),
         }
     }
 
@@ -1794,6 +2196,7 @@ impl App {
             RightView::Shell => self.shell(),
             RightView::Queue => &self.queue,
             RightView::Diag => &self.diag,
+            RightView::Ask => self.ask(),
         }
     }
 }
@@ -1839,6 +2242,32 @@ fn block_line<'a>(title: Line<'a>, focused: bool) -> Block<'a> {
     Block::bordered()
         .title(title)
         .border_style(Style::default().fg(colour))
+}
+
+/// What `?` attaches, from the path the pane that was asked handed over.
+///
+/// One place rather than one per pane that can ask, so a forty-six-column pane
+/// shows one kind of label whichever view the question came from.
+///
+/// The file name, and the whole path travels underneath it. Those are two
+/// different jobs: the label is what a reader recognises at a glance, and the
+/// leading directories are exactly the half a narrow pane clips — `viewer.rs`
+/// survives where `crates/abeam/src/panes/viewer.rs` becomes `crates/abeam/…`,
+/// which names no file at all. What is *sent* is the path, unclipped, and the
+/// pane draws that too; see `crate::panes::ask` on why it is a pointer and not a
+/// payload.
+fn ask_context(path: PathBuf) -> AskContext {
+    let label = path
+        .file_name()
+        // A path with no final component is a root directory, which nothing
+        // here can produce — both callers hand over a file. Falling back to the
+        // whole spelling rather than to an empty label, because a row reading
+        // `▸ ` says less than nothing.
+        .map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+    AskContext { label, path }
 }
 
 fn hit(r: Rect, ev: &MouseEvent) -> bool {
@@ -1917,6 +2346,7 @@ fn help_overlay(f: &mut Frame) {
 mod tests {
     use super::*;
     use crate::agentstate::Readiness;
+    use crate::launch::Launch;
     use crate::panes::queue::Mode;
     use crate::testutil::TempDir;
     use abeam_pty::PtyConfig;
@@ -2095,6 +2525,19 @@ mod tests {
             crate::config::Opening::default(),
         );
         Fixture { app, dir }
+    }
+
+    /// A second workspace, hosting what the fixture hosts and on the palette
+    /// the fixture opened on.
+    ///
+    /// One helper rather than five call sites, because a `Space` now carries
+    /// two things that are the same in every test and interesting in none of
+    /// them: which agent its ask pane would start, and which page that pane
+    /// paints. Both are exercised where they mean something — in
+    /// `crate::panes::ask` and in the theme test below — rather than four times
+    /// over in tests about routing.
+    fn space(root: PathBuf, label: &str) -> Space {
+        Space::new(root, label.to_string(), true, "claude", Theme::default())
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3675,9 +4118,7 @@ mod tests {
     fn switching_workspaces_moves_the_right_pane_and_leaves_the_agents_own_alone() {
         let mut fx = app();
         let other = a_second_workspace(&fx, ".claude/worktrees/other");
-        fx.app
-            .spaces
-            .push(Space::new(other.clone(), "other".into(), true));
+        fx.app.spaces.push(space(other.clone(), "other"));
         let agent_root = fx.app.root.clone();
 
         assert!(fx.app.set_workspace(1), "a switch is worth a frame");
@@ -3737,7 +4178,7 @@ mod tests {
 
         // ...and it says where you are the moment you are somewhere else.
         let other = a_second_workspace(&fx, ".claude/worktrees/review");
-        fx.app.spaces.push(Space::new(other, "review".into(), true));
+        fx.app.spaces.push(space(other, "review"));
         fx.app.set_workspace(1);
         let elsewhere = title(&fx);
         assert!(elsewhere.contains("review · "), "{elsewhere}");
@@ -3837,9 +4278,7 @@ mod tests {
         let mut fx = app();
         let other = a_second_workspace(&fx, ".claude/worktrees/other");
         std::fs::write(other.join("notes.md"), b"# theirs\n").expect("write");
-        fx.app
-            .spaces
-            .push(Space::new(other.clone(), "other".into(), true));
+        fx.app.spaces.push(space(other.clone(), "other"));
 
         fx.app.git.stub_open_request("notes.md");
         fx.app.git.set_worktree_rows(vec![
@@ -3891,9 +4330,7 @@ mod tests {
         // is exactly the decision abeam refuses to make on its own.
         let mut fx = app();
         let other = a_second_workspace(&fx, ".claude/worktrees/other");
-        fx.app
-            .spaces
-            .push(Space::new(other.clone(), "other".into(), true));
+        fx.app.spaces.push(space(other.clone(), "other"));
         // The platform's plainest shell rather than whatever the candidate
         // search would pick: this is about the app's bookkeeping.
         fx.app.spaces[1].shell = ShellPane::new(other, Some(A_PLAIN_SHELL.into()));
@@ -4010,5 +4447,484 @@ mod tests {
         // progress — which beats a confident zero for the first second of a
         // session, when somebody watching for a stall is most likely looking.
         assert!(s.last_ms >= 40.0, "last was {} ms", s.last_ms);
+    }
+
+    // --- the reader in the right pane ---------------------------------------
+    //
+    // Everything below is about the wiring `crate::panes::ask` and `crate::ask`
+    // deliberately do not have: which child was started, who was told to ignore
+    // it, what `?` and `Esc` do to the view, and what happens to a command the
+    // reader chose. The pane's own arguments and the protocol's are tested in
+    // those two modules, on strings, with nothing spawned.
+    //
+    // **No test here starts a real `claude`.** A real one costs somebody's
+    // tokens on every `cargo test` — the two-turn probe that produced
+    // `crate::ask`'s observations cost $0.054 — and would put a second agent in
+    // whatever repository the test binary was standing in. It would also make
+    // every one of these tests pass or fail depending on whether the machine
+    // running them has Claude installed, which is not a property a test may
+    // have: `AskPane::new` walks the real machine, so every pane below is built
+    // through `with_launch` instead.
+
+    /// The background colour of one cell well inside the right pane.
+    ///
+    /// One cell rather than the whole frame, because two ask panes with
+    /// different transcripts in them draw different *text* and what is being
+    /// compared is the page underneath it. Every pane that paints its own
+    /// background fills its whole rect first and draws spans that carry only a
+    /// foreground on top, so this cell answers about the palette whatever is
+    /// written across it.
+    fn right_page(app: &mut App) -> ratatui::style::Color {
+        page(app, 120, 24)[12 * 120 + 100]
+    }
+
+    /// A `Launch` that could exist and is never started.
+    ///
+    /// For the tests whose subject is a view switch or a key, where starting
+    /// anything at all would be a process spawned to prove something about a
+    /// `RightView`.
+    fn unstarted() -> Launch {
+        #[cfg(windows)]
+        let exe = PathBuf::from(r"C:\Users\someone\.local\bin\claude.exe");
+        #[cfg(unix)]
+        let exe = PathBuf::from("/home/someone/.local/bin/claude");
+        Launch {
+            program: exe.clone(),
+            target: exe,
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    /// A stand-in for `claude` that says one line of the protocol and leaves.
+    ///
+    /// The shape `crate::ask`'s own spawning tests use: a `.cmd` on Windows, a
+    /// `#!/bin/sh` with the execute bit on Unix, because a `#!` file without
+    /// one is `EACCES` at the spawn. It resolves through `crate::launch` like
+    /// every other spawn in abeam, so the Windows npm route — `cmd.exe` in
+    /// front of a script — is the one being exercised here as well.
+    #[cfg(windows)]
+    fn a_reader_that_leaves(dir: &TempDir) -> Launch {
+        let script = dir.write(
+            "abeam-reader.cmd",
+            b"@echo off\r\necho {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\"}\r\n",
+        );
+        crate::launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves")
+    }
+    #[cfg(unix)]
+    fn a_reader_that_leaves(dir: &TempDir) -> Launch {
+        let script = dir.write_exec(
+            "abeam-reader",
+            b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\"}'\n",
+        );
+        crate::launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves")
+    }
+
+    /// The same, blocking on its standard input for ever and starting nothing
+    /// else.
+    ///
+    /// The "starting nothing else" is what makes the drop assertion mean
+    /// something: `ping -n 60` is the usual way to make a `.cmd` wait, and it
+    /// would have that test asserting that `cmd.exe` was killed while a
+    /// grandchild nobody looked at went on running. `set /p` and `read` both
+    /// block *in the interpreter*, on the pipe abeam is holding open — which is
+    /// also what a real `claude -p` does between turns.
+    #[cfg(windows)]
+    fn a_reader_that_stays(dir: &TempDir) -> Launch {
+        let script = dir.write(
+            "abeam-waits.cmd",
+            b"@echo off\r\n:loop\r\nset /p LINE=\r\ngoto loop\r\n",
+        );
+        crate::launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves")
+    }
+    #[cfg(unix)]
+    fn a_reader_that_stays(dir: &TempDir) -> Launch {
+        let script = dir.write_exec(
+            "abeam-waits",
+            b"#!/bin/sh\nwhile read -r LINE; do :; done\n",
+        );
+        crate::launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves")
+    }
+
+    /// Point the agent's own workspace at a reader that is not the machine's.
+    ///
+    /// Takes the *builder* rather than a `Launch`, because two of the three
+    /// need the fixture's own directory to write a shim into and
+    /// `reading(&mut fx, shim(&fx.dir))` borrows the fixture twice.
+    fn reading(fx: &mut Fixture, launch: impl FnOnce(&TempDir) -> Launch) {
+        let launch = launch(&fx.dir);
+        fx.app.spaces[0].ask = AskPane::with_launch(fx.dir.path().to_path_buf(), Ok(launch));
+    }
+
+    /// Ask a question the way somebody asks one: typed into the pane, then
+    /// `Enter`. The app drains it on the next [`App::pump`].
+    fn asked(fx: &mut Fixture, question: &str) {
+        for c in question.chars() {
+            fx.app.spaces[0]
+                .ask
+                .handle_key(key(KeyCode::Char(c)))
+                .expect("a letter");
+        }
+        fx.app.spaces[0]
+            .ask
+            .handle_key(key(KeyCode::Enter))
+            .expect("enter sends");
+    }
+
+    fn session_id(fx: &Fixture) -> String {
+        fx.app.spaces[0]
+            .ask_session
+            .as_ref()
+            .expect("a question starts a session")
+            .session_id()
+            .to_string()
+    }
+
+    /// The record that child writes: `interactive`, in abeam's own `cwd`,
+    /// started after abeam did, and carrying the id abeam chose.
+    ///
+    /// Every field is what `crate::ask` observed on 2.1.222 rather than what
+    /// would make this test convenient — the whole hazard is that a reader's
+    /// record is *indistinguishable* from the agent's except by that id.
+    fn the_readers_record(dir: &TempDir, root: &std::path::Path, id: &str, status: &str) {
+        let cwd = serde_json::to_string(&root.to_string_lossy()).expect("a JSON string");
+        let record = format!(
+            r#"{{"pid":7777,"sessionId":"{id}","cwd":{cwd},"startedAt":9,"peerProtocol":1,"kind":"interactive","name":"reader","status":"{status}"}}"#
+        );
+        dir.write("7777.json", record.as_bytes());
+    }
+
+    /// Whether a process is still there, asked of the operating system.
+    ///
+    /// `kill(pid, 0)` performs the existence and permission check and delivers
+    /// nothing, which is what it is for. Windows has no such call without a
+    /// binding this crate does not have, so the question goes to `tasklist`,
+    /// named absolutely out of `%SystemRoot%` for `crate::launch`'s reason: a
+    /// bare name reaching `CreateProcessW` is resolved against the current
+    /// directory first, and under `cargo test` that is the crate being built.
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        // SAFETY: `kill` with signal 0 touches no memory abeam owns and
+        // delivers nothing. It is unsafe only because every function in `libc`
+        // is.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    fn alive(pid: u32) -> bool {
+        let tasklist =
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+                .join("System32")
+                .join("tasklist.exe");
+        let out = std::process::Command::new(tasklist)
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist is a Windows component and is always there");
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    #[test]
+    fn a_reader_abeam_started_is_never_read_as_the_agent_going_idle() {
+        // **The most important test in this file.** `crate::ask`'s child writes
+        // `~/.claude/sessions/<pid>.json` with `"kind":"interactive"` and
+        // abeam's own `cwd`, started after abeam did — the three facts
+        // `agentstate`'s candidate filter tests for — and it is always the
+        // *newer* of the two records, so the documented fallback that takes the
+        // newest one wins with it. A reader between questions is `idle`, and
+        // `Idle` is the one answer that lets `crate::panes::queue` type a
+        // queued prompt into an agent that is mid-turn.
+        //
+        // Delete the `disown` from `App::start_ask` and nothing fails to
+        // compile, nothing looks wrong on screen, and this is what goes red.
+        let mut fx = app();
+        let records = TempDir::new("ask-records");
+        // Aimed *before* the session starts, because the disown is told to the
+        // probe abeam is holding and a probe built afterwards would never have
+        // heard it.
+        fx.app.probe = Probe::over(
+            records.path().to_path_buf(),
+            fx.dir.path().to_path_buf(),
+            // No pid, so the shortcut is skipped and the candidate filter is
+            // what answers — which is the path the fallback lives on.
+            None,
+            0,
+        );
+
+        reading(&mut fx, a_reader_that_stays);
+        asked(&mut fx, "what does this do?");
+        fx.app.pump();
+        let id = session_id(&fx);
+        the_readers_record(&records, fx.dir.path(), &id, "idle");
+
+        assert_eq!(
+            fx.app.probe.readiness(),
+            Readiness::Unknown,
+            "abeam read its own reader as the agent, and `Idle` is the answer \
+             that types a queued prompt into a mid-turn session"
+        );
+
+        // The control, without which the assertion above would pass for a
+        // planted record nothing could ever have adopted: a probe that was
+        // never told answers `Idle` about the very same file.
+        let mut stranger = Probe::over(
+            records.path().to_path_buf(),
+            fx.dir.path().to_path_buf(),
+            None,
+            0,
+        );
+        assert_eq!(
+            stranger.readiness(),
+            Readiness::Idle,
+            "the planted record is not the shape this test is about"
+        );
+    }
+
+    #[test]
+    fn a_second_question_goes_to_the_same_child_and_a_third_after_it_has_gone_starts_another() {
+        // One session per conversation, which is the whole reason this shape
+        // was chosen over one process per question: the second answer is
+        // allowed to remember the first. And one *new* session once the child
+        // has gone, which is the promise the pane has already made on screen —
+        // "asking again starts a fresh one, which will not remember this
+        // conversation".
+        let mut fx = app();
+        reading(&mut fx, a_reader_that_stays);
+
+        asked(&mut fx, "one");
+        fx.app.pump();
+        let first = session_id(&fx);
+        asked(&mut fx, "two");
+        fx.app.pump();
+        assert_eq!(session_id(&fx), first, "the conversation was restarted");
+
+        // Now a reader that leaves. The pane is replaced rather than the
+        // session, because what the app is asked is "is this one live" and a
+        // shim that has exited answers that whatever it was started from.
+        reading(&mut fx, a_reader_that_leaves);
+        fx.app.spaces[0].ask_session = None;
+        asked(&mut fx, "three");
+        fx.app.pump();
+        let second = session_id(&fx);
+        assert_ne!(second, first);
+
+        // Wait for it to go, the way the loop would: `poll` is what notices.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fx.app.spaces[0]
+            .ask_session
+            .as_ref()
+            .is_some_and(AskSession::is_live)
+        {
+            assert!(Instant::now() < deadline, "the shim never exited");
+            fx.app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        asked(&mut fx, "four");
+        fx.app.pump();
+        assert_ne!(
+            session_id(&fx),
+            second,
+            "a question after the reader had gone was written to a dead pipe"
+        );
+    }
+
+    #[test]
+    fn a_live_reader_does_not_hold_the_door_at_quit_and_is_killed_anyway() {
+        // Two halves of one decision, and the second is why the first is safe.
+        // `any_shell_live` exists because ending a shell can kill somebody's
+        // build; ending a reader loses a conversation abeam was not keeping
+        // anyway. So it does not hold the door — and it still goes, because
+        // `App::run` takes `self` by value and `AskSession`'s `Drop` closes the
+        // child's standard input and then kills it.
+        let mut fx = app();
+        reading(&mut fx, a_reader_that_stays);
+        asked(&mut fx, "are you there?");
+        fx.app.pump();
+
+        let pid = fx.app.spaces[0]
+            .ask_session
+            .as_ref()
+            .expect("a session")
+            .pid()
+            .expect("a live one");
+        assert!(alive(pid), "the shim was not running to begin with");
+        assert!(
+            !fx.app.any_shell_live(),
+            "a reader made Alt+Q ask twice, which is the confirmation losing \
+             its meaning for the shell it exists for"
+        );
+
+        drop(fx);
+        assert!(
+            !alive(pid),
+            "process {pid} outlived the abeam that started it"
+        );
+    }
+
+    #[test]
+    fn question_mark_opens_the_reader_on_what_the_pane_was_showing() {
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        let doc = fx.dir.path().join("notes.md");
+        fx.app.viewer.show(doc);
+        fx.app.set_right_view(RightView::Viewer);
+        fx.app.focus = Focus::Right;
+        // A frame first, because focus is asked of the layout and `area` is
+        // whatever the last frame drew.
+        screen(&mut fx.app, 120, 24);
+
+        fx.app.handle_key(key(KeyCode::Char('?'))).unwrap();
+        fx.app.pump();
+        assert_eq!(fx.app.right_view, RightView::Ask);
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "asking a question means typing one"
+        );
+
+        // The context is on screen before it goes, which is the disclosure the
+        // pane's module docs are about: what is attached is what will be sent.
+        let text = screen(&mut fx.app, 120, 24);
+        assert!(text.contains("notes.md"), "nothing said what was attached");
+    }
+
+    #[test]
+    fn question_mark_with_nothing_open_still_opens_the_reader() {
+        // `?` is the only way to this view — there is no `Alt` key for it, on
+        // purpose — so a reader with nothing open and a git pane with nothing
+        // selectable must both still reach it. Squashed into one `Option` the
+        // "no path" and "no request" cases are indistinguishable, and the pane
+        // would be unreachable in a repository with no markdown in it and
+        // nothing yet changed. See `crate::panes::AskRequest`.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        fx.app.set_right_view(RightView::Git);
+        fx.app.focus = Focus::Right;
+        screen(&mut fx.app, 120, 24);
+
+        fx.app.handle_key(key(KeyCode::Char('?'))).unwrap();
+        fx.app.pump();
+        assert_eq!(fx.app.right_view, RightView::Ask);
+    }
+
+    #[test]
+    fn esc_out_of_the_reader_puts_back_the_view_it_displaced() {
+        // The `Diag` displacement precedent, one view along. `?` is pressed
+        // while reading a file, so an `Esc` that handed focus back and left the
+        // ask on screen would have cost the reader the document they asked the
+        // question about.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        for displaced in [RightView::Viewer, RightView::Git] {
+            fx.app.set_right_view(displaced);
+            fx.app.focus = Focus::Right;
+            screen(&mut fx.app, 120, 24);
+            fx.app.handle_key(key(KeyCode::Char('?'))).unwrap();
+            fx.app.pump();
+            assert_eq!(fx.app.right_view, RightView::Ask);
+
+            fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+            assert_eq!(fx.app.right_view, displaced, "Esc left the ask on screen");
+            assert_eq!(fx.app.focus, Focus::Left);
+        }
+
+        // ...and it is never the view `F2` puts back, for the same reason it is
+        // never the view `Esc` puts back: a displaceable view that remembered
+        // itself is a key that can never leave.
+        assert_ne!(fx.app.last_workspace_view, RightView::Ask);
+    }
+
+    #[test]
+    fn esc_with_something_typed_clears_the_draft_and_stays() {
+        // The pane's own `Esc` runs first and claims the key while there is a
+        // draft, so the restore above is never the press that throws away
+        // something typed. Two presses, two different things, which is what the
+        // border promises: `esc→clear`, then `esc→agent`.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        fx.app.set_right_view(RightView::Ask);
+        fx.app.focus = Focus::Right;
+        fx.app.handle_key(key(KeyCode::Char('h'))).unwrap();
+
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(fx.app.right_view, RightView::Ask, "the draft cost the view");
+        assert_eq!(fx.app.focus, Focus::Right);
+
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(fx.app.right_view, fx.app.last_workspace_view);
+        assert_eq!(fx.app.focus, Focus::Left);
+    }
+
+    #[test]
+    fn a_command_the_reader_chose_is_carried_to_the_shell_view_a_frame_later() {
+        // The app's half of the hand-off. What the shell does with the text is
+        // `ShellPane::send_command`'s test, in a real pty; what is pinned here
+        // is that the request leaves the pane, switches the view, takes focus,
+        // and *waits* — because a cold shell spawns on the frame that draws it
+        // and one attempt on the pass that switched would silently drop it.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        // A question, drained by hand rather than by `pump`, so that nothing is
+        // started: what this test is about is downstream of the answer.
+        asked(&mut fx, "how do I see what changed?");
+        fx.app.spaces[0].ask.take_question();
+        fx.app.spaces[0].ask.on_event(crate::ask::AskEvent::Turn {
+            text: "run this:\n\n```\ngit status\n```\n".to_string(),
+            cost_usd: None,
+            error: None,
+        });
+        fx.app.set_right_view(RightView::Ask);
+        fx.app.focus = Focus::Right;
+        screen(&mut fx.app, 120, 24);
+        // `Enter` on an empty composer hands the selected command over. It
+        // never runs anything — see `crate::panes::ask`.
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert!(fx.app.pump(), "a hand-off is worth a frame");
+        assert_eq!(fx.app.right_view, RightView::Shell);
+        assert_eq!(fx.app.focus, Focus::Right);
+        let (waiting, _) = fx
+            .app
+            .ask_command
+            .clone()
+            .expect("the command is owed to a shell that does not exist yet");
+        assert_eq!(waiting, "git status");
+    }
+
+    #[test]
+    fn f3_moves_the_reader_and_the_ask_pane_together() {
+        // B's warning, pinned: the ask draws its answers through the reader's
+        // own markdown renderer, whose colours are absolute RGB chosen against
+        // a known page, and it paints that page itself. Left out of `F3`, a
+        // reader in a light session gets one dark pane in the corner of an
+        // otherwise light window.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        fx.app.set_right_view(RightView::Ask);
+        assert_eq!(fx.app.theme, Theme::Dark);
+
+        let dark = right_page(&mut fx.app);
+        fx.app.handle_key(key(KeyCode::F(3))).unwrap();
+        assert_eq!(fx.app.theme, Theme::Light);
+        let light = right_page(&mut fx.app);
+        assert_ne!(
+            dark, light,
+            "F3 repainted the reader and left the ask on the page it had"
+        );
+
+        // And a workspace opened *after* the flip starts where the session is,
+        // rather than dark under a light window one switch later. Its pane is
+        // built by `Space::new` from the app's own answer, which is the line
+        // this half exists to hold: the palette is not a fact about the pane
+        // that happened to be on screen when `F3` was pressed.
+        let other = a_second_workspace(&fx, ".claude/worktrees/other");
+        fx.app
+            .sync_workspaces(&[the_main_worktree(&fx), worktree(other, "other")]);
+        assert_eq!(fx.app.spaces.len(), 2);
+        fx.app.set_workspace(1);
+        assert_eq!(
+            right_page(&mut fx.app),
+            light,
+            "a workspace opened after the flip painted the page the session left"
+        );
     }
 }

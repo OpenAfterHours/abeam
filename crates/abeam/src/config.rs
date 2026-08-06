@@ -535,12 +535,22 @@ struct Wire {
 
 /// Which right-hand view opens.
 ///
-/// Four words, and `crate::panes::RightView` has five variants: `Diag` is the
+/// Five words, and `crate::panes::RightView` has six variants: `Diag` is the
 /// pty instrument behind `F2`, which is somewhere you go to answer a question
 /// and then come back from. A session that opened there would be a session
 /// whose config file had accidentally been left in a debugging state, so it is
 /// not in this vocabulary at all — the enum is the whole of the answer and
 /// there is nothing to check afterwards.
+///
+/// `ask` is in, and it is the variant that had to be argued rather than
+/// assumed, because it is displaceable in exactly the way `Diag` is: it is
+/// reached by `?` from another view and `Esc` puts that view back. What settles
+/// it is that opening *there* is not a debugging state — it is a session that
+/// starts by asking a question, which is a thing somebody may reasonably want
+/// every morning — and the view `Esc` returns to is simply whichever one was
+/// showing when the ask displaced it, which on the first frame is abeam's own
+/// default. Nothing about the config file is left in an odd state by choosing
+/// it, which is the whole of the test `Diag` fails.
 ///
 /// `files` rather than `viewer`, because that is what the pane is called
 /// everywhere a user meets it: the README's tour, the `F1` key list, the border.
@@ -551,6 +561,7 @@ enum View {
     Files,
     Shell,
     Queue,
+    Ask,
 }
 
 impl View {
@@ -560,6 +571,7 @@ impl View {
             View::Files => RightView::Viewer,
             View::Shell => RightView::Shell,
             View::Queue => RightView::Queue,
+            View::Ask => RightView::Ask,
         }
     }
 }
@@ -1166,16 +1178,38 @@ mod tests {
 
     #[test]
     fn every_word_the_two_vocabularies_take_maps_to_something() {
-        // Four views and two sides, spelled as the file spells them. This is
+        // Five views and two sides, spelled as the file spells them. This is
         // the test that fails if a variant is added to `RightView` and its word
         // is not decided on here, which is the right way round: the vocabulary
         // is abeam's promise to a file somebody has already written.
-        for (word, view) in [
-            ("git", RightView::Git),
-            ("files", RightView::Viewer),
-            ("shell", RightView::Shell),
-            ("queue", RightView::Queue),
+        //
+        // The exhaustive `match` below is what makes that sentence true rather
+        // than merely intended, and it is here because the sentence was not
+        // true when it was written: this was a list of pairs, `RightView::Ask`
+        // was added next door, and every test in this file went on passing. A
+        // list can only fail to mention a variant. A `match` cannot compile
+        // without one — so a new view either gets a word here or states, in
+        // this file, why it has none, which is what `Diag`'s arm is.
+        for view in [
+            RightView::Git,
+            RightView::Viewer,
+            RightView::Shell,
+            RightView::Queue,
+            RightView::Diag,
+            RightView::Ask,
         ] {
+            let word = match view {
+                RightView::Git => Some("git"),
+                RightView::Viewer => Some("files"),
+                RightView::Shell => Some("shell"),
+                RightView::Queue => Some("queue"),
+                RightView::Ask => Some("ask"),
+                // Outside the vocabulary on purpose; [`View`]'s own docs carry
+                // the argument, and there is nothing to assert about a word
+                // that does not exist.
+                RightView::Diag => None,
+            };
+            let Some(word) = word else { continue };
             let config = config(&format!("[defaults]\nview = \"{word}\"\n"));
             assert_eq!(config.opening(None).view, view, "`{word}`");
         }

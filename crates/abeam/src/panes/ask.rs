@@ -525,7 +525,16 @@ impl AskPane {
         }
     }
 
-    fn note(&mut self, text: String) {
+    /// One thing abeam has to say about this conversation, in the transcript
+    /// where the rest of it is.
+    ///
+    /// `pub(crate)` for the app, which owns the child and is therefore the only
+    /// party that can see the three things this pane cannot: a `claude` that
+    /// would not start, a question that could not be written to the pipe, and a
+    /// shell that would not take a command it was handed. Each of those happens
+    /// *between* two answers, which is what an entry is for and what a status
+    /// line would misdate.
+    pub(crate) fn note(&mut self, text: String) {
         self.entries.push(Entry::Note(text));
         self.bump();
     }

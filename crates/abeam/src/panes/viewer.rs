@@ -161,6 +161,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::pane::{Handled, Pane};
+use crate::panes::AskRequest;
 use crate::scroll::{self, Scroll};
 use crate::text::{self, wrap};
 use browse::Browser;
@@ -306,6 +307,10 @@ pub struct ViewerPane {
 
     scroll: Scroll,
 
+    /// `?` — the ask view, and the document to ask about if one is open.
+    /// Drained by the shell, exactly as `GitPane`'s open request is.
+    ask: Option<AskRequest>,
+
     /// A file the watcher noticed, waiting for the pane to be on screen.
     pending: Option<PathBuf>,
     /// The pane changed its own state inside [`Pane::render`], so the title the
@@ -367,6 +372,7 @@ impl ViewerPane {
             search: None,
             missed: None,
             scroll,
+            ask: None,
             pending: None,
             owed: false,
             recent: Vec::new(),
@@ -645,6 +651,22 @@ impl ViewerPane {
             State::Doc(d) => Some(&d.path),
             State::Failed { path, .. } => Some(path),
         }
+    }
+
+    /// The document `?` was pressed on, if `?` has been pressed.
+    ///
+    /// Draining, and drained unconditionally by the shell, for
+    /// `GitPane::take_open_request`'s reason: a request left sitting fires
+    /// late, at whatever unrelated moment next reads it. The `Some(None)` case
+    /// is a `?` pressed with nothing open — see [`AskRequest`], which is the
+    /// only reason this is not a bare `Option<PathBuf>`.
+    ///
+    /// [`ViewerPane::path`] is the whole of what leaves this pane, and it is
+    /// what makes the ask a pointer rather than a payload: neither the rows nor
+    /// the scroll position is exposed here, and `crate::panes::ask` argues at
+    /// length why naming the file is the better half of that trade anyway.
+    pub fn take_ask_request(&mut self) -> Option<AskRequest> {
+        self.ask.take()
     }
 
     /// Re-read the file on screen. Bound to `r`, and the answer to a document
@@ -1623,6 +1645,32 @@ impl Pane for ViewerPane {
             _ if bare(key, 'f') => self.open_results(Back::Doc),
             KeyCode::Char('n') => self.step_hit(true),
             KeyCode::Char('N') => self.step_hit(false),
+            // `?` for the ask view, about the document on screen. Pane-local
+            // and exempt from `crate::keys`'s invariant for the reason the four
+            // keys above are, and for the reason the README gives for `w` in
+            // the git view: no agent can be listening for a key that is only
+            // ever delivered to a focused pane. There is deliberately no `Alt`
+            // spelling — a question about what you are reading is asked from
+            // where you are reading it.
+            //
+            // CONTROL and ALT are named rather than `modifiers.is_empty()`
+            // because `?` is a shifted key on most layouts, so SHIFT arrives
+            // with it and must not disqualify it. The git pane's arm is the
+            // same shape. (The CONTROL half is already covered by the arm at
+            // the top of this match; naming it here keeps the two panes' rule
+            // readable as one rule rather than two that happen to agree.)
+            KeyCode::Char('?')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                // Snapshot rather than a promise to look later: the watcher can
+                // put another document on screen between this keystroke and the
+                // drain, and what `?` meant is what was open when it was
+                // pressed.
+                self.ask = Some(AskRequest(self.path().map(Path::to_path_buf)));
+                Handled::Yes
+            }
             // The middle of the three states `Esc` passes through: the box is
             // shut and the hits are still marked, and this is what clears them.
             // Only an `Esc` with neither falls through to the shell as "give
@@ -1921,6 +1969,47 @@ mod tests {
         pane.ensure_layout(width);
         pane.scroll.measure(pane.lines.len(), height);
         text(&pane.lines)
+    }
+
+    #[test]
+    fn question_mark_hands_over_the_document_and_nothing_else_about_it() {
+        // Pane-local, exempt from `crate::keys`'s invariant for the reason the
+        // README gives for `w` in the git view, and drained like `GitPane`'s
+        // open request. What leaves is the *path*: this pane exposes neither
+        // its rows nor its scroll position, which is what makes the ask a
+        // pointer rather than a payload — see `crate::panes::ask`.
+        let dir = TempDir::new("view-ask");
+        let path = dir.write("plan.md", b"# Plan\n\nDo **the thing**.\n");
+        let mut pane = quiet(dir.path());
+
+        // With nothing open the view still has to open, because `?` is the only
+        // key that reaches it. That is the whole of why `AskRequest` is a
+        // newtype over an `Option` rather than an `Option`.
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('?'))).unwrap(),
+            Handled::Yes
+        );
+        let AskRequest(nothing) = pane.take_ask_request().expect("the view opens");
+        assert_eq!(nothing, None);
+        assert!(
+            pane.take_ask_request().is_none(),
+            "a request left sitting fires late, at whatever unrelated moment \
+             next reads it"
+        );
+
+        pane.show(&path);
+        pane.handle_key(key(KeyCode::Char('?'))).unwrap();
+        let AskRequest(asked) = pane.take_ask_request().expect("a request");
+        assert_eq!(asked.as_deref(), Some(path.as_path()));
+
+        // And in the search box it is a letter, like every other printable key
+        // — the rule the F1 overlay states once as "in a find box".
+        pane.handle_key(key(KeyCode::Char('/'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('?'))).unwrap();
+        assert!(
+            pane.take_ask_request().is_none(),
+            "a `?` typed into a query opened a pane instead"
+        );
     }
 
     #[test]
