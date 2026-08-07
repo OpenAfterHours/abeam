@@ -203,6 +203,48 @@ impl ShellPane {
         matches!(&self.state, State::Hosted { term, .. } if !term.has_exited())
     }
 
+    /// Put `text` at the prompt **without submitting it**, and say whether it
+    /// went.
+    ///
+    /// The only route into this child that is not a keystroke somebody made,
+    /// and the missing newline is the whole of what it promises. `Enter` in the
+    /// ask pane picks a single-line command out of an answer and hands it here;
+    /// what arrives is a prompt with a command typed at it, which the reader
+    /// then reads and submits, or edits, or backspaces away. Sending the
+    /// newline as well would turn "abeam suggested this" into "abeam ran this",
+    /// and the two are not the same decision — see `crate::panes::ask`, which
+    /// refuses to join a multi-line block for the same reason.
+    ///
+    /// Three guards, and each is a different failure:
+    ///
+    /// - **[`live`](Self::live)**, because a cold pane has no child at all: it
+    ///   spawns on the frame that draws it, so a hand-off arriving before that
+    ///   frame has nowhere to go. `App` is what defers it a frame, the way it
+    ///   already defers the queue's `Enter`.
+    /// - **`set_scrollback(0)`**, for [`handle_key`](Pane::handle_key)'s
+    ///   reason: text appearing at a prompt that is scrolled off the bottom of
+    ///   the pane is text nobody can see arrive.
+    /// - **[`bracketed_paste`](TerminalPane::bracketed_paste)**, which is the
+    ///   one that costs something. `TerminalPane::send_text` degrades to raw
+    ///   bytes for a child that never enabled the mode, and raw bytes carrying
+    ///   a newline submit — so a caller sending text nobody typed has to check
+    ///   first, which is the rule `App::pump_queue` already applies to the
+    ///   agent's own pty. What it costs here is real and worth naming: PSReadLine
+    ///   enables the mode and `cmd.exe` does not, so on the `cmd` fallback the
+    ///   hand-off is refused rather than typed. Refusing is the safe direction —
+    ///   nothing appears, rather than a command running unread — and the way
+    ///   through is the shell the pane leads with.
+    pub fn send_command(&mut self, text: &str) -> bool {
+        let Some(term) = self.live() else {
+            return false;
+        };
+        term.set_scrollback(0);
+        if !term.bracketed_paste() {
+            return false;
+        }
+        term.send_text(text).is_ok()
+    }
+
     /// Try each candidate in order and keep the first that starts.
     ///
     /// Takes `&self` and returns the state rather than assigning it, which is
@@ -1192,6 +1234,118 @@ mod tests {
         assert!(found("cmd.exe").is_absolute());
     }
 
+    /// A child that has enabled bracketed paste, which is the mode
+    /// [`ShellPane::send_command`] refuses to write without.
+    ///
+    /// Typed out of a *file* rather than asked for by the child, exactly as
+    /// `crate::app`'s own fixture does it: `cmd.exe` has no line editor that
+    /// would ever ask, so a test that waited for one would wait for ever. The
+    /// pty forwards the bytes and the parser behind the pane picks the mode up,
+    /// which is the same route a real PSReadLine's takes.
+    fn asks_for_paste(dir: &TempDir) -> ShellPane {
+        dir.write("bracketed.txt", b"\x1b[?2004h");
+        pane(dir, "cmd.exe", &["/k", "type", "bracketed.txt"])
+    }
+
+    /// Poll until the child has enabled bracketed paste, or give up loudly.
+    ///
+    /// Its own wait rather than a predicate handed to [`settled`], because what
+    /// it asks about is the parser and not the screen — and a closure reading
+    /// the pane cannot be handed to a function already holding it mutably.
+    fn wait_for_paste(pane: &mut ShellPane) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            pane.tick();
+            if hosted(pane).bracketed_paste() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the child never asked for bracketed paste, so nothing would ever be sent");
+    }
+
+    /// Draw until what is on screen satisfies `enough`, or give up loudly.
+    ///
+    /// A bounded wait rather than a sleep, because what is being waited for is
+    /// a real child echoing at a real pty and how long that takes is the
+    /// machine's business. The panic carries the screen: a timeout with no
+    /// account of what was actually drawn is a test somebody deletes.
+    fn settled(pane: &mut ShellPane, what: &str, enough: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pane.tick();
+            let screen = draw(pane, 120, 12);
+            if enough(&screen) {
+                return screen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waited twenty seconds for {what}. The screen says:\n{screen}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_handed_over_command_is_typed_at_the_prompt_and_nothing_submits_it() {
+        // The whole promise of the ask pane's hand-off, asked of a real pty:
+        // what ends up at the prompt is what was on the screen, and it is the
+        // reader who runs it. Delete the `bracketed_paste` check and this still
+        // passes; delete the missing newline and it fails on the count below,
+        // which is the assertion this test exists for.
+        let dir = TempDir::new("shell-handoff");
+
+        // Cold: nothing to type into, and nothing started by trying. `App`
+        // defers the hand-off a frame for exactly this — a pane spawns its
+        // child on the frame that draws it, so the keystroke that chose the
+        // command arrives before there is a child to give it to.
+        let mut cold = pane(&dir, "cmd.exe", &[]);
+        assert!(!cold.send_command("echo ZQXJ"));
+        assert!(
+            matches!(cold.state, State::Cold),
+            "a refused hand-off started a shell"
+        );
+
+        // Live, and provably never going to ask for bracketed paste: refused,
+        // because without that mode `send_text` writes raw bytes and a newline
+        // among them would submit. `cmd.exe` is that child, which is why this
+        // branch is a cost somebody pays rather than a hypothetical.
+        let mut plain = pane(&dir, "cmd.exe", &[]);
+        draw(&mut plain, 120, 12);
+        settled(&mut plain, "the plain shell to print anything", |screen| {
+            !screen.trim().is_empty()
+        });
+        assert!(!hosted(&plain).bracketed_paste());
+        assert!(!plain.send_command("echo ZQXJ"));
+
+        // And a child that did ask takes it.
+        let mut pane = asks_for_paste(&dir);
+        draw(&mut pane, 120, 12);
+        wait_for_paste(&mut pane);
+        assert!(pane.send_command("echo ZQXJ"));
+
+        // At the prompt, once, and unrun. Twice would be the command *and* its
+        // output, which is exactly what a newline sent along with it would have
+        // produced — so the count is the assertion and `contains` is only what
+        // makes the wait terminate.
+        let typed = settled(&mut pane, "the command to appear", |screen| {
+            screen.contains("echo ZQXJ")
+        });
+        assert_eq!(
+            typed.matches("ZQXJ").count(),
+            1,
+            "the command was submitted rather than typed:\n{typed}"
+        );
+
+        // The reader's own `Enter` is what runs it, and this half is what
+        // proves the text is really in the child's input rather than painted on
+        // the screen by an echo abeam could have faked.
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        settled(&mut pane, "the command to run", |screen| {
+            screen.matches("ZQXJ").count() >= 2
+        });
+    }
+
     #[test]
     fn a_shell_that_is_a_cmd_wrapper_starts_and_the_border_names_the_wrapper() {
         // `ABEAM_SHELL=…\nu.cmd` is the same wish as `abeam +claude` on an npm
@@ -1745,6 +1899,123 @@ mod unix_tests {
         assert!(screen.contains("not found on PATH"), "got: {screen}");
     }
 
+    /// A child that has enabled bracketed paste, and one that provably never
+    /// will — the same pair `crate::app`'s fixture keeps and for the same
+    /// reason.
+    ///
+    /// `cat` rather than a shell, and that is a decision rather than a shortage
+    /// of ideas: whether a child asks for the mode is the whole subject of two
+    /// assertions below, and `/bin/sh` is bash on some distributions and dash
+    /// on others — bash's readline enables bracketed paste and dash has no line
+    /// editor at all, so the answer would depend on which image CI pulled.
+    /// `cat` has no prompt and no opinion about terminals: it copies bytes. So
+    /// the mode is handed over in a file when it is wanted and simply absent
+    /// when it is not.
+    fn asks_for_paste(dir: &TempDir) -> ShellPane {
+        dir.write("bracketed.txt", b"\x1b[?2004h");
+        pane(dir, "/bin/cat", &["bracketed.txt", "-"])
+    }
+
+    fn never_asks(dir: &TempDir) -> ShellPane {
+        dir.write("plain.txt", b"nothing here is an escape sequence\n");
+        pane(dir, "/bin/cat", &["plain.txt", "-"])
+    }
+
+    /// Poll until the child has enabled bracketed paste, or give up loudly.
+    fn wait_for_paste(pane: &mut ShellPane) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            pane.tick();
+            if hosted(pane).bracketed_paste() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the child never asked for bracketed paste, so nothing would ever be sent");
+    }
+
+    /// Draw until what is on screen satisfies `enough`, or give up loudly.
+    fn settled(pane: &mut ShellPane, what: &str, enough: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pane.tick();
+            let screen = draw(pane, 120, 12);
+            if enough(&screen) {
+                return screen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waited twenty seconds for {what}. The screen says:\n{screen}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_handed_over_command_is_typed_at_the_prompt_and_nothing_submits_it() {
+        // The whole promise of the ask pane's hand-off, asked of a real pty:
+        // what ends up at the prompt is what was on the screen, and it is the
+        // reader who runs it. Delete the `bracketed_paste` check and this still
+        // passes; delete the missing newline and it fails on the count below,
+        // which is the assertion this test exists for.
+        //
+        // The echo is the tty's, not the child's: a pty is opened with `ECHO`
+        // and `ICANON` on, so what is written appears immediately and `cat`
+        // does not see it until a newline completes the line. Which is why the
+        // second half below is the strong one — it is `cat` repeating the line,
+        // and it cannot happen until somebody presses `Enter`.
+        let dir = TempDir::new("shell-handoff");
+
+        // Cold: nothing to type into, and nothing started by trying. `App`
+        // defers the hand-off a frame for exactly this — a pane spawns its
+        // child on the frame that draws it, so the keystroke that chose the
+        // command arrives before there is a child to give it to.
+        let mut cold = pane(&dir, SH, &[]);
+        assert!(!cold.send_command("echo ZQXJ"));
+        assert!(
+            matches!(cold.state, State::Cold),
+            "a refused hand-off started a shell"
+        );
+
+        // Live, and provably never going to ask for bracketed paste: refused,
+        // because without that mode `send_text` writes raw bytes and a newline
+        // among them would submit.
+        let mut plain = never_asks(&dir);
+        draw(&mut plain, 120, 12);
+        settled(&mut plain, "the plain child to print anything", |screen| {
+            screen.contains("nothing here is an escape sequence")
+        });
+        assert!(!hosted(&plain).bracketed_paste());
+        assert!(!plain.send_command("echo ZQXJ"));
+
+        // And a child that did ask takes it.
+        let mut pane = asks_for_paste(&dir);
+        draw(&mut pane, 120, 12);
+        wait_for_paste(&mut pane);
+        assert!(pane.send_command("echo ZQXJ"));
+
+        // Once, and unrun. Twice would be the tty's echo *and* `cat` repeating
+        // the completed line, which is exactly what a newline sent along with
+        // it would have produced — so the count is the assertion and
+        // `contains` is only what makes the wait terminate.
+        let typed = settled(&mut pane, "the command to appear", |screen| {
+            screen.contains("echo ZQXJ")
+        });
+        assert_eq!(
+            typed.matches("ZQXJ").count(),
+            1,
+            "the command was submitted rather than typed:\n{typed}"
+        );
+
+        // The reader's own `Enter` is what completes the line, and this half is
+        // what proves the text is really in the child's input rather than
+        // painted on the screen by an echo abeam could have faked.
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        settled(&mut pane, "the line to come back", |screen| {
+            screen.matches("ZQXJ").count() >= 2
+        });
+    }
+
     #[test]
     fn a_shell_that_is_a_script_wrapper_starts_and_the_border_names_the_wrapper() {
         // `ABEAM_SHELL=~/bin/nu-wrapper` is the same wish as `abeam +claude` on
@@ -1772,3 +2043,4 @@ mod unix_tests {
         assert_eq!(pane.title(), "shell · abeam-wrapper");
     }
 }
+

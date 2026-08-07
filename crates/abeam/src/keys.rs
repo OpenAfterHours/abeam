@@ -275,6 +275,23 @@ pub const HELP: &[(&str, &str)] = &[
     // this file, stated there once rather than re-argued beside every key that
     // relies on it.
     ("w", "git: the worktrees of this repository"),
+    // The second key that opens a view without being in the `Alt` table, and
+    // it is pane-local for `w`'s reason rather than for a reason of its own:
+    // the *intercept* paragraph at the top of this file. A question about the
+    // file you are reading is asked from where you are reading it, so the key
+    // is only ever delivered to a focused pane and no agent is listening for
+    // it. `Esc` puts back whatever view it displaced, the way `F2` does.
+    //
+    // "document" and not "files", which is a row about the reader's *modes*
+    // rather than about the reader. The file list and the `f` results each own
+    // every key while they are up — a pane cannot hand the same key to two
+    // vocabularies and hope — so `?` reaches nothing there, and this table must
+    // not advertise a key two rows below `Alt+E` that `Alt+E` `Alt+E` turns
+    // off. The document view and the git view are the whole of where it works.
+    (
+        "?",
+        "document, git: ask a second Claude about the file on screen",
+    ),
     // The queue's own four. `space` is conspicuously not among them: it pages,
     // here as in every other pane, and arming moved to `a` rather than take a
     // key out of the shared vocabulary this table promises three rows above.
@@ -298,9 +315,54 @@ pub const HELP: &[(&str, &str)] = &[
         "(in a find box)",
         "every letter is typed; arrows and Tab move, Esc leaves; f's box runs on Enter",
     ),
+    // The same rule, and the ask pane needs its own row rather than being
+    // folded into the one above because the box there is never *shut*. A find
+    // box is a state you leave; the ask's composer is the pane, so `j`, `k`,
+    // `g`, `G`, `space`, `b`, `r` and `q` are letters for the whole of the time
+    // you are in it and the three scroll rows near the top of this table are
+    // simply untrue there. Naming exactly what does scroll is the honest
+    // version: this table must not promise a key that types a letter.
+    //
+    // `Esc` is on this row rather than left to the last row of the table
+    // because it is the one key here that does something *before* it does what
+    // the last row says: it clears a draft, and only an already-empty composer
+    // falls through to the way out. Stated here, beside the rule it belongs to,
+    // rather than as a fourth clause on a row that is already a list.
+    (
+        "(in the ask)",
+        "every letter is typed; arrows, PgUp/PgDn, Home/End, Ctrl+D/U scroll; Esc clears the draft",
+    ),
+    // `Enter` has a row above for the three views where it opens something.
+    // Here it does two things and neither is running a command: it sends the
+    // question, or — with nothing typed — types the selected command at the
+    // shell **without submitting it**, which is the whole promise of the
+    // hand-off. `Tab` walks the offered commands, which is the same "next /
+    // previous item" the row above already means.
+    (
+        "Enter (ask)",
+        "send · with nothing typed, type the chosen command at the shell",
+    ),
+    // Its own row rather than a clause on the one above, because what it does
+    // is not what a reader would guess from "clear": it ends the *session*, not
+    // the rows showing it. That is the whole point — a conversation left open
+    // is re-sent as context with every question, so the file you have finished
+    // with goes on being paid for until the child holding it is gone.
+    (
+        "Ctrl+L (ask)",
+        "end the conversation and start fresh — the child goes too",
+    ),
+    // The parenthetical is an exhaustive list of the panes that deviate, which
+    // is the only thing that makes it worth having, so a view that deviates has
+    // to be added to it on the day it lands. The ask is the fourth: `q` is a
+    // letter there for the whole of the time the pane is up — it is never the
+    // way out — and this row sits *after* the ask's own two rows, so leaving it
+    // out left the last thing a reader saw contradicting the two above it.
+    // `Esc` is the ask's only while there is a draft to clear, which the
+    // `(in the ask)` row says rather than this one: this row would have had to
+    // carry the condition as well as the key, and it is already a list.
     (
         "Esc or q",
-        "back to the agent (a shell and a find box keep both; worktrees keep Esc)",
+        "back to the agent (a shell and a find box keep both; the ask keeps q; worktrees keep Esc)",
     ),
 ];
 

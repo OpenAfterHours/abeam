@@ -4,8 +4,9 @@ One window for an AI coding session.
 
 Your agent runs in the left pane — hosted in a pty, parsed, and drawn by abeam,
 not passed through to your terminal. The right pane shows the state of the git
-worktree, the document the agent just wrote, or a shell to run things in. A file
-watcher drives the first two, so neither has to be asked.
+worktree, the document the agent just wrote, a shell to run things in, or a
+second Claude you can ask about the file in front of you — one that may read and
+may not write. A file watcher drives the first two, so neither has to be asked.
 
 It replaces a three-window setup: the agent in one terminal, git in another, and
 an editor open purely to read the markdown it produced.
@@ -18,6 +19,13 @@ is not a thing to remember: the left border says. Read the Copilot half of this
 document knowing that **abeam has never been run with Copilot CLI**, not once:
 the selection, the launcher and the failure message are tested, a session is
 not, and "Not done, and known" says exactly why and what that leaves unproven.
+
+Read the ask half the same way, because it is the same kind of gap and it is
+newer: **nobody has ever typed a question into that pane.** Every test drives
+it against shims and fabricated launches, the only real `claude` runs were
+hand-driven probes of the protocol rather than of the pane, and what comes back
+from it is a model's answer — which can be confidently wrong about the file it
+was pointed at. "Not done, and known" has the whole list.
 
 ```
 ┌ claude ──────────────────────────────┐┌ git · main ↑2 · 12 changed ──────┐
@@ -334,8 +342,8 @@ so half-reading it is the one outcome worse than refusing it.
 
 ```toml
 [defaults]
-view  = "git"    # git | files | shell | queue — which right-hand view opens
-focus = "left"   # left | right               — which pane has the keyboard
+view  = "git"    # git | files | shell | queue | ask — which right-hand view opens
+focus = "left"   # left | right                     — which pane has the keyboard
 zoom  = false
 theme = "dark"   # light | dark               — the reader's page
 
@@ -443,6 +451,9 @@ the document is *where is it on this page* — `n` and `N` walk the matches — 
 disk, and it is the only one of the three whose box waits for `Enter` rather
 than narrowing as you type. `Esc` or `q` hands focus back to the agent.
 
+**Two of the views do not answer to that paragraph, and both are named below.**
+It used to be one.
+
 `w` is the one key in that vocabulary that is not about reading: in the git view
 it opens the repository's worktrees, `Enter` there points the right pane at the
 selected one, and `Esc` gives you the status list back instead of the agent —
@@ -457,9 +468,44 @@ and refused twice over — `Alt+W` is Claude's, and a view key spelled `F6` woul
 be a key nobody groups with `Alt+G` and `Alt+E`. The list is not a peer of those
 views anyway; it is how you point one of them somewhere else.
 
-The shell view is the exception, and it has to be: `Esc` and `q` belong to
-whatever is running in it. `Alt+S` or `F4` is the way out, and its border says
-so rather than leaving you to find out.
+`?` is the second key in that vocabulary that is not about reading, and the table
+above is right to leave it out for exactly the reason it leaves out `w`. In the
+document the reader is showing, or in the git view, it opens **ask** — a second
+Claude in the right pane, described under "The panes" — with the file you were
+looking at attached to the first question, and `Esc` puts back the view it
+displaced the way `F2` does out of the diagnostics. Those two views and no
+others: the file list and the `f` results own every key while they are up, so
+`?` is inert in both, which "Not done, and known" says is a gap rather than a
+decision. A question about the file you are reading is asked from where you are
+reading it, so the key is only ever delivered to a focused pane; that is
+the whole of the exemption, and it is the same sentence `w` relies on rather than
+a second argument that happens to agree. A global spelling was not on offer here
+either: every plausible `Alt` letter is Claude's or Copilot's, and there is
+nothing to switch *to* from the left pane — the pane is opened by pointing at
+something, which is a thing you can only do from the pane holding it.
+
+**The shell is the first exception, and it has to be**: `Esc` and `q` belong to
+whatever is running in it, along with every other plain key, because a pane you
+type into cannot also read what you typed. `Alt+S` or `F4` is the way out, and
+its border says so rather than leaving you to find out. `Alt+J`/`Alt+K` are
+what scroll its history, which is why they are not the arrow keys the shell
+would read as history.
+
+**The ask is the second, and it is the easier of the two to trip over**,
+because it looks like something you read rather than something you type at. The
+composer there is live the whole time the pane is, so `j`, `k`, `space`, `b`,
+`g`, `G`, `r` and `q` are **letters** — they go into the question, exactly as
+they do in a find box — and the scroll half of the paragraph above is simply
+untrue there. What scrolls is the arrows, PgUp/PgDn, Home/End and
+`Ctrl+D`/`Ctrl+U`, with `Alt+J`/`Alt+K` reaching it from outside as they reach
+every other view. `Enter` is not "open" either: it sends the question, or —
+with nothing typed — hands the selected command to the shell view, which types
+it without submitting. And `Esc` clears a draft before it hands anything back,
+so the key that means "never mind" costs you what you were writing rather than
+the pane, which is what it costs in the find boxes too. The F1 overlay carries
+that as a row of its own rather than leaving it to be discovered, because a
+table promising `j` in every pane must not go on promising it in the one pane
+where `j` types a letter.
 
 `Ctrl+\` exists so abeam can never permanently shadow a binding of the agent you
 are typing at. If a future Claude or Copilot release binds `Alt+G`, `Ctrl+\`
@@ -603,6 +649,95 @@ command is running at all, and on Unix the question has an answer abeam does not
 go and get (`tcgetpgrp` on the master says which process group holds the
 terminal in the foreground) — so on both a shell sitting at a prompt holds the
 door exactly as a build does. Type `exit` in it, or `Alt+Q` twice.
+
+**ask** — `?` from the document the reader has open or from the git view, and a
+second Claude in the right pane which **may read and may not write**. The gap it
+fills is narrow and constant: you are reading a file, or a diff, and a question
+comes up that is *about* what is on screen — what does this call do, where is
+this written, is this the only caller — and every way of answering it costs the
+conversation in the left pane. You interrupt a turn, or you queue the question
+and wait, or you open a second terminal. This is the fourth way.
+
+**Nobody has ever asked it anything.** Everything in this section follows from
+the code and from tests that drive the pane against shims and strings, with no
+`claude` anywhere near them; no human has typed a question into it and read the
+answer back. So read the present tense here as what abeam does rather than as
+what somebody has watched happen — and read what comes out of it as a model's
+answer, which can be fluent, specific and wrong. "Not done, and known" says
+both of those again, with the rest of what this pane costs.
+
+The read-only claim is a flag rather than a promise. The child is started with
+`--tools "Read,Grep,Glob"`, which is an allowlist over the built-in set: what is
+not named there does not exist for that session, so there is no `Write`, no
+`Edit` and no `Bash` to permit or refuse. `--disallowedTools
+"Write,Edit,NotebookEdit,Bash"` says the same four words from the other side, and
+`--strict-mcp-config` is the one worth reading twice — `--tools` is an allowlist
+over the *built-in* set and says nothing about MCP servers, so without it a
+user's configured servers would be loaded into a session abeam had just called
+read-only. The tools the child reports back on its opening line are drawn along
+the bottom of the pane, so what is on screen is what it actually got rather than
+what abeam meant it to get. A probe on 2026-08-05 asked it to create a file in a
+throwaway directory and it could not; the model **did** emit a `Write` call, and
+what stopped the file appearing is that nothing executed it. The guarantee is
+enforcement, not the model's cooperation, which is the right way round.
+
+What travels is a **path, never a payload**. `?` attaches the file the pane you
+came from was showing, the pane draws `▸ viewer.rs` above the composer until the
+question goes, and what the child is handed is one line naming that file. It
+stands in the same directory and has `Read`, `Grep` and `Glob`, so naming the
+file is enough: it fetches what it needs and skips what it does not. Sending the
+body instead would mean a cap, a truncation notice, a decision about how much of
+a four-thousand-line file to send, and a question that silently carries part of
+somebody's repository off the machine — where a path costs one line on screen and
+is the *whole* of what was sent, which is what makes that row complete rather
+than a summary.
+
+**`Enter` never runs anything.** An answer full of shell commands is the ordinary
+shape of a useful answer, and the distance between reading one and running it is
+where this could do real harm. So there is exactly one route out and it ends at a
+prompt: `Tab` picks a single-line command out of the transcript, `Enter` on an
+empty composer hands it to the shell view, and the shell **types it without
+submitting**. A block of more than one line is never offered — not truncated, not
+joined with `&&`, not offered as its first line — because a command assembled out
+of several lines by a program is indistinguishable, once it is sitting at a
+prompt, from one somebody read and approved. The refusal is drawn where the offer
+would have been, and the way through is to copy it out of the answer.
+
+The composer is live the whole time the pane is, which costs it half the scroll
+vocabulary and is worth naming rather than papering over: `j`, `k`, `g`, `G`,
+`space`, `b`, `r` and `q` are **letters** here, exactly as they are in a find
+box, so the arrows, PgUp/PgDn, Home/End and `Ctrl+D`/`Ctrl+U` are what scroll,
+and `Alt+J`/`Alt+K` still reach it from outside. `q` is in that list rather than
+left out of it because it is the key somebody presses to leave, and here it
+types a letter. The F1 overlay says all of that in its own row rather than
+leaving you to discover it, and "Keys" names this pane as the second of the two
+exceptions to the one scroll vocabulary. Answers stream and the view follows the
+bottom until you scroll up, and stops until you come back to the end.
+
+It is one session per pane and per workspace, held open across questions, so the
+second answer can remember the first — that is the whole reason it is a
+long-lived child rather than one process per question. `Esc` puts the view back
+and leaves it running; what ends it is quitting, and nothing is persisted, so
+`Alt+Q` and a crash lose the conversation equally and by design. Asking again
+after that starts a fresh reader, which the pane says on screen rather than
+letting you find out from an answer that has forgotten the question before it.
+`Ctrl+L` ends the conversation and starts a fresh one, and **it ends the child
+along with it** — which is the only version of that key worth having. What a
+long conversation costs is not the rows on screen: every turn is sent again as
+context with the next question, so the file you finished with half an hour ago
+is still being paid for. Clearing the pane and keeping the reader would have
+hidden that rather than fixed it. The composer keeps what you have typed and the
+attached file stays attached, because starting again about *this* file is what
+pressing `?` and then `Ctrl+L` means.
+
+The title carries what the session has cost so far, in three decimal places,
+because a trivial exchange is a few hundredths of a dollar and a title reporting
+`$0.00` over something that cost money is worse than one reporting nothing. What
+the pane does *not* do is warn you about it. It is the same Claude, on the same
+account, started by the same person — a standing caution about that would read
+as though abeam had found something alarming, and there is nothing alarming to
+find. The row along the bottom is spent on what a reader can act on instead: the
+tools the child actually got, and the key that ends the conversation.
 
 **pty diagnostics** (`F2`) — what the emulation layer is doing: alt-screen,
 application cursor, bracketed paste, mouse mode, byte counts, resize count, and
@@ -773,6 +908,9 @@ crates/abeam/src/workspace.rs      the worktrees of the repository, and which of
                                    and the argument for it live here.
 crates/abeam/src/paths.rs          when two spellings are one directory, and the
                                    one spelling everything starts from
+crates/abeam/src/ask/              the second Claude: what it is started with,
+                                   and a wire format abeam does not own. `mod.rs`
+                                   is the record of one run against one version.
 crates/abeam/src/panes/viewer/mermaid/   a diagram on a character grid, or an
                                    honest refusal to draw one. `mod.rs` holds
                                    the rule both families answer to.
@@ -823,7 +961,7 @@ cargo clippy --workspace --all-targets
 Working, and used. Not finished.
 
 **Done.** The pty host layer, proven by a spike that ran a real Claude session
-against it on 2026-08-01. All four right-hand views, the file list, the
+against it on 2026-08-01. All five right-hand views, the file list, the
 rendered/source toggle, the watcher driving what it should, and the three
 searches under the reader — a file by its name, a phrase on the page, a phrase
 in every file under the root. Focus, zoom, help, the diagnostics view, and the
@@ -831,7 +969,7 @@ literal-next escape hatch. Agent selection and the launcher underneath it. The
 Unix port, in the sense that the whole workspace builds, tests and lints clean
 for both `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see
 "Platforms" for the sense in which it is not done. Mermaid flowcharts and
-sequence diagrams, drawn rather than shown as source. 648 tests on Windows, and
+sequence diagrams, drawn rather than shown as source. 752 tests on Windows, and
 `clippy --all-targets` clean on both.
 
 Two of those changed Windows behaviour on the way past, and both are worth
@@ -1062,6 +1200,146 @@ work, on either platform.
   46-column right pane is not the same thing. Expect the first real `cargo test`
   run in there to find something about width, wrapping or the scrollback that no
   test thought to ask about.
+- **The ask pane has never been driven by a human either, and it is newer.** No
+  person has typed a question into it and read an answer. What exists is a
+  probe — one `claude -p` started by hand on 2026-08-05, asked two questions
+  down one standard input, which recalled a word from the first in the second
+  and cost $0.054 — and a suite that drives every argument in the pane and every
+  line of the protocol against strings and shims, with no `claude` anywhere near
+  it. That is more than a smoke test and still less than use. Expect the first
+  real question to find something about streaming, about the forty-six columns
+  an answer has to wrap into, or about what a long tool-using turn looks like
+  when the only thing on screen is a growing paragraph.
+- **The answer can be wrong, and nothing on screen says so.** What comes back is
+  a model's answer about a file it went and read, which is exactly as reliable
+  as the agent in the left pane and no more — it can name a caller that does not
+  exist, miss the one that does, and be fluent and specific about both. Every
+  other risk this pane carries is written down somewhere: what it may do, what
+  it costs, what it shares. This one was not, and it is the one that most needs
+  saying, because a confident paragraph in a 46-column pane beside the file it
+  is about reads as a fact about that file. There is no fix here, only the
+  admission: it is a second Claude, not a second opinion from something that
+  cannot be wrong. Check what it tells you the way you would check the left
+  pane, and the `Read`, `Grep` and `Glob` it was given are what it checked
+  against — everything else it says came out of the model.
+- **It reads a working tree the agent on the left is writing.** The child is
+  handed a path and goes and reads it whenever it gets round to it, which can be
+  halfway through the edit the left pane is making — so an answer can describe a
+  file that never existed in that state before the read and does not exist in it
+  after. Nothing on screen dates the read: the transcript says what was asked
+  and what came back, and not which version of the file was underneath. Every
+  other pane here that can be out of date looks out of date — the git pane says
+  it is reading, the reader says what it has open — and an answer about a file
+  caught mid-edit looks exactly like an answer about the file.
+- **A turn that never ends has no way out.** There is no cancel key, no timeout
+  and no note: the pane draws `ask · answering` and goes on drawing it. That is
+  a reachable state rather than a hypothetical one, because `parse_line` drops
+  every message type it does not know — so a child that stops mid-turn to ask
+  abeam for something abeam has never heard of gets no reply, never sends the
+  `result` that is the only reliable end of a turn, and leaves the title reading
+  `answering` for the rest of the session, indistinguishable from a slow answer.
+  `Alt+Q` is the whole of the escape. The dropping is deliberate and the
+  wire-format bullet below is the argument for it; what is missing is a way out
+  beside it.
+- **`?` is inert in the file list and in the `f` results.** It opens the ask from
+  the document the reader is showing and from the git view, and nowhere else —
+  the list and the results each own every key while they are up, because a pane
+  cannot hand the same key to two vocabularies and hope, and neither of them has
+  an arm for `?`. So `Alt+E` `Alt+E` reaches a view where the key the F1 overlay
+  advertises two rows above does nothing at all, silently. The overlay says
+  "document, git" rather than "files, git" for that reason, which is a correction
+  and not a fix: the honest answer is that the list should ask about the file the
+  selection is on, exactly as the git view asks about the row it is on.
+- **The transcript costs more to draw the longer it gets.** It is laid out as
+  one markdown document, on the frame path, exactly as the reader's own body is
+  — and every fragment of a streaming answer changes that document, so while an
+  answer is arriving the *whole* transcript is re-wrapped once per frame, every
+  earlier turn included and not only the one growing. Measured in a release
+  build at a 46-column pane: **2.25 ms per frame at 10 turns, 3.74 ms at 30 and
+  6.51 ms at 40**, against the 8 ms a frame has and in a frame that still has to
+  redraw the agent's whole screen beside it. An idle transcript costs nothing —
+  the layout is kept until something changes it or the width moves — so the
+  whole of the cost lands exactly while the pane is busiest. Forty turns is a
+  long conversation rather than an absurd one and nothing stops it growing.
+  Retiring it means laying each turn out once and keeping it, which is a
+  per-turn cache with a width rule on it rather than a smaller constant.
+- **Starting the reader blocks the loop that draws**, measured at **11.6 ms**
+  for the first question, against the same 8 ms. So the frame carrying
+  somebody's first question is a late one, and it is late on the keystroke most
+  obviously theirs. It is once per workspace rather than once per question — the
+  session is held open across questions — which is the only reason this is a
+  hitch rather than a stutter, and it is the same shape as the shell starting
+  its child on the first frame that draws it. Neither has been moved off that
+  path.
+- **The wire format this rests on is not published, and what is written down is
+  one run on one version.** Claude's CLI reference documents that
+  `--input-format stream-json`, `--output-format stream-json` and `--session-id`
+  exist, and the SDK layered over them; the *shape of the lines* — that a
+  `result` is the only reliable end of a turn, that `text_delta` is the fragment
+  worth showing and thinking deltas are not, that a `system`/`init` reports the
+  tools actually granted, that the child exits 0 when its standard input closes
+  — is none of it specified anywhere. Every one of those was read off a single
+  run against **Claude Code 2.1.222 on Windows**, and it is recorded that way in
+  `crates/abeam/src/ask/mod.rs` so that the day it stops being true somebody can
+  see what it used to be. A release that renames a field does not break a
+  contract; it breaks an observation. The parser ignores line types it does not
+  know rather than complaining, which is what makes that failure look like a
+  pane that has gone quiet rather than one that has crashed — and the one line
+  that would show it is `crate::ask`'s `Broke`, which reaches the transcript
+  rather than a log.
+- **On a Windows npm install, `Drop` cannot reach the grandchild.**
+  `crate::launch` starts a `claude.cmd` by naming `cmd.exe` in front of it, so
+  the process abeam holds is the interpreter and the Claude is *its* child.
+  Killing `cmd.exe` does not kill a node underneath it — the same limitation
+  `abeam_pty` answers with a job object for the pane on the left, which is
+  machinery this module does not have. What closes it in practice is the
+  observation above: the child exits 0 when its standard input closes, and
+  `Drop` drops the write end of that pipe *before* it kills anything, so an
+  orphaned node reaches end of file on its next read and leaves of its own
+  accord. That is a mitigation resting on observed behaviour rather than a
+  guarantee resting on the operating system, and the difference is the point: if
+  it ever has to be a guarantee, the answer is `abeam_pty`'s job object rather
+  than a longer kill. A native install and every Linux install are unaffected —
+  there is no interpreter in between, and the process abeam holds is the one it
+  kills.
+- **Nothing caps what it spends, and a long conversation costs more per
+  question than a short one.** It is the same account as the agent, which is
+  what anybody would expect and is not the part worth writing down. What is
+  worth writing down is the shape of the bill: context is re-sent with every
+  turn, so the tenth question in a conversation carries the nine before it and
+  costs accordingly. `Ctrl+L` is the whole of the answer abeam offers, and it is
+  a manual one — nothing clears the conversation for you when you move to
+  another file, and the title's running cost is disclosure rather than a
+  defence. `--max-budget-usd`
+  exists and is not passed: a ceiling abeam picked would be a number nobody
+  chose, and a ceiling in the config file is a decision worth making after
+  somebody has seen what a day of this actually costs. Every workspace gets its
+  own session too, for the reason each gets its own shell — a child's working
+  directory belongs to the child, and a reader still standing in the checkout
+  you left would resolve a path against the wrong one and answer confidently
+  about somebody else's file — so switching workspaces with the ask up starts a
+  second `claude` on the next question rather than moving the first. Both are
+  cold until a *question*, so a session that never presses `?` never starts one.
+  **The pane is not quite free either, and this used to say it was.** Before it
+  can tell you on screen that there is no `claude` here to ask, it has to find
+  out, and finding out is a `PATH` walk. That walk happens once per workspace,
+  on the frame that first draws the pane rather than when the workspace is made
+  — so pressing `?` is what pays for it, a workspace you never ask in pays
+  nothing, and every question after the first in one you have pays nothing
+  again. A walk is not a process, which is why this is a clause rather than a
+  bullet of its own; it is here because "pays nothing at all" was a stronger
+  sentence than the code supports, and the strong version is the one somebody
+  would have built on.
+- **A command handed to the shell is refused when the shell is `cmd.exe`.**
+  `Enter` on an empty composer types the selected command at the shell view
+  without submitting it, and that write is a bracketed paste — which abeam will
+  not send to a child that has not asked for the mode, because without it a
+  newline in what abeam wrote would submit. PSReadLine asks; `cmd.exe` never
+  does. So on the `cmd` fallback, and on any shell without a line editor, the
+  hand-off waits ten seconds and then says so in the transcript rather than
+  typing anything. Refusing is the safe direction — nothing appears, rather than
+  a command running unread — and the command is still on screen in the answer
+  above, which is what the message points at.
 - **abeam has never been run with Copilot CLI.** Not once, not for a minute. It
   is not installed on the machine abeam is developed on and cannot easily be:
   the npm package wants Node 22 and this box has v20.14.0, and neither `winget

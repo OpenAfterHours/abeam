@@ -15,6 +15,7 @@
 mod agent;
 mod agentstate;
 mod app;
+mod ask;
 mod config;
 mod dispatch;
 mod keys;
