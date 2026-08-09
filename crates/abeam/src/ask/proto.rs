@@ -16,34 +16,61 @@
 //! often than it was right. Only a line that is not JSON at all, or one whose
 //! shape contradicts what it claims to be, is [`AskEvent::Broke`].
 //!
-//! ## Which of the six line shapes carries the answer, and why two do not
+//! ## Which line shapes carry the answer, which carry the waiting, and why
 //!
-//! Four `type` values reach the pane and the rest are dropped. Two of the drops
-//! are decisions rather than gaps, and both are about the same text arriving
-//! more than once.
+//! A turn is mostly not answer. Measured on the probe of 2026-08-09 recorded in
+//! `crate::ask`: one ordinary question produced **123 lines and ten of them
+//! were text**, over thirty seconds in which the child read three files and ran
+//! nothing the reader could see. The rest is the child working — reasoning
+//! blocks opening, tool calls being assembled, tool results coming back — and a
+//! parser that keeps only the text is a parser that reports a thirty-second
+//! silence as a pane that has hung.
 //!
-//! **`assistant` produces nothing.** A completed assistant message repeats,
-//! whole, the text the `text_delta` fragments have already put on screen — so
-//! turning it into an event would draw the answer twice, and turning it into a
-//! *replacement* for the deltas would mean the transcript sat empty until the
-//! model finished thinking, which is the entire thing `--include-partial-
-//! messages` is passed to avoid. The authoritative final text is on the
-//! `result` line, which arrives after it and which [`AskEvent::Turn`] carries.
+//! So four `type` values carry content and two carry progress:
 //!
-//! That last part is what makes the drop safe rather than merely tidy, and it
-//! is worth being explicit about because it is the one place this file has a
-//! single point of failure. If `--include-partial-messages` were ever refused
-//! or quietly stopped being honoured, no `stream_event` would arrive at all and
-//! the transcript would go empty — and `Turn.text` is what the pane falls back
-//! to, in one piece at the end of the turn instead of a word at a time. So the
-//! answer reaches the reader on either route, and it reaches them twice on
-//! neither.
+//! **`assistant` carries the tool calls and not the text.** A completed
+//! assistant message repeats, whole, the text the `text_delta` fragments have
+//! already put on screen — so drawing its text would draw the answer twice, and
+//! drawing it *instead* would mean the transcript sat empty until the model
+//! finished, which is the entire thing `--include-partial-messages` is passed
+//! to avoid. What the deltas do *not* carry is the `tool_use` blocks, and those
+//! are the only place the child says what it is about to do and to which file.
+//! [`AskEvent::Using`] is that and nothing else: a name, and the one argument
+//! worth a reader's attention. It is progress, never content.
 //!
-//! **`user` produces nothing either**, for a nearer reason: on this session it
-//! is a tool result coming back — the child has `Read`, `Grep` and `Glob` — or
-//! the child's own echo of what was written to its standard input. Neither is
-//! an answer to the question, and a transcript that showed the contents of
-//! every file the child opened would bury the sentence the reader asked for.
+//! One message can hold several of them — the probe caught a `Read` and a
+//! `Glob` in one — which is why that variant carries a `Vec`. They are
+//! dispatched together, so a batch is what actually happens.
+//!
+//! **A thinking block opening is [`AskEvent::Thinking`], and the thinking is
+//! not.** `content_block_start` says a block of reasoning has begun; the
+//! `thinking_delta`s that follow are the reasoning itself, and those stay
+//! dropped for [`TEXT_DELTA`]'s reason — thinking is fluent prose about the
+//! question, and a reader has no way to tell it from an answer. That there
+//! *is* thinking happening is the part they can use.
+//!
+//! **`user` produces nothing**, for a nearer reason: on this session it is a
+//! tool result coming back — the child has `Read`, `Grep` and `Glob` — or the
+//! child's own echo of what was written to its standard input. Neither is an
+//! answer to the question, and a transcript that showed the contents of every
+//! file the child opened would bury the sentence the reader asked for.
+//!
+//! ## The fallback the whole design leans on
+//!
+//! The `result` line carries a copy of the answer, and [`AskEvent::Turn`] hands
+//! it on. That matters because it is this file's one single point of failure:
+//! if `--include-partial-messages` were ever refused or quietly stopped being
+//! honoured, no `stream_event` would arrive at all and the transcript would go
+//! empty — and `Turn.text` is what the pane falls back to, in one piece at the
+//! end of the turn instead of a word at a time.
+//!
+//! **But it is a fallback and not a better copy, and the probe is what settles
+//! that.** `result` holds the *last* text block of the turn, not the turn: two
+//! runs on 2026-08-09 streamed 1144 and 2449 characters and reported 944 and
+//! 2278, because in both the model said something before it reached for a tool
+//! and `result` begins after the last one. A pane that took `result` as
+//! authoritative would delete the opening paragraph of every answer that used a
+//! tool. See `crate::panes::ask`, which is where that is now refused.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -68,10 +95,24 @@ pub enum AskEvent {
     /// A `text_delta` fragment. Never a thinking delta and never a tool-input
     /// delta; see [`parse_line`].
     Delta(String),
+    /// The tools one assistant message asked for, in the order it asked for
+    /// them.
+    ///
+    /// **Progress, never content.** Nothing here is any part of the answer, and
+    /// the pane draws it as the child's account of what it is doing rather than
+    /// as anything it said.
+    Using(Vec<Step>),
+    /// A block of the model's reasoning has begun. The reasoning itself never
+    /// leaves this file — see the module docs.
+    Thinking,
     /// `result` — the end of a turn, and the only reliable signal of one.
     Turn {
         text: String,
         cost_usd: Option<f64>,
+        /// How long the turn took, as the child measured it. Wall-clock and
+        /// including every tool call, which is the number a reader who has just
+        /// waited for it is comparing against.
+        duration_ms: Option<u64>,
         error: Option<String>,
     },
     /// A rate limit, reduced to something sayable.
@@ -81,6 +122,22 @@ pub enum AskEvent {
     /// A line that could not be read, or the reader itself failing. Carries
     /// what can honestly be said about it and is never silently dropped.
     Broke(String),
+}
+
+/// One tool call the child announced: what it is running, and the one argument
+/// worth showing somebody watching it work.
+///
+/// **One argument and not the input**, which is a decision about a pane
+/// forty-six columns wide rather than a limit of the format. A tool input is an
+/// object of arbitrary size — a `Grep` carries a pattern, a path, a glob, a
+/// context count and four flags — and a reader watching a turn go by wants to
+/// know *which file*, not to read a serialised call. [`TARGETS`] is the
+/// preference order, and `None` is an honest answer for a tool whose input
+/// carries none of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub tool: String,
+    pub target: Option<String>,
 }
 
 /// The delta that is an answer, out of the several that are not.
@@ -133,12 +190,17 @@ pub fn parse_line(line: &str) -> Option<AskEvent> {
 
     match kind {
         "system" => init(&value),
-        "stream_event" => delta(&value),
+        "stream_event" => streamed(&value),
         "result" => Some(finished(&value)),
-        "rate_limit_event" => Some(AskEvent::RateLimited(sayable(&value))),
-        // The two that are dropped on purpose — see the module docs, which are
-        // the argument rather than this line.
-        "assistant" | "user" => None,
+        "rate_limit_event" => limited(&value),
+        // The tool calls, which are the only place the child says what it is
+        // doing while it is doing it. Its *text* is dropped here and arrives as
+        // fragments — see the module docs, which are the argument rather than
+        // this line.
+        "assistant" => using(&value),
+        // Dropped on purpose: a tool result coming back, or the child's echo of
+        // its own standard input.
+        "user" => None,
         // And everything else, which is how a format grows. A `type` this
         // version has never heard of is Claude having added a message, not
         // Claude having gone wrong, and the pane says nothing about it.
@@ -266,6 +328,7 @@ struct Init {
 struct Finish {
     result: Option<String>,
     total_cost_usd: Option<f64>,
+    duration_ms: Option<u64>,
     is_error: Option<bool>,
     subtype: Option<String>,
     api_error_status: Option<Value>,
@@ -339,6 +402,40 @@ fn init(value: &Value) -> Option<AskEvent> {
     })
 }
 
+/// The two `stream_event` shapes that reach the pane, out of the six that
+/// arrive.
+///
+/// Total, and never [`AskEvent::Broke`], for [`delta`]'s reason: this is the
+/// highest-frequency line by two orders of magnitude, so a shape that stopped
+/// parsing would produce hundreds of complaints rather than one.
+///
+/// `content_block_start` is read for the reasoning blocks and **not** for the
+/// tool calls it also announces, which is worth a sentence because it looks
+/// like the obvious place for them. It carries the tool's name and an *empty*
+/// input — the arguments arrive afterwards, a character at a time, as the
+/// `input_json_delta`s this file drops. So the block start knows `Read` and not
+/// *what* is being read, and a progress line saying `Read` alone is barely
+/// progress. The `assistant` message a moment later carries the same call with
+/// its input complete and still lands before the tool has run; see [`using`].
+fn streamed(value: &Value) -> Option<AskEvent> {
+    let event = value.get("event")?;
+    match event.get("type").and_then(Value::as_str)? {
+        "content_block_delta" => delta(event),
+        "content_block_start" => started(event),
+        _ => None,
+    }
+}
+
+/// A block of reasoning beginning, out of the three kinds of block that can.
+///
+/// The whole event, and deliberately no payload. What the model is thinking is
+/// dropped for [`TEXT_DELTA`]'s reason; that it is thinking is the part a
+/// reader watching a silent pane can use.
+fn started(event: &Value) -> Option<AskEvent> {
+    let block = event.get("content_block")?;
+    (block.get("type").and_then(Value::as_str)? == "thinking").then_some(AskEvent::Thinking)
+}
+
 /// The one delta shape that is an answer.
 ///
 /// Total, and never [`AskEvent::Broke`]. This is the highest-frequency line by
@@ -349,11 +446,7 @@ fn init(value: &Value) -> Option<AskEvent> {
 /// already paid for: the whole answer arrives again on the `result` line, so a
 /// stream this function has stopped understanding degrades to an answer that
 /// appears all at once at the end of the turn instead of a word at a time.
-fn delta(value: &Value) -> Option<AskEvent> {
-    let event = value.get("event")?;
-    if event.get("type").and_then(Value::as_str) != Some("content_block_delta") {
-        return None;
-    }
+fn delta(event: &Value) -> Option<AskEvent> {
     let delta = event.get("delta")?;
     if delta.get("type").and_then(Value::as_str) != Some(TEXT_DELTA) {
         return None;
@@ -364,6 +457,85 @@ fn delta(value: &Value) -> Option<AskEvent> {
     // transcript as nothing at all.
     let text = delta.get("text").and_then(Value::as_str)?;
     Some(AskEvent::Delta(text.to_string()))
+}
+
+/// What the child is about to do, out of an assistant message.
+///
+/// Never [`AskEvent::Broke`] and never a complaint, which is the same call
+/// [`delta`] makes and for a weaker version of the same reason: this is
+/// progress. A message whose shape this cannot read costs the reader a line of
+/// reassurance while a tool runs, and the answer itself arrives by two other
+/// routes that do not touch this function. Complaining here would put a warning
+/// in the transcript for every assistant message of every turn the day the
+/// shape moves — dozens per question — which is exactly the noise
+/// [`limited`] exists to stop.
+///
+/// `None` when the message asked for no tools, which is most of them: a message
+/// that is only text is the answer arriving, and the fragments have it.
+fn using(value: &Value) -> Option<AskEvent> {
+    let content = value.get("message")?.get("content")?.as_array()?;
+    let steps: Vec<Step> = content.iter().filter_map(step).collect();
+    (!steps.is_empty()).then_some(AskEvent::Using(steps))
+}
+
+/// One `tool_use` block, or `None` for any other kind of block.
+fn step(block: &Value) -> Option<Step> {
+    if block.get("type").and_then(Value::as_str)? != "tool_use" {
+        return None;
+    }
+    let tool = block.get("name").and_then(Value::as_str)?;
+    Some(Step {
+        // Clipped because it is drawn on a row of chrome and this is a name
+        // abeam does not choose. An MCP tool arrives as `mcp__server__tool`,
+        // and nothing bounds what somebody calls their server.
+        tool: clip(tool, 40),
+        target: target(block.get("input")),
+    })
+}
+
+/// The argument of a tool call worth putting in front of a reader, in
+/// preference order.
+///
+/// The order is the point rather than the list. `Grep` carries a `pattern` and
+/// often a `path` as well, and `Glob` carries both too — and in both cases the
+/// pattern is what the child is actually looking for, while the path is usually
+/// just the repository root said the long way. `Read` carries only a
+/// `file_path`. So the two path fields bracket the pattern: the tool that has
+/// nothing else is served first, and the tools that have both are served the
+/// half that says something.
+///
+/// Names beyond the three tools this session is given, because [`TOOLS`] is a
+/// list abeam passes and not one it can enforce a *shape* on — an MCP tool that
+/// slipped past `--strict-mcp-config` would arrive here with whatever input it
+/// likes, and a `command` or a `url` is worth naming if one ever does.
+///
+/// [`TOOLS`]: crate::ask::TOOLS
+const TARGETS: [&str; 7] = [
+    "file_path",
+    "notebook_path",
+    "pattern",
+    "path",
+    "command",
+    "url",
+    "query",
+];
+
+/// The first of [`TARGETS`] the input actually carries, as text.
+///
+/// String-valued only, and that is not laziness about numbers: what this
+/// produces is drawn on one row beside a tool name, and a field that arrives as
+/// an object or an array is one whose rendering abeam would be inventing. A
+/// call with nothing sayable in it draws as its tool name alone, which is true.
+fn target(input: Option<&Value>) -> Option<String> {
+    let input = input?.as_object()?;
+    TARGETS.iter().find_map(|name| {
+        input
+            .get(*name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|said| !said.is_empty())
+            .map(|said| clip(said, 200))
+    })
 }
 
 /// The end of a turn.
@@ -387,13 +559,18 @@ fn finished(value: &Value) -> AskEvent {
     // that has already said there was none.
     let error = finish.is_error.unwrap_or(false).then(|| refused(&finish));
     AskEvent::Turn {
-        // What Claude said, and the fallback the whole design leans on: if
-        // `--include-partial-messages` were ever not honoured, no delta would
-        // have arrived and this is the entire answer. Empty when the field is
-        // absent, which is the ordinary shape of a turn that failed — see
-        // `error` above, which is where a failed turn says anything at all.
+        // What Claude said *last*, and the fallback the whole design leans on
+        // when nothing streamed: if `--include-partial-messages` were ever not
+        // honoured, no delta would have arrived and this is the only answer
+        // there is. It is not a better copy of one that did stream — see the
+        // module docs, which have the measurement — and `crate::panes::ask` is
+        // where that distinction is kept. Empty when the field is absent, which
+        // is the ordinary shape of a turn that failed: the error subtypes carry
+        // no `result` at all, and `error` above is where such a turn says
+        // anything.
         text: finish.result.unwrap_or_default(),
         cost_usd: finish.total_cost_usd,
+        duration_ms: finish.duration_ms,
         error,
     }
 }
@@ -421,16 +598,141 @@ fn refused(finish: &Finish) -> String {
     said
 }
 
-/// A rate limit, reduced to something sayable — out of a line nobody has
-/// captured.
+/// The status a `rate_limit_event` carries when nothing is wrong, which is
+/// nearly always.
 ///
-/// `rate_limit_event` is in `crate::ask`'s list of observed types and its
-/// *fields* are not: the probe that found it recorded the `type` and an
-/// ellipsis. So this is written to be right about a shape it has never seen,
-/// which means never failing and never inventing. It looks for the three field
-/// names such an event would plausibly carry a sentence in, and when it finds
-/// none it hands over what the line actually said, minus the two fields every
-/// line of this stream carries and which would say nothing.
+/// The other two the format defines are `allowed_warning` and `rejected`.
+const ALLOWED: &str = "allowed";
+
+/// A `rate_limit_event`, which is **usually not a rate limit**.
+///
+/// This is the correction that matters most in this file, because the previous
+/// version of it was wrong on nearly every line it saw. `rate_limit_event` is
+/// emitted whenever the child's rate-limit *information changes*, which
+/// includes the moment a session learns where it stands — so an ordinary
+/// question that is nowhere near any limit produces one, and the pane put a
+/// warning in the transcript saying so. A caution that fires when nothing is
+/// wrong is worse than no caution: the one that means something arrives
+/// looking exactly like the dozens that did not.
+///
+/// The shape was unknown when this was first written and is now known. From the
+/// probe of 2026-08-09 in `crate::ask`, and confirmed against 2.1.222's own
+/// schema for the message:
+///
+/// ```json
+/// {"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
+///  "resetsAt":1786276200,"rateLimitType":"five_hour","overageStatus":"rejected",
+///  "overageDisabledReason":"org_level_disabled","isUsingOverage":false},
+///  "uuid":"…","session_id":"…"}
+/// ```
+///
+/// `status` is one of `allowed`, `allowed_warning` and `rejected`, and it is
+/// the only field that decides whether there is anything to say. [`ALLOWED`] is
+/// silence.
+///
+/// **`overageStatus` is deliberately not read**, and the line above is why: it
+/// came back `rejected` on a session with nothing wrong with it. Overage is
+/// billing beyond the plan, and an organisation that has not turned it on
+/// reports it refused for ever. Reading it would rebuild the false alarm one
+/// field along.
+///
+/// `utilization` is not read either, for a plainer reason: it is a number whose
+/// unit is not written down anywhere abeam can see, and the probe did not carry
+/// one. A percentage that might be a fraction is worse than no percentage.
+///
+/// A line whose `rate_limit_info` cannot be read at all still speaks, through
+/// [`sayable`], because a limit abeam cannot parse is the worst one to swallow.
+/// That is the deliberate hole in the noise fix: if this shape moves, the
+/// racket comes back rather than the silence.
+fn limited(value: &Value) -> Option<AskEvent> {
+    let Some(status) = value
+        .get("rate_limit_info")
+        .and_then(|info| info.get("status"))
+        .and_then(Value::as_str)
+    else {
+        return Some(AskEvent::RateLimited(sayable(value)));
+    };
+    if status == ALLOWED {
+        return None;
+    }
+    Some(AskEvent::RateLimited(limit(status, &value["rate_limit_info"])))
+}
+
+/// What abeam says about a limit that is real, out of the two fields worth
+/// saying it with.
+///
+/// Which limit and when it lifts, in that order, because those are the two
+/// things a reader can act on: one tells them whether to stop for five hours or
+/// for the week, and the other tells them when to come back. The status itself
+/// is turned into a sentence rather than printed, since `allowed_warning` names
+/// a state rather than describing one.
+fn limit(status: &str, info: &Value) -> String {
+    let mut said = match status {
+        "allowed_warning" => String::from("Claude is close to a usage limit"),
+        "rejected" => String::from("Claude has hit a usage limit"),
+        // A status this version has never heard of. Named rather than guessed
+        // at: the two above are a claim about today's format, and a third value
+        // is one abeam has no sentence for and must not invent one for.
+        other => format!("Claude reported a rate limit (`{}`)", clip(other, 40)),
+    };
+    if let Some(which) = info.get("rateLimitType").and_then(Value::as_str) {
+        let _ = write!(said, " on the `{}` limit", clip(which, 40));
+    }
+    match info.get("resetsAt").and_then(Value::as_i64).and_then(lifts_in) {
+        Some(when) => {
+            let _ = write!(said, ", and it lifts in about {when}.");
+        }
+        None => said.push('.'),
+    }
+    said
+}
+
+/// How long until `resets_at`, as a phrase, or `None` when the answer would be
+/// no use.
+///
+/// A duration from now rather than a time of day, and that is a decision about
+/// dependencies as much as about reading: `resetsAt` is a Unix timestamp, and
+/// turning one into a local wall-clock time needs a calendar and a time zone
+/// database — a whole crate, for one line of one pane. Subtracting two integers
+/// needs neither, and "in about 40 minutes" is the form somebody deciding
+/// whether to wait actually wants.
+///
+/// `None` for a reset that has already passed, which is not an error: the field
+/// describes the window the *child* knew about, and a stale one says nothing
+/// useful. The sentence simply ends earlier.
+fn lifts_in(resets_at: i64) -> Option<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let left = resets_at.checked_sub(now).filter(|left| *left > 0)?;
+    Some(match left {
+        ..=90 => format!("{left} {}", plural(left, "second", "seconds")),
+        91..=5400 => {
+            let mins = (left + 30) / 60;
+            format!("{mins} {}", plural(mins, "minute", "minutes"))
+        }
+        _ => {
+            let hours = (left + 1800) / 3600;
+            format!("{hours} {}", plural(hours, "hour", "hours"))
+        }
+    })
+}
+
+/// The same, in the `i64` this file counts seconds in. `crate::text::plural`
+/// takes a `usize`, and a negative count cannot reach here.
+fn plural<'a>(n: i64, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}
+
+/// A rate limit whose own shape abeam could not read, reduced to something
+/// sayable.
+///
+/// The fallback [`limited`] falls back to, and written for a shape it has never
+/// seen: never failing and never inventing. It looks for the three field names
+/// such an event would plausibly carry a sentence in, and when it finds none it
+/// hands over what the line actually said, minus the two fields every line of
+/// this stream carries and which would say nothing.
 ///
 /// The alternative — a fixed sentence of abeam's own, ignoring the line — reads
 /// better and is worse: a rate limit is the one event where the reader needs
@@ -544,8 +846,20 @@ mod tests {
     /// Captured. The completed message, which repeats what the deltas carried.
     const ASSISTANT: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ALPHA"}]},"session_id":"3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e"}"#;
 
+    /// Captured, 2026-08-09. One message asking for two tools at once, which is
+    /// the shape that decided [`AskEvent::Using`] carries a `Vec`.
+    const CALLS: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll look at the file first."},{"type":"tool_use","id":"toolu_015erCbGbCbPdCJpm9YDnhzc","name":"Read","input":{"file_path":"C:\\Users\\philm\\PycharmProjects\\forge\\crates\\abeam\\src\\scroll.rs"},"caller":{"type":"direct"}},{"type":"tool_use","id":"toolu_01Ee989XWwZzc2JTnyv8Nbwg","name":"Glob","input":{"pattern":"crates/abeam/src/**/*.rs"},"caller":{"type":"direct"}}]},"session_id":"x"}"#;
+
+    /// Captured, 2026-08-09. A block of reasoning opening — the one
+    /// `content_block_start` that is news.
+    const THINKS: &str = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}},"session_id":"x"}"#;
+
+    /// Captured, 2026-08-09. The line that used to put a warning in the
+    /// transcript of every session that was working perfectly well.
+    const LIMIT_OK: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1786276200,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false},"uuid":"2881f8f0-a25b-423a-a9f9-aa377ceee850","session_id":"x"}"#;
+
     /// Captured. The end of a turn, and what it cost.
-    const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ALPHA","total_cost_usd":0.0544,"stop_reason":"end_turn","terminal_reason":"completed","api_error_status":null,"session_id":"3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e"}"#;
+    const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ALPHA","total_cost_usd":0.0544,"duration_ms":30652,"stop_reason":"end_turn","terminal_reason":"completed","api_error_status":null,"session_id":"3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e"}"#;
 
     /// Constructed: the delta envelope above with the model's own reasoning in
     /// it. This is the negative that matters most — thinking is text, it is
@@ -611,7 +925,73 @@ mod tests {
     }
 
     #[test]
-    fn an_assistant_message_adds_nothing_the_deltas_and_the_result_did_not() {
+    fn an_assistant_message_carries_the_tool_calls_and_never_the_text() {
+        // The two halves of the decision the module docs argue. A message that
+        // is only text produces nothing: the fragments already drew it, and an
+        // event here would draw the answer twice.
+        assert_eq!(parse_line(ASSISTANT), None);
+
+        // A message that asks for tools produces those and *only* those — the
+        // sentence in front of them is text, and text arrives as fragments.
+        let Some(AskEvent::Using(steps)) = parse_line(CALLS) else {
+            panic!("the child said what it was about to do and nothing carried it");
+        };
+        assert_eq!(steps.len(), 2, "one message, two calls: {steps:?}");
+        assert_eq!(steps[0].tool, "Read");
+        assert_eq!(
+            steps[0].target.as_deref(),
+            Some(r"C:\Users\philm\PycharmProjects\forge\crates\abeam\src\scroll.rs"),
+            "which file is the whole value of the line"
+        );
+        assert_eq!(steps[1].tool, "Glob");
+        // The pattern rather than the path, which is `TARGETS`' whole ordering
+        // argument: a `Grep` carries both and only one of them says anything.
+        assert_eq!(steps[1].target.as_deref(), Some("crates/abeam/src/**/*.rs"));
+        assert!(
+            !format!("{steps:?}").contains("I'll look at the file first"),
+            "the answer text came through the progress route: {steps:?}"
+        );
+
+        // A tool nobody has a target field for is still a tool, and a message
+        // whose shape this cannot read is silence rather than a complaint —
+        // progress that fails must never become noise.
+        let Some(AskEvent::Using(steps)) = parse_line(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"mcp__notes__list","input":{}}]},"session_id":"x"}"#,
+        ) else {
+            panic!("a tool with nothing sayable in it is still a tool");
+        };
+        assert_eq!(steps[0].tool, "mcp__notes__list");
+        assert_eq!(steps[0].target, None);
+        for odd in [
+            r#"{"type":"assistant","message":{"role":"assistant","content":"ALPHA"},"session_id":"x"}"#,
+            r#"{"type":"assistant","session_id":"x"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t"}]},"session_id":"x"}"#,
+        ] {
+            assert_eq!(parse_line(odd), None, "progress became noise: {odd}");
+        }
+    }
+
+    #[test]
+    fn a_reasoning_block_opening_is_the_fact_and_never_the_reasoning() {
+        // What a reader watching a silent pane can use, out of the one
+        // `content_block_start` that is news.
+        assert_eq!(parse_line(THINKS), Some(AskEvent::Thinking));
+
+        // And the two that are not. A tool call's block start knows the name
+        // and not the argument — the input is `{}` until the
+        // `input_json_delta`s have assembled it — so the tools are taken from
+        // the `assistant` message instead, and this shape says nothing.
+        for quiet in [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"x"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t","name":"Read","input":{}}},"session_id":"x"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0},"session_id":"x"}"#,
+        ] {
+            assert_eq!(parse_line(quiet), None, "got an event from: {quiet}");
+        }
+    }
+
+    #[test]
+    fn the_assistant_text_is_not_the_answer_arriving_twice() {
         // The decision the module docs argue: the completed message repeats the
         // text the fragments already drew, and the authoritative copy is on the
         // `result` line after it. An event here would draw the answer twice.
@@ -724,19 +1104,24 @@ mod tests {
             Some(AskEvent::Turn {
                 text: "ALPHA".to_string(),
                 cost_usd: Some(0.0544),
+                // Thirty seconds, which is the measured shape of an ordinary
+                // question and the reason this field is read at all: a reader
+                // who has just waited that long is owed the number.
+                duration_ms: Some(30652),
                 error: None,
             })
         );
 
-        // A turn with no cost on it is still a turn. The field is optional
-        // because the pane's cost line is worth less than the end-of-turn
-        // signal, and losing the second over the first would shut the composer
-        // for good.
+        // A turn with no cost and no duration on it is still a turn. Both
+        // fields are optional because the pane's footnote is worth less than
+        // the end-of-turn signal, and losing the second over either of the
+        // first would shut the composer for good.
         assert_eq!(
             parse_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#),
             Some(AskEvent::Turn {
                 text: "ok".to_string(),
                 cost_usd: None,
+                duration_ms: None,
                 error: None,
             })
         );
@@ -824,10 +1209,69 @@ mod tests {
     // --- the shapes nobody captured -----------------------------------------
 
     #[test]
+    fn the_rate_limit_line_that_says_nothing_is_wrong_says_nothing() {
+        // The correction this file exists to record. `rate_limit_event` fires
+        // when the child's rate-limit information *changes*, which includes
+        // learning where it stands — so an ordinary question nowhere near any
+        // limit produces one, and abeam used to put a warning in the transcript
+        // about it. A caution that fires when nothing is wrong is worse than no
+        // caution, because the one that means something then looks like all the
+        // others.
+        assert_eq!(parse_line(LIMIT_OK), None);
+
+        // Including the trap inside that captured line: `overageStatus` is
+        // `rejected` on it, because this organisation has never turned on
+        // billing beyond the plan. Reading that field would rebuild the false
+        // alarm one field along.
+        assert!(LIMIT_OK.contains(r#""overageStatus":"rejected""#));
+
+        // And the two that are real, which now say which limit and when it
+        // lifts rather than printing the line.
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock set after 1970")
+            .as_secs()
+            + 2400;
+        let said = match parse_line(&format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"seven_day_opus","resetsAt":{far}}},"session_id":"x"}}"#
+        )) {
+            Some(AskEvent::RateLimited(said)) => said,
+            other => panic!("a real limit went unreported, got {other:?}"),
+        };
+        assert!(said.contains("hit a usage limit"), "got: {said}");
+        assert!(said.contains("seven_day_opus"), "which limit: {said}");
+        assert!(said.contains("40 minutes"), "when it lifts: {said}");
+
+        let said = match parse_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour"},"session_id":"x"}"#,
+        ) {
+            Some(AskEvent::RateLimited(said)) => said,
+            other => panic!("a warning went unreported, got {other:?}"),
+        };
+        assert!(said.contains("close to a usage limit"), "got: {said}");
+        // A reset that has been and gone, or none at all, ends the sentence
+        // early rather than inventing one.
+        assert!(said.ends_with("limit."), "got: {said}");
+
+        // A status this version has never heard of is reported rather than
+        // guessed at or dropped: the two sentences above are a claim about
+        // today's format, and silence on a third value would be the old bug
+        // pointing the other way.
+        let said = match parse_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"throttled_2027"},"session_id":"x"}"#,
+        ) {
+            Some(AskEvent::RateLimited(said)) => said,
+            other => panic!("an unknown status was swallowed, got {other:?}"),
+        };
+        assert!(said.contains("throttled_2027"), "got: {said}");
+    }
+
+    #[test]
     fn a_rate_limit_is_reduced_to_something_sayable_whatever_it_arrives_as() {
-        // The `type` was observed and its fields were not, so this is written
-        // to be right about a shape it has never seen. Three plausible ones,
-        // and none of them may produce silence or a panic.
+        // The deliberate hole in the fix above: a line whose `rate_limit_info`
+        // abeam cannot read at all still speaks, because a limit that cannot be
+        // parsed is the worst one to swallow. Three plausible shapes, and none
+        // of them may produce silence or a panic.
         let said = match parse_line(
             r#"{"type":"rate_limit_event","message":"You have reached your usage limit. It resets at 5pm.","session_id":"x"}"#,
         ) {

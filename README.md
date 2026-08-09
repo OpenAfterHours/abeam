@@ -692,6 +692,44 @@ somebody's repository off the machine — where a path costs one line on screen 
 is the *whole* of what was sent, which is what makes that row complete rather
 than a summary.
 
+**A turn is mostly not answer, and the pane draws what it is instead.** Probed
+on 2026-08-09: one ordinary question took **30.7 seconds**, produced 123 lines
+of protocol, and ten of them were text. The rest was the child working — opening
+a block of reasoning, assembling a tool call, waiting for a file to come back —
+and a pane that draws only the text draws nothing at all for most of every
+question. So the working is on screen too. A line under the question names each
+tool as it is asked for and what it was asked about — `Read
+crates/abeam/src/scroll.rs`, `Grep fn key`, with the repository root taken off
+the front — a reasoning block opening reads `thinking`, and the row above the
+composer counts the seconds since you pressed `Enter`. That counter is the
+load-bearing part: `answering` on its own says the same thing at second one and
+at second thirty, and second thirty is where you start to wonder whether the
+pane has died. The tool line stays after the turn, because *which files did it
+read* is the question you have about an answer you are not sure of, and the
+finished turn is labelled with what it cost in both currencies — `30s ·
+$0.1634`.
+
+**What streamed is the answer, and the `result` line is not a better copy of
+it.** The same probe found the pane deleting the thing it was there to show. A
+turn ends with a `result` message carrying answer text, and abeam took that as
+authoritative and replaced what it had drawn — but `result` carries the *last
+text block* of the turn rather than the turn. Measured twice: 1144 characters
+streamed against 944 reported, and 2449 against 2278. Both answers said
+something before reaching for a tool, and both times that opening was thrown
+away at the end. At its worst it threw away all of it, because
+`--permission-mode plan` — which abeam passed on the theory that a
+read-and-propose mode suits a read-only tool list — instructs the model to
+finish by calling `ExitPlanMode`, a tool this session is deliberately not given.
+So a long, correct explanation would arrive, and be replaced at the end by one
+paragraph about being in read-only mode with no way to present a plan. The mode
+is now `default`, which changes no authority — `--tools` is the guarantee and it
+is untouched — and the streamed text is authoritative whenever there is any. A
+`result` that is *not* how the streamed text ends is appended rather than
+substituted, because a duplicated paragraph is something you can read past and a
+deleted one is not. Keeping every block exposed one more thing the wire does not
+carry: two text blocks either side of a tool call arrive with nothing between
+them, so the pane puts the paragraph break back where the interruption was.
+
 **`Enter` never runs anything.** An answer full of shell commands is the ordinary
 shape of a useful answer, and the distance between reading one and running it is
 where this could do real harm. So there is exactly one route out and it ends at a
@@ -1200,16 +1238,28 @@ work, on either platform.
   46-column right pane is not the same thing. Expect the first real `cargo test`
   run in there to find something about width, wrapping or the scrollback that no
   test thought to ask about.
-- **The ask pane has never been driven by a human either, and it is newer.** No
-  person has typed a question into it and read an answer. What exists is a
-  probe — one `claude -p` started by hand on 2026-08-05, asked two questions
-  down one standard input, which recalled a word from the first in the second
-  and cost $0.054 — and a suite that drives every argument in the pane and every
-  line of the protocol against strings and shims, with no `claude` anywhere near
-  it. That is more than a smoke test and still less than use. Expect the first
-  real question to find something about streaming, about the forty-six columns
-  an answer has to wrap into, or about what a long tool-using turn looks like
-  when the only thing on screen is a growing paragraph.
+- **The ask pane has never been driven by a human, and it is newer than
+  everything else here.** No person has typed a question into it and read the
+  answer back. What exists is three probes — one `claude -p` started by hand on
+  2026-08-05, asked two questions down one standard input, which recalled a word
+  from the first in the second and cost $0.054; and two more on 2026-08-09,
+  driven the same way, which are where the numbers above about turn length and
+  the `result` line come from — plus a suite that drives every argument in the
+  pane and every line of the protocol against strings and shims, with no
+  `claude` anywhere near it. That is more than a smoke test and still less than
+  use.
+
+  The version of this bullet written on 2026-08-05 said to expect the first real
+  question to find something about "what a long tool-using turn looks like when
+  the only thing on screen is a growing paragraph". That is exactly what it
+  found, three ways: half a minute of blank pane, a warning about a rate limit
+  on every healthy session, and an answer deleted at the end of the turn that
+  produced it. All three are fixed above and none of them was visible from
+  inside the tests, because every one of them was the pane being *shown the
+  wrong thing* rather than doing the wrong thing with it. The next such bug will
+  be found the same way, so the prediction stands: expect the first sustained
+  use to find something about the forty-six columns an answer has to wrap into,
+  or about a shape of turn none of the three probes happened to produce.
 - **The answer can be wrong, and nothing on screen says so.** What comes back is
   a model's answer about a file it went and read, which is exactly as reliable
   as the agent in the left pane and no more — it can name a caller that does not
@@ -1231,14 +1281,16 @@ work, on either platform.
   other pane here that can be out of date looks out of date — the git pane says
   it is reading, the reader says what it has open — and an answer about a file
   caught mid-edit looks exactly like an answer about the file.
-- **A turn that never ends has no way out.** There is no cancel key, no timeout
-  and no note: the pane draws `ask · answering` and goes on drawing it. That is
-  a reachable state rather than a hypothetical one, because `parse_line` drops
+- **A turn that never ends has no way out.** There is no cancel key and no
+  timeout: the pane draws `ask · answering` and goes on drawing it. That is a
+  reachable state rather than a hypothetical one, because `parse_line` drops
   every message type it does not know — so a child that stops mid-turn to ask
   abeam for something abeam has never heard of gets no reply, never sends the
-  `result` that is the only reliable end of a turn, and leaves the title reading
-  `answering` for the rest of the session, indistinguishable from a slow answer.
-  `Alt+Q` is the whole of the escape. The dropping is deliberate and the
+  `result` that is the only reliable end of a turn, and stays `answering` for
+  the rest of the session. `Alt+Q` is the whole of the escape. What has changed
+  is only that it is now *visible*: the composer row counts the seconds, so a
+  wedged turn reads `answering 900s` rather than looking like a slow one. Being
+  able to tell is not being able to stop it. The dropping is deliberate and the
   wire-format bullet below is the argument for it; what is missing is a way out
   beside it.
 - **`?` is inert in the file list and in the `f` results.** It opens the ask from

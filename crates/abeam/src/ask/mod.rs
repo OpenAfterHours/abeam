@@ -53,6 +53,37 @@
 //! - The child wrote `~/.claude/sessions/<pid>.json` with `"kind":"interactive"`
 //!   and abeam's own `cwd`. See the section below, which is the most important
 //!   thing in this file.
+//!
+//! ## What a second probe found, on 2026-08-09
+//!
+//! Two more runs, same version, driven the same way — one question each, both
+//! with [`AskSession::args`]'s list as it stands. They were run because the
+//! pane built on the first probe turned out to be showing people something
+//! wrong, and every one of these is a fact that was being guessed at before:
+//!
+//! - **A turn is mostly not answer.** One ordinary question produced **123
+//!   lines, ten of which were text**, over **30.7 seconds** — `duration_ms` on
+//!   the `result` line — during which the child ran six tool calls. Time to the
+//!   first fragment was 2.4 seconds. So the pane's old picture of a turn (a
+//!   question, then text) described a tenth of one, and the other nine tenths
+//!   were a blank space under the question for half a minute.
+//! - **`result` carries the last text block, not the turn.** The two runs
+//!   streamed 1144 and 2449 characters of text and reported 944 and 2278 on the
+//!   `result` line. Both said something before reaching for a tool, and both
+//!   times `result` began after the last tool call. The pane used to take
+//!   `result` as the better copy and overwrite what had streamed, which deleted
+//!   the opening of every answer that used a tool.
+//! - **`rate_limit_event` is mostly not a rate limit.** Its shape is
+//!   `rate_limit_info: {status, resetsAt, rateLimitType, overageStatus, …}`
+//!   with `status` one of `allowed`, `allowed_warning`, `rejected` — and a
+//!   perfectly healthy session emits one saying `allowed`. abeam was drawing a
+//!   warning for it. `crate::ask::proto::limited` is that correction, and has
+//!   the captured line.
+//! - **`--permission-mode plan` was actively harmful here**, for reasons that
+//!   are [`PERMISSION_MODE`]'s to give.
+//! - The tool calls are on the `assistant` messages with their inputs complete,
+//!   and reasoning blocks announce themselves on `content_block_start`. Both
+//!   were being dropped. They are what the pane now draws while it waits.
 //! - **Hooks still ran.** `--strict-mcp-config` is about MCP servers and does
 //!   not disable them, and neither does a tool list: a hook is an arbitrary
 //!   shell command the session runs on its own events, gated by nothing on
@@ -158,7 +189,7 @@ use anyhow::{Result, anyhow};
 // the top of this file would be an unused one on every Linux build.
 use crate::launch::Launch;
 
-pub use proto::{AskEvent, new_session_id};
+pub use proto::{AskEvent, Step, new_session_id};
 
 /// The tools the child is given, and the load-bearing half of the read-only
 /// claim.
@@ -182,15 +213,45 @@ pub const TOOLS: &str = "Read,Grep,Glob";
 /// The permission posture this child starts in, which is not the load-bearing
 /// flag and is here so that nobody mistakes it for one.
 ///
-/// `plan` is Claude's read-and-propose mode. It is passed because a mode that
-/// matches the tool list is one fewer thing for the child to be surprised by,
-/// and because a session that cannot be asked for permission is a session that
-/// never blocks on a dialog nobody can see — there is no terminal here to
-/// answer one at. But it is a *mode*, and a mode is a policy the agent applies
-/// to the tools it has. [`TOOLS`] is what decides which tools those are, and it
-/// is the guarantee. Change this and the child proposes differently; change
-/// that and the child can write to the repository.
-const PERMISSION_MODE: &str = "plan";
+/// It is a *mode*, and a mode is a policy the agent applies to the tools it
+/// has. [`TOOLS`] is what decides which tools those are, and it is the
+/// guarantee. Change this and the child answers differently; change that and
+/// the child can write to the repository.
+///
+/// ## It was `plan`, and `plan` was breaking the answers
+///
+/// The argument for `plan` was that a read-and-propose mode matches a read-only
+/// tool list, and it was wrong in a way nothing here could see until somebody
+/// read the pane's output: **plan mode is not a posture, it is a set of
+/// instructions**. Claude Code wraps the session prompt with a plan-mode
+/// preamble and an `ExitPlanMode` protocol footer — the model is told to finish
+/// by calling `ExitPlanMode` with its plan — and `ExitPlanMode` is not on
+/// [`TOOLS`]. So the child would answer the question, reach the end, look for a
+/// tool that did not exist, and spend its last paragraph explaining that it was
+/// in read-only mode and had no way to present a plan. On the transcript that
+/// paragraph is the one thing a reader was left holding, because it is the last
+/// text block of the turn and the pane used to keep only that. Two bugs
+/// compounding: one produced a confused epilogue, the other threw the answer
+/// away and kept it.
+///
+/// `default` is what a read-only session should have been given all along.
+/// Nothing is widened by it: the mode governs what the agent may do with the
+/// tools it has, and this one has three that read. What goes away is a page of
+/// instructions about a workflow this session cannot take part in.
+///
+/// ## Checked against a real Claude rather than reasoned about
+///
+/// A mode change is exactly the sort of thing that would look fine and then
+/// block on a permission dialog nobody can see — there is no terminal here to
+/// answer one at — so it was run rather than argued. On 2.1.222, 2026-08-09,
+/// with [`AskSession::args`]'s list as it stands and only this value changed:
+/// `system`/`init` reported `permissionMode` as `default` and the same
+/// `["Glob","Grep","Read"]`; the turn ran six tool calls — a `Read` of an
+/// absolute path and five `Grep`s — and came back with `permission_denials`
+/// **empty**; the child exited 0 and nothing waited on anything. The answer
+/// contained no mention of plan mode, of `ExitPlanMode`, or of being unable to
+/// do what it had been asked.
+const PERMISSION_MODE: &str = "default";
 
 /// The tools named again, from the other side.
 ///
@@ -859,7 +920,7 @@ mod tests {
                 "--tools",
                 "Read,Grep,Glob",
                 "--permission-mode",
-                "plan",
+                "default",
                 "--strict-mcp-config",
                 "--setting-sources",
                 "user",
@@ -937,15 +998,29 @@ mod tests {
             );
         }
 
-        // The mode is `plan` and it is spelled here as well as in the whole
-        // list, because `--permission-mode` is the argument whose *value* is
-        // the thing that matters and a diff that changed one word of it would
-        // otherwise pass through one assertion.
+        // The mode is spelled here as well as in the whole list, because
+        // `--permission-mode` is the argument whose *value* is the thing that
+        // matters and a diff that changed one word of it would otherwise pass
+        // through one assertion.
+        //
+        // It is `default` and was `plan`, which is the one value change on this
+        // line since the pane shipped. [`PERMISSION_MODE`] has the whole reason
+        // and the run that checked it; the short version is that plan mode
+        // instructs the model to finish by calling `ExitPlanMode`, which is not
+        // a tool this session has, and the answers said so. Nothing about the
+        // authority on this line moved: the two lists below are what decide
+        // that, and they are asserted whole above.
         let mode = list
             .iter()
             .position(|arg| arg == "--permission-mode")
             .map(|at| list[at + 1].clone());
-        assert_eq!(mode.as_deref(), Some("plan"));
+        assert_eq!(mode.as_deref(), Some("default"));
+        // Named rather than only asserted, because the way this regresses is
+        // somebody reaching for a mode that *sounds* narrower and getting one
+        // that hands over the machine.
+        for widest in ["bypassPermissions", "acceptEdits", "dangerously-skip"] {
+            assert_ne!(mode.as_deref(), Some(widest));
+        }
 
         // And no prompt: nothing on this line is the user's, which is why there
         // is no `--` fence on it. The only value abeam did not write is the
@@ -1029,7 +1104,7 @@ mod tests {
             "--include-partial-messages",
             "--verbose",
             "--tools \"Read,Grep,Glob\"",
-            "--permission-mode plan",
+            "--permission-mode default",
             "--strict-mcp-config",
             "--session-id 3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e",
             "--disallowedTools \"Write,Edit,NotebookEdit,Bash\"",
@@ -1307,7 +1382,7 @@ mod tests {
         assert!(
             any(&seen, |event| matches!(
                 event,
-                AskEvent::Turn { text, cost_usd, error }
+                AskEvent::Turn { text, cost_usd, error, .. }
                     if text == "ALPHA" && *cost_usd == Some(0.0544) && error.is_none()
             )),
             "the turn did not reach the pane whole: {seen:#?}"
