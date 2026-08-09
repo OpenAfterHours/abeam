@@ -137,6 +137,7 @@
 
 use std::cell::OnceCell;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -148,7 +149,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::ask::AskEvent;
+use crate::ask::{AskEvent, Step};
 use crate::dispatch::Unavailable;
 use crate::launch::{self, Launch};
 use crate::pane::{Handled, Pane};
@@ -177,14 +178,24 @@ const COMMAND: &str = "⌘ ";
 /// spawning something that has never heard of `--input-format stream-json`.
 const AGENT: &str = "claude";
 
-/// What the composer says while an answer is still arriving.
+/// What the composer says while an answer is still arriving, after the count of
+/// seconds it has been arriving for.
 ///
-/// Short for the reason [`QUOTA`] is: it shares the bottom of a pane that is
-/// routinely forty-six columns wide. At thirty-six cells it fits there whole,
-/// and both halves a reader needs are in it — `enter` does not send yet, and
-/// what they have typed is still there when it does. See [`AskPane::submit`]
-/// for what a second question asked mid-answer does to the first.
-const WAITING: &str = "answering · enter waits · draft kept";
+/// Short because it shares the bottom of a pane that is routinely forty-six
+/// columns wide, where `answering 12s · enter waits · draft kept` is forty-one
+/// cells and fits whole. Both halves a reader needs are in it — `enter` does
+/// not send yet, and what they have typed is still there when it does. See
+/// [`AskPane::submit`] for what a second question asked mid-answer does to the
+/// first.
+///
+/// **The counter is the load-bearing part, and it is there because of a
+/// measurement.** A probed question took 30.7 seconds and spent 28 of them
+/// inside tool calls that put nothing on screen. A row that says `answering`
+/// and nothing else says the same thing at second one and at second thirty,
+/// which is exactly when a reader starts to wonder whether anything is
+/// happening at all. A number that goes up cannot be mistaken for a pane that
+/// has stopped.
+const WAITING: &str = "enter waits · draft kept";
 
 /// How to start again, offered beside the tool list once there is something to
 /// start again *from*.
@@ -248,10 +259,34 @@ struct Exchange {
     /// rather than on the pane so that what was sent stays visible after the
     /// attachment row has gone.
     path: Option<String>,
-    /// Everything `Delta` has carried so far, replaced by `Turn`'s own text
-    /// when one arrives with any.
+    /// Everything `Delta` has carried so far. **Never replaced** — see
+    /// [`AskPane::finish`], which is where the one thing that used to replace
+    /// it is refused.
     answer: String,
+    /// A fragment has arrived, so the stream is working and the answer on
+    /// screen is the whole of what was said. What tells [`AskPane::finish`]
+    /// whether the `result` line is a fallback or a repetition.
+    streamed: bool,
+    /// What the child said it was doing, oldest first. Progress and never
+    /// content: nothing here came out of the answer.
+    steps: Vec<Step>,
+    /// The last thing to happen was a block of reasoning opening, so the child
+    /// is thinking rather than running anything. Cleared by the next fragment
+    /// or the next tool call, because both mean it has moved on.
+    thinking: bool,
+    /// Something interrupted the prose, so the next fragment begins a new
+    /// paragraph rather than the sentence the last one ended.
+    broken: bool,
+    /// When the question went. abeam's own clock rather than the child's,
+    /// because this one has to answer *while* the turn is running and nothing
+    /// on the wire says how long it has been — the child's own number arrives
+    /// on the `result` line, thirty seconds after the reader started wondering.
+    started: Option<Instant>,
     cost_usd: Option<f64>,
+    /// How long the child says the turn took, once it is over. Preferred to
+    /// abeam's clock for the finished figure: it is measured across the whole
+    /// turn by the process that ran it.
+    duration_ms: Option<u64>,
     /// What the `result` line said went wrong, if it said anything.
     error: Option<String>,
     /// A `result` has been seen. The only reliable end of a turn there is.
@@ -268,7 +303,15 @@ enum Entry {
     /// it being an entry: these things happen *between* two answers, and a
     /// status line showing the latest one would misdate every one before it and
     /// lose all but the last. Nothing the reader threads report is dropped.
-    Note(String),
+    ///
+    /// `count` is how the rule "nothing is dropped" survives a child that says
+    /// the same thing forty times. A pipe that has started failing fails on
+    /// every read, and forty identical warnings do not carry forty times the
+    /// information of one — they carry the same information and bury the
+    /// answer it interrupted. So a repeat is counted rather than appended, and
+    /// the count is drawn: the reader is told it happened, and how often, in
+    /// one line.
+    Note { text: String, count: usize },
 }
 
 
@@ -360,6 +403,9 @@ pub struct AskPane {
     /// this pane from a thread's worth of output and `tick` is where a pane
     /// asks to be redrawn.
     owed: bool,
+    /// The second [`Pane::tick`] last claimed a frame for. What keeps the
+    /// waiting counter to one frame a second rather than one a pass.
+    ticked: Option<u64>,
 
     theme: theme::Mode,
     drawn: Rect,
@@ -448,6 +494,7 @@ impl AskPane {
             scroll: Scroll::default(),
             following: true,
             owed: false,
+            ticked: None,
             theme: theme::Mode::default(),
             drawn: Rect::ZERO,
         }
@@ -603,47 +650,87 @@ impl AskPane {
                             return;
                         }
                         if let Entry::Exchange(x) = &mut self.entries[i] {
+                            // The break the wire does not carry. Two text
+                            // blocks either side of a tool call are two
+                            // messages, and the fragments of both arrive with
+                            // nothing between them — so `…read the file
+                            // first.Ctrl+U is already bound…` is what
+                            // concatenation produces, and it is what the reader
+                            // sees the moment the answer stops being deleted at
+                            // the end of the turn. A blank line is the markdown
+                            // for "these are two paragraphs", which is what
+                            // they are.
+                            if x.broken && !x.answer.ends_with('\n') {
+                                x.answer.push_str("\n\n");
+                            }
+                            x.broken = false;
                             x.answer.push_str(&text);
+                            x.streamed = true;
+                            // Words are arriving, so whatever it was thinking
+                            // about it has finished thinking about.
+                            x.thinking = false;
                         }
                     }
                     // A fragment with no question above it is not something to
                     // throw away: it is either a bug in the reader or a turn
                     // abeam did not know it had started, and both are worth
                     // seeing.
-                    None => self.entries.push(Entry::Note(format!(
+                    None => self.note(format!(
                         "an answer arrived with no question above it: {}",
                         clip(&one_line(&text), 200)
-                    ))),
+                    )),
                 }
                 self.bump();
+            }
+            // The two progress events, which are the only things in this file
+            // that are dropped when there is nowhere to put them.
+            //
+            // **And that is not the rule bending.** "Nothing the reader threads
+            // report is dropped" is a rule about what the child *said* — its
+            // answers, its complaints, its reasons. These two say neither: they
+            // are abeam's own account of a turn being under way, and an account
+            // of a turn abeam has no record of is not something a reader can
+            // use. It would also be the loudest possible way to fail, since
+            // these arrive a dozen times a question.
+            AskEvent::Using(steps) => {
+                if let Some(x) = self.working() {
+                    x.steps.extend(steps);
+                    x.thinking = false;
+                    // Whatever it says next is a new message and so a new
+                    // paragraph. See the `Delta` arm, which is where that is
+                    // spent.
+                    x.broken = !x.answer.is_empty();
+                    self.bump();
+                }
+            }
+            AskEvent::Thinking => {
+                if let Some(x) = self.working().filter(|x| !x.thinking) {
+                    x.thinking = true;
+                    x.broken = !x.answer.is_empty();
+                    self.bump();
+                }
             }
             AskEvent::Turn {
                 text,
                 cost_usd,
+                duration_ms,
                 error,
             } => {
                 match self.open_exchange() {
                     Some(i) => {
                         if let Entry::Exchange(x) = &mut self.entries[i] {
-                            // The `result` line carries the whole answer and
-                            // the deltas carry it in pieces, so the two should
-                            // agree — and when they do not, the complete one
-                            // wins. An empty `result` does *not*: a turn that
-                            // streamed four paragraphs and then reported no
-                            // text is a turn whose text abeam already has, and
-                            // blanking it would throw away the only copy.
-                            if !text.trim().is_empty() {
-                                x.answer = text;
-                            }
+                            finish(x, text);
                             x.cost_usd = cost_usd;
+                            x.duration_ms = duration_ms;
                             x.error = error;
+                            x.thinking = false;
                             x.done = true;
                         }
                     }
-                    None => self.entries.push(Entry::Note(format!(
+                    None => self.note(format!(
                         "a turn ended with no question above it: {}",
                         clip(&one_line(&text), 200)
-                    ))),
+                    )),
                 }
                 self.bump();
             }
@@ -654,7 +741,16 @@ impl AskPane {
                 // caution about spending: it is the same account as the agent
                 // in the left pane, so this is news about the account rather
                 // than about this pane in particular.
-                self.note(format!("rate limited: {why}"));
+                //
+                // Passed on whole, with no `rate limited:` in front of it. That
+                // prefix was there when this event arrived for every session
+                // whether or not anything was wrong and the sentence behind it
+                // could be anything; now the event only fires when something
+                // *is* wrong and `crate::ask::proto::limit` says which of the
+                // two things it is. Announcing "rate limited" over a sentence
+                // reading "Claude is close to a usage limit" would be abeam
+                // contradicting the only party that knows.
+                self.note(why);
             }
             AskEvent::Ended => {
                 if !self.ended {
@@ -681,8 +777,29 @@ impl AskPane {
     /// *between* two answers, which is what an entry is for and what a status
     /// line would misdate.
     pub(crate) fn note(&mut self, text: String) {
-        self.entries.push(Entry::Note(text));
+        // Counted rather than repeated when it is the same sentence again, and
+        // *only* when it is the one immediately before: two identical warnings
+        // with an answer between them are two things that happened, and
+        // collapsing those would misdate the second. See [`Entry::Note`].
+        match self.entries.last_mut() {
+            Some(Entry::Note { text: said, count }) if *said == text => *count += 1,
+            _ => self.entries.push(Entry::Note { text, count: 1 }),
+        }
         self.bump();
+    }
+
+    /// The exchange a progress event belongs to: the newest one, if it is still
+    /// running.
+    ///
+    /// `None` once the `result` has arrived, which is what keeps a late tool
+    /// call from reopening a finished turn — the pane would draw a spinner
+    /// under an answer that was complete, for a turn that had ended.
+    fn working(&mut self) -> Option<&mut Exchange> {
+        let at = self.open_exchange()?;
+        match &mut self.entries[at] {
+            Entry::Exchange(x) if !x.done => Some(x),
+            _ => None,
+        }
     }
 
     /// Where the answer that is arriving belongs.
@@ -732,7 +849,7 @@ impl AskPane {
             .iter()
             .filter_map(|e| match e {
                 Entry::Exchange(x) => x.cost_usd,
-                Entry::Note(_) => None,
+                Entry::Note { .. } => None,
             })
             .sum()
     }
@@ -831,6 +948,11 @@ impl AskPane {
         self.entries.push(Entry::Exchange(Exchange {
             question,
             path,
+            // Stamped here rather than on the first thing the child says,
+            // because what the reader is timing starts when they press `Enter`.
+            // The two are two and a half seconds apart on a measured turn, and
+            // those are the seconds where the pane looks emptiest.
+            started: Some(Instant::now()),
             ..Exchange::default()
         }));
         // A question you asked is a thing you are waiting to see.
@@ -909,6 +1031,14 @@ impl AskPane {
                         out.push_str("`\n");
                     }
                     out.push('\n');
+                    // What it is doing, above the answer rather than below it,
+                    // because while the turn is running this is the only thing
+                    // on screen that is moving — and after it, it reads as the
+                    // working that produced what follows.
+                    if let Some(doing) = self.activity(x) {
+                        out.push_str(&doing);
+                        out.push_str("\n\n");
+                    }
                     if x.answer.trim().is_empty() {
                         // Never nothing. A question with a blank space under it
                         // is indistinguishable from a pane that has stopped
@@ -928,21 +1058,106 @@ impl AskPane {
                         out.push_str(&one_line(why));
                         out.push_str("\n\n");
                     }
-                    if let Some(cost) = x.cost_usd {
-                        // Per turn and not only in total, because the total in
-                        // the title cannot say which question was the expensive
-                        // one.
-                        out.push_str(&format!("`${cost:.4}`\n\n"));
+                    // Per turn and not only in total, because the total in the
+                    // title cannot say which question was the expensive one —
+                    // and the same is true of the slow one, which is why the
+                    // duration keeps it company here rather than anywhere else.
+                    if let Some(spent) = spent(x) {
+                        out.push_str(&format!("`{spent}`\n\n"));
                     }
                 }
-                Entry::Note(text) => {
+                Entry::Note { text, count } => {
                     out.push_str("> [!WARNING]\n> ");
                     out.push_str(&one_line(text));
+                    if *count > 1 {
+                        // The rule that nothing is dropped, kept without the
+                        // transcript being buried by a failure that repeats.
+                        out.push_str(&format!(" (×{count})"));
+                    }
                     out.push_str("\n\n");
                 }
             }
         }
         out
+    }
+
+    /// What the child is doing, or did, as one line of the document — or `None`
+    /// for a turn that has not needed to do anything.
+    ///
+    /// **One line and not one per step**, which is the whole shape of this and
+    /// the thing to reconsider first if it ever needs changing. A question that
+    /// takes thirty seconds runs six or eight tools; a list of them would be
+    /// eight rows above every answer in a pane forty-six columns wide, and a
+    /// transcript of four exchanges would be more scaffolding than answer. As a
+    /// sentence it wraps to two or three rows, keeps every target, and reads as
+    /// what it is — a note about how the answer was arrived at.
+    ///
+    /// Kept after the turn rather than collapsed to a count, because *which
+    /// files it read* is the question a reader has about an answer they are not
+    /// sure they trust, and a summary saying `Read ×3` answers a question
+    /// nobody asked.
+    ///
+    /// Every step is a code span, and that is not decoration: a `Glob` target
+    /// is `crates/abeam/src/**/*.rs`, and a pair of asterisks loose in a
+    /// markdown paragraph starts emphasis that swallows the rest of the line.
+    /// Inside a span they are literal — and a backtick in a target, which would
+    /// end the span early, is replaced rather than escaped, because what this
+    /// line is for is being glanceable rather than being a faithful copy of an
+    /// argument the answer above already quotes.
+    fn activity(&self, x: &Exchange) -> Option<String> {
+        if x.steps.is_empty() && !x.thinking {
+            return None;
+        }
+        let mut said: Vec<String> = x.steps.iter().map(|step| self.step(step)).collect();
+        if x.thinking {
+            said.push("*thinking…*".to_string());
+        }
+        // The leader is only there while it means something. `⋯` on a finished
+        // turn would read as an answer that is still coming.
+        let lead = if x.done { "" } else { "⋯ " };
+        Some(format!("{lead}{}", said.join(" · ")))
+    }
+
+    /// One tool call as a code span: what ran, and to what.
+    fn step(&self, step: &Step) -> String {
+        let mut said = step.tool.replace('`', "'");
+        if let Some(target) = &step.target {
+            said.push(' ');
+            said.push_str(&self.shorten(target));
+        }
+        format!("`{said}`")
+    }
+
+    /// A tool's argument as it is worth reading in a narrow pane.
+    ///
+    /// The repository root comes off the front, because every path the child
+    /// reports is absolute and in a pane this wide
+    /// `C:\Users\someone\src\project\` is the part that is the same on every
+    /// line and never the part being read. What is left is the path as the
+    /// reader thinks of it, which is also how the answer above will name it.
+    fn shorten(&self, target: &str) -> String {
+        let root = self.root.display().to_string();
+        let shown = target
+            .strip_prefix(&root)
+            .map(|rest| rest.trim_start_matches(['/', '\\']))
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(target);
+        clip(&one_line(shown), 80).replace('`', "'")
+    }
+
+    /// How long the reader has been waiting on the turn that is running, in
+    /// whole seconds — or `None` when nothing is.
+    ///
+    /// abeam's own clock, because this has to answer while the turn is in
+    /// flight and nothing on the wire says how long it has been. The child's
+    /// own measurement arrives on the `result` line, which is thirty seconds
+    /// after the reader started wondering, and is what the finished turn is
+    /// labelled with.
+    fn elapsed(&self) -> Option<u64> {
+        match self.open_exchange().map(|at| &self.entries[at]) {
+            Some(Entry::Exchange(x)) if !x.done => Some(x.started?.elapsed().as_secs()),
+            _ => None,
+        }
     }
 
     /// The transcript as the document it is drawn from.
@@ -1088,11 +1303,19 @@ impl AskPane {
         // had already been surprised, and the state it describes is one they can
         // see beginning: the answer is arriving above it.
         if self.streaming() {
+            let t = self.theme.theme();
+            let waited = match self.elapsed() {
+                Some(secs) => format!(" answering {secs}s"),
+                // A turn abeam has no start time for, which is a transcript
+                // driven by a test rather than by a keystroke. The row still
+                // has to be true.
+                None => " answering".to_string(),
+            };
             out.push(clip_line(
-                Line::from(Span::styled(
-                    format!(" {WAITING}"),
-                    self.theme.theme().dim(),
-                )),
+                Line::from(vec![
+                    Span::styled(waited, Style::new().fg(t.accent)),
+                    Span::styled(format!(" · {WAITING}"), t.dim()),
+                ]),
                 w,
             ));
         }
@@ -1345,12 +1568,28 @@ impl Pane for AskPane {
     }
 
     /// A frame is owed exactly when something the child said, or something the
-    /// app told this pane, changed what the next frame would show.
+    /// app told this pane, changed what the next frame would show — **plus one
+    /// a second while a turn is running**.
     ///
-    /// Never on a bare pass of the loop. A frame re-renders the agent's whole
-    /// screen, and a pane that claims one every time it is asked would do that
-    /// at the frame ceiling for a transcript nobody is adding to.
+    /// Never on a bare pass of the loop otherwise. A frame re-renders the
+    /// agent's whole screen, and a pane that claimed one every time it was
+    /// asked would do that at the frame ceiling for a transcript nobody is
+    /// adding to.
+    ///
+    /// The exception is the whole of the waiting problem. While an answer is
+    /// streaming the deltas claim frames of their own and the counter comes
+    /// along free — but the gaps that make a reader doubt the pane are exactly
+    /// the ones where *no* delta arrives, because the child is thinking or
+    /// three tool calls deep. One frame a second, for as long as a turn is
+    /// open, is what makes the number on the composer row move through them.
+    /// It stops the moment the `result` lands, because [`AskPane::elapsed`]
+    /// answers `None` for a finished turn.
     fn tick(&mut self) -> bool {
+        let waited = self.elapsed();
+        if waited != self.ticked {
+            self.ticked = waited;
+            self.owed |= waited.is_some();
+        }
         std::mem::take(&mut self.owed)
     }
 
@@ -1694,6 +1933,86 @@ fn refusal(skipped: usize) -> String {
     )
 }
 
+/// What a finished turn cost, in the two currencies a reader is spending.
+///
+/// Time first, because it is the one they have already paid and the one they
+/// were wondering about while they waited. `None` when the child reported
+/// neither, which is a turn that failed early.
+fn spent(x: &Exchange) -> Option<String> {
+    match (x.duration_ms.map(took), x.cost_usd) {
+        (Some(time), Some(cost)) => Some(format!("{time} · ${cost:.4}")),
+        (Some(time), None) => Some(time),
+        (None, Some(cost)) => Some(format!("${cost:.4}")),
+        (None, None) => None,
+    }
+}
+
+/// A duration as somebody who just waited through it would say it.
+fn took(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// Fold the `result` line's text into the answer, **without ever deleting what
+/// streamed**.
+///
+/// This function is a bug fix with a measurement behind it, and the measurement
+/// is the reason it is four lines with a page of comment rather than the one
+/// line it replaced. That line was `x.answer = text`, on the belief that the
+/// `result` carries the whole answer and the fragments carry it in pieces, so
+/// the complete one should win.
+///
+/// **The `result` line does not carry the whole answer. It carries the last
+/// text block of the turn.** Probed on 2026-08-09 against 2.1.222, twice: the
+/// fragments streamed 1144 and 2449 characters and the `result` reported 944
+/// and 2278. Both times the model said something before it reached for a tool —
+/// "I'll look at the file first" — and both times `result` began after the last
+/// tool call. So the assignment did not prefer a better copy; it deleted the
+/// opening of every answer that used a tool, which is most answers worth
+/// asking for.
+///
+/// At its worst it deleted all of them. A turn whose last block is an apology —
+/// and plan mode used to manufacture exactly that, see
+/// `crate::ask::PERMISSION_MODE` — left a reader who had watched three
+/// paragraphs arrive holding one sentence about why there was no answer.
+///
+/// So the streamed text is authoritative whenever there is any, and the three
+/// cases are:
+///
+/// - **Nothing streamed.** The `result` is the entire answer — the fallback
+///   `crate::ask::proto` describes for a session where
+///   `--include-partial-messages` was not honoured — and it is taken whole.
+/// - **The `result` is how the streamed text ends**, which is the ordinary
+///   case. Nothing to do: the reader already has it, and appending would draw
+///   the last paragraph twice.
+/// - **Neither**, which means fragments went missing. It is appended rather
+///   than substituted, because a duplicated overlap is a thing a reader can see
+///   past and a deleted answer is not.
+fn finish(x: &mut Exchange, text: String) {
+    let said = text.trim();
+    // An empty `result` is the ordinary shape of a failed turn, and of a turn
+    // that streamed four paragraphs and then reported no text. Either way abeam
+    // already holds whatever there is.
+    if said.is_empty() {
+        return;
+    }
+    if !x.streamed {
+        x.answer = text;
+        return;
+    }
+    if x.answer.trim_end().ends_with(said) {
+        return;
+    }
+    if !x.answer.trim().is_empty() {
+        x.answer.push_str("\n\n");
+    }
+    x.answer.push_str(said);
+}
+
 /// Anything that has to survive being put inside a block quote, or on one row
 /// of chrome, with its newlines taken out rather than its meaning.
 fn one_line(text: &str) -> String {
@@ -1785,6 +2104,7 @@ mod tests {
         p.on_event(AskEvent::Turn {
             text: text.to_string(),
             cost_usd: Some(0.01),
+            duration_ms: None,
             error: None,
         });
     }
@@ -2011,6 +2331,7 @@ mod tests {
         p.on_event(AskEvent::Turn {
             text: "It walks the table.".to_string(),
             cost_usd: Some(0.0544),
+            duration_ms: None,
             error: None,
         });
         assert_eq!(p.title(), "ask · 1 turn · $0.054");
@@ -2094,11 +2415,273 @@ mod tests {
         p.on_event(AskEvent::Turn {
             text: String::new(),
             cost_usd: None,
+            duration_ms: None,
             error: Some("stopped early".to_string()),
         });
         let text = screen(&mut p, 70, 20);
         assert!(text.contains("the whole answer"), "{text}");
         assert!(text.contains("stopped early"), "the reason is kept too: {text}");
+    }
+
+    #[test]
+    fn a_result_never_deletes_the_answer_that_streamed() {
+        // The bug this pane shipped with, and it is worth stating as a
+        // measurement rather than as a principle because the code it replaced
+        // was written from a plausible principle. Probed twice on 2026-08-09:
+        // the fragments carried 1144 and 2449 characters and the `result` line
+        // reported 944 and 2278, because `result` is the *last text block* of a
+        // turn and both answers said something before reaching for a tool.
+        // `x.answer = text` therefore did not prefer a better copy — it deleted
+        // the opening of every answer that used one.
+        let mut p = live();
+        ask(&mut p, "what does this do?");
+        p.on_event(AskEvent::Delta("I'll read the file first.\n\n".to_string()));
+        p.on_event(AskEvent::Using(vec![Step {
+            tool: "Read".to_string(),
+            target: Some("/repo/crates/abeam/src/scroll.rs".to_string()),
+        }]));
+        p.on_event(AskEvent::Delta("It scrolls by physical row.".to_string()));
+        p.on_event(AskEvent::Turn {
+            text: "It scrolls by physical row.".to_string(),
+            cost_usd: Some(0.1634),
+            duration_ms: Some(30_652),
+            error: None,
+        });
+
+        let doc = p.source();
+        assert!(
+            doc.contains("I'll read the file first."),
+            "the opening paragraph was deleted by the result line: {doc}"
+        );
+        // And exactly once: the `result` repeating what the fragments already
+        // drew is the ordinary case, and appending it would draw the last
+        // paragraph twice.
+        assert_eq!(
+            doc.matches("It scrolls by physical row.").count(),
+            1,
+            "the last block was drawn twice: {doc}"
+        );
+        // What it cost, in the two currencies — the time first, because that is
+        // the one the reader has already spent.
+        assert!(doc.contains("`30s · $0.1634`"), "{doc}");
+
+        // Fragments that went missing — a delta shape the parser stopped
+        // understanding — leave a `result` that is not how the streamed text
+        // ends. It is appended rather than substituted: a duplicated overlap is
+        // something a reader can see past, and a deleted answer is not.
+        let mut p = live();
+        ask(&mut p, "and this?");
+        p.on_event(AskEvent::Delta("half an answer".to_string()));
+        p.on_event(AskEvent::Turn {
+            text: "a different ending".to_string(),
+            cost_usd: None,
+            duration_ms: None,
+            error: None,
+        });
+        let doc = p.source();
+        assert!(doc.contains("half an answer"), "{doc}");
+        assert!(doc.contains("a different ending"), "{doc}");
+
+        // The break the wire does not carry, which only became visible once the
+        // answer stopped being deleted. Two text blocks either side of a tool
+        // call are two messages and their fragments arrive with nothing between
+        // them, so concatenation produces `first.Ctrl+U is` — which is what a
+        // replay of the captured probe produced the first time it was run
+        // through this pane.
+        let mut p = live();
+        ask(&mut p, "?");
+        p.on_event(AskEvent::Delta("I'll look at the file first.".to_string()));
+        p.on_event(AskEvent::Using(vec![Step {
+            tool: "Read".to_string(),
+            target: None,
+        }]));
+        p.on_event(AskEvent::Delta("Ctrl+U is already bound.".to_string()));
+        let doc = p.source();
+        assert!(
+            doc.contains("first.\n\nCtrl+U"),
+            "two messages ran into one sentence: {doc}"
+        );
+        // And a fragment that already ended a paragraph does not get a second
+        // blank line for it.
+        let mut p = live();
+        ask(&mut p, "?");
+        p.on_event(AskEvent::Delta("One.\n\n".to_string()));
+        p.on_event(AskEvent::Thinking);
+        p.on_event(AskEvent::Delta("Two.".to_string()));
+        assert!(p.source().contains("One.\n\nTwo."), "{}", p.source());
+
+        // And the fallback the whole design leans on is untouched: with nothing
+        // streamed — which is what `--include-partial-messages` not being
+        // honoured looks like — the `result` is the entire answer.
+        let mut p = live();
+        ask(&mut p, "anything?");
+        p.on_event(AskEvent::Turn {
+            text: "the entire answer, in one piece".to_string(),
+            cost_usd: None,
+            duration_ms: None,
+            error: None,
+        });
+        assert!(p.source().contains("the entire answer, in one piece"));
+    }
+
+    #[test]
+    fn the_pane_says_what_the_child_is_doing_while_it_is_doing_it() {
+        // The waiting problem, measured: an ordinary question took 30.7 seconds
+        // and produced ten lines of text out of 123, so a pane that draws only
+        // the text draws nothing for most of every question. These are the
+        // lines that were being dropped.
+        let mut p = live();
+        ask(&mut p, "where is the scroll table?");
+        assert!(p.source().contains("*…*"), "the empty state is still there");
+
+        p.on_event(AskEvent::Thinking);
+        assert!(
+            p.source().contains("thinking"),
+            "a reasoning block opening is the one thing on screen that is \
+             moving: {}",
+            p.source()
+        );
+
+        p.on_event(AskEvent::Using(vec![
+            Step {
+                tool: "Read".to_string(),
+                target: Some("/repo/crates/abeam/src/scroll.rs".to_string()),
+            },
+            Step {
+                tool: "Glob".to_string(),
+                target: Some("crates/abeam/src/**/*.rs".to_string()),
+            },
+        ]));
+        let doc = p.source();
+        // The root comes off the front: it is the same on every line and never
+        // the part being read.
+        assert!(
+            doc.contains("`Read crates/abeam/src/scroll.rs`"),
+            "the repository root is still on it: {doc}"
+        );
+        assert!(doc.contains("`Glob crates/abeam/src/**/*.rs`"), "{doc}");
+        assert!(
+            !doc.contains("thinking"),
+            "it is running a tool, and the row still says it is thinking: {doc}"
+        );
+
+        // The asterisks in that glob are inside a code span, which is the whole
+        // reason each step is one. Loose in a paragraph they would start
+        // emphasis and swallow the rest of the transcript.
+        let text = screen(&mut p, 70, 24);
+        assert!(text.contains("crates/abeam/src/**/*.rs"), "{text}");
+        assert!(text.contains("where is the scroll table?"), "{text}");
+
+        // It survives the turn, because "which files did it read" is the
+        // question somebody has about an answer they are not sure of — and the
+        // leader that means "still going" does not.
+        p.on_event(AskEvent::Turn {
+            text: "`scroll.rs:102`.".to_string(),
+            cost_usd: None,
+            duration_ms: Some(49_153),
+            error: None,
+        });
+        let doc = p.source();
+        assert!(doc.contains("`Read crates/abeam/src/scroll.rs`"), "{doc}");
+        assert!(
+            !doc.contains('⋯'),
+            "a finished turn still says it is working: {doc}"
+        );
+        assert!(doc.contains("`49s`"), "how long it took: {doc}");
+
+        // Progress about a turn abeam has no record of is dropped, which is the
+        // one thing in this pane that is. It is not the "nothing is dropped"
+        // rule bending: that rule is about what the child *said*, and this is
+        // abeam's own account of a turn being under way.
+        let mut p = live();
+        p.on_event(AskEvent::Using(vec![Step {
+            tool: "Read".to_string(),
+            target: None,
+        }]));
+        p.on_event(AskEvent::Thinking);
+        assert!(
+            p.entries.is_empty(),
+            "an account of a turn nobody asked for: {}",
+            p.source()
+        );
+    }
+
+    #[test]
+    fn the_composer_row_counts_the_seconds_somebody_has_been_waiting() {
+        // Because `answering` on its own says the same thing at second one and
+        // at second thirty, and second thirty is where a reader starts to
+        // wonder whether the pane has died. A number that goes up cannot be
+        // read as a pane that has stopped.
+        let mut p = live();
+        ask(&mut p, "a slow question");
+        let text = screen(&mut p, 60, 16);
+        assert!(text.contains("answering 0s"), "{text}");
+        assert!(text.contains("enter waits"), "the refusal is still said: {text}");
+        p.tick();
+
+        // Reached into rather than waited for, because the alternative is a
+        // test that sleeps. Half a second past the boundary so that two reads
+        // of the clock either side of an assertion cannot disagree.
+        let Some(Entry::Exchange(x)) = p.entries.last_mut() else {
+            panic!("a question is an exchange")
+        };
+        x.started = Some(Instant::now() - std::time::Duration::from_millis(42_500));
+        assert_eq!(p.elapsed(), Some(42));
+        assert!(screen(&mut p, 60, 16).contains("answering 42s"));
+
+        // One frame per second while it runs, and not one per pass: a frame
+        // here re-renders the agent's whole screen.
+        assert!(p.tick(), "the second that passed did not claim a frame");
+        assert!(!p.tick(), "a frame every pass of the loop");
+
+        // And it stops the moment the turn does, which is what keeps an idle
+        // pane idle.
+        p.on_event(AskEvent::Turn {
+            text: "done".to_string(),
+            cost_usd: None,
+            duration_ms: Some(42_600),
+            error: None,
+        });
+        assert_eq!(p.elapsed(), None, "a finished turn is still being timed");
+        assert!(p.tick(), "the answer arriving is a frame");
+        assert!(!p.tick());
+        assert!(!p.tick(), "an idle pane is claiming frames");
+        let text = screen(&mut p, 60, 16);
+        assert!(!text.contains("answering"), "{text}");
+        assert!(text.contains("42s"), "how long it took is not on record: {text}");
+    }
+
+    #[test]
+    fn a_warning_that_repeats_is_counted_rather_than_repeated() {
+        // "Nothing the reader threads report is dropped" has to survive a child
+        // that says the same thing forty times, and a failing pipe fails on
+        // every read. Forty identical warnings carry the information of one and
+        // bury the answer they interrupted.
+        let mut p = live();
+        for _ in 0..40 {
+            p.on_event(AskEvent::Broke("the pipe is gone".to_string()));
+        }
+        let doc = p.source();
+        assert_eq!(
+            doc.matches("the pipe is gone").count(),
+            1,
+            "forty copies of one failure: {doc}"
+        );
+        assert!(doc.contains("×40"), "and how often it happened: {doc}");
+        assert_eq!(p.entries.len(), 1);
+
+        // Only when it is the sentence immediately before, though: two
+        // identical warnings with an answer between them are two things that
+        // happened, and collapsing those would misdate the second.
+        ask(&mut p, "still there?");
+        answer(&mut p, "yes");
+        p.on_event(AskEvent::Broke("the pipe is gone".to_string()));
+        assert_eq!(
+            p.source().matches("the pipe is gone").count(),
+            2,
+            "two failures either side of an answer became one: {}",
+            p.source()
+        );
     }
 
     // --- context ------------------------------------------------------------
@@ -2431,6 +3014,7 @@ mod tests {
         p.on_event(AskEvent::Turn {
             text: String::new(),
             cost_usd: None,
+            duration_ms: None,
             error: None,
         });
         p.handle_key(key(KeyCode::PageUp)).unwrap();
@@ -2499,6 +3083,7 @@ mod tests {
         p.on_event(AskEvent::Turn {
             text: "It walks the table.".to_string(),
             cost_usd: Some(0.0544),
+            duration_ms: None,
             error: None,
         });
         assert!(p.source().contains("It walks the table."), "{}", p.source());
@@ -2532,6 +3117,7 @@ mod tests {
         p.on_event(AskEvent::Turn {
             text: "because it does.".to_string(),
             cost_usd: None,
+            duration_ms: None,
             error: None,
         });
         assert_eq!(p.title(), "ask · 1 turn");

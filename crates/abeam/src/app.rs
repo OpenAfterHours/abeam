@@ -5023,6 +5023,7 @@ mod tests {
         fx.app.spaces[0].ask.on_event(crate::ask::AskEvent::Turn {
             text: "ok".to_string(),
             cost_usd: None,
+            duration_ms: None,
             error: None,
         });
 
@@ -5245,6 +5246,7 @@ mod tests {
         fx.app.spaces[0].ask.on_event(crate::ask::AskEvent::Turn {
             text: "run this:\n\n```\ngit status\n```\n".to_string(),
             cost_usd: None,
+            duration_ms: None,
             error: None,
         });
         fx.app.set_right_view(RightView::Ask);
@@ -5289,6 +5291,7 @@ mod tests {
         fx.app.spaces[ix].ask.on_event(crate::ask::AskEvent::Turn {
             text: format!("run this:\n\n```\n{command}\n```\n"),
             cost_usd: None,
+            duration_ms: None,
             error: None,
         });
         // `Enter` on an empty composer is the hand-off, and never a run.
