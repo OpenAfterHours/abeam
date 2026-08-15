@@ -1,5 +1,8 @@
 //! A second Claude in the right pane, which may read and may not write.
 //!
+//! One of two shapes the ask pane can be driven in; `copilot.rs` is the other,
+//! and the section at the foot of these docs is the difference between them.
+//!
 //! This is the third way abeam starts an agent, and the three differ in what
 //! they are *for* rather than in mechanism. `crate::agent` hosts the session
 //! you are working in: a pty, interactive, the whole conversation.
@@ -57,7 +60,7 @@
 //! ## What a second probe found, on 2026-08-09
 //!
 //! Two more runs, same version, driven the same way — one question each, both
-//! with [`AskSession::args`]'s list as it stands. They were run because the
+//! with [`ClaudeSession::args`]'s list as it stands. They were run because the
 //! pane built on the first probe turned out to be showing people something
 //! wrong, and every one of these is a fact that was being guessed at before:
 //!
@@ -87,7 +90,7 @@
 //! - **Hooks still ran.** `--strict-mcp-config` is about MCP servers and does
 //!   not disable them, and neither does a tool list: a hook is an arbitrary
 //!   shell command the session runs on its own events, gated by nothing on
-//!   [`AskSession::args`]'s list. That observation is what [`SETTING_SOURCES`]
+//!   [`ClaudeSession::args`]'s list. That observation is what [`SETTING_SOURCES`]
 //!   was added for — the repository's own `.claude/settings.json` no longer
 //!   loads, so a checkout cannot configure the reader abeam started to read it.
 //!   The user's own hooks, in `~/.claude`, still run. The claim this module
@@ -98,7 +101,7 @@
 //! ## The read-only claim, tested by asking it to write
 //!
 //! The list above says what the child was *given*. A second run, on the same
-//! day and with [`AskSession::args`]'s list exactly as it stands, asked it the
+//! day and with [`ClaudeSession::args`]'s list exactly as it stands, asked it the
 //! other question: it was pointed at a throwaway directory holding one file and
 //! told to create a second one.
 //!
@@ -152,7 +155,7 @@
 //! once. On Unix the child stays in abeam's process group and session, so every
 //! signal aimed at the job the user started reaches it too — which is what is
 //! wanted. On Windows it inherits abeam's console, so `CTRL_CLOSE_EVENT` on a
-//! closed window reaches it as well. [`AskSession`]'s `Drop` is the ordinary
+//! closed window reaches it as well. [`ClaudeSession`]'s `Drop` is the ordinary
 //! route and those are the backstops for the exits a `Drop` never runs on.
 //!
 //! ## What abeam cannot promise about the grandchild
@@ -172,7 +175,34 @@
 //! which is exactly the distinction worth writing down: if this ever needs to
 //! be a guarantee, the answer is `abeam_pty`'s job object rather than a longer
 //! kill.
+//!
+//! ## And a second agent, which shares none of the above
+//!
+//! Everything up to here is about Claude, and it stayed that way for as long as
+//! the pane did. [`AskSession`] is now a choice between two shapes and this file
+//! holds one of them; `copilot.rs` holds the other and has its own module docs,
+//! which are worth reading before assuming anything here carries across. What
+//! carries across is the *pane* — a reader you can ask, tied to a window, that
+//! cannot change a file — and very little else.
+//!
+//! Two differences are worth naming from this side, because they are the ones a
+//! reader of this file would otherwise assume away:
+//!
+//! - **A Copilot session is not a process.** There is no streaming-JSON print
+//!   mode to hold open, so a question is a child and a conversation is a *name*
+//!   resumed across several of them. [`AskSession::is_live`] answers for the
+//!   conversation rather than for a pid, which is why it is not simply "has the
+//!   child exited" any more.
+//! - **The read-only claim is made the other way round.** [`TOOLS`] is an
+//!   allowlist and there is no Copilot equivalent; over there it is a denylist,
+//!   which is a weaker sentence honestly said rather than the same one repeated.
+//!   `copilot::DENIED` is where that is argued.
+//!
+//! And the difference that governs how both files should be read: everything in
+//! *this* one is a recorded observation, with a version and a date. Nothing in
+//! that one is. abeam has never been run with Copilot CLI.
 
+mod copilot;
 mod proto;
 
 use std::io::{BufReader, Read, Write};
@@ -189,7 +219,148 @@ use anyhow::{Result, anyhow};
 // the top of this file would be an unused one on every Linux build.
 use crate::launch::Launch;
 
+pub use copilot::CopilotSession;
 pub use proto::{AskEvent, Step, new_session_id};
+
+/// Which agent the pane is asking, and therefore which of the two shapes below
+/// it gets.
+///
+/// A two-valued enum rather than a string compared at the call site, for
+/// `crate::agent`'s reason: `abeam +Claude` and `abeam +claude` are one request
+/// everywhere else in this program, and a program named outright —
+/// `abeam +C:\tools\claude.exe` — is neither of these and must not become one.
+/// `crate::panes::ask::resolve` is the one place that decision is made, and this
+/// is what it hands on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flavour {
+    /// Streaming JSON, one long-lived child, an allowlist of three tools.
+    /// Everything this file's module docs describe, all of it observed.
+    Claude,
+    /// Prose on stdout, a child per question, a denylist. See `copilot.rs`, and
+    /// note before relying on any of it that none of it has been run.
+    Copilot,
+}
+
+impl Flavour {
+    /// The agent's own name, for a message that has to say which one this is.
+    pub fn agent(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Copilot => "copilot",
+        }
+    }
+}
+
+/// One conversation, in whichever shape the agent being hosted supports.
+///
+/// A `match` at every seam rather than a `Box<dyn>`, and the two-arm shape is
+/// the argument: what the app needs of a session is four calls, the two
+/// implementations disagree about what nearly all of them *mean*, and a trait
+/// would have made those disagreements look like an implementation detail
+/// instead of the subject. `is_live` is the clearest case — over there it is a
+/// question about a process and over here it is a question about a name — and a
+/// trait method with one doc comment covering both would have been a lie in one
+/// of the two directions.
+pub enum AskSession {
+    Claude(ClaudeSession),
+    Copilot(CopilotSession),
+}
+
+impl AskSession {
+    /// Start one. `root` becomes the child's working directory, and
+    /// `session_id` names the conversation.
+    ///
+    /// **`Claude` starts a process here and `Copilot` does not**, which is the
+    /// first place the two shapes visibly part company: there is nothing for a
+    /// Copilot session to start until there is a question to start it with. So a
+    /// failure that arrives at this call for one agent arrives at
+    /// [`AskSession::ask`] for the other, and `crate::app::App::pump_ask` has to
+    /// put a sentence on screen for both — which it already did, because a start
+    /// that fails and a question that cannot be sent were always two messages.
+    pub fn start(
+        flavour: Flavour,
+        launch: &Launch,
+        root: &Path,
+        session_id: String,
+    ) -> Result<Self> {
+        Ok(match flavour {
+            Flavour::Claude => Self::Claude(ClaudeSession::start(launch, root, session_id)?),
+            Flavour::Copilot => Self::Copilot(CopilotSession::start(launch, root, session_id)),
+        })
+    }
+
+    pub fn ask(&mut self, prompt: &str) -> Result<()> {
+        match self {
+            Self::Claude(session) => session.ask(prompt),
+            Self::Copilot(session) => session.ask(prompt),
+        }
+    }
+
+    pub fn poll(&mut self) -> Vec<AskEvent> {
+        match self {
+            Self::Claude(session) => session.poll(),
+            Self::Copilot(session) => session.poll(),
+        }
+    }
+
+    /// The id abeam gave the conversation, which `crate::agentstate` disowns.
+    ///
+    /// Disowned for both, and it is only *load-bearing* for one: a Claude in
+    /// print mode writes a session record indistinguishable by `kind` from the
+    /// hosted agent's, which is the bug §4 above exists to prevent, and Copilot
+    /// writes nothing of the sort. Answered by both anyway rather than made
+    /// conditional, because a caller deciding whether to disown by asking which
+    /// agent it is would be a second copy of this fact in a file that has no
+    /// business knowing it.
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Claude(session) => session.session_id(),
+            Self::Copilot(session) => session.session_id(),
+        }
+    }
+
+    /// Is there still a conversation to ask a question of?
+    ///
+    /// **Not "is the child running", and the difference is the whole reason this
+    /// is not a field.** For Claude the two are the same sentence: one child
+    /// holds the conversation and a dead one has lost it. For Copilot the child
+    /// is a *turn* and is supposed to be gone between questions, while the
+    /// conversation lives on in a name that `--resume` picks up. `App::pump_ask`
+    /// starts a fresh session whenever this is false, so a Copilot answering
+    /// honestly-about-its-process would forget every question the moment it had
+    /// answered it.
+    pub fn is_live(&self) -> bool {
+        match self {
+            Self::Claude(session) => session.is_live(),
+            Self::Copilot(session) => session.is_live(),
+        }
+    }
+
+    /// Has the child exited, asked of the operating system and of nothing else?
+    ///
+    /// For the tests in `crate::app` that have to know a child has gone
+    /// *without* draining the channel that would say so. `true` for a Copilot
+    /// session between turns, which is the honest answer: there is no child, so
+    /// there is none still running.
+    #[cfg(test)]
+    pub fn exited(&mut self) -> bool {
+        match self {
+            Self::Claude(session) => session.exited(),
+            Self::Copilot(session) => session.exited(),
+        }
+    }
+
+    /// The child's process id while there is a child, for a message or a
+    /// diagnostic. **Never what identifies a session** — see
+    /// [`AskSession::session_id`].
+    #[cfg(test)]
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Claude(session) => session.pid(),
+            Self::Copilot(session) => session.pid(),
+        }
+    }
+}
 
 /// The tools the child is given, and the load-bearing half of the read-only
 /// claim.
@@ -207,7 +378,7 @@ pub use proto::{AskEvent, Step, new_session_id};
 /// ran, and a hook is an arbitrary shell command gated by no tool list at all.
 /// [`SETTING_SOURCES`] is what narrows that, and it narrows rather than closes
 /// it. The honest claim is the pair of them together, with the remainder named
-/// where the pair is assembled — see [`AskSession::args`].
+/// where the pair is assembled — see [`ClaudeSession::args`].
 pub const TOOLS: &str = "Read,Grep,Glob";
 
 /// The permission posture this child starts in, which is not the load-bearing
@@ -244,7 +415,7 @@ pub const TOOLS: &str = "Read,Grep,Glob";
 /// A mode change is exactly the sort of thing that would look fine and then
 /// block on a permission dialog nobody can see — there is no terminal here to
 /// answer one at — so it was run rather than argued. On 2.1.222, 2026-08-09,
-/// with [`AskSession::args`]'s list as it stands and only this value changed:
+/// with [`ClaudeSession::args`]'s list as it stands and only this value changed:
 /// `system`/`init` reported `permissionMode` as `default` and the same
 /// `["Glob","Grep","Read"]`; the turn ran six tool calls — a `Read` of an
 /// absolute path and five `Grep`s — and came back with `permission_denials`
@@ -300,7 +471,7 @@ const DISALLOWED: &str = "Write,Edit,NotebookEdit,Bash";
 const SETTING_SOURCES: &str = "user";
 
 /// A live child, its pipes, and the reader threads draining them.
-pub struct AskSession {
+pub struct ClaudeSession {
     /// The id abeam chose and passed on the command line — **not** the one the
     /// child echoed back. `crate::agentstate` disowns records carrying this, so
     /// it has to be the value abeam knows it asked for rather than a value read
@@ -312,21 +483,21 @@ pub struct AskSession {
     /// is told there is nothing more coming.
     stdin: Option<ChildStdin>,
     events: Receiver<AskEvent>,
-    /// What [`AskSession::is_live`] answers, and why that is a remembered
+    /// What [`ClaudeSession::is_live`] answers, and why that is a remembered
     /// answer rather than a fresh one: the frozen signature takes `&self` and
     /// asking the operating system needs `&mut`. It is set false by
-    /// [`AskSession::poll`] — which runs every frame and does have `&mut` — on
+    /// [`ClaudeSession::poll`] — which runs every frame and does have `&mut` — on
     /// any of the three ways a session ends: stdout closing, the channel
     /// disconnecting, or the child having exited. So it is at most one frame
     /// behind, and the frame it is behind by is the one that notices.
     ///
-    /// **Four setters and not three.** [`AskSession::ask`] is the fourth: a
+    /// **Four setters and not three.** [`ClaudeSession::ask`] is the fourth: a
     /// write that fails means the other end of the pipe has gone, and a session
     /// that cannot be written to is over whatever the reader threads have got
     /// round to saying. Enumerating three of them was how the guard on the reap
     /// below came to look safe.
     live: bool,
-    /// How many times [`AskSession::poll`] has found the child gone and waited
+    /// How many times [`ClaudeSession::poll`] has found the child gone and waited
     /// on it. A test's only way to prove a reap happened, since a `Child` keeps
     /// no note of it; the same seam `AskPane::builds` is for the frame path.
     #[cfg(test)]
@@ -339,15 +510,23 @@ pub struct AskSession {
 /// rather than one loop over both handles: stdout is the protocol, and stderr
 /// is whatever the program felt like saying.
 enum Voice {
-    /// Lines are JSON, parsed by [`proto::parse_line`], and end of file here is
-    /// the end of the session.
-    Out,
-    /// Lines are prose, and end of file here means nothing at all — a child can
-    /// perfectly well close standard error and go on answering.
-    Err,
+    /// Lines are JSON, parsed by [`proto::parse_line`]. Claude's stdout.
+    Json,
+    /// Lines are prose the child meant as its answer, parsed by
+    /// [`copilot::said`]. Copilot's stdout, where there is no envelope at all
+    /// and the whole of the protocol is "every line is answer".
+    Text,
+    /// Lines are prose the child did not mean as anything, and end of file here
+    /// means nothing at all — a child can perfectly well close standard error
+    /// and go on answering.
+    ///
+    /// Carries the agent's own name, because [`complaint`] quotes it and a
+    /// sentence reading "`claude` said on standard error" in a pane that is
+    /// asking Copilot would send the reader looking for the wrong program.
+    Err(&'static str),
 }
 
-impl AskSession {
+impl ClaudeSession {
     /// Start one. `root` becomes the child's working directory, and
     /// `session_id` becomes both the child's `--session-id` and the name the
     /// probe next door is told to disown.
@@ -409,8 +588,8 @@ impl AskSession {
         // processes' worth of buffering apart, so the pane must not read the
         // arrival order of the two as a sequence of events.
         let (say, events) = std::sync::mpsc::channel();
-        read(stdout, say.clone(), Voice::Out);
-        read(stderr, say, Voice::Err);
+        read(stdout, say.clone(), Voice::Json, Some(AskEvent::Ended));
+        read(stderr, say, Voice::Err(Flavour::Claude.agent()), None);
 
         Ok(Self {
             session_id,
@@ -531,7 +710,10 @@ impl AskSession {
         let mut line = proto::turn(prompt);
         line.push('\n');
 
-        if let Err(why) = stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()) {
+        if let Err(why) = stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.flush())
+        {
             // A failed write is the end of the conversation and not a hiccup: a
             // pipe fails when the other end has gone, and half a JSON line
             // followed by a whole one is a stream the child would refuse
@@ -617,7 +799,7 @@ impl AskSession {
     /// install it is `cmd.exe`'s rather than the Claude's, because
     /// `crate::launch` routes a `.cmd` through an interpreter; and a pid is
     /// handed out again once its process is gone, so a record named after this
-    /// one may belong to something else entirely. [`AskSession::session_id`] is
+    /// one may belong to something else entirely. [`ClaudeSession::session_id`] is
     /// the answer to that question.
     ///
     /// `None` once the session is not live — which is *nearly* "once the process
@@ -671,7 +853,7 @@ impl AskSession {
 /// that has been killed — `SIGKILL` cannot be caught and `TerminateProcess`
 /// does not ask — and it does not wait for the pipes, so a grandchild holding
 /// them open does not hold abeam's exit.
-impl Drop for AskSession {
+impl Drop for ClaudeSession {
     fn drop(&mut self) {
         self.stdin = None;
         let _ = self.child.kill();
@@ -704,7 +886,7 @@ impl Drop for AskSession {
 /// does that is abeam's bug rather than something the reader typed, so the
 /// message says so.
 fn plan(launch: &Launch, session_id: &str) -> Result<Launch> {
-    let args = AskSession::args(session_id);
+    let args = ClaudeSession::args(session_id);
 
     // Windows-only for `crate::dispatch`'s reason: on Unix `crate::launch`
     // cannot produce a program that is not its own target — the kernel reads
@@ -758,7 +940,12 @@ fn plan(launch: &Launch, session_id: &str) -> Result<Launch> {
 /// prints a newline grows this buffer until abeam runs out of memory. A cap
 /// belongs here on the day anything has ever seen that happen, with the size
 /// taken from the observation rather than from an opinion.
-fn read<R: Read + Send + 'static>(source: R, events: Sender<AskEvent>, voice: Voice) {
+fn read<R: Read + Send + 'static>(
+    source: R,
+    events: Sender<AskEvent>,
+    voice: Voice,
+    at_eof: Option<AskEvent>,
+) {
     thread::spawn(move || {
         use std::io::BufRead;
 
@@ -767,19 +954,20 @@ fn read<R: Read + Send + 'static>(source: R, events: Sender<AskEvent>, voice: Vo
         loop {
             line.clear();
             match pipe.read_until(b'\n', &mut line) {
-                // End of file. On stdout that is the session ending and the
-                // pane is told; on stderr it is a child that has stopped
-                // complaining, which is not news and must not be announced as
-                // an ending — the two pipes close in whatever order they close
-                // in, and only one of them is the protocol.
+                // End of file, which is `at_eof`'s subject rather than this
+                // arm's: on stdout it means something and on stderr it means
+                // nothing, and what it means on stdout is no longer one answer
+                // either. The two pipes close in whatever order they close in,
+                // and only one of them is the protocol.
                 Ok(0) => break,
                 Ok(_) => {
                     let text = String::from_utf8_lossy(trimmed(&line));
                     let event = match voice {
-                        Voice::Out => proto::parse_line(&text),
-                        Voice::Err => complaint(&text),
+                        Voice::Json => proto::parse_line(&text),
+                        Voice::Text => copilot::said(&text),
+                        Voice::Err(who) => complaint(who, &text),
                     };
-                    // A send that fails means the `AskSession` has been
+                    // A send that fails means the `ClaudeSession` has been
                     // dropped, so there is nobody left to tell and nothing left
                     // to read for.
                     if let Some(event) = event
@@ -802,8 +990,14 @@ fn read<R: Read + Send + 'static>(source: R, events: Sender<AskEvent>, voice: Vo
             }
         }
 
-        if matches!(voice, Voice::Out) {
-            let _ = events.send(AskEvent::Ended);
+        // What end of file on *this* pipe means, decided by the caller rather
+        // than here. Stdout is the only one that means anything, and what it
+        // means differs by agent: for Claude the session is over, and for
+        // Copilot one turn of it is. `None` is standard error, where a pipe
+        // closing is not news and announcing it as an ending would offer the
+        // reader a restart while the child was still answering.
+        if let Some(event) = at_eof {
+            let _ = events.send(event);
         }
     });
 }
@@ -821,9 +1015,9 @@ fn read<R: Read + Send + 'static>(source: R, events: Sender<AskEvent>, voice: Vo
 /// Blank lines are dropped. A child that prints an empty line on standard error
 /// has not said anything, and an empty complaint in a transcript is a reader
 /// looking for the missing half of it.
-fn complaint(line: &str) -> Option<AskEvent> {
+fn complaint(who: &str, line: &str) -> Option<AskEvent> {
     let said = line.trim();
-    (!said.is_empty()).then(|| AskEvent::Broke(format!("`claude` said on standard error: {said}")))
+    (!said.is_empty()).then(|| AskEvent::Broke(format!("`{who}` said on standard error: {said}")))
 }
 
 /// The line without its terminator, whichever of the two this platform's child
@@ -908,7 +1102,7 @@ mod tests {
         // question is not "is this flag useful". It is "would somebody who was
         // told this pane can only read agree that it still can".
         assert_eq!(
-            AskSession::args("3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e"),
+            ClaudeSession::args("3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e"),
             args(&[
                 "-p",
                 "--input-format",
@@ -933,7 +1127,7 @@ mod tests {
 
         // The four constants the module documents, spelled once each so that
         // changing one is visibly changing that rather than editing a vector.
-        let list = AskSession::args("x");
+        let list = ClaudeSession::args("x");
         assert_eq!(TOOLS, "Read,Grep,Glob");
         assert!(list.contains(&TOOLS.to_string()));
         assert!(list.contains(&PERMISSION_MODE.to_string()));
@@ -982,7 +1176,7 @@ mod tests {
         // authority *it* hands out, and the two are the pair worth reading
         // together: that one grants edits to an unattended agent on purpose and
         // draws the line at `dangerously`; this one grants nothing at all.
-        let list = AskSession::args("3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e");
+        let list = ClaudeSession::args("3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e");
         for forbidden in [
             "--dangerously-skip-permissions",
             "--allow-dangerously-skip-permissions",
@@ -1026,7 +1220,7 @@ mod tests {
         // is no `--` fence on it. The only value abeam did not write is the
         // session id it generated.
         let id = new_session_id();
-        let list = AskSession::args(&id);
+        let list = ClaudeSession::args(&id);
         assert_eq!(
             list.iter().filter(|arg| arg.as_str() == "--").count(),
             0,
@@ -1047,7 +1241,7 @@ mod tests {
             planned.target, planned.program,
             "a program started directly is its own target"
         );
-        assert_eq!(planned.args, AskSession::args("abcd-1234"));
+        assert_eq!(planned.args, ClaudeSession::args("abcd-1234"));
         assert!(
             planned.env.is_empty(),
             "an executable's arguments travel as arguments"
@@ -1206,10 +1400,7 @@ mod tests {
     }
     #[cfg(unix)]
     fn waits_for_input() -> Vec<String> {
-        vec![
-            says("READY"),
-            "while read -r LINE; do :; done".to_string(),
-        ]
+        vec![says("READY"), "while read -r LINE; do :; done".to_string()]
     }
 
     /// Whether a process is still there, asked of the operating system.
@@ -1230,11 +1421,10 @@ mod tests {
     }
     #[cfg(windows)]
     fn alive(pid: u32) -> bool {
-        let tasklist = PathBuf::from(
-            std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
-        )
-        .join("System32")
-        .join("tasklist.exe");
+        let tasklist =
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+                .join("System32")
+                .join("tasklist.exe");
         let out = Command::new(tasklist)
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .output()
@@ -1262,7 +1452,7 @@ mod tests {
     /// the second one had been scheduled. Waiting for the *set* asks the
     /// question the test actually has.
     fn wait_for(
-        session: &mut AskSession,
+        session: &mut ClaudeSession,
         what: &str,
         enough: impl Fn(&[AskEvent]) -> bool,
     ) -> Vec<AskEvent> {
@@ -1286,16 +1476,17 @@ mod tests {
     /// Whether the reader threads have carried a line of standard error saying
     /// `what`.
     fn complained(seen: &[AskEvent], what: &str) -> bool {
-        any(seen, |event| {
-            matches!(event, AskEvent::Broke(said) if said.contains(what))
-        })
+        any(
+            seen,
+            |event| matches!(event, AskEvent::Broke(said) if said.contains(what)),
+        )
     }
 
     /// Start a shim as though it were the agent, through the same resolver
     /// every other spawn in abeam goes through.
-    fn through(script: &Path, root: &Path) -> AskSession {
+    fn through(script: &Path, root: &Path) -> ClaudeSession {
         let resolved = launch::resolve(&script.to_string_lossy(), &[]).expect("the shim resolves");
-        AskSession::start(&resolved, root, new_session_id()).expect("the shim starts")
+        ClaudeSession::start(&resolved, root, new_session_id()).expect("the shim starts")
     }
 
     #[test]
@@ -1466,9 +1657,10 @@ mod tests {
         // different pipes — so waiting for the answer would routinely stop
         // before the thing this test is about had been read at all.
         let seen = wait_for(&mut session, "the shim to echo the question", |seen| {
-            any(seen, |event| {
-                matches!(event, AskEvent::Turn { text, .. } if text == "SAW")
-            }) && complained(seen, r#""type":"user""#)
+            any(
+                seen,
+                |event| matches!(event, AskEvent::Turn { text, .. } if text == "SAW"),
+            ) && complained(seen, r#""type":"user""#)
         });
         let echoed: String = seen
             .iter()

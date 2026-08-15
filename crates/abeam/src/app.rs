@@ -267,7 +267,7 @@ struct Space {
     /// processes grows with the number of workspaces somebody has typed in, and
     /// each of them holds abeam open at `Alt+Q` until it is finished with.
     shell: ShellPane,
-    /// The second Claude, one per workspace and here for the shell's reason
+    /// The second agent, one per workspace and here for the shell's reason
     /// rather than by analogy with it.
     ///
     /// `crate::ask::AskSession::start` makes the workspace root the child's
@@ -1538,22 +1538,29 @@ impl App {
     /// gives at length: a pid is handed out again, and a disowned pid is a
     /// future Claude disowned by accident.
     fn start_ask(&mut self, ix: usize) {
-        let Some(launch) = self.spaces[ix].ask.launch().cloned() else {
+        // Both or neither: `AskPane::flavour` and `AskPane::launch` are two
+        // reads of one resolved answer, so a `Some` from one and a `None` from
+        // the other cannot happen — and is destructured rather than unwrapped so
+        // that it stays unable to happen if that ever stops being true.
+        let (Some(launch), Some(flavour)) = (
+            self.spaces[ix].ask.launch().cloned(),
+            self.spaces[ix].ask.flavour(),
+        ) else {
             // Unreachable through the pane: an ask with nothing to start takes
             // no typing at all, so it has no way to produce a question. Said
             // rather than ignored, because the alternative is a composer that
             // accepts a question and answers nothing.
             self.spaces[ix].ask.note(
-                "there is no Claude to ask, so this question has not gone \
-                 anywhere. The pane says which agent abeam is hosting and what \
-                 that costs; the question can still be asked of the session in \
-                 the left pane."
+                "there is nothing to ask, so this question has not gone \
+                 anywhere. The pane says which agent abeam is hosting and why \
+                 that one cannot be asked; the question can still be put to the \
+                 session in the left pane."
                     .to_string(),
             );
             return;
         };
         let root = self.spaces[ix].root.clone();
-        match AskSession::start(&launch, &root, ask::new_session_id()) {
+        match AskSession::start(flavour, &launch, &root, ask::new_session_id()) {
             Ok(session) => {
                 self.probe.disown(session.session_id().to_string());
                 self.spaces[ix].ask_session = Some(session);
@@ -2059,6 +2066,40 @@ impl App {
                 // it, so the instrument does not take focus.
                 self.set_right_view(target);
             }
+            // `?` reaches this pane from the file you are reading; this reaches
+            // it from anywhere, and the difference between the two is the
+            // context. `?` attaches a path and says so above the composer; F6
+            // attaches nothing.
+            //
+            // **Which means it also detaches**, and that is deliberate rather
+            // than a side effect worth guarding against. An attachment survives
+            // until the question it rides on has gone, so before this there was
+            // no way to take a file back off — `?` on the wrong file left you
+            // asking about it or clearing the whole conversation. Nothing is
+            // hidden by it: the attachment row is what disappears, on the frame
+            // the key was pressed.
+            Action::ShowAsk => {
+                if self.right_view == RightView::Ask {
+                    // Displaced and put back, exactly as `F2` does, and for the
+                    // same reason `Esc` in this pane restores rather than merely
+                    // hands focus over: the ask is somewhere you went *from*
+                    // something, and leaving it on screen would cost the reader
+                    // whatever they were looking at.
+                    self.set_right_view(self.last_workspace_view);
+                    self.focus = Focus::Left;
+                } else {
+                    self.ask_mut().attach(None);
+                    self.set_right_view(RightView::Ask);
+                    // Focused, because asking a question means typing one — and
+                    // asked of the layout rather than of the last frame for
+                    // `Action::ShowShell`'s reason: `set_right_view` has just
+                    // un-zoomed, so the pane that is about to exist does not
+                    // exist yet.
+                    if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                        self.focus = Focus::Right;
+                    }
+                }
+            }
 
             // Deliberately does not switch to the viewer or take focus. Unlike
             // the view keys, this changes nothing about *what* is on screen, so
@@ -2542,6 +2583,7 @@ fn help_overlay(f: &mut Frame) {
 mod tests {
     use super::*;
     use crate::agentstate::Readiness;
+    use crate::ask::Flavour;
     use crate::launch::Launch;
     use crate::panes::queue::Mode;
     use crate::testutil::TempDir;
@@ -3681,9 +3723,23 @@ mod tests {
 
     #[test]
     fn the_help_overlay_shows_every_binding_without_clipping_it() {
+        // Given room. This test is about the *box* — a constant width was once
+        // clipping the two longest rows, which is the overlay explaining the
+        // keys while quietly losing its own text — and the terminal it is given
+        // has to be big enough that a row going missing means the box got it
+        // wrong rather than that there was nowhere to put it.
+        //
+        // Worth knowing while you are here, because the number below is now one
+        // taller than the table and was exactly its height before `F6` joined
+        // it: **the overlay has no answer for a terminal shorter than it is.**
+        // `help_overlay` takes `min(rows + 2, height)` and draws from the top,
+        // so on a 24-row window the bottom of this table — the way out among
+        // it — is simply not there. That is older than this test and is not
+        // what it checks; it wants a scroll, or a second page, on the day
+        // somebody minds.
         let mut app = app();
         app.handle_key(key(KeyCode::F(1))).unwrap();
-        let text = screen(&mut app, 120, 40);
+        let text = screen(&mut app, 120, keys::HELP.len() as u16 + 2);
         for (k, what) in keys::HELP {
             if k.is_empty() {
                 continue;
@@ -4781,7 +4837,8 @@ mod tests {
     /// `reading(&mut fx, shim(&fx.dir))` borrows the fixture twice.
     fn reading(fx: &mut Fixture, launch: impl FnOnce(&TempDir) -> Launch) {
         let launch = launch(&fx.dir);
-        fx.app.spaces[0].ask = AskPane::with_launch(fx.dir.path().to_path_buf(), Ok(launch));
+        fx.app.spaces[0].ask =
+            AskPane::with_launch(fx.dir.path().to_path_buf(), Flavour::Claude, Ok(launch));
     }
 
     /// Ask a question the way somebody asks one: typed into the pane, then
@@ -5125,12 +5182,15 @@ mod tests {
 
     #[test]
     fn question_mark_with_nothing_open_still_opens_the_reader() {
-        // `?` is the only way to this view — there is no `Alt` key for it, on
-        // purpose — so a reader with nothing open and a git pane with nothing
-        // selectable must both still reach it. Squashed into one `Option` the
+        // A reader with nothing open, and a git pane with nothing selectable,
+        // must both still reach this view. Squashed into one `Option` the
         // "no path" and "no request" cases are indistinguishable, and the pane
         // would be unreachable in a repository with no markdown in it and
         // nothing yet changed. See `crate::panes::AskRequest`.
+        //
+        // This is not the *only* way in any more — `F6` is the other, and is
+        // the one a reader typing at the agent can reach. It remains the only
+        // way in that attaches a file, which is what this test is about.
         let mut fx = app();
         reading(&mut fx, |_| unstarted());
         fx.app.set_right_view(RightView::Git);
@@ -5140,6 +5200,82 @@ mod tests {
         fx.app.handle_key(key(KeyCode::Char('?'))).unwrap();
         fx.app.pump();
         assert_eq!(fx.app.right_view, RightView::Ask);
+    }
+
+    #[test]
+    fn f6_asks_about_nothing_in_particular_from_wherever_you_are() {
+        // The gap `?` leaves and the reason F6 exists: `?` is pane-local, so
+        // from the agent — which is where you are most of the time — there is no
+        // way in at all. A question about the repository rather than about a
+        // file had to start with a view switch to something you did not want to
+        // look at.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        fx.app.set_right_view(RightView::Git);
+        fx.app.focus = Focus::Left;
+        screen(&mut fx.app, 120, 24);
+
+        fx.app.handle_key(key(KeyCode::F(6))).unwrap();
+        assert_eq!(fx.app.right_view, RightView::Ask);
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "asking a question means typing one"
+        );
+
+        // And back again, which is `F2`'s contract rather than a second key:
+        // the ask is somewhere you went *from* something.
+        fx.app.handle_key(key(KeyCode::F(6))).unwrap();
+        assert_eq!(fx.app.right_view, RightView::Git);
+        assert_eq!(fx.app.focus, Focus::Left);
+    }
+
+    #[test]
+    fn f6_takes_the_attached_file_back_off_and_shows_that_it_has() {
+        // The half of F6 that is not about reach. An attachment survives until
+        // the question it rides on has gone, so before this there was no way to
+        // take a file back off: `?` on the wrong one left you asking about it or
+        // clearing the whole conversation. "About nothing in particular" has to
+        // mean it, or the pane would send a path the reader had stopped meaning.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        let doc = fx.dir.path().join("notes.md");
+        fx.app.viewer.show(doc);
+        fx.app.set_right_view(RightView::Viewer);
+        fx.app.focus = Focus::Right;
+        screen(&mut fx.app, 120, 24);
+
+        fx.app.handle_key(key(KeyCode::Char('?'))).unwrap();
+        fx.app.pump();
+        let attached = screen(&mut fx.app, 120, 24);
+        assert!(
+            attached.contains("notes.md"),
+            "nothing was attached to detach"
+        );
+
+        // Out and back in through F6, which is the ordinary way somebody
+        // changes their mind: the row above the composer is what goes away, on
+        // the frame the key was pressed.
+        fx.app.handle_key(key(KeyCode::F(6))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(6))).unwrap();
+        assert_eq!(fx.app.right_view, RightView::Ask);
+        let detached = screen(&mut fx.app, 120, 24);
+        assert!(
+            !detached.contains("notes.md"),
+            "the file was still attached to a question about nothing: {detached}"
+        );
+
+        // And the question that goes is the one that was typed, with no path
+        // under it — which is the whole of what the disclosure row promises.
+        for c in "why".chars() {
+            fx.app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+        let sent = fx.app.spaces[0]
+            .ask
+            .take_question()
+            .expect("a question was submitted");
+        assert_eq!(sent, "why", "a detached question carried a path anyway");
     }
 
     #[test]
@@ -5309,7 +5445,7 @@ mod tests {
     fn second_space_that_can_be_asked(fx: &mut Fixture, rel: &str) -> PathBuf {
         let root = a_second_workspace(fx, rel);
         let mut space = space(root.clone(), "other");
-        space.ask = AskPane::with_launch(root.clone(), Ok(unstarted()));
+        space.ask = AskPane::with_launch(root.clone(), Flavour::Claude, Ok(unstarted()));
         fx.app.spaces.push(space);
         root
     }

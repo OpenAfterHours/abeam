@@ -34,15 +34,19 @@ pub enum RightView {
     /// toggle that remembers what it displaced, because you go there to answer
     /// a question and then come back.
     Diag,
-    /// A second Claude, which may read and may not write, asked about the file
-    /// the pane you came from was showing.
+    /// A second copy of the hosted agent, which may read and may not write,
+    /// asked about the file the pane you came from was showing — or about
+    /// nothing in particular, which is what `F6` is for.
     ///
     /// **Not a workspace view either, and for `Diag`'s reason rather than by
-    /// analogy with it.** There is no global key that shows this: it is reached
-    /// by `?` in a focused viewer or git pane, which means it is always
-    /// somewhere you went *from* something, and `Esc` puts that something back.
-    /// A view you can only arrive at from another one has to remember which,
-    /// so it is left out of `App::last_workspace_view` exactly as `Diag` is.
+    /// analogy with it.** Both keys that reach it are keys you press while
+    /// looking at something else — `?` in a focused viewer or git pane, and
+    /// `F6` from anywhere — so it is always somewhere you went *from*
+    /// something, and `Esc` puts that something back. A view you can only
+    /// arrive at from another one has to remember which, so it is left out of
+    /// `App::last_workspace_view` exactly as `Diag` is. `F6` is a global key
+    /// and does not change that: it is `Diag`'s `F2` rather than the queue's
+    /// `Alt+A`, which is the same distinction seen from the key's side.
     ///
     /// It is per workspace, beside the shell, because the child's working
     /// directory belongs to the child — see `crate::app::Space`. Everything
@@ -53,12 +57,19 @@ pub enum RightView {
 /// `?`: a pane handing the ask view what it was looking at.
 ///
 /// A newtype over an `Option` rather than a bare `Option<PathBuf>`, and the
-/// inner `None` is the whole reason it exists. `?` is the *only* way to this
-/// view — there is no `Alt` key for it, deliberately — so a `?` pressed in a
-/// reader with nothing open, or in a git pane whose selected row names nothing
-/// that can be read, still has to open it. Squashed into one `Option` the two
-/// cases would be indistinguishable, and the pane would be unreachable in a
-/// repository with no markdown in it and nothing yet changed.
+/// inner `None` is the whole reason it exists. A `?` pressed in a reader with
+/// nothing open, or in a git pane whose selected row names nothing that can be
+/// read, still has to open the view. Squashed into one `Option` the two cases
+/// would be indistinguishable, and the pane would be unreachable in a repository
+/// with no markdown in it and nothing yet changed.
+///
+/// `?` is no longer the only way in — `F6` opens the same view from anywhere,
+/// with nothing attached — and this type is untouched by that, which is worth a
+/// sentence because it looks like it should not be. `F6` is not a request from a
+/// pane: nothing was pointed at, so there is nothing to hand over, and
+/// `crate::app` calls `AskPane::attach(None)` outright. What this carries is
+/// still "a pane asked, and here is what it was showing", where the inner `None`
+/// means it was showing nothing.
 ///
 /// The label the pane draws is not in here: it is built where the context is,
 /// from the path, so there is one rule about what a forty-six-column pane shows

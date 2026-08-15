@@ -1,4 +1,5 @@
-//! Asking a second Claude about the thing you are already looking at.
+//! Asking a second copy of your agent about the thing you are already looking
+//! at — or, with `F6`, about nothing in particular.
 //!
 //! The gap this is for is narrow and constant. You are reading a file in the
 //! viewer, or a diff in the git pane, and a question comes up that is *about*
@@ -9,17 +10,43 @@
 //! without spending any of that, and it is deliberately the smallest of the
 //! three agents abeam starts.
 //!
+//! ## It is whichever agent is being hosted, in whichever shape that one has
+//!
+//! [`ASKABLE`] is two names long and `crate::ask::Flavour` is what the pane
+//! carries away from resolving one. Nearly everything below is the same either
+//! way — the composer, the transcript, the hand-off, the scroll table — because
+//! all of that is about a pane rather than about a protocol. What differs is
+//! the section immediately after this one and one row of chrome, and both
+//! differences are the same underlying fact: `crate::ask::copilot` cannot make
+//! the promise the next paragraph is about.
+//!
+//! abeam will not start a Claude for a session that asked for Copilot. It hosts
+//! the agent it was told to; a pane that quietly reached for the other one would
+//! be spending an account the reader did not name, on a model they did not
+//! choose, to answer a question about their repository.
+//!
 //! ## It reads, and the tool list is the proof rather than the promise
 //!
-//! `crate::ask` hands the child `--tools "Read,Grep,Glob"`, which is an
-//! allowlist over the built-in set: what is not named there does not exist for
-//! that session, so there is no `Write`, no `Edit` and no `Bash` to permit or
-//! refuse. That is a claim about a *list*, and a claim about a list is worth
-//! showing rather than asserting — so the tools that came back on
+//! **Under Claude.** `crate::ask` hands the child `--tools "Read,Grep,Glob"`,
+//! which is an allowlist over the built-in set: what is not named there does not
+//! exist for that session, so there is no `Write`, no `Edit` and no `Bash` to
+//! permit or refuse. That is a claim about a *list*, and a claim about a list is
+//! worth showing rather than asserting — so the tools that came back on
 //! [`AskEvent::Ready`] are drawn along the bottom of the pane, and what is on
 //! screen is what the child actually got. A pane that said "read-only" in its
 //! own voice would be repeating abeam's intention back at the reader; this
 //! repeats the child's answer.
+//!
+//! **Under Copilot there is no such list to show, and the row says so rather
+//! than filling the gap.** `crate::ask::copilot` makes the claim from the other
+//! side — `--deny-tool` for the kinds that can write, and no approval channel
+//! for anything else that would need one — and Copilot sends nothing announcing
+//! what it was given. So the row reads `copilot · no tool list to show`, and it
+//! pointedly does *not* print the denylist: a list abeam chose, drawn in the
+//! place a list the child reported goes, would be exactly the "abeam's intention
+//! wearing the child's clothes" this pane's whole discipline is against. The
+//! opening screen is where that is explained at length, because it is the one
+//! screen with room — see [`AskPane::what_it_is`].
 //!
 //! The same row says the other thing a second agent costs, because nothing
 //! else on screen would: **this session shares the user's quota with the agent
@@ -36,9 +63,16 @@
 //! `?` in the viewer or the git pane attaches an [`AskContext`] — a label and a
 //! path — and the pane draws `▸ <label>` above the composer until the question
 //! goes. What travels is the *path*, on its own line under what was typed. The
-//! child stands in the same directory and has `Read`, `Grep` and `Glob`, so
-//! naming the file is enough: it fetches what it needs and skips what it does
-//! not.
+//! child stands in the same directory and has tools that read, so naming the
+//! file is enough: it fetches what it needs and skips what it does not.
+//!
+//! **`F6` is the same pane with no context at all**, and is the answer to the
+//! question that is not about a file — which is most of them, if you are typing
+//! at the agent rather than reading. It is also the only thing that *detaches*:
+//! an attachment survives until the question it rides on has gone, so without it
+//! a `?` on the wrong file left the reader asking about that file or clearing
+//! the whole conversation. Detaching is disclosed by the row above the composer
+//! going away, on the frame the key was pressed.
 //!
 //! Shipping the body instead would mean a cap, a truncation notice, a decision
 //! about how much of a four-thousand-line file to send, and a question that
@@ -149,7 +183,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::ask::{AskEvent, Step};
+use crate::ask::{AskEvent, Flavour, Step};
 use crate::dispatch::Unavailable;
 use crate::launch::{self, Launch};
 use crate::pane::{Handled, Pane};
@@ -169,14 +203,21 @@ const ATTACHED: &str = "▸ ";
 /// What marks a command the pane is offering to type into the shell.
 const COMMAND: &str = "⌘ ";
 
-/// The one agent this is available for.
+/// The agents this pane can ask, and which shape each one gets.
 ///
-/// Written out rather than taken from [`crate::agent::DEFAULT`], for
-/// `crate::dispatch`'s reason: the default is what abeam hosts when nobody
-/// said, and this is whose streaming-JSON print mode the whole shape rests on.
-/// The day the first of those changes must not be the day this pane starts
-/// spawning something that has never heard of `--input-format stream-json`.
-const AGENT: &str = "claude";
+/// A table rather than a name, and written out rather than derived from
+/// `crate::agent::AGENTS`, for `crate::dispatch`'s reason: that table answers
+/// what abeam can *host*, and this one answers which of those have a print mode
+/// this pane knows how to drive. The two are not the same question and the day a
+/// third agent joins the first must not be the day this pane starts spawning
+/// something that has never heard of either shape.
+///
+/// **The two entries are not equally well founded, and the pane says so where
+/// it matters.** `crate::ask`'s Claude is a recorded observation with a version
+/// and a date on it; `crate::ask::copilot` is GitHub's documentation, never run.
+/// See [`AskPane::opening`], which is where a reader is told which of the two
+/// they are looking at.
+const ASKABLE: &[(&str, Flavour)] = &[("claude", Flavour::Claude), ("copilot", Flavour::Copilot)];
 
 /// What the composer says while an answer is still arriving, after the count of
 /// seconds it has been arriving for.
@@ -247,6 +288,11 @@ pub struct AskContext {
 #[derive(Debug)]
 pub struct Ready {
     launch: Launch,
+    /// Which of the two shapes the child will be driven in. Decided here, with
+    /// the program, rather than re-derived from the agent's name at each of the
+    /// four places that need it — the name and the shape are one answer and
+    /// splitting them is how they come to disagree.
+    flavour: Flavour,
 }
 
 /// One question and the answer accumulating under it.
@@ -313,6 +359,7 @@ enum Entry {
     /// one line.
     Note { text: String, count: usize },
 }
+
 
 
 /// The pane.
@@ -442,11 +489,21 @@ impl AskPane {
     /// needs — so it is compiled only where it is called, rather than left
     /// behind an `allow` that says a shipped build has a constructor nobody
     /// reaches.
+    ///
+    /// `flavour` is handed in beside the launch rather than guessed from it,
+    /// because the two rows that differ between the agents — the opening screen
+    /// and the capability line — are the whole of what a test of this pane would
+    /// otherwise be unable to reach without a `copilot` on the machine. There is
+    /// no `copilot` on the machine this was written on.
     #[cfg(test)]
-    pub fn with_launch(root: PathBuf, launch: Result<Launch, Unavailable>) -> Self {
+    pub fn with_launch(
+        root: PathBuf,
+        flavour: Flavour,
+        launch: Result<Launch, Unavailable>,
+    ) -> Self {
         let ready = OnceCell::new();
-        let _ = ready.set(launch.map(|launch| Ready { launch }));
-        Self::with_ready(root, AGENT.to_string(), ready)
+        let _ = ready.set(launch.map(|launch| Ready { launch, flavour }));
+        Self::with_ready(root, flavour.agent().to_string(), ready)
     }
 
     /// Whether there is a Claude to ask, resolved on the first thing that needs
@@ -459,8 +516,19 @@ impl AskPane {
     /// than a resolve per caller: a PATH walk repeated every frame would be a
     /// worse bug than the one this replaced.
     fn ready(&self) -> &Result<Ready, Unavailable> {
-        self.ready
-            .get_or_init(|| resolve(&self.agent).map(|launch| Ready { launch }))
+        self.ready.get_or_init(|| resolve(&self.agent))
+    }
+
+    /// Which shape the child is driven in, or `None` when there is no child to
+    /// drive.
+    ///
+    /// Read by the two rows that cannot be written once for both agents — the
+    /// opening screen and the capability line — and by `crate::app`, which does
+    /// the starting. It is deliberately not a field: the answer lives with the
+    /// program in [`Ready`], because the pane that has resolved one has resolved
+    /// the other in the same breath.
+    pub fn flavour(&self) -> Option<Flavour> {
+        self.ready().as_ref().ok().map(|ready| ready.flavour)
     }
 
     /// The one place every field starts, so two constructors cannot drift.
@@ -1181,10 +1249,7 @@ impl AskPane {
     /// they are written out here in full.
     fn opening(&self) -> String {
         format!(
-            "Ask a second Claude about what is in front of you. It can read this \
-             repository — `Read`, `Grep` and `Glob`, and the row along the bottom \
-             is the list it actually got — and it has no tool that can change a \
-             file.\n\
+            "{}\n\
              \n\
              - `enter` sends what you have typed; `ctrl+enter` starts a new line \
              inside it.\n\
@@ -1206,8 +1271,57 @@ impl AskPane {
              conversation.\n\
              \n\
              It reads `{}`\n",
+            self.what_it_is(),
             self.root.display()
         )
+    }
+
+    /// The paragraph the opening screen leads with, which is the one thing on
+    /// that screen the two agents cannot share.
+    ///
+    /// Long for Copilot, and deliberately: this is the only place with room for
+    /// the two sentences the chrome can only abbreviate, and against Copilot
+    /// there are two *more* — what the capability row cannot show, and that none
+    /// of this has been run. A reader who leans on the pane's read-only promise
+    /// should learn from the pane which of the two versions of that promise they
+    /// have, rather than from a README.
+    ///
+    /// The unavailable case never reaches here: `AskPane::build` draws the
+    /// reason instead of the transcript, so [`AskPane::opening`] is only ever
+    /// asked of a pane that resolved something.
+    fn what_it_is(&self) -> &'static str {
+        match self.flavour() {
+            Some(Flavour::Copilot) => {
+                "Ask a second Copilot about what is in front of you. Each \
+                 question is one `copilot -p`, resuming a session of its own so \
+                 that it remembers the last, and abeam refuses it `shell`, \
+                 `write`, `edit`, `web_fetch` and `web_search` — so it has no \
+                 tool that can change a file and none that reaches the network.\n\
+                 \n\
+                 **Three things are weaker here than in the Claude version of \
+                 this pane, and they are worth knowing before you lean on it.** \
+                 Copilot publishes no line announcing what it was given, so the \
+                 row along the bottom cannot show you the tools it actually got \
+                 — abeam can tell you what it asked for and not what was \
+                 granted. It publishes no cost or duration either, so a finished \
+                 turn is not labelled with what it cost. And **none of this has \
+                 ever been run**: the flags come from GitHub's documentation \
+                 rather than from a session anybody watched. A repository's own \
+                 instructions file, and any MCP server you have configured, \
+                 still load.\n\
+                 \n\
+                 The conversation is a named session, so it is in your own \
+                 `copilot --resume` list afterwards, under `abeam-ask-`."
+            }
+            // Claude, which is also what an unavailable pane would say if it
+            // ever drew this — and it never does.
+            _ => {
+                "Ask a second Claude about what is in front of you. It can read \
+                 this repository — `Read`, `Grep` and `Glob`, and the row along \
+                 the bottom is the list it actually got — and it has no tool \
+                 that can change a file."
+            }
+        }
     }
 
     /// Rebuild the commands the transcript is offering, if the transcript has
@@ -1347,6 +1461,15 @@ impl AskPane {
                 tools.join(" "),
                 Style::new().fg(t.ok).add_modifier(Modifier::BOLD),
             )),
+            // The row that cannot be the child's answer, because this child
+            // never gives one. Copilot publishes no `system`/`init` line, so
+            // there is nothing to show — and what abeam must not do is fill the
+            // gap with `--deny-tool`'s list, which would read as a confirmation
+            // and is only ever abeam's intention. Saying there is no list is the
+            // one true thing available; the opening screen has the paragraph.
+            _ if self.flavour() == Some(Flavour::Copilot) => {
+                spans.push(Span::styled("copilot · no tool list to show", t.dim()));
+            }
             // Not "read-only". Nothing has told this pane anything yet, and a
             // list printed before the child has reported one would be abeam's
             // intention wearing the child's clothes.
@@ -1789,25 +1912,30 @@ impl Pane for AskPane {
 /// With no arguments, for `Dispatcher::new`'s reason: what is being asked is
 /// whether there is a Claude at all, and the answer has to arrive while the
 /// pane is being built rather than on the keystroke that asks a question.
-fn resolve(agent: &str) -> Result<Launch, Unavailable> {
+fn resolve(agent: &str) -> Result<Ready, Unavailable> {
     // Through the table rather than by comparing the string, so `abeam +Claude`
     // and `abeam +claude` are one request here as they are everywhere else. A
     // program named outright — `abeam +C:\tools\claude.exe` — is not the
     // table's Claude and does not become it.
-    let Some(claude) = crate::agent::find(agent).filter(|found| found.name == AGENT) else {
+    let Some((found, flavour)) = crate::agent::find(agent).and_then(|found| {
+        ASKABLE
+            .iter()
+            .find(|(name, _)| *name == found.name)
+            .map(|(_, flavour)| (found, *flavour))
+    }) else {
         return Err(Unavailable(elsewhere(agent)));
     };
     let mut why = String::new();
-    for candidate in claude.candidates {
+    for candidate in found.candidates {
         match launch::resolve(candidate, &[]) {
-            Ok(launch) => return Ok(launch),
+            Ok(launch) => return Ok(Ready { launch, flavour }),
             Err(reason) => why = reason,
         }
     }
     // And that is the end of the search. Nothing on this path fetches anything;
     // `crate::agent`'s module docs record the route that was written for exactly
     // this problem and then deliberately taken out again.
-    Err(Unavailable(missing(claude, &why)))
+    Err(Unavailable(missing(found, &why)))
 }
 
 /// What abeam says to a session that is hosting something else.
@@ -1818,13 +1946,18 @@ fn resolve(agent: &str) -> Result<Launch, Unavailable> {
 /// not losing the ability to ask a question — it is losing the ability to ask
 /// one *without spending the conversation on the left*.
 fn elsewhere(agent: &str) -> String {
+    let known: Vec<String> = ASKABLE
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect();
     format!(
-        "abeam is hosting `{agent}`, and this pane is a second Claude in \
-         streaming-JSON print mode: it needs `--input-format stream-json`, \
-         `--tools` and `--session-id`, which are Claude's. `{agent}` publishes \
-         no equivalent, and abeam will not quietly start a Claude you did not \
-         ask for — it hosts the agent you named. The question can still be \
-         asked of the session in the left pane, which is the agent you chose."
+        "abeam is hosting `{agent}`, and this pane is a second copy of the agent \
+         you are already talking to — started in whatever print mode that agent \
+         publishes, with its writing tools taken away. abeam knows two: {}. \
+         `{agent}` is neither, and abeam will not quietly start an agent you did \
+         not ask for — it hosts the one you named. The question can still be \
+         asked of the session in the left pane, which is the agent you chose.",
+        known.join(" and ")
     )
 }
 
@@ -1835,18 +1968,19 @@ fn elsewhere(agent: &str) -> String {
 /// — plus the observation that makes this odd rather than ordinary: reaching
 /// here means abeam is *hosting* Claude, so there was one when the session
 /// started and something has moved it since.
-fn missing(claude: &crate::agent::Agent, why: &str) -> String {
-    let tried: Vec<String> = claude
+fn missing(agent: &crate::agent::Agent, why: &str) -> String {
+    let tried: Vec<String> = agent
         .candidates
         .iter()
         .map(|name| format!("`{name}`"))
         .collect();
     format!(
-        "abeam has nothing to ask: it looked for the Claude it is hosting and \
-         did not find one. Tried: {}. {why}\n\nThat is odd rather than ordinary \
-         — this session started a Claude, so there was one when it began. {}",
+        "abeam has nothing to ask: it looked for the `{}` it is hosting and did \
+         not find one. Tried: {}. {why}\n\nThat is odd rather than ordinary — \
+         this session started one, so there was one when it began. {}",
+        agent.name,
         tried.join(", "),
-        claude.install
+        agent.install
     )
 }
 
@@ -2048,11 +2182,15 @@ mod tests {
     }
 
     fn live() -> AskPane {
-        AskPane::with_launch(PathBuf::from("/repo"), Ok(fake_launch()))
+        AskPane::with_launch(PathBuf::from("/repo"), Flavour::Claude, Ok(fake_launch()))
     }
 
     fn unavailable(why: &str) -> AskPane {
-        AskPane::with_launch(PathBuf::from("/repo"), Err(Unavailable(why.to_string())))
+        AskPane::with_launch(
+            PathBuf::from("/repo"),
+            Flavour::Claude,
+            Err(Unavailable(why.to_string())),
+        )
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -2183,12 +2321,20 @@ mod tests {
     }
 
     #[test]
-    fn only_the_agent_with_the_flags_can_be_asked_and_the_rest_are_told_why() {
-        for hosting in ["copilot", "Copilot"] {
-            let Unavailable(why) = resolve(hosting).expect_err("this shape is Claude's");
+    fn only_an_agent_with_a_print_mode_can_be_asked_and_the_rest_are_told_why() {
+        // [`ASKABLE`] is two names long and `crate::agent::AGENTS` is the same
+        // two, so what reaches this refusal is a *program* abeam is hosting
+        // rather than an agent it knows — `abeam +pwsh`, a preset over a shell,
+        // a path named outright. Each of those is a session with no print mode
+        // to drive, and the pane has to say which and offer the way through.
+        for hosting in ["pwsh", "bash", "not-an-agent"] {
+            let Unavailable(why) = resolve(hosting).expect_err("this pane knows two");
             assert!(why.contains(hosting), "the agent in front of them: {why}");
-            assert!(why.contains("stream-json"), "which flags: {why}");
-            assert!(why.contains("Claude"), "whose they are: {why}");
+            // Both of the ones that would have worked, named rather than
+            // implied: a reader whose agent cannot be asked is exactly the
+            // reader who wants to know which can.
+            assert!(why.contains("`claude`"), "{why}");
+            assert!(why.contains("`copilot`"), "{why}");
             // The reversal `crate::agent` records, in the place it would be
             // easiest to undo quietly.
             assert!(why.contains("did not ask for"), "{why}");
@@ -2196,20 +2342,81 @@ mod tests {
             assert!(why.contains("left pane"), "{why}");
         }
 
-        // Whether Claude then resolves is a fact about the machine rather than
+        // Whether either then resolves is a fact about the machine rather than
         // a decision, so what is asserted is that the spellings are one
-        // question — and that the answer is never the refusal meant for a
-        // different agent.
+        // question — and that the answer is never the refusal meant for
+        // something this pane cannot drive at all.
         let answer = |name: &str| match resolve(name) {
-            Ok(_) => "there is a claude",
+            Ok(_) => "it is installed",
             Err(Unavailable(why)) => {
-                assert!(!why.contains("is hosting `"), "read as another agent: {why}");
+                assert!(
+                    !why.contains("is hosting `"),
+                    "read as another agent: {why}"
+                );
                 assert!(why.contains("Tried:"), "{why}");
-                "there is no claude"
+                "it is not installed"
             }
         };
         assert_eq!(answer("claude"), answer("Claude"));
         assert_eq!(answer("claude"), answer("CLAUDE"));
+        assert_eq!(answer("copilot"), answer("Copilot"));
+        assert_eq!(answer("copilot"), answer("COPILOT"));
+
+        // And the shape follows the name rather than the machine. Guarded
+        // rather than asserted outright because whether either program is on
+        // *this* machine is not a property a test may have — what must never
+        // happen is a resolve that finds one agent and drives it as the other,
+        // which is a session started with flags it has never heard of.
+        if let Ok(ready) = resolve("Claude") {
+            assert_eq!(ready.flavour, Flavour::Claude);
+        }
+        if let Ok(ready) = resolve("Copilot") {
+            assert_eq!(ready.flavour, Flavour::Copilot);
+        }
+    }
+
+    #[test]
+    fn a_copilot_pane_never_shows_a_tool_list_it_was_not_given() {
+        // The one promise this pane makes that Copilot cannot keep, kept the
+        // only way left: by saying so. The capability row is the child's answer
+        // and never abeam's intention — and against Copilot there is no answer,
+        // because it publishes no line announcing what it was given. What must
+        // never appear on that row is `--deny-tool`'s list, which would read as
+        // a confirmation of something nothing has confirmed.
+        let mut p =
+            AskPane::with_launch(PathBuf::from("/repo"), Flavour::Copilot, Ok(fake_launch()));
+        let row = screen(&mut p, 46, 12);
+        assert!(row.contains("no tool list"), "got: {row}");
+        for named in ["deny", "shell", "web_fetch", "Read Grep Glob"] {
+            assert!(
+                !row.contains(named),
+                "`{named}` was drawn as though a child had reported it: {row}"
+            );
+        }
+
+        // The opening screen is where the whole of it is said, because it is the
+        // one screen with room — including the sentence that governs how the
+        // rest of this feature should be read.
+        let doc = p.source();
+        assert!(doc.contains("Copilot"), "which agent: {doc}");
+        assert!(
+            doc.contains("ever been run"),
+            "the caveat is the point: {doc}"
+        );
+        assert!(doc.contains("copilot -p"), "how it is driven: {doc}");
+        // The tools it is refused, which the *screen* may name because it says
+        // in the same breath that this is what abeam asked for rather than what
+        // was granted.
+        assert!(doc.contains("`shell`"), "{doc}");
+        assert!(
+            doc.contains("cannot show you the tools it actually got"),
+            "{doc}"
+        );
+
+        // And a Claude pane is unchanged by any of it.
+        let claude = live().source();
+        assert!(claude.contains("`Read`, `Grep` and `Glob`"), "{claude}");
+        assert!(!claude.contains("ever been run"), "{claude}");
     }
 
     // --- the transcript ----------------------------------------------------
@@ -2254,7 +2461,10 @@ mod tests {
         // hide the evidence and leave the bill.
         let mut p = live();
         ask(&mut p, "what does this file do?");
-        answer(&mut p, "It parses `stream-json`.\n\n```sh\ncargo test ask\n```\n");
+        answer(
+            &mut p,
+            "It parses `stream-json`.\n\n```sh\ncargo test ask\n```\n",
+        );
         p.sync();
         assert!(!p.entries.is_empty());
         assert_eq!(p.commands, ["cargo test ask"]);
@@ -2267,7 +2477,10 @@ mod tests {
         );
 
         assert!(p.entries.is_empty(), "the transcript survived the clear");
-        assert!(p.commands.is_empty(), "a command from the old answer is still offered");
+        assert!(
+            p.commands.is_empty(),
+            "a command from the old answer is still offered"
+        );
         assert!(
             p.take_reset(),
             "the pane cleared itself and left the child running, which is the \
@@ -2314,7 +2527,10 @@ mod tests {
     #[test]
     fn a_question_and_the_answer_arriving_under_it_are_both_on_screen() {
         let mut p = live();
-        assert_eq!(ask(&mut p, "what does resolve do?").as_deref(), Some("what does resolve do?"));
+        assert_eq!(
+            ask(&mut p, "what does resolve do?").as_deref(),
+            Some("what does resolve do?")
+        );
 
         // The question is drawn before anything has come back, because a
         // question with nothing under it is the state every question passes
@@ -2420,7 +2636,10 @@ mod tests {
         });
         let text = screen(&mut p, 70, 20);
         assert!(text.contains("the whole answer"), "{text}");
-        assert!(text.contains("stopped early"), "the reason is kept too: {text}");
+        assert!(
+            text.contains("stopped early"),
+            "the reason is kept too: {text}"
+        );
     }
 
     #[test]
@@ -2616,7 +2835,10 @@ mod tests {
         ask(&mut p, "a slow question");
         let text = screen(&mut p, 60, 16);
         assert!(text.contains("answering 0s"), "{text}");
-        assert!(text.contains("enter waits"), "the refusal is still said: {text}");
+        assert!(
+            text.contains("enter waits"),
+            "the refusal is still said: {text}"
+        );
         p.tick();
 
         // Reached into rather than waited for, because the alternative is a
@@ -2648,7 +2870,10 @@ mod tests {
         assert!(!p.tick(), "an idle pane is claiming frames");
         let text = screen(&mut p, 60, 16);
         assert!(!text.contains("answering"), "{text}");
-        assert!(text.contains("42s"), "how long it took is not on record: {text}");
+        assert!(
+            text.contains("42s"),
+            "how long it took is not on record: {text}"
+        );
     }
 
     #[test]
@@ -2843,7 +3068,9 @@ mod tests {
         // Never joined, on any route: the two lines of the second block do not
         // appear as one command anywhere.
         assert!(
-            !p.commands.iter().any(|c| c.contains("&&") || c.contains("clippy")),
+            !p.commands
+                .iter()
+                .any(|c| c.contains("&&") || c.contains("clippy")),
             "{:?}",
             p.commands
         );
@@ -2864,7 +3091,10 @@ mod tests {
         // clause.
         let said = refusal(1);
         assert!(said.contains("nobody read"), "the reason: {said}");
-        assert!(said.contains("copy it out of the answer"), "the way out: {said}");
+        assert!(
+            said.contains("copy it out of the answer"),
+            "the way out: {said}"
+        );
         assert!(!p.command_lines(60).is_empty(), "the refusal was not drawn");
         assert!(screen(&mut p, 60, 24).contains("Joining"), "not on screen");
     }
@@ -2885,7 +3115,11 @@ mod tests {
         // With something typed, the same key is a send and never a hand-off.
         typed(&mut p, "and now?");
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
-        assert_eq!(p.take_command(), None, "Enter sent a question and ran a command");
+        assert_eq!(
+            p.take_command(),
+            None,
+            "Enter sent a question and ran a command"
+        );
         assert_eq!(p.take_question().as_deref(), Some("and now?"));
     }
 
@@ -2933,7 +3167,10 @@ mod tests {
         ask(&mut p, "?");
         answer(&mut p, &"a paragraph of text.\n\n".repeat(40));
         screen(&mut p, 30, 8);
-        assert!(p.scroll.max() > 0, "the transcript must overflow eight rows");
+        assert!(
+            p.scroll.max() > 0,
+            "the transcript must overflow eight rows"
+        );
 
         p.handle_key(key(KeyCode::Home)).unwrap();
         assert_eq!(p.scroll.offset, 0);
@@ -3020,7 +3257,10 @@ mod tests {
         p.handle_key(key(KeyCode::PageUp)).unwrap();
         assert!(!p.following);
         ask(&mut p, "and one more thing");
-        assert!(p.following, "a question you asked is one you are waiting to see");
+        assert!(
+            p.following,
+            "a question you asked is one you are waiting to see"
+        );
     }
 
     #[test]
@@ -3093,10 +3333,7 @@ mod tests {
         // survived the refusal.
         assert!(!screen(&mut p, 46, 16).contains("enter waits"));
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
-        assert_eq!(
-            p.take_question().as_deref(),
-            Some("and what about launch?")
-        );
+        assert_eq!(p.take_question().as_deref(), Some("and what about launch?"));
     }
 
     #[test]
@@ -3126,7 +3363,10 @@ mod tests {
     #[test]
     fn a_question_is_never_sent_twice_however_often_the_app_asks() {
         let mut p = live();
-        assert_eq!(ask(&mut p, "just the once").as_deref(), Some("just the once"));
+        assert_eq!(
+            ask(&mut p, "just the once").as_deref(),
+            Some("just the once")
+        );
         for _ in 0..200 {
             assert_eq!(p.take_question(), None, "a question came back");
         }
@@ -3169,7 +3409,10 @@ mod tests {
         // Before anything has said, nothing is claimed.
         let text = screen(&mut p, 70, 12);
         assert!(text.contains("no reader yet"), "{text}");
-        assert!(!text.contains("read-only"), "a claim with nothing behind it");
+        assert!(
+            !text.contains("read-only"),
+            "a claim with nothing behind it"
+        );
 
         p.on_event(AskEvent::Ready {
             session_id: "1e6a7c40-0000-4000-8000-000000000001".to_string(),
@@ -3180,7 +3423,10 @@ mod tests {
         assert!(text.contains("Glob Grep Read"), "{text}");
         // What is *not* there is the point of showing the list at all.
         for forbidden in ["Write", "Edit", "Bash"] {
-            assert!(!text.contains(forbidden), "{forbidden} is on screen: {text}");
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} is on screen: {text}"
+            );
         }
         assert!(p.tick(), "a tool list is worth the frame that draws it");
     }
@@ -3269,4 +3515,3 @@ mod tests {
         assert!(!p.tick());
     }
 }
-

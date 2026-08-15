@@ -113,6 +113,26 @@ pub enum Action {
     ToggleHelp,
     /// Show the pty instrument, or put back whatever it displaced.
     ToggleDiag,
+    /// Show the ask with **nothing attached**, or put back whatever it
+    /// displaced.
+    ///
+    /// The global half of `?`, and the two are deliberately not the same key.
+    /// `?` is pane-local and means "about the file I am reading"; there is no
+    /// file here and no pane to have pressed it from — the common case is
+    /// mid-sentence at the agent, wondering something about the repository — so
+    /// this one is reachable from everywhere and carries no context at all.
+    ///
+    /// **Showing it also detaches**, which is worth stating because it is the
+    /// only way a file comes back *off* the composer. `?` attaches and the
+    /// attachment survives until the question goes, so without this a reader who
+    /// pressed `?` on a file and then thought better of it had no way to ask
+    /// about anything else. Detaching is disclosed the moment it happens: the
+    /// row above the composer is what goes away.
+    ///
+    /// It takes focus, unlike [`Action::ToggleDiag`] and like
+    /// [`Action::ShowShell`], for that key's reason — a box you have to press a
+    /// second key to type into is not a box you can ask a question in.
+    ShowAsk,
     /// Flip the file reader between its light and dark palettes.
     ///
     /// Global rather than a key the viewer handles, so it works from the left
@@ -173,6 +193,24 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // argument, and `the_agents_alt_bindings_are_left_alone` pins it.
         KeyCode::F(4) if bare => Some(Action::FocusLeft),
         KeyCode::F(5) if bare => Some(Action::FocusRight),
+        // F6 for the ask, and an F-key rather than an `Alt` letter for a
+        // stronger version of F2's and F3's reason. The letters this key would
+        // want are gone twice over: `?` is not reachable under `Alt` on every
+        // layout, `Alt+A` is the queue, and the classic readline meta set that
+        // caught `Alt+F` covers most of what is left. And there is now a second
+        // agent to clear a binding against, which is the part that decides it —
+        // no function key appears in any published Copilot shortcut table, and
+        // Copilot CLI is an Ink application whose `useInput` cannot describe one
+        // to a handler at all. `Alt` is the namespace both agents actually use;
+        // the F-keys are the one namespace both leave alone.
+        //
+        // It joins F2 rather than the four view keys, and the grouping is real
+        // rather than a leftover: `Diag` and `Ask` are the two views that
+        // *displace* something and put it back, and neither is remembered as a
+        // workspace view. The row further down this file arguing that a fifth
+        // view spelled `F6` would be a key nobody groups with the other three
+        // still stands — this is not a fifth view.
+        KeyCode::F(6) if bare => Some(Action::ShowAsk),
 
         _ if !alt => None,
 
@@ -232,6 +270,13 @@ pub const HELP: &[(&str, &str)] = &[
     ("F1", "this help"),
     ("F2", "pty diagnostics, and back"),
     ("F3", "file reader: light / dark page"),
+    // Next to F2 because it behaves like F2 — a view that displaces one and puts
+    // it back — and phrased against `?` two dozen rows below, which is the same
+    // pane reached the other way. "about nothing in particular" is the whole
+    // difference between them, and it is the half a reader is looking for when
+    // they are typing at the agent and have a question about the repository
+    // rather than about a file.
+    ("F6", "ask a second agent, about nothing in particular"),
     ("Ctrl+\\ or F12", "send the next key to the agent verbatim"),
     ("", ""),
     ("j / k, arrows", "right pane, when focused: scroll a line"),
@@ -288,9 +333,14 @@ pub const HELP: &[(&str, &str)] = &[
     // vocabularies and hope — so `?` reaches nothing there, and this table must
     // not advertise a key two rows below `Alt+E` that `Alt+E` `Alt+E` turns
     // off. The document view and the git view are the whole of where it works.
+    // "a second agent" and not "a second Claude": the pane can drive Copilot's
+    // print mode too now, and a row promising Claude in a session hosting
+    // Copilot would be advertising the wrong program. Which one it is is on the
+    // pane's own opening screen, where there is room to say what each of them
+    // can and cannot promise.
     (
         "?",
-        "document, git: ask a second Claude about the file on screen",
+        "document, git: ask a second agent about the file on screen (F6: about nothing)",
     ),
     // The queue's own four. `space` is conspicuously not among them: it pages,
     // here as in every other pane, and arming moved to `a` rather than take a
@@ -485,6 +535,50 @@ mod tests {
             global(&k(KeyCode::F(5), KeyModifiers::NONE)),
             Some(Action::FocusRight)
         );
+        assert_eq!(
+            global(&k(KeyCode::F(6), KeyModifiers::NONE)),
+            Some(Action::ShowAsk)
+        );
+    }
+
+    #[test]
+    fn the_ad_hoc_ask_is_an_f_key_because_alt_belongs_to_the_agents() {
+        // The argument for F6 rather than a letter, written as the assertion it
+        // rests on: `?` is the pane-local half and it cannot be the global one,
+        // because a bare `?` typed at the agent is a `?`.
+        assert_eq!(global(&k(KeyCode::Char('?'), KeyModifiers::NONE)), None);
+        assert_eq!(global(&k(KeyCode::Char('?'), KeyModifiers::SHIFT)), None);
+        // And `Alt+?` is not it either. It is a shifted key under `Alt`, which
+        // is a shape neither agent's keymap has been audited against — and `Alt`
+        // is the namespace both of them actually use, where the F-keys are the
+        // one namespace both leave alone.
+        assert_eq!(global(&k(KeyCode::Char('?'), KeyModifiers::ALT)), None);
+        assert_eq!(
+            global(&k(
+                KeyCode::Char('?'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            None
+        );
+        // A modified F6 stays the agent's, exactly as every other F-key does:
+        // the audits that cleared these cleared the *bare* ones.
+        for mods in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+        ] {
+            assert_eq!(global(&k(KeyCode::F(6), mods)), None);
+        }
+        // And the overlay says so, in a row that names the difference from `?`
+        // rather than repeating it: the whole point of a second way in is that
+        // it carries no file.
+        let (key, said) = HELP
+            .iter()
+            .find(|(key, _)| *key == "F6")
+            .expect("the key the overlay promises");
+        assert_eq!(*key, "F6");
+        assert!(said.contains("ask"), "got: {said}");
+        assert!(said.contains("nothing"), "what it does not attach: {said}");
     }
 
     #[test]
@@ -504,7 +598,7 @@ mod tests {
             KeyModifiers::ALT,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ] {
-            for n in [1u8, 2, 3, 4, 5, 12] {
+            for n in [1u8, 2, 3, 4, 5, 6, 12] {
                 assert_eq!(
                     global(&k(KeyCode::F(n), mods)),
                     None,
@@ -524,8 +618,8 @@ mod tests {
         }
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
         for expected in [
-            "Alt+G", "Alt+E", "Alt+S", "Alt+A", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4",
-            "F5",
+            "Alt+G", "Alt+E", "Alt+S", "Alt+A", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4", "F5",
+            "F6",
         ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),

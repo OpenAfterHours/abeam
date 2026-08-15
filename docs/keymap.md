@@ -74,6 +74,7 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `F1` | key help overlay |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page (no other view changes) |
+| `F6` | right pane → ask, **nothing attached, and focus it**; again for what it displaced |
 | `Ctrl+\` or `F12` | literal-next: send the following key to the agent verbatim |
 
 `Alt+E` pressed while the files view is already showing opens the file list, so
@@ -122,6 +123,28 @@ the audit below found Claude handling without declaring. It is global rather
 than a key the viewer handles, so it works while Claude has focus — the reader
 is a pane you glance at, and having to enter it before you could change how it
 looks would defeat the point.
+
+`F6` is an F-key by the same argument as `F2` and `F3`, and by one more that
+neither of them had to make. The letters an "ask" binding would reach for are
+gone twice over — `Alt+A` is the queue, `Alt+Q` is quit, and `?` is a shifted
+key whose `Alt` form no audit here has looked at in either agent — and by the
+time this landed there were two agents to clear a binding against rather than
+one. `Alt` is the namespace both of them actually use; the F-keys are the one
+namespace both leave alone, and the Copilot half of that is *structural* rather
+than merely unrefuted (see "Why Ink settles the function keys and unsettles the
+letters"). It joins `F2` rather than the four `Alt` view keys, and that grouping
+is real: the diagnostics and the ask are the two views that displace another and
+put it back, and neither is remembered as a workspace view. The `Alt+A`
+paragraph above still stands — a fifth *view* spelled `F6` would be a key nobody
+groups with the other four — because this is not a fifth view.
+
+It is the global half of a pane-local `?`, and the two are deliberately
+different keys rather than two spellings of one. `?` means "about the file I am
+reading" and is only ever delivered to a focused pane, which is what exempts it
+from this file's invariant. `F6` means "about nothing in particular", is
+reachable while the agent has focus — which is where the question usually comes
+up — and attaches nothing, which also makes it the only way to take an
+attachment back off.
 
 `F4` and `F5` are the odd pair in this table: the only binding that was *taken
 away* from abeam rather than chosen for it. Focus moved on `Alt+←`/`Alt+→` until
@@ -240,7 +263,8 @@ deleteWordBefore.
   possible failure for a binding nobody chose. Replaced by `Alt+Q`.
 - **No F-key is bound anywhere, in any context.** That is why `F1` is help,
   `F2` and `F3` are the instrument and the reader's page, `F4`/`F5` are focus,
-  and `F12` is the literal-next alias. The audit covered the *bare* keys, so abeam
+  `F6` is the ad-hoc ask, and `F12` is the literal-next alias. The audit covered
+  the *bare* keys, so abeam
   claims only those: `Ctrl+F12` and `Shift+F1` are keys nobody has checked, and
   they go to Claude. Swallowing `Ctrl+F12` would have been worse than a dead
   key — it arms literal-next with nothing on screen to say so, and the *next*
@@ -417,6 +441,7 @@ that only lists keys abeam still holds cannot explain why focus is on an F-key.
 | `F3` | no-op | As `F1`. |
 | `F4` | no-op | As `F1`, and now load-bearing: this is the argument focus movement rests on. |
 | `F5` | no-op | As `F4`. |
+| `F6` | no-op | As `F1`, and load-bearing for the same reason `F4` is: the ad-hoc ask rests on it. |
 | `F12` | no-op | As `F1`. |
 | `Ctrl+\` | no-op | Absent from the tables and the changelog, and in legacy encoding it is a byte Ink's parser matches no branch of. |
 
@@ -554,6 +579,16 @@ strings for the declared shortcut tables, and then — the part that actually
 earns the confidence — for the *undeclared* comparisons, `meta` or `alt` tested
 against a single letter, in the prompt editor and in each modal view. Record the
 version, the byte size and the mtime, as the Claude provenance above does.
+
+An install now buys a second thing, and it is the larger of the two: the ask
+pane can drive `copilot -p`, and **not one of those flags has ever been run**.
+`crates/abeam/src/ask/copilot.rs` names beside each choice what would fail first
+if the documentation is wrong, and the three worth checking on the day there is
+a binary are whether `-p` is programmatic mode rather than a prompt typed into
+the UI, whether `--name` and `--resume=<name>` create and pick up a session, and
+whether `--deny-tool` refuses what GitHub says it refuses — that last being the
+whole of a read-only claim abeam makes to the reader on screen. A keymap audit
+is about keys abeam might shadow; this is about authority abeam hands out.
 
 **Then probe both ends of the wire.** `crates/abeam/examples/keyprobe.rs`, run
 as `cargo run -p abeam --example keyprobe`, puts the terminal into raw mode and

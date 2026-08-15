@@ -5,8 +5,9 @@ One window for an AI coding session.
 Your agent runs in the left pane — hosted in a pty, parsed, and drawn by abeam,
 not passed through to your terminal. The right pane shows the state of the git
 worktree, the document the agent just wrote, a shell to run things in, or a
-second Claude you can ask about the file in front of you — one that may read and
-may not write. A file watcher drives the first two, so neither has to be asked.
+second copy of your agent you can ask about the file in front of you — one that
+may read and may not write. A file watcher drives the first two, so neither has
+to be asked.
 
 It replaces a three-window setup: the agent in one terminal, git in another, and
 an editor open purely to read the markdown it produced.
@@ -25,7 +26,9 @@ newer: **nobody has ever typed a question into that pane.** Every test drives
 it against shims and fabricated launches, the only real `claude` runs were
 hand-driven probes of the protocol rather than of the pane, and what comes back
 from it is a model's answer — which can be confidently wrong about the file it
-was pointed at. "Not done, and known" has the whole list.
+was pointed at. The Copilot route through that pane is weaker again: no process
+has driven it either, and it is the one whose read-only claim rests on flags
+nobody has watched work. "Not done, and known" has the whole list.
 
 ```
 ┌ claude ──────────────────────────────┐┌ git · main ↑2 · 12 changed ──────┐
@@ -414,6 +417,7 @@ pinning it. Everything else you type goes to the agent untouched.
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page |
 | `F4` / `F5` | move focus left / right |
+| `F6` | right pane → **ask**, with nothing attached, **and focus it** (again for what it displaced) |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
 | `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
 | `Alt+Z` | zoom: hide / show the right pane |
@@ -464,25 +468,39 @@ abeam's global bindings from the keys that only mean anything while the right
 pane has focus and one particular view is showing, and it is exempt from that
 file's invariant for exactly that reason: no agent can be listening for a key
 that is only ever delivered to a focused pane. A global spelling was available
-and refused twice over — `Alt+W` is Claude's, and a view key spelled `F6` would
-be a key nobody groups with `Alt+G` and `Alt+E`. The list is not a peer of those
-views anyway; it is how you point one of them somewhere else.
+and refused twice over — `Alt+W` is Claude's, and a *view* key spelled `F6`
+would be a key nobody groups with `Alt+G` and `Alt+E`. The list is not a peer of
+those views anyway; it is how you point one of them somewhere else. (`F6` is
+bound now, and to the ask rather than to a view: the ask displaces something and
+puts it back, which is `F2`'s shape and not `Alt+G`'s. That argument is about
+which set a key joins, and it still holds.)
 
 `?` is the second key in that vocabulary that is not about reading, and the table
 above is right to leave it out for exactly the reason it leaves out `w`. In the
 document the reader is showing, or in the git view, it opens **ask** — a second
-Claude in the right pane, described under "The panes" — with the file you were
-looking at attached to the first question, and `Esc` puts back the view it
-displaced the way `F2` does out of the diagnostics. Those two views and no
-others: the file list and the `f` results own every key while they are up, so
+copy of your agent in the right pane, described under "The panes" — with the
+file you were looking at attached to the first question, and `Esc` puts back the
+view it displaced the way `F2` does out of the diagnostics. Those two views and
+no others: the file list and the `f` results own every key while they are up, so
 `?` is inert in both, which "Not done, and known" says is a gap rather than a
 decision. A question about the file you are reading is asked from where you are
 reading it, so the key is only ever delivered to a focused pane; that is
 the whole of the exemption, and it is the same sentence `w` relies on rather than
-a second argument that happens to agree. A global spelling was not on offer here
-either: every plausible `Alt` letter is Claude's or Copilot's, and there is
-nothing to switch *to* from the left pane — the pane is opened by pointing at
-something, which is a thing you can only do from the pane holding it.
+a second argument that happens to agree.
+
+**`F6` is the same pane with nothing attached, and it is in the table above
+because it has to be reachable from the left pane.** `?` answers "about this
+file", and the question you have while typing at the agent is usually not about
+a file at all — it is about the repository, and there is no pane to press `?` in
+without first switching to one you did not want to look at. So `F6` opens the
+ask from anywhere, focused, with no context on it, and a second press puts back
+what it displaced. It is an F-key rather than an `Alt` letter for the reason
+`F2` and `F3` are: every plausible letter is Claude's or Copilot's, and the
+F-keys are the one namespace both agents leave alone. Showing it is also the
+only way to take an attached file back **off** — an attachment survives until the
+question it rides on has gone, so before this, `?` on the wrong file left you
+asking about it or clearing the whole conversation. Nothing is hidden by that:
+the row naming the attachment is what disappears.
 
 **The shell is the first exception, and it has to be**: `Esc` and `q` belong to
 whatever is running in it, along with every other plain key, because a pane you
@@ -650,13 +668,16 @@ go and get (`tcgetpgrp` on the master says which process group holds the
 terminal in the foreground) — so on both a shell sitting at a prompt holds the
 door exactly as a build does. Type `exit` in it, or `Alt+Q` twice.
 
-**ask** — `?` from the document the reader has open or from the git view, and a
-second Claude in the right pane which **may read and may not write**. The gap it
-fills is narrow and constant: you are reading a file, or a diff, and a question
-comes up that is *about* what is on screen — what does this call do, where is
-this written, is this the only caller — and every way of answering it costs the
-conversation in the left pane. You interrupt a turn, or you queue the question
-and wait, or you open a second terminal. This is the fourth way.
+**ask** — `?` from the document the reader has open or from the git view, `F6`
+from anywhere, and a second copy of your agent in the right pane which **may
+read and may not write**. The gap it fills is narrow and constant: you are
+reading a file, or a diff, and a question comes up that is *about* what is on
+screen — what does this call do, where is this written, is this the only caller
+— and every way of answering it costs the conversation in the left pane. You
+interrupt a turn, or you queue the question and wait, or you open a second
+terminal. This is the fourth way. `F6` is the same pane for the question that is
+not about a file: it attaches nothing, it is reachable while you are typing at
+the agent, and it is the only way to take an attachment back off.
 
 **Nobody has ever asked it anything.** Everything in this section follows from
 the code and from tests that drive the pane against shims and strings, with no
@@ -665,6 +686,14 @@ answer back. So read the present tense here as what abeam does rather than as
 what somebody has watched happen — and read what comes out of it as a model's
 answer, which can be fluent, specific and wrong. "Not done, and known" says
 both of those again, with the rest of what this pane costs.
+
+**It is whichever agent you are hosting**, and the two are not the same pane
+under the skin. Everything from here to "`Enter` never runs anything" describes
+the Claude one, which is the one that has been probed; "Asking Copilot instead"
+below is the other, and is a shorter section because there is less that can
+honestly be said about it. abeam will not quietly start a Claude for you when
+you asked for Copilot — it hosts the agent you named — and against a program
+that is neither, the pane says so and names the two it can drive.
 
 The read-only claim is a flag rather than a promise. The child is started with
 `--tools "Read,Grep,Glob"`, which is an allowlist over the built-in set: what is
@@ -754,7 +783,9 @@ bottom until you scroll up, and stops until you come back to the end.
 
 It is one session per pane and per workspace, held open across questions, so the
 second answer can remember the first — that is the whole reason it is a
-long-lived child rather than one process per question. `Esc` puts the view back
+long-lived child rather than one process per question. (Under Copilot the same
+sentence is true of the *conversation* and false of the child; see below.) `Esc`
+puts the view back
 and leaves it running; what ends it is quitting, and nothing is persisted, so
 `Alt+Q` and a crash lose the conversation equally and by design. Asking again
 after that starts a fresh reader, which the pane says on screen rather than
@@ -776,6 +807,54 @@ account, started by the same person — a standing caution about that would read
 as though abeam had found something alarming, and there is nothing alarming to
 find. The row along the bottom is spent on what a reader can act on instead: the
 tools the child actually got, and the key that ends the conversation.
+
+### Asking Copilot instead
+
+**Everything in this subsection is documentation-derived and has never been
+run.** That is the same footing as the rest of abeam's Copilot support and it
+matters more here, because what is being described is the shape of a read-only
+guarantee. GitHub's published flags are the whole of the evidence;
+`crates/abeam/src/ask/copilot.rs` names, beside each choice, what would break
+first if a flag turns out not to mean what the documentation says.
+
+Copilot CLI publishes no streaming-JSON print mode — no `--output-format`, no
+`--input-format`, no `--session-id`, no `--tools`. So the pane is driven a
+different way, and four things follow that a reader of the Claude half should
+not assume across:
+
+- **A question is a process.** `copilot -p` answers one question and exits, so
+  abeam runs one child per turn. What carries the conversation is a *name*: the
+  first question creates a session with `--name abeam-ask-<id>` and every
+  question after it resumes that session. `Ctrl+L` starts a new name.
+- **The read-only claim is a denylist rather than an allowlist**, and that is
+  weaker. Claude's `--tools` means the other tools do not exist for that session;
+  Copilot has no equivalent, so abeam passes `--deny-tool` for `shell`, `write`,
+  `edit`, `web_fetch` and `web_search`, never passes `--allow-all-tools`, and
+  passes `--no-ask-user` so that a tool needing approval cannot get one. GitHub
+  documents deny as taking precedence over both allow flags. A tool kind that
+  ships next month under a sixth name is not covered by that line, and saying so
+  is the point of putting it here.
+- **The pane cannot show you what the child was given.** The Claude pane's
+  standing rule is that the row along the bottom is the child's own answer and
+  never abeam's intention — Copilot sends no line announcing its tools, so that
+  row says `copilot · no tool list to show` rather than reprinting the denylist
+  as though something had confirmed it. There is no cost or duration on the wire
+  either, so a finished turn is unlabelled rather than labelled with a guess.
+- **The question is on the command line**, where Claude's goes down a pipe as
+  JSON. `-p` is the documented programmatic switch and abeam takes it, which
+  costs exactly one case: a multi-line question on a Windows npm install, where
+  the `.cmd` runs through `cmd.exe` and a newline cannot be put on that command
+  line in any form. That is refused with a sentence naming the way through
+  rather than mangled.
+
+Two things abeam cannot close on this route, named rather than left to be
+discovered: a repository's own Copilot instructions still load, and so do any
+MCP servers you have configured — `--strict-mcp-config` and `--setting-sources`
+are Claude's, and Copilot publishes nothing equivalent. And the named sessions
+are persisted where your own are, so abeam's conversations turn up in your
+`copilot --resume` list afterwards under `abeam-ask-`. The pane's opening screen
+says all of this too, because somebody leaning on the read-only promise should
+learn which version of it they have from the pane rather than from here.
 
 **pty diagnostics** (`F2`) — what the emulation layer is doing: alt-screen,
 application cursor, bracketed paste, mouse mode, byte counts, resize count, and
@@ -946,9 +1025,10 @@ crates/abeam/src/workspace.rs      the worktrees of the repository, and which of
                                    and the argument for it live here.
 crates/abeam/src/paths.rs          when two spellings are one directory, and the
                                    one spelling everything starts from
-crates/abeam/src/ask/              the second Claude: what it is started with,
+crates/abeam/src/ask/              the second agent: what it is started with,
                                    and a wire format abeam does not own. `mod.rs`
-                                   is the record of one run against one version.
+                                   is the record of one run against one version;
+                                   `copilot.rs` is the record of no run at all.
 crates/abeam/src/panes/viewer/mermaid/   a diagram on a character grid, or an
                                    honest refusal to draw one. `mod.rs` holds
                                    the rule both families answer to.
@@ -1260,6 +1340,23 @@ work, on either platform.
   be found the same way, so the prediction stands: expect the first sustained
   use to find something about the forty-six columns an answer has to wrap into,
   or about a shape of turn none of the three probes happened to produce.
+- **The Copilot half of the ask is weaker than that again: it has never been run
+  at all.** The bullet above is about a pane no human has driven; this is about a
+  pane no *process* has driven either. Not one `copilot` has been started by
+  abeam, by hand or otherwise, because there is no `copilot` on the machine this
+  was written on — every flag on that command line comes from GitHub's published
+  documentation, and the tests hold the argument list still and drive the session
+  against a shell script pretending to be Copilot. What that leaves unproven is
+  named where each flag is chosen, and three are worth repeating here because
+  they are the ones that would fail loudest. `-p` is assumed to be programmatic
+  mode rather than a prompt typed into an interactive UI. `--name` and
+  `--resume=` are assumed to be how a session is created and picked up, and if
+  they are not, every answer will have forgotten the question before it while the
+  pane goes on calling it a conversation. And `--deny-tool` is assumed to mean
+  what GitHub says it means, which is the assumption the read-only claim rests
+  on — the pane says `copilot · no tool list to show` rather than pretending
+  otherwise, but a reader who wants a *guaranteed* read-only second agent should
+  use the Claude one until somebody has watched this one refuse a write.
 - **The answer can be wrong, and nothing on screen says so.** What comes back is
   a model's answer about a file it went and read, which is exactly as reliable
   as the agent in the left pane and no more — it can name a caller that does not
@@ -1323,6 +1420,15 @@ work, on either platform.
   hitch rather than a stutter, and it is the same shape as the shell starting
   its child on the first frame that draws it. Neither has been moved off that
   path.
+
+  **Under Copilot it is once per *question*, and that is a stutter rather than a
+  hitch.** A `copilot -p` exits when it has answered, so every turn spawns a
+  child on the thread that draws — the one saving grace being that it is paid on
+  a keystroke the reader made rather than on a bare pass of the loop. It has not
+  been measured, because it has not been run. Moving the spawn onto a thread of
+  its own is the fix for both, and is the same fix: what stopped it being taken
+  is that a start which fails would then be reported a frame or two later, with
+  nothing on screen connecting it to the `Enter` that caused it.
 - **The wire format this rests on is not published, and what is written down is
   one run on one version.** Claude's CLI reference documents that
   `--input-format stream-json`, `--output-format stream-json` and `--session-id`
@@ -1402,6 +1508,11 @@ work, on either platform.
   other one — and the launcher, which is the same code path Claude and the
   command view's shells already take every day. None of that is a session. The
   first real one will find something.
+
+  The ask pane learned to drive Copilot after that was written, which widens
+  this bullet rather than narrowing it: there is now a second Copilot command
+  line abeam has never watched run, and it is the one carrying a read-only
+  claim. The bullet above about the ask has the detail.
 - **The Copilot keymap audit is documentation- and source-derived**, and that is
   weaker evidence than the Claude half of `docs/keymap.md` rests on. Those
   bindings came out of strings extracted from the installed binary. Copilot's
