@@ -2,8 +2,8 @@
 //! the state a session opens in.
 //!
 //! abeam's configuration has been two environment variables for its whole life,
-//! and the README lists what that costs in the same breath as it lists what it
-//! buys. This file is the smallest thing that pays the two debts worth paying.
+//! and `docs/design.md` lists what that costs in the same breath as it lists
+//! what it buys. This file is the smallest thing that pays the two debts worth paying.
 //! `[preset.<name>]` puts a command line behind a word — `abeam +fleet` instead
 //! of `abeam +claude agent` with a view to switch to afterwards — and
 //! `[defaults]` is somewhere for the reader's light/dark choice to live, which

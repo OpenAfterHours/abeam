@@ -867,7 +867,8 @@ mod tests {
 
     #[test]
     fn the_whole_npm_layout_resolves_to_the_one_file_of_the_three_that_can_run() {
-        // The README's bug, end to end. `npm i -g` writes exactly these three
+        // The bug `docs/status.md` records, end to end. `npm i -g` writes
+        // exactly these three
         // files, and only the middle one is startable: the extensionless shim
         // is a POSIX shell script, and the `.ps1` loses twice over — `.PS1` is
         // absent from the *default* `PATHEXT`, and where somebody has added it
@@ -967,7 +968,8 @@ mod tests {
 
     #[test]
     fn every_character_cmd_reads_as_syntax_is_shut_inside_quotes() {
-        // The README's reason the obvious fix is wrong. Unquoted, each of these
+        // The reason `docs/status.md` gives for the obvious fix being wrong.
+        // Unquoted, each of these
         // ends abeam's command and starts somebody else's.
         assert_eq!(line(&["a&b"]), r#""C:\npm\claude.cmd" "a&b""#);
         assert_eq!(line(&["a|b"]), r#""C:\npm\claude.cmd" "a|b""#);
@@ -1104,7 +1106,7 @@ mod tests {
     // a string. These two are the only place anything asks it.
 
     /// A `.cmd` that prints its whole argument list back, in a directory with a
-    /// space in its name — one of the two hazards the README names, and one
+    /// space in its name — one of the two hazards `docs/status.md` names, and one
     /// that has to be paid for by every one of these tests rather than by the
     /// one that is about it.
     fn shim(dir: &TempDir) -> PathBuf {
@@ -1148,7 +1150,7 @@ mod tests {
         // printing back what it was given.
         //
         // One argument carries an `&`, which is why "go through cmd.exe /c" is
-        // called the wrong fix in the README. Unquoted it would end abeam's
+        // called the wrong fix in `docs/status.md`. Unquoted it would end abeam's
         // command and run `b]` as another one, which is exactly what is on
         // screen when this regresses.
         let dir = TempDir::new("launch-spawn");
