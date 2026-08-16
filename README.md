@@ -17,6 +17,12 @@ the markdown it writes into the document on screen and refreshes git within a
 debounce interval of any file it touches. The panes are read-only, they never
 take focus from the agent, and they never switch themselves.
 
+Text comes back the other way by dragging over it. Run something in the shell
+pane, highlight what it printed, and it is on your clipboard when you let go —
+or press `Enter` and the rows land in the agent's composer, unsent, ready for
+you to say what you want done about them. That round trip is
+[a section of its own](#copying-out-of-the-right-pane) below.
+
 ```
 ┌ claude ──────────────────────────────┐┌ git · main ↑2 · 12 changed ──────┐
 │                                      ││ Staged (1)          +40 -6       │
@@ -112,7 +118,8 @@ running process cannot be moved.
 
 The left pane is your agent. The right pane is one of six views, and switching
 between them or scrolling them costs you nothing — you only need to move focus
-to drive a selection or to type.
+to pick something out of a list, to type, or to copy with the keyboard rather
+than the mouse.
 
 **git** (`Alt+G`) — read-only. Branch, ahead/behind, staged / unstaged /
 untracked files with per-file line counts, and recent commits. Every `git` call
@@ -154,6 +161,13 @@ never before. This is the one view that keeps `Esc` and `q` — they belong to t
 shell — so `Alt+S` or `F4` is the way out. abeam will not quit out from under a
 running command: the agent exiting holds the door and the left title says
 `shell open · Alt+Q to quit`.
+
+**Telling the agent what it printed is a drag and a keystroke.** Highlight the
+output with the mouse — that copies it — and press `Enter` while the highlight
+is up to put those rows in the agent's composer without sending them. Long lines
+come back as the lines they were written as, not as the rows the pane was too
+narrow to fit them in. See [Copying out of the right
+pane](#copying-out-of-the-right-pane).
 
 **queue** (`Alt+A`) — work lined up for the agent, for the gap between having a
 thought and being able to act on it. Items go one of two ways: **send**, typed
@@ -354,6 +368,12 @@ before you install it.
   answer, which can be fluent, specific and wrong about the file it read.
 - **A turn in the ask pane that never ends has no way out** but `Alt+Q`. There is
   no cancel key and no timeout.
+- **Copying takes whole rows, of the right pane, that are on screen.** Not a
+  column range, so a hash comes with the row around it; not the left pane, so
+  what the agent drew cannot be selected at all; and not what has scrolled past,
+  which has to be scrolled back to first. The clipboard is reached with OSC 52,
+  which your terminal has to honour — and a drag over text replaces whatever was
+  on it, as copy-on-select does everywhere.
 
 ## From source
 
@@ -391,6 +411,8 @@ crates/abeam/src/config.rs         the one file abeam reads
 crates/abeam/src/launch/           where a program may be found, and what may
                                    then be started
 crates/abeam/src/workspace.rs      which workspace owns a watched path
+crates/abeam/src/select.rs         the rows a drag chose, and the keys that
+                                   choose them without one
 crates/abeam/src/ask/              the second agent, and a wire format abeam
                                    does not own
 crates/abeam/src/panes/            one file per view
