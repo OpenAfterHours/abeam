@@ -426,6 +426,80 @@ that as a row of its own rather than leaving it to be discovered, because a
 table promising `j` in every pane must not go on promising it in the one pane
 where `j` types a letter.
 
+**Copying out of the right pane is abeam's job, and a drag is the whole of it.**
+Two things make it abeam's rather than the terminal's. `EnableMouseCapture` takes
+the host terminal's own drag-select away for the whole session, and even without
+that, a linear drag across a split window is a drag across *both* panes: the two
+share every screen row, so what came back would be the agent's text with the
+shell's interleaved a column at a time. Only a rectangular selection cuts one
+pane out, and which terminals offer one — and behind which modifier — is exactly
+the sort of thing abeam cannot promise on somebody else's behalf.
+
+So abeam takes the gesture over and keeps its meaning: **press, drag, let go, and
+what was highlighted is on the clipboard.** No key and no mode, because on a
+command line highlighting something *is* the request to take it — that is what
+every terminal with copy-on-select already assumes, and what the host terminal
+would have done here if abeam had not taken its mouse. `Ctrl+C` copies too while
+a highlight is up, which is the same rule Windows Terminal applies: with a
+selection it copies, without one it belongs to the child. It is the only
+`Ctrl`+letter abeam ever takes and it is not in `crate::keys`'s table, because
+`global` claims nothing — the state it is reached in is one where every key is
+already being swallowed, so it costs the child nothing it was going to get.
+
+A *press* deliberately starts nothing, because the git view, the queue and the
+file list all pick a row on a click and a selection that took that gesture would
+have taken it from them. It is the movement after the press that selects, and the
+release that copies. The one cost is the one the convention carries: a drag over
+text replaces what was on the clipboard. A drag over blank rows does not — there
+is nothing to write, and silently emptying somebody's clipboard is worse than a
+gesture that appears to do nothing.
+
+**`F7` is the same thing for a keyboard**, and the reason it exists is not
+symmetry: the mouse belongs to whatever the right pane is running the moment that
+program asks for it, so a `lazygit` or a `vim` in the shell view leaves a drag
+with nowhere to go. It puts a caret on the pane and the scroll vocabulary above
+moves it — `v` anchors, `y` or `Ctrl+C` copies, `Enter` hands the rows to the
+agent. Nothing else is new. Auto-copy stops at the keyboard on purpose: a drag
+has an end and a caret does not, so copying on every `j` would rewrite the
+clipboard on the way to what you actually wanted. While a selection is up
+**nothing reaches the pane behind it**, which is not a nicety: that pane can have
+a live shell in it, and a key that fell through would be a command typed at a
+prompt nobody was looking at.
+
+**What it selects is whole rows of the pane, as they are on screen** — not a
+range in the content behind them. That is the one thing about it worth learning,
+and everything else follows from it. Six views live in that pane and they are six
+different kinds of thing: a terminal grid, wrapped markdown with quote gutters,
+a column-aligned status list. A cell-precise selection means something different
+in each, and three of them have no coordinate space to draw it in. A row means
+the same thing in all six, and a row is what somebody copying a path, a hash, a
+stack trace or a test failure is after. It also means the highlight stays put
+when the pane scrolls under it, naming whatever is there now — which is the
+honest consequence, and it keeps the property that matters: what is highlighted
+is always exactly what will be copied, because the text is read at the moment you
+press the key.
+
+The **shell view is the one pane that improves on that**, and it is the reason
+`Pane` has a `selected_text` at all rather than the app simply reading the frame
+back. A terminal grid records which of its rows are continuations of the row
+above, so a `cargo` diagnostic drawn over three rows of a 46-column pane comes
+back as the one line it was written as. A frame cannot know that — a wrapped row
+and a row that happens to be full look identical once drawn — and a path
+rejoined with a newline through the middle of it is worse than not copying it.
+The other five answer `None` and get what was drawn, which is genuinely all there
+is to know about them.
+
+The two destinations are not the same feature wearing two hats. The clipboard is
+reached with **OSC 52**, which is the one mechanism that reaches the
+clipboard of the machine you are *sitting at* when abeam is running over SSH —
+and it costs a feature flag on a dependency abeam already had rather than a
+per-platform clipboard stack. It also has no reply, so abeam says what it did and
+not what your terminal did with it. `Enter` needs none of that: it is
+`send_text`, the same bracketed paste the queue writes, so the rows arrive in the
+composer as one insertion and stop there. **It never submits**, for the reason
+the queue's `Enter` is a separate pass: rows off a screen are not a message
+somebody wrote, and the one who decides they are is the one at the keyboard.
+
 `Ctrl+\` exists so abeam can never permanently shadow a binding of the agent you
 are typing at. If a future Claude or Copilot release binds `Alt+G`, `Ctrl+\`
 then `Alt+G` still reaches it.

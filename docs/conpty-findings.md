@@ -97,7 +97,17 @@ marks say where each rule comes from, not which ones may be dropped.
   exactly the same way: a stall with a tiny byte count. Check `dsr_replies` and
   `bytes_read` first.
 - **`EnableMouseCapture` disables the host terminal's native text selection.**
-  Copying out of abeam needs Shift+drag, and which terminals honour that varies.
+  Shift+drag is the terminal's own way back to it and which terminals honour that
+  varies, which is why abeam has a selection of its own: `F7`, or a drag in the
+  right pane. See `crate::select` and the README.
+- **ConPTY keeps the wrap marker across a row it wrapped itself.** Line 1 above
+  says wrapping is the parser's job, and the consequence is the useful half:
+  `vt100`'s `row_wrapped` is true for a row whose text continues on the next one,
+  so `Screen::contents_between` rejoins them — which is what makes a selection
+  over the shell view copy a long line as one line on both platforms.
+  `panes::shell`'s `a_selection_rejoins_a_line_the_pane_was_too_narrow_for` pins
+  it, in the Windows module as well as the Unix one, because it is a fact about
+  ConPTY and not only about the parser.
 
 ## Reading the diagnostics
 

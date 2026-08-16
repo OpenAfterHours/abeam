@@ -515,6 +515,20 @@ impl Pane for ShellPane {
         self.is_live()
     }
 
+    /// The one pane that answers this, for [`Pane::selected_text`]'s reason:
+    /// there is a terminal grid behind these rows and it knows which of them
+    /// are continuations of the row above.
+    ///
+    /// Answered whatever the child is doing, exited included — the last screen
+    /// of a shell that died is the output of whatever killed it, which is the
+    /// single most likely thing anybody wants to hand the agent.
+    fn selected_text(&self, first: u16, last: u16) -> Option<String> {
+        let State::Hosted { term, .. } = &self.state else {
+            return None;
+        };
+        Some(term.rows_text(first, last))
+    }
+
     /// `Esc` belongs to the child, so the border names the key that does not.
     /// Once the child has exited it belongs to nobody, and the way out is the
     /// one every other view taught — which is the default, and saying it here
@@ -1363,6 +1377,90 @@ mod tests {
         assert!(pane.is_live(), "the wrapper did not start: {}", pane.title());
         assert_eq!(pane.title(), "shell · abeam-wrapper");
     }
+
+    // --- what a selection over this pane copies ----------------------------
+
+    const WRAP_COLS: u16 = 30;
+    const WRAP_ROWS: u16 = 14;
+
+    /// A child that has printed a line too long for the pane, and stopped.
+    ///
+    /// The pane is deliberately narrow and the line deliberately longer than
+    /// it: what is under test is a row and its continuation, which cannot be
+    /// arranged without a wrap actually happening. Tall enough that a `cmd`
+    /// prompt — an absolute path, over three of these columns — cannot push the
+    /// output off the top before the test looks at it.
+    fn with_a_long_line(dir: &TempDir, line: &str) -> ShellPane {
+        dir.write("wide.txt", format!("head\r\n{line}\r\ntail\r\n").as_bytes());
+        let mut pane = pane(dir, "cmd.exe", &["/k", "type", "wide.txt"]);
+        draw(&mut pane, WRAP_COLS, WRAP_ROWS);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pane.tick();
+            let screen = draw(&mut pane, WRAP_COLS, WRAP_ROWS);
+            if screen.contains("tail") {
+                return pane;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the long line never arrived. The screen says:\n{screen}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_selection_rejoins_a_line_the_pane_was_too_narrow_for() {
+        // The whole reason this pane answers `selected_text` at all rather than
+        // letting the app read the rows back off the frame. A frame cannot tell
+        // a wrapped row from a row that happens to be full, so a path or a URL
+        // copied out of one would arrive at the agent with a newline through
+        // the middle of it — which is worse than not copying it.
+        let dir = TempDir::new("shell-wrap");
+        let line = "the-quick-brown-fox/jumps/over/the/lazy/dog.rs";
+        assert!(line.len() > WRAP_COLS as usize, "the fixture does not wrap");
+        let pane = with_a_long_line(&dir, line);
+
+        let text = pane
+            .selected_text(0, WRAP_ROWS - 1)
+            .expect("a hosted child says what is on its screen");
+        assert!(
+            text.lines().any(|row| row == line),
+            "the wrapped line came back in pieces:\n{text}"
+        );
+        // And the rows either side are still rows: rejoining must not swallow a
+        // boundary it was not asked about.
+        assert!(text.lines().any(|row| row == "head"), "{text}");
+        assert!(text.lines().any(|row| row == "tail"), "{text}");
+    }
+
+    #[test]
+    fn a_selection_reads_the_rows_under_the_view_and_not_the_live_screen() {
+        // The property that makes selecting worth anything in a shell: what you
+        // scrolled back to is what you copy. Both `rows` and `contents_between`
+        // walk `visible_rows`, which is what the scrollback offset moves — so
+        // this asks whether the pane consults the parser rather than
+        // remembering a screen.
+        let dir = TempDir::new("shell-select-history");
+        let mut pane = with_history(&dir);
+
+        let live = pane.selected_text(0, 5).expect("a hosted child");
+        pane.to(20);
+        let back = pane.selected_text(0, 5).expect("a hosted child");
+        assert_ne!(live, back, "scrolling back copied the live screen anyway");
+        assert!(
+            back.lines().any(|row| row.starts_with("line-")),
+            "the history under the view is not what came back:\n{back}"
+        );
+
+        // A row past the bottom of the pty is clamped rather than refused: a
+        // pane one row taller than its child, for the frame between a resize
+        // and the pty being told, is an ordinary state.
+        assert!(!pane.selected_text(0, u16::MAX).unwrap().is_empty());
+        // And a span that begins past the end is empty rather than a panic.
+        assert!(pane.selected_text(u16::MAX, u16::MAX).unwrap().is_empty());
+    }
 }
 
 /// The same suite on Unix, question for question. A second module rather than a
@@ -2041,6 +2139,80 @@ mod unix_tests {
 
         assert!(pane.is_live(), "the wrapper did not start: {}", pane.title());
         assert_eq!(pane.title(), "shell · abeam-wrapper");
+    }
+
+    // --- what a selection over this pane copies ----------------------------
+    //
+    // The Windows twins of these two carry the argument; what differs here is
+    // the child and the fact that a `sh` prompt is one character rather than an
+    // absolute path, so nothing is at risk of being pushed off the top.
+
+    const WRAP_COLS: u16 = 30;
+    const WRAP_ROWS: u16 = 14;
+
+    /// A child that has printed a line too long for the pane, and stopped.
+    fn with_a_long_line(dir: &TempDir, line: &str) -> ShellPane {
+        // `\r\n` for `with_history`'s reason: the parser is fed what it needs
+        // whether or not the line discipline has `ONLCR` on.
+        dir.write("wide.txt", format!("head\r\n{line}\r\ntail\r\n").as_bytes());
+        let mut pane = pane(dir, SH, &["-c", "cat wide.txt; exec /bin/sh"]);
+        draw(&mut pane, WRAP_COLS, WRAP_ROWS);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pane.tick();
+            let screen = draw(&mut pane, WRAP_COLS, WRAP_ROWS);
+            if screen.contains("tail") {
+                return pane;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the long line never arrived. The screen says:\n{screen}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_selection_rejoins_a_line_the_pane_was_too_narrow_for() {
+        // The whole reason this pane answers `selected_text` at all rather than
+        // letting the app read the rows back off the frame: a frame cannot tell
+        // a wrapped row from a row that happens to be full.
+        let dir = TempDir::new("shell-wrap");
+        let line = "the-quick-brown-fox/jumps/over/the/lazy/dog.rs";
+        assert!(line.len() > WRAP_COLS as usize, "the fixture does not wrap");
+        let pane = with_a_long_line(&dir, line);
+
+        let text = pane
+            .selected_text(0, WRAP_ROWS - 1)
+            .expect("a hosted child says what is on its screen");
+        assert!(
+            text.lines().any(|row| row == line),
+            "the wrapped line came back in pieces:\n{text}"
+        );
+        assert!(text.lines().any(|row| row == "head"), "{text}");
+        assert!(text.lines().any(|row| row == "tail"), "{text}");
+    }
+
+    #[test]
+    fn a_selection_reads_the_rows_under_the_view_and_not_the_live_screen() {
+        // What you scrolled back to is what you copy, which is the property
+        // that makes selecting worth anything in a shell.
+        let dir = TempDir::new("shell-select-history");
+        let mut pane = with_history(&dir);
+
+        let live = pane.selected_text(0, 5).expect("a hosted child");
+        pane.to(20);
+        let back = pane.selected_text(0, 5).expect("a hosted child");
+        assert_ne!(live, back, "scrolling back copied the live screen anyway");
+        assert!(
+            back.lines().any(|row| row.starts_with("line-")),
+            "the history under the view is not what came back:\n{back}"
+        );
+
+        // Clamped rather than refused, and empty rather than a panic.
+        assert!(!pane.selected_text(0, u16::MAX).unwrap().is_empty());
+        assert!(pane.selected_text(u16::MAX, u16::MAX).unwrap().is_empty());
     }
 }
 

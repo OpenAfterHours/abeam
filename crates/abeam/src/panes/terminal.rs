@@ -178,6 +178,37 @@ impl TerminalPane {
         rows
     }
 
+    /// Rows `first..=last` of the hosted program's screen, as text, with
+    /// wrapped rows rejoined into the lines they were written as.
+    ///
+    /// What a selection in this pane is copied from — see `crate::select`. It
+    /// is `contents_between` rather than `rows()` and that is the whole point
+    /// of asking the parser instead of reading the frame back: vt100 records
+    /// which rows are continuations, and only omits the newline between a row
+    /// and its continuation. A 200-column `cargo` diagnostic drawn over three
+    /// rows of a 46-column pane comes back as one line.
+    ///
+    /// Rows are the *visible* ones, so a selection made while the view is
+    /// scrolled back reads the history under it rather than the live screen —
+    /// `Screen::rows` and `contents_between` both walk `visible_rows`, which is
+    /// what the scrollback offset moves.
+    ///
+    /// Clamped rather than refused: `last` is a row on somebody's screen, and a
+    /// pane one row taller than its pty for the frame between a resize and the
+    /// `ResizePseudoConsole` that follows it is an ordinary state, not an error.
+    pub fn rows_text(&self, first: u16, last: u16) -> String {
+        let screen = self.session.screen();
+        let (rows, cols) = screen.size();
+        let Some(bottom) = rows.checked_sub(1) else {
+            return String::new();
+        };
+        let last = last.min(bottom);
+        if first > last {
+            return String::new();
+        }
+        screen.contents_between(first, 0, last, cols)
+    }
+
     /// A copy of everything the diagnostics view shows, taken on the frame that
     /// shows it.
     ///

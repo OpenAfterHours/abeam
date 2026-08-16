@@ -27,7 +27,8 @@ use abeam_pty::ExitStatus;
 use anyhow::Result;
 use crossterm::QueueableCommand;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
@@ -49,6 +50,7 @@ use crate::panes::{
     ShellPane, TerminalPane, ViewerPane,
 };
 use crate::paths;
+use crate::select::Select;
 use crate::watch::{Change, Watch};
 use crate::workspace::{self, Worktree};
 
@@ -382,6 +384,29 @@ pub struct App {
     /// even once the pointer leaves it. Without this, dragging a selection in
     /// the agent and crossing the divider silently retargets mid-gesture.
     mouse_owner: Option<Focus>,
+    /// Rows of the right pane the user is selecting, or `None` for not
+    /// selecting. See `crate::select`; `F7` and a drag are the two ways in.
+    ///
+    /// Held here rather than by a pane for the reason that module gives: the
+    /// same three keys have to work over all six views, and a selection is
+    /// something a pane is copied *from* rather than something it implements.
+    select: Option<Select>,
+    /// The right pane's rows, exactly as the last frame drew them, kept only
+    /// while a selection is up.
+    ///
+    /// **The only honest moment to read a pane's rows is the frame that drew
+    /// them**, and a key arrives between frames. `Frame::buffer_mut` is
+    /// reachable inside [`App::ui`] and nowhere else, so `y` pressed afterwards
+    /// would have nothing to read — hence a stash, refreshed on every frame a
+    /// selection is up and untouched the rest of the time.
+    ///
+    /// It is the fallback rather than the mechanism: a pane that can say what
+    /// its rows *mean* answers [`Pane::selected_text`] instead, and the shell
+    /// view does. What this catches is the other five, where what was drawn is
+    /// genuinely all there is.
+    select_rows: Vec<String>,
+    /// The left-button gesture in progress in the right pane, if there is one.
+    drag: Option<Drag>,
     /// Stashed by the last frame. Panes are sized from exactly the rects that
     /// were drawn, so the two can never disagree.
     left_inner: Rect,
@@ -479,6 +504,22 @@ pub struct App {
     root: PathBuf,
     /// The hosted agent's name, for the same reason.
     agent: String,
+}
+
+/// A left-button gesture in the right pane, from the press that began it.
+///
+/// **Two fields, because a click and a selection start identically.** The git
+/// view picks a file row on a press, and the queue and the file list do the
+/// same, so a press cannot start a selection — only the movement after it can.
+/// `moved` is what tells the two apart, and it is also what decides whether
+/// letting go is a *copy*: a drag that ended is somebody who has finished
+/// choosing, and on a command line the reason to choose text is to take it.
+struct Drag {
+    /// The row the button went down on, which the selection anchors to.
+    from: u16,
+    /// Whether the pointer has moved since. A click leaves this false and
+    /// copies nothing.
+    moved: bool,
 }
 
 /// A command a reader chose out of an answer, on its way to a prompt.
@@ -631,6 +672,9 @@ impl App {
             pending_quit: false,
             agent_exit: None,
             mouse_owner: None,
+            select: None,
+            select_rows: Vec::new(),
+            drag: None,
             left_inner: Rect::ZERO,
             right_inner: None,
             area: Rect::ZERO,
@@ -748,6 +792,11 @@ impl App {
             return false;
         }
         self.at = ix;
+        // Every view in the right pane is now describing a different worktree —
+        // a different shell, a different git, a different reader — so a
+        // selection over the last one names rows that have gone. Same rule as
+        // `set_right_view`, for the same reason.
+        self.select = None;
 
         let root = self.spaces[ix].root.clone();
         let watched = self.spaces[ix].watched;
@@ -1938,6 +1987,21 @@ impl App {
             return self.act(action, confirming, was_helping);
         }
 
+        // After the globals and before the pane, which is the whole of where a
+        // mode like this can sit. After, so `F1`, `F4`/`F5`, `Alt+J`/`Alt+K`
+        // and the view keys all go on working while a selection is up — and so
+        // `Ctrl+\` can still hand a key to whatever is hosted. Before, because
+        // the point of the mode is that the pane and the child in it hear
+        // nothing at all.
+        //
+        // Conditioned on focus rather than on the selection existing, because
+        // `F4` is allowed to leave one on screen and go back to typing at the
+        // agent: focus is what decides who gets a keystroke, everywhere else in
+        // this file, and a selection is not an exception to that.
+        if self.select.is_some() && self.focus == Focus::Right {
+            return self.select_key(key);
+        }
+
         match self.focus {
             Focus::Left => {
                 self.note_left_key(&key);
@@ -2129,6 +2193,30 @@ impl App {
                 }
             }
 
+            // Pressed again it puts the selection away, wherever focus is: the
+            // highlight is drawn from the left pane too, so `F7` has to be able
+            // to take it off from there. Focus follows only when it was the
+            // selection that had it, or the key would drag a typist out of the
+            // composer they had gone back to.
+            Action::ToggleSelect => {
+                if self.select.take().is_some() {
+                    if self.focus == Focus::Right {
+                        self.focus = Focus::Left;
+                    }
+                } else {
+                    // Asking to select is asking to see what you are selecting,
+                    // which is the same argument `set_right_view` makes for
+                    // un-zooming — and asked of the layout rather than of the
+                    // last frame, because `right_inner` is a frame behind and
+                    // this key has just changed the answer.
+                    self.zoom = false;
+                    if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                        self.select = Some(Select::new());
+                        self.focus = Focus::Right;
+                    }
+                }
+            }
+
             Action::FocusLeft => self.focus = Focus::Left,
             Action::FocusRight => {
                 if self.right_inner.is_some() {
@@ -2157,6 +2245,256 @@ impl App {
         Ok(Flow::redraw())
     }
 
+    // --- selecting -------------------------------------------------------
+
+    /// A key while a selection is up and the right pane has focus.
+    ///
+    /// **Everything is swallowed**, and that is the mode's whole safety
+    /// property rather than a shortcut. The right pane can have a live shell in
+    /// it, and a key that fell through to the child while the user was aiming a
+    /// caret is a command typed at a prompt nobody was looking at. So a letter
+    /// this vocabulary has no use for does nothing at all, visibly — the
+    /// highlight and the border hint are on screen saying which mode this is —
+    /// rather than going somewhere.
+    ///
+    /// The way out is `Esc` or `q`, which is the way out of every read-only
+    /// view, and it lands on the agent for the reason those do.
+    fn select_key(&mut self, key: KeyEvent) -> Result<Flow> {
+        // The motions and `v` are the selection's own. Taken first, so that
+        // `Ctrl+D` and `Ctrl+U` — the only chord this vocabulary claims — are
+        // matched before the chord guard below turns the rest away.
+        if let Some(sel) = self.select.as_mut() {
+            // A frame whether or not the caret moved: the note may have gone
+            // even when nothing else did.
+            if sel.key(key).is_some() {
+                return Ok(Flow::redraw());
+            }
+            if key.code == KeyCode::Char('v') && !chord(&key) {
+                sel.toggle_anchor();
+                return Ok(Flow::redraw());
+            }
+        }
+
+        // `Ctrl+C` copies while a selection is up, and this is the one place in
+        // abeam where a `Ctrl`+letter means anything of abeam's.
+        //
+        // **It does not break `crate::keys`'s invariant, and the difference is
+        // the whole reason it is here rather than in that table.** `global`
+        // claims nothing: this is reached only while a selection is on screen
+        // and the right pane has focus, which is a state in which no agent and
+        // no child is being offered keys anyway — everything is swallowed. So
+        // `Ctrl+C` costs the child nothing it was going to get, and `Esc` first
+        // is how you interrupt something instead.
+        //
+        // It is the rule the host terminal already taught: Windows Terminal
+        // copies on `Ctrl+C` when there is a selection and interrupts when
+        // there is not. Somebody who has just highlighted output and reaches
+        // for `Ctrl+C` is not asking to kill anything.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.copy_selection();
+            return Ok(Flow::redraw());
+        }
+
+        // Any other chord is aimed at something this mode is standing in front
+        // of. Swallowed like everything else, and worth its own arm rather than
+        // falling into the match below: `Ctrl+Q` and `Alt+Q` must not be read
+        // as the bare `q` that leaves.
+        if chord(&key) {
+            return Ok(Flow::idle());
+        }
+
+        match key.code {
+            KeyCode::Char('y') => self.copy_selection(),
+            KeyCode::Enter => self.send_selection(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.select = None;
+                self.focus = Focus::Left;
+            }
+            // Swallowed. See this function's own doc: the child behind this
+            // pane must not hear a keystroke aimed at a caret.
+            _ => return Ok(Flow::idle()),
+        }
+        Ok(Flow::redraw())
+    }
+
+    /// `y`: the selected rows to the host terminal's clipboard.
+    ///
+    /// It says what it did, because OSC 52 has no reply and a copy that
+    /// reported nothing is indistinguishable from a dead key. What it says is
+    /// what *abeam* did — the write went — and deliberately not that somebody
+    /// else's terminal honoured it, which is not knowable from here.
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selection_text() else {
+            return;
+        };
+        let rows = self.select.as_ref().map_or(0, Select::height);
+        let note = if text.is_empty() {
+            // A blank row copies as nothing at all, and a clipboard silently
+            // emptied is worse than a key that refused: the thing you copied
+            // ten seconds ago is gone too.
+            "nothing on those rows".to_string()
+        } else {
+            match crate::term::copy_to_clipboard(&text) {
+                // The note carries the next key as well as the last one, and
+                // that is the whole of how anybody finds out this route exists.
+                // A drag copies without being asked, so the border is the only
+                // moment at which somebody who never pressed a key is looking
+                // at a sentence about what to do with what they just took.
+                Ok(()) => format!("copied {rows} row{} · ⏎ agent", plural(rows)),
+                // The one terminal that fails loudly here is a legacy Windows
+                // console, which has no OSC 52 and no API fallback either.
+                Err(_) => "this terminal has no clipboard".to_string(),
+            }
+        };
+        if let Some(sel) = self.select.as_mut() {
+            sel.say(note);
+        }
+    }
+
+    /// `Enter`: the selected rows into the agent's composer, unsent.
+    ///
+    /// The route the whole feature exists for — a command's output on its way
+    /// to the session that is about to be told about it — and it is
+    /// `send_text`, so it goes in as one bracketed paste and stops there. The
+    /// `Enter` that submits it is the user's, exactly as it is for a prompt the
+    /// queue sends: this one they can still take back with a backspace.
+    ///
+    /// Gated on [`TerminalPane::bracketed_paste`] for `pump_queue`'s reason,
+    /// which is not a formality here: without the mode a newline in the middle
+    /// of a pasted block is a submit, so a twelve-row selection would arrive as
+    /// twelve prompts and eleven of them would land while the agent was busy
+    /// with the first.
+    ///
+    /// It leaves the mode on success, and the confirmation is that the text is
+    /// now in the composer where you are looking — which is also where you now
+    /// want to be typing.
+    fn send_selection(&mut self) {
+        let Some(text) = self.selection_text() else {
+            return;
+        };
+        let note = if text.is_empty() {
+            Some("nothing on those rows".to_string())
+        } else if !self.left.bracketed_paste() {
+            // An agent that has exited is the common way to be here, and it is
+            // the honest thing to say: the pty is gone, not fussy.
+            Some(if self.left.has_exited() {
+                "the agent has gone".to_string()
+            } else {
+                "the agent is not taking pastes".to_string()
+            })
+        } else if self.left.send_text(&text).is_err() {
+            Some("the agent's pty refused it".to_string())
+        } else {
+            None
+        };
+
+        match note {
+            Some(note) => {
+                if let Some(sel) = self.select.as_mut() {
+                    sel.say(note);
+                }
+            }
+            None => {
+                // Text in the composer is a draft like any other, and the queue
+                // has to know: it holds an automatic send back while one is
+                // open, and a queued prompt pasted on top of these rows would
+                // be one message made of two things nobody joined.
+                self.draft_open = true;
+                self.queue.set_draft_open(true);
+                self.select = None;
+                self.focus = Focus::Left;
+            }
+        }
+    }
+
+    /// What the selection names, as text.
+    ///
+    /// Two sources and a strict order. The pane first — the shell view knows
+    /// which of its rows are continuations and rejoins them — and what the last
+    /// frame drew otherwise, which is all there is to know about the other
+    /// five.
+    ///
+    /// Trailing blank rows are dropped, and only trailing ones. Selecting past
+    /// the end of a command's output is the ordinary way to use `G`, and a
+    /// dozen empty lines arriving in the agent's composer is the kind of mess
+    /// that makes somebody stop using the feature; blank rows *inside* a
+    /// selection are the shape of what was on screen and stay.
+    ///
+    /// The `None` is reachable in one state and it is a moment rather than a
+    /// failure: a selection entered and acted on inside a single batch of
+    /// events, before the frame that measures the pane. Both callers do nothing
+    /// with it, which is right — that frame is already owed.
+    fn selection_text(&self) -> Option<String> {
+        let sel = self.select.as_ref()?;
+        let (lo, hi) = sel.rows();
+        let text = match self.right_pane_ref().selected_text(lo, hi) {
+            Some(text) => text,
+            None => {
+                let last = self.select_rows.len().checked_sub(1)?;
+                let rows = self
+                    .select_rows
+                    .get(usize::from(lo)..=usize::from(hi).min(last))?;
+                rows.join("\n")
+            }
+        };
+        Some(text.trim_end().to_string())
+    }
+
+    /// The mouse half of a selection: drag to select, let go to copy.
+    ///
+    /// Only ever reached with an event the pane itself declined, so a child
+    /// that asked for mouse reports goes on getting them and a drag inside
+    /// `lazygit` is `lazygit`'s. `F7` is the way to select over one of those.
+    ///
+    /// **A press starts nothing and a release copies**, which between them are
+    /// the whole gesture. The press cannot start a selection because the git
+    /// view, the queue and the file list all pick a row on one, and the release
+    /// copies because a drag that ended is somebody who has finished choosing —
+    /// on a command line, choosing text is what wanting to take it looks like,
+    /// and a second keystroke to say so is a keystroke that teaches nobody
+    /// anything. It is what every terminal with copy-on-select does, and what
+    /// the host terminal would have done here if abeam had not taken its mouse.
+    ///
+    /// The cost is the one that convention carries: a drag over text replaces
+    /// whatever was on the clipboard. A drag over *blank* rows does not —
+    /// [`copy_selection`](Self::copy_selection) writes nothing when there is
+    /// nothing, so a stray gesture in an empty pane cannot silently empty it.
+    fn select_mouse(&mut self, ev: &MouseEvent) {
+        match ev.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(drag) = self.drag.as_mut() else {
+                    return;
+                };
+                drag.moved = true;
+                let from = drag.from;
+                // Rebuilt from both ends on every event rather than extended,
+                // which is what keeps a drag stateless — see `Select::dragged`.
+                // Measured from the last frame's rect rather than left for the
+                // next one, so that a wheel notch arriving before that frame
+                // has a pane height to clamp against.
+                let mut sel = Select::dragged(from, ev.row);
+                sel.measure(self.right_inner.map_or(0, |r| r.height));
+                self.select = Some(sel);
+            }
+            // Letting go of a drag copies what it chose. A click — a press and
+            // a release with nothing in between — is not a drag and copies
+            // nothing, which is what leaves the row-picking panes their gesture.
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.drag.as_ref().is_some_and(|drag| drag.moved) {
+                    self.copy_selection();
+                }
+            }
+            // The wheel moves the caret while a selection is up, rather than
+            // the pane under it — see `Select::wheel`.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if let Some(sel) = self.select.as_mut() {
+                    sel.wheel(matches!(ev.kind, MouseEventKind::ScrollUp));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_mouse(&mut self, me: MouseEvent) -> Result<()> {
         let press = matches!(me.kind, MouseEventKind::Down(_));
         let release = matches!(me.kind, MouseEventKind::Up(_));
@@ -2176,6 +2514,12 @@ impl App {
             // scrolling the right pane is that it does not disturb typing.
             self.focus = target;
             self.mouse_owner = Some(target);
+            // A press anywhere but the right pane is not the start of a
+            // selection, and leaving the last one's row lying about would
+            // anchor the next drag to a row nobody pressed.
+            if target == Focus::Left {
+                self.drag = None;
+            }
             // And a click cancels a pending quit, for the same reason any other
             // key does: the user has moved on to something else.
             self.pending_quit = false;
@@ -2189,13 +2533,38 @@ impl App {
             Focus::Right => {
                 if let Some(r) = self.right_inner {
                     let ev = relative(&me, r);
-                    self.right_pane().handle_mouse(&ev)?;
+                    // Remembered *before* the pane is offered anything, and
+                    // whether or not it takes it. A press the git view claims
+                    // is a file row being picked, and that says nothing about
+                    // whether the gesture is about to become a drag — where
+                    // clearing it afterwards meant no selection could ever
+                    // start on a row those panes care about. None of the six
+                    // claims a `Drag`, so the two questions do not collide.
+                    if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        self.drag = Some(Drag {
+                            from: ev.row,
+                            moved: false,
+                        });
+                    }
+                    // Offered to the pane, and only what it declines becomes a
+                    // selection. That is the rule the shell view already
+                    // applies to the wheel — a child that asked for mouse
+                    // reports gets them — and it is what keeps a drag inside a
+                    // full-screen program in the right pane that program's
+                    // business. `F7` is how you select over one of those.
+                    if !self.right_pane().handle_mouse(&ev)?.is_yes() {
+                        self.select_mouse(&ev);
+                    }
                 }
             }
         }
 
         if release {
             self.mouse_owner = None;
+            // The gesture is over, so the row it was anchored to is not the
+            // anchor of whatever comes next. After `select_mouse`, which is
+            // where letting go of a drag becomes a copy.
+            self.drag = None;
         }
         Ok(())
     }
@@ -2244,6 +2613,10 @@ impl App {
         // The right pane can vanish under a narrow window while focused.
         if self.right_inner.is_none() {
             self.focus = Focus::Left;
+            // And a selection over a pane that is not on screen is a highlight
+            // nobody can see and rows nothing drew. `Alt+Z` while selecting is
+            // the ordinary way to get here.
+            self.select = None;
         }
 
         let left_focused = self.focus == Focus::Left;
@@ -2297,6 +2670,10 @@ impl App {
             }
             f.render_widget(block_line(self.right_title(focused), focused), outer);
             self.right_pane().render(f, inner);
+            // After the pane has drawn and before anything else can: what a
+            // selection names is rows of the frame, so this is the one moment
+            // they exist to be read or to be painted over.
+            self.snap_selection(f, inner);
         }
 
         // The real cursor sits in whichever focused pane has one — the agent,
@@ -2308,6 +2685,13 @@ impl App {
         let (rect, at) = match self.focus {
             Focus::Left => (self.left_inner, self.left.cursor()),
             Focus::Right => match self.right_inner {
+                // Nothing is typing into this pane while a selection is up —
+                // the mode swallows every key — so the shell view's prompt must
+                // not go on blinking. This is the strongest focus signal there
+                // is, which is exactly what makes it the strongest possible lie
+                // about where the keys are going. The highlight is what says
+                // where they are going instead.
+                Some(_) if self.select.is_some() => (Rect::ZERO, None),
                 Some(r) => (r, self.right_pane_ref().cursor()),
                 None => (Rect::ZERO, None),
             },
@@ -2326,6 +2710,57 @@ impl App {
         if self.help {
             help_overlay(f);
         }
+    }
+
+    /// Take the right pane's rows out of the frame that just drew them, and
+    /// paint the selected ones back inverted.
+    ///
+    /// **One implementation for six panes**, which is the whole reason it is
+    /// here and not in the `Pane` trait. Highlighting the shell would mean
+    /// inverting a terminal grid, the reader styled markdown, git a row that is
+    /// already inverted because it is the selected one — and done to the cells
+    /// of the frame all three are the same operation, which no pane has to know
+    /// about. The same frame is where the rows are read from, for the reason
+    /// [`select_rows`](App::select_rows) gives: it is the only moment they
+    /// exist.
+    ///
+    /// `toggle` rather than `add`, so that a row the pane drew inverted comes
+    /// back the right way up. What the eye is being told is "these rows are the
+    /// other way round from the rest", and that stays true whatever was
+    /// underneath.
+    fn snap_selection(&mut self, f: &mut Frame, inner: Rect) {
+        let Some(sel) = self.select.as_mut() else {
+            return;
+        };
+        sel.measure(inner.height);
+        let (lo, hi) = sel.rows();
+
+        let buf = f.buffer_mut();
+        let mut rows = Vec::with_capacity(usize::from(inner.height));
+        for row in 0..inner.height {
+            let y = inner.y + row;
+            let mut text = String::new();
+            for x in inner.left()..inner.right() {
+                if let Some(cell) = buf.cell((x, y)) {
+                    // The second cell of a wide character carries an empty
+                    // symbol, so joining the symbols is right where pushing a
+                    // placeholder per cell would double every CJK column.
+                    text.push_str(cell.symbol());
+                }
+            }
+            // Trailing blanks are padding the pane drew to the edge, not
+            // something somebody wrote.
+            rows.push(text.trim_end().to_string());
+
+            if row >= lo && row <= hi {
+                for x in inner.left()..inner.right() {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.modifier.toggle(Modifier::REVERSED);
+                    }
+                }
+            }
+        }
+        self.select_rows = rows;
     }
 
     /// The right pane's border text.
@@ -2368,6 +2803,40 @@ impl App {
         }
 
         spans.push(Span::raw(self.right_pane_ref().title()));
+
+        // The mode's hint replaces the pane's, and does so whether or not the
+        // pane has focus — the highlight is on screen from the left pane too,
+        // and a reader looking at it needs to know what took their keys and how
+        // to give them back. It says what the last `y` did when there is
+        // something to say, because OSC 52 has no reply and this note is the
+        // whole of the acknowledgement.
+        //
+        // Yellow, like the unread mark and the queue's countdown: the two other
+        // things in this program that say "abeam is in a state you did not
+        // leave it in".
+        if let Some(sel) = &self.select {
+            let rows = sel.height();
+            let said = match sel.note() {
+                Some(note) => note.to_string(),
+                // `v` is named only while there is nothing anchored, which is
+                // the only state in which somebody needs it — and it is what
+                // makes room for the row count once they do. The way out is
+                // not named at all: `Esc` back to the agent is what every
+                // read-only view already promises, and the border has 46
+                // columns to spend on the two keys that are new.
+                None if sel.anchored() => {
+                    format!("{rows} row{} · y copy · ⏎ agent", plural(rows))
+                }
+                None => "v more · y copy · ⏎ agent".to_string(),
+            };
+            spans.push(Span::styled(
+                format!(" · {said}"),
+                Style::default().fg(Color::Yellow),
+            ));
+            spans.push(Span::raw(" "));
+            return Line::from(spans);
+        }
+
         if focused {
             // Asked of the pane rather than decided here. The way out differs
             // per view and, in two of them, per state — a shell keeps `Esc` for
@@ -2395,6 +2864,11 @@ impl App {
         // is a dead key while zoomed, which is a worse surprise than the pane
         // reappearing — that at least is visible and one keystroke to undo.
         self.zoom = false;
+        // A selection names rows of the pane that drew them, so it does not
+        // survive another pane taking those rows. Silently keeping it would be
+        // the worst version of this feature: the same highlight over different
+        // text, and `Enter` sending whatever happens to be under it now.
+        self.select = None;
         let was_typing = self.focus == Focus::Right && self.right_pane().takes_input();
         self.right_view = view;
         // Neither of the two displaceable views is remembered, and `Ask` is in
@@ -2505,6 +2979,23 @@ fn ask_context(path: PathBuf) -> AskContext {
             |name| name.to_string_lossy().into_owned(),
         );
     AskContext { label, path }
+}
+
+/// Is this key aimed past abeam at whatever is hosted?
+///
+/// `CONTROL` and `ALT` by name rather than `modifiers.is_empty()`, for the
+/// reason the right pane's `Esc`/`q` arm gives: some terminals report `SHIFT`
+/// for an uppercase letter, and `G` has to go on meaning `G`.
+fn chord(key: &KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+/// `s` when there is more than one of something. One place, because the border
+/// is 46 columns and "1 rows" is exactly the sort of thing that survives review
+/// and then reads wrong forever.
+fn plural(n: u16) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn hit(r: Rect, ev: &MouseEvent) -> bool {
@@ -5589,5 +6080,458 @@ mod tests {
             light,
             "a workspace opened after the flip painted the page the session left"
         );
+    }
+
+    // --- selecting rows out of the right pane ------------------------------
+    //
+    // Three parts and two joins. `crate::select` holds the rows and has its own
+    // tests; the panes draw what they draw; and everything in between is here —
+    // reading the rows back out of the frame that drew them, and putting them
+    // in the agent's composer. Both joins are of the kind that stays green
+    // while doing nothing: a highlight painted over rows nobody reads, and a
+    // send that marks itself done without writing to a pty.
+
+    /// Which rows of the right pane the last frame drew inverted, pane-relative.
+    ///
+    /// Scoped to that pane's own rect rather than the whole frame, so a cursor
+    /// or a selected row in the *other* half cannot be mistaken for a
+    /// selection. What is asserted is which rows, which is the only thing a
+    /// highlight has to get right.
+    fn inverted(app: &mut App, width: u16, height: u16) -> Vec<u16> {
+        let mut term = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.ui(f)).unwrap();
+        let inner = app.right_inner.expect("a right pane to select in");
+        let buf = term.backend().buffer();
+        (0..inner.height)
+            .filter(|row| {
+                (inner.left()..inner.right()).any(|x| {
+                    buf[(x, inner.y + row)]
+                        .modifier
+                        .contains(Modifier::REVERSED)
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the frame just drawn left a cursor on screen anywhere.
+    fn cursor_shown(app: &mut App) -> bool {
+        let mut term = ratatui::Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| app.ui(f)).unwrap();
+        term.backend().cursor_visible()
+    }
+
+    /// A frame, then `F7`. The frame is not optional and the order is the
+    /// subject of one of the assertions below: `F7` asks the layout whether
+    /// there is a right pane, and before the first frame there is not.
+    fn selecting(app: &mut App) {
+        screen(app, 120, 24);
+        app.handle_key(key(KeyCode::F(7))).unwrap();
+        screen(app, 120, 24);
+    }
+
+    #[test]
+    fn f7_selects_from_the_pane_on_screen_and_gives_focus_back() {
+        let mut fx = app();
+
+        // Before any frame there is no pane to select in, and no `area` to ask
+        // about one. Silence is the right answer — the same one `Alt+S` gives
+        // when the window is too narrow to split.
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert!(fx.app.select.is_none(), "a selection over nothing drawn");
+
+        selecting(&mut fx.app);
+        assert!(fx.app.select.is_some());
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "a caret you cannot move is a picture of one"
+        );
+
+        // And the same key puts it away, landing on the agent — the round trip
+        // `Alt+S` taught.
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert!(fx.app.select.is_none());
+        assert_eq!(fx.app.focus, Focus::Left);
+    }
+
+    #[test]
+    fn zooming_the_right_pane_away_takes_the_selection_with_it() {
+        // `Alt+Z` while selecting is the ordinary way to get here, and a
+        // selection over a pane that is not on screen names rows nothing drew.
+        let mut fx = app();
+        selecting(&mut fx.app);
+        assert!(fx.app.select.is_some());
+
+        fx.app.handle_key(alt(KeyCode::Char('z'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+        assert!(fx.app.select.is_none());
+        assert_eq!(fx.app.focus, Focus::Left);
+    }
+
+    #[test]
+    fn a_view_switch_puts_the_selection_away() {
+        // The worst version of this feature would be the same highlight left
+        // over different text, with `Enter` sending whatever is under it now.
+        let mut fx = app();
+        selecting(&mut fx.app);
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        assert!(fx.app.select.is_none(), "a selection outlived its pane");
+    }
+
+    #[test]
+    fn the_rows_selected_are_the_rows_drawn_inverted() {
+        // The instrument view, because it claims no mouse and highlights
+        // nothing of its own: what comes back inverted is this feature's doing
+        // and nobody else's.
+        let mut fx = app();
+        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        selecting(&mut fx.app);
+        assert_eq!(inverted(&mut fx.app, 120, 24), vec![0], "the caret's row");
+
+        // `v` anchors and the caret walks away from it, so three rows are lit
+        // where one was.
+        fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(inverted(&mut fx.app, 120, 24), vec![0, 1, 2]);
+
+        // `v` again picks the anchor back up, leaving the row the caret is on —
+        // which is what makes it a toggle rather than a key you can press once
+        // and never undo.
+        fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
+        assert_eq!(inverted(&mut fx.app, 120, 24), vec![2]);
+
+        // And a selection made *upwards* from an anchor is the same selection,
+        // which is the half a normalising bug leaves empty rather than wrong.
+        fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('k'))).unwrap();
+        assert_eq!(inverted(&mut fx.app, 120, 24), vec![1, 2]);
+    }
+
+    #[test]
+    fn nothing_typed_while_selecting_reaches_the_pane() {
+        // The mode's safety property, and it is not a nicety: the right pane
+        // can have a live shell in it, so a key that fell through while
+        // somebody was aiming a caret would be a command typed at a prompt they
+        // were not looking at. `w` is the git view's own key and opens its
+        // worktree list — a change with a name this test can ask about.
+        let mut fx = app();
+        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        selecting(&mut fx.app);
+
+        for pressed in "wrt/f?".chars() {
+            fx.app.handle_key(key(KeyCode::Char(pressed))).unwrap();
+        }
+        assert!(
+            !fx.app.git.wants_worktrees(),
+            "a key aimed at the caret reached the pane behind it"
+        );
+        assert!(fx.app.select.is_some(), "and it took the selection with it");
+    }
+
+    #[test]
+    fn a_selection_takes_the_cursor_off_the_pane_it_stands_in_front_of() {
+        // A cursor is the strongest focus signal this program has, which is
+        // exactly what makes it the strongest available lie while this mode
+        // holds the keys. The queue's composer is the cheapest one to open —
+        // the shell's prompt is the case that matters, and it is the same line
+        // of code.
+        let mut fx = app();
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('i'))).unwrap();
+        assert!(
+            cursor_shown(&mut fx.app),
+            "the composer never showed a cursor, so this proves nothing"
+        );
+
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert!(
+            !cursor_shown(&mut fx.app),
+            "a cursor left blinking in a pane that is taking no keys"
+        );
+
+        // And it comes back with the keys.
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        assert!(cursor_shown(&mut fx.app));
+    }
+
+    #[test]
+    fn selected_rows_reach_the_agents_composer_and_nothing_submits_them() {
+        // The wire, asked of a real pty. Delete the `send_text` from
+        // `send_selection` and everything above still passes: the highlight is
+        // drawn, the mode is left, focus goes back to the agent, and nothing
+        // ever arrives.
+        //
+        // The second half is the other decision. A paste and its `Enter` are
+        // two separate things everywhere else in this program — the queue sends
+        // one and submits it a pass later — and this route deliberately never
+        // does the second. Rows off a screen are not a message somebody wrote.
+        let mut fx = app();
+        stays(&mut fx);
+
+        // The queue, because it draws text this test chose. Any pane would do:
+        // what is under test is that the rows on screen are what leaves.
+        fx.app.queue.stub_item("wire-check-selection", Mode::Send);
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        selecting(&mut fx.app);
+
+        // The whole pane: anchor at the top and run the caret to the bottom.
+        fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('G'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        reaches_the_agent(&mut fx, "wire-check-selection");
+        assert_eq!(
+            keys_sent(&fx),
+            0,
+            "the rows were submitted, not left in the composer"
+        );
+        assert!(fx.app.select.is_none(), "the mode outlived the send");
+        assert_eq!(fx.app.focus, Focus::Left, "and left focus in the pane");
+        assert!(
+            fx.app.draft_open && fx.app.queue.is_draft_open(),
+            "text in the composer is a draft, and the queue has to know"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_cannot_take_a_paste_is_told_about_and_the_selection_stays() {
+        // The fixture's own child has already exited, which is the common way
+        // to be here — and the one case where losing the selection would be
+        // worst, because the rows are still on screen and still wanted.
+        let mut fx = app();
+        assert!(!fx.app.left.bracketed_paste());
+
+        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        selecting(&mut fx.app);
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        let sel = fx
+            .app
+            .select
+            .as_ref()
+            .expect("the selection was thrown away");
+        assert!(sel.note().is_some(), "a refusal with nothing on screen");
+        assert_eq!(fx.app.focus, Focus::Right);
+        // And the border is where it says so.
+        assert!(screen(&mut fx.app, 120, 24).contains("agent"));
+    }
+
+    #[test]
+    fn y_says_what_it_did_and_the_next_key_takes_the_note_away() {
+        // OSC 52 has no reply, so this note is the whole acknowledgement a copy
+        // gets. What it must never be is silent — that is indistinguishable
+        // from a dead key, which is what `y` was in every terminal before this.
+        let mut fx = app();
+        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        selecting(&mut fx.app);
+        fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('y'))).unwrap();
+
+        let said = fx
+            .app
+            .select
+            .as_ref()
+            .and_then(|sel| sel.note().map(str::to_string))
+            .expect("y said nothing at all");
+        // Whichever branch this machine took — a terminal with a clipboard, or
+        // a test harness with none — it has to have said something a reader can
+        // act on, and the border is where.
+        assert!(
+            screen(&mut fx.app, 120, 24).contains(&said),
+            "the note never reached the border: {said}"
+        );
+
+        fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert!(
+            fx.app.select.as_ref().unwrap().note().is_none(),
+            "a reader who has pressed another key has read it"
+        );
+    }
+
+    #[test]
+    fn letting_go_of_a_drag_copies_and_a_click_does_not() {
+        // The whole point of the mouse path: highlighting something on a
+        // command line *is* the request to take it, so a drag that ends is a
+        // copy and there is no second key. What can be asserted in-process is
+        // that abeam decided it copied — the write itself is `crate::term`'s,
+        // and the terminal on the other end is nobody's to assert about.
+        let mut fx = app();
+        fx.app.queue.stub_item("wire-check-drag", Mode::Send);
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+        let inner = fx.app.right_inner.expect("a right pane");
+
+        let at = |kind, row: u16| MouseEvent {
+            kind,
+            column: inner.x + 1,
+            row: inner.y + row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // A click: press and release with nothing in between. It picks a row in
+        // the panes that pick rows, and it must not touch the clipboard.
+        fx.app
+            .handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 0))
+            .unwrap();
+        fx.app
+            .handle_mouse(at(MouseEventKind::Up(MouseButton::Left), 0))
+            .unwrap();
+        assert!(
+            fx.app.select.is_none(),
+            "a click copied something nobody chose"
+        );
+
+        // A drag down the top of the pane, which is where the queue draws what
+        // it has, and released at the end of it.
+        fx.app
+            .handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 0))
+            .unwrap();
+        fx.app
+            .handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 3))
+            .unwrap();
+        // The frame a real drag would have had between the two: it is what
+        // measures the pane and stashes the rows the release will copy.
+        screen(&mut fx.app, 120, 24);
+        assert!(
+            fx.app.select.as_ref().and_then(Select::note).is_none(),
+            "a drag still in progress copied before it was finished"
+        );
+
+        fx.app
+            .handle_mouse(at(MouseEventKind::Up(MouseButton::Left), 3))
+            .unwrap();
+        assert!(
+            fx.app
+                .selection_text()
+                .is_some_and(|text| text.contains("wire-check-drag")),
+            "the drag copied rows other than the ones it was over"
+        );
+        let said = fx
+            .app
+            .select
+            .as_ref()
+            .and_then(Select::note)
+            .expect("letting go said nothing, so nothing was copied")
+            .to_string();
+        assert!(said.contains("copied"), "the note reads: {said}");
+        // And it names the way on, which is the only place somebody who pressed
+        // no keys at all can learn there is one.
+        assert!(said.contains("agent"), "the note reads: {said}");
+        assert!(screen(&mut fx.app, 120, 24).contains(&said));
+    }
+
+    #[test]
+    fn ctrl_c_copies_while_a_selection_is_up() {
+        // The key everybody's hands already know, and the rule the host
+        // terminal taught: with a selection, copy; without one, it is the
+        // child's. The second half is what `crate::keys` guarantees by never
+        // claiming it — this arm is only ever reached while the mode holds
+        // every key anyway.
+        let mut fx = app();
+        fx.app.queue.stub_item("wire-check-ctrl-c", Mode::Send);
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        selecting(&mut fx.app);
+        fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('G'))).unwrap();
+
+        fx.app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+        let said = fx
+            .app
+            .select
+            .as_ref()
+            .and_then(Select::note)
+            .expect("Ctrl+C said nothing");
+        assert!(said.contains("copied"), "the note reads: {said}");
+        assert!(
+            fx.app.select.is_some(),
+            "Ctrl+C threw away the selection it had just copied"
+        );
+    }
+
+    #[test]
+    fn a_click_picks_a_row_and_only_a_drag_selects() {
+        // Two gestures the panes below have to go on telling apart: the git
+        // view, the queue and the file list all pick a row on a press, and a
+        // press that started a selection would have taken that away from them.
+        let mut fx = app();
+        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        screen(&mut fx.app, 120, 24);
+        let inner = fx.app.right_inner.expect("a right pane");
+
+        let at = |kind, row: u16| MouseEvent {
+            kind,
+            column: inner.x + 1,
+            row: inner.y + row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        fx.app
+            .handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 2))
+            .unwrap();
+        assert!(fx.app.select.is_none(), "a click selected something");
+
+        fx.app
+            .handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 5))
+            .unwrap();
+        assert_eq!(
+            fx.app.select.as_ref().map(Select::rows),
+            Some((2, 5)),
+            "anchored where the button went down, reaching where the pointer is"
+        );
+
+        // Dragging back above the anchor is the same selection the other way
+        // up, and the release leaves it standing to be copied.
+        fx.app
+            .handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 0))
+            .unwrap();
+        assert_eq!(fx.app.select.as_ref().map(Select::rows), Some((0, 2)));
+        fx.app
+            .handle_mouse(at(MouseEventKind::Up(MouseButton::Left), 0))
+            .unwrap();
+        assert_eq!(fx.app.select.as_ref().map(Select::rows), Some((0, 2)));
+
+        // And a drag with nothing pressed first is nothing at all, which is
+        // what the pointer leaving the window and coming back looks like.
+        fx.app.select = None;
+        fx.app
+            .handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 4))
+            .unwrap();
+        assert!(fx.app.select.is_none());
+    }
+
+    #[test]
+    fn what_is_copied_is_what_was_drawn() {
+        // The read half of the join: the rows come out of the frame, so a
+        // highlight over row 3 and text taken from row 0 is exactly the defect
+        // this asks about.
+        let mut fx = app();
+        fx.app.queue.stub_item("wire-check-drawn", Mode::Send);
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        selecting(&mut fx.app);
+
+        let row = fx
+            .app
+            .select_rows
+            .iter()
+            .position(|row| row.contains("wire-check-drawn"))
+            .expect("the queue never drew the item");
+
+        // Onto that row and no other.
+        for _ in 0..row {
+            fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        }
+        let text = fx.app.selection_text().expect("a row with an item on it");
+        assert!(
+            text.contains("wire-check-drawn"),
+            "copied instead: {text:?}"
+        );
+        assert_eq!(text.lines().count(), 1, "one row is one line: {text:?}");
     }
 }
