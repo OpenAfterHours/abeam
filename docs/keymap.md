@@ -75,6 +75,7 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page (no other view changes) |
 | `F6` | right pane → ask, **nothing attached, and focus it**; again for what it displaced |
+| `F7` | select rows of the right pane by keyboard, **and focus it**; again to put the selection away |
 | `Ctrl+\` or `F12` | literal-next: send the following key to the agent verbatim |
 
 `Alt+E` pressed while the files view is already showing opens the file list, so
@@ -145,6 +146,43 @@ from this file's invariant. `F6` means "about nothing in particular", is
 reachable while the agent has focus — which is where the question usually comes
 up — and attaches nothing, which also makes it the only way to take an
 attachment back off.
+
+`F7` is an F-key by a stronger argument than `F2`, `F3` and `F6` had to make,
+and it is worth separating from theirs. Those three are F-keys because the
+`Alt` letters they wanted turned out to be taken; this one could not have been a
+letter under *any* namespace. The pane it acts on is the one pane that takes
+every key it is given — a shell with a live child in it claims `Esc`, `q` and
+every letter, which is why the border there advertises `Alt+S` as the way out —
+so a pane-local key would be missing from the view the whole feature exists for.
+You select what a command printed. That leaves only what `global` claims before
+any pane is offered anything, and inside `global` only the namespace both agents
+leave alone.
+
+It is also not the way most people will copy anything, and the table above is
+right to be the only place it looks central. **A drag in the right pane selects
+and copies on its own**, with no key and no mode — the gesture the host
+terminal's own selection used, kept doing what it did. `F7` is what a keyboard
+has instead, and what anyone has when the right pane is running something that
+asked for the mouse.
+
+What it opens is a mode, and the mode is the third place in abeam where the
+ordinary vocabulary is suspended — the find boxes and the ask's composer being
+the other two, both of which the F1 overlay states in a row of its own. This one
+is stated loudest because it swallows *every* key while it is up, over a pane
+that may have a live child behind it: the scroll keys move a caret instead of a
+view, `v` anchors, `y` copies to the host terminal's clipboard over OSC 52,
+`Enter` puts the selected rows in the agent's composer unsent, and `Esc` or `q`
+leaves. Nothing reaches the pane or the child until it does.
+
+**`Ctrl+C` copies while a selection is up, and it is the one `Ctrl`+letter in
+this program that is ever abeam's.** It is deliberately not in the table above,
+and the distinction is this file's own: `global` claims nothing, so the invariant
+at the top holds unchanged. The key is read inside a mode that is already
+swallowing every keystroke, so what it costs the child is nothing it would have
+received — and the state it is read in is exactly the one where a hand reaching
+for `Ctrl+C` means "copy this", which is the rule Windows Terminal already
+taught. `Esc` first is how you interrupt something instead, and the overlay says
+so on the row beside it.
 
 `F4` and `F5` are the odd pair in this table: the only binding that was *taken
 away* from abeam rather than chosen for it. Focus moved on `Alt+←`/`Alt+→` until

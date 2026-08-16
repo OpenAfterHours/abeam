@@ -165,6 +165,29 @@ pub trait Pane {
         Ok(())
     }
 
+    /// The text on rows `first..=last`, if this pane can say it better than the
+    /// screen can.
+    ///
+    /// `None` — the default, and the right answer for five of the six views —
+    /// means "what was drawn is what there is", and the shell reads the rows
+    /// back out of the frame it drew. See `crate::select` for why a selection
+    /// here is whole rows of the *pane* rather than a range in the content.
+    ///
+    /// The one override is the shell view, and it earns itself: a terminal grid
+    /// knows which rows are continuations of the row above, so a command line
+    /// that wrapped over three rows comes back as the one line it was typed as.
+    /// A frame cannot know that — a wrapped row and a row that happens to be
+    /// full look identical once drawn — and a path or a URL rejoined with a
+    /// newline in the middle of it is worse than not copying it at all.
+    ///
+    /// Rows are the pane's own, 0-based, as [`render`](Pane::render) was given
+    /// them, and `last` may be past the end: it is a row on screen, and what is
+    /// behind it is the pane's business to clamp.
+    fn selected_text(&self, first: u16, last: u16) -> Option<String> {
+        let _ = (first, last);
+        None
+    }
+
     /// A bracketed paste, offered to whichever pane has focus.
     ///
     /// Offered unconditionally, and declined by returning `No` — the same

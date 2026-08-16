@@ -626,3 +626,95 @@ fn the_right_pane_can_be_pointed_at_a_worktree_and_both_of_its_views_follow() {
     send(&session, &alt('q'));
     drop(session);
 }
+
+#[test]
+fn rows_of_the_shell_view_are_selected_and_copied_and_the_child_never_sees_the_keys() {
+    // Two things no in-process test can reach, and the second is the one that
+    // would hurt.
+    //
+    // `F7` has to *arrive* as `F7`. Every other test of this feature builds a
+    // `KeyEvent` and hands it to `App`, which assumes the answer to the only
+    // question worth asking on Windows: whether `ESC [ 1 8 ~` written at a pty
+    // comes back out of ConPTY as the function key it names. `F5` in the test
+    // above says the shape works; nothing said it for this key.
+    //
+    // And the mode has to swallow what it claims to swallow, in front of a real
+    // child. In-process, "the pane did not act on it" is asserted against a
+    // pane. Here there is a live shell with a prompt on screen, and a key that
+    // leaked would be visible in it — which is exactly the failure the mode
+    // exists to prevent, since the keys somebody presses while aiming a caret
+    // are letters, and letters at a prompt are the beginning of a command.
+    let dir = Dir::new("select");
+    let session = abeam(&dir);
+    wait_for(&session, "git");
+
+    send(&session, &alt('s'));
+    wait_for(&session, SHELL_IS_UP);
+    send(&session, ARITHMETIC);
+    wait_for(&session, "56088");
+
+    // The path that needs no keys at all, and the one most people will ever
+    // use: press, drag, let go. SGR mouse reports, which is what a terminal
+    // sends once abeam has asked for them — column 80 is inside the right pane
+    // of a 120-column window, and the rows are where a shell that has just
+    // printed something puts it.
+    send(&session, b"\x1b[<0;80;2M");
+    send(&session, b"\x1b[<32;80;5M");
+    send(&session, b"\x1b[<0;80;5m");
+    let dragged = wait_for(&session, "copied");
+    assert!(
+        dragged.contains("agent"),
+        "the note never said what to do with what it took:\n{dragged}"
+    );
+
+    // Out again, so what follows is not reading the drag's own selection.
+    send(&session, b"\x1b");
+
+    // Into the mode by keyboard. The border is the proof it engaged, and it is
+    // the same border that tells a user what the keys are.
+    send(&session, b"\x1b[18~");
+    wait_for(&session, "y copy");
+
+    // Now the part that matters. `jjj` moves the caret three rows; at a prompt
+    // it is three characters somebody would then have to notice and delete.
+    send(&session, b"jjj");
+    let quiet = screen(&session);
+    assert!(
+        !quiet.contains("jjj"),
+        "keys aimed at the caret reached the shell behind it:\n{quiet}"
+    );
+
+    // Anchor, run to the bottom, copy. What can be asserted from out here is
+    // that abeam says it copied — whether the terminal on the other end kept it
+    // is not knowable from either side of this pty, which is the same limit the
+    // feature has in real use.
+    send(&session, b"vGy");
+    let copied = wait_for(&session, "copied");
+
+    // The arithmetic is still on screen underneath the highlight, which is what
+    // says the pane was selected *from* rather than replaced by a mode.
+    assert!(
+        copied.contains("56088"),
+        "the shell's output went away while it was being copied:\n{copied}"
+    );
+
+    // `Ctrl+C` is the other key a hand reaches for with something highlighted,
+    // and it is the one place in abeam where a `Ctrl`+letter is not the child's
+    // — reachable only here, where the child is being offered nothing anyway.
+    send(&session, b"\x03");
+    wait_for(&session, "copied");
+
+    // And leaving gives the keys back: the same `jjj` now reaches the prompt it
+    // was kept away from, which is the other half of the claim and the half a
+    // mode that never exited would pass without. `Esc` lands on the agent, so
+    // `Alt+S` is the way back into the shell.
+    send(&session, b"\x1b");
+    send(&session, &alt('s'));
+    send(&session, b"jjj");
+    let typed = wait_for(&session, "jjj");
+    assert!(typed.contains("jjj"));
+
+    send(&session, &alt('q'));
+    send(&session, &alt('q'));
+    drop(session);
+}

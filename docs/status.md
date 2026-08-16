@@ -55,8 +55,11 @@ literal-next escape hatch. Agent selection and the launcher underneath it. The
 Unix port, in the sense that the whole workspace builds, tests and lints clean
 for both `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see
 "Platforms" for the sense in which it is not done. Mermaid flowcharts and
-sequence diagrams, drawn rather than shown as source. 752 tests on Windows, and
-`clippy --all-targets` clean on both.
+sequence diagrams, drawn rather than shown as source. Copying rows out of the
+right pane: a drag copies when you let go, `Ctrl+C` copies whatever is
+highlighted, `F7` is the keyboard's way in, and `Enter` puts the rows in the
+agent's composer without sending them — with the limits listed at the foot of
+this document. 769 tests on Windows, and `clippy --all-targets` clean on both.
 
 Two of those changed Windows behaviour on the way past, and both are worth
 seeing before you upgrade rather than after.
@@ -92,11 +95,15 @@ and reads the screen that comes back. That is what proves the parts no in-proces
 test can reach — that abeam starts at all, that raw mode and the alternate
 screen survive being someone else's child, that `Alt+S` written as `ESC s`
 becomes the binding it should, and that a command typed into the shell view runs
-in the right directory and puts its answer on screen. Three paths are pinned that
+in the right directory and puts its answer on screen. Four paths are pinned that
 way today: type a command in the shell and read its output; reach a file nothing
-pointed the pane at, by `Alt+E` `Alt+E` `/`; and a copy of a real shell planted
-in the repository under the name abeam is about to look for, which abeam must
-refuse to run. That last one is a test about an attack rather than a feature, and
+pointed the pane at, by `Alt+E` `Alt+E` `/`; select rows of the shell view with
+`F7` and copy them, which is the only place `ESC [ 1 8 ~` is proved to come back
+out of ConPTY as the function key it names *and* the only place the mode's
+promise — that nothing reaches the child while a caret is up — is asked in front
+of a real prompt; and a copy of a real shell planted in the repository under the
+name abeam is about to look for, which abeam must refuse to run. That last one is
+a test about an attack rather than a feature, and
 the two platforms arrive at it down different roads, which is worth stating twice
 rather than generalising once. Windows resolves a bare program name against the
 *calling* process's directory before it consults `PATH`, so a `pwsh.exe`
@@ -761,8 +768,27 @@ work, on either platform.
   `Ctrl+B` / `Ctrl+C` in legacy terminal encoding, and hold-to-talk voice needs
   key *release* events, which abeam drops for a load-bearing reason
   (`docs/conpty-findings.md`, constraint 3).
-- **`EnableMouseCapture` disables your terminal's native text selection.**
-  Copying out of abeam needs Shift+drag, and which terminals honour that varies.
+- **`EnableMouseCapture` disables your terminal's native text selection**, which
+  is why abeam has one of its own — a drag in the right pane, which copies when
+  you let go, or `F7` for the same thing by keyboard. Shift+drag is still your
+  terminal's way back to *its* selection and which terminals honour that still
+  varies; what is worth knowing about abeam's is where it stops. **A drag over
+  text replaces what was on your clipboard**, which is what copy-on-select costs
+  everywhere it exists — a drag over blank rows writes nothing, so a stray
+  gesture cannot silently empty it, but a stray gesture over output can still
+  cost you what you copied a minute ago. It
+  selects **whole rows**, never a column range, so a hash in the middle of a git
+  row comes with the row around it. It selects only what is **on screen**, so
+  anything above the top of the pane has to be scrolled to first — and because
+  the rows it names are rows of the *pane*, scrolling under a selection leaves
+  the highlight where it is rather than following the text. It is the **right
+  pane only**: there is no way to select what the agent has drawn on the left.
+  And `y` is OSC 52, which the host terminal has to honour — Windows Terminal,
+  VS Code, iTerm2, kitty, WezTerm and Alacritty do, a legacy `conhost` does not,
+  and tmux wants `set -g set-clipboard on`. There is no reply to such a write, so
+  abeam reports what it did rather than what your terminal did with it. `Enter`,
+  which puts the rows in the agent's composer unsent, needs none of that and is
+  the route the feature was built for.
 - **A routed script agent sees an abeam variable in its environment, on
   Windows.** The command line `cmd.exe` is asked to run travels in
   `%ABEAM_LAUNCH%` rather than on the wire, for the quoting reason above, and

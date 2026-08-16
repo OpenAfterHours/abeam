@@ -215,6 +215,7 @@ pinning it. Everything else you type goes to the agent untouched.
 | `F6` | right pane → ask, nothing attached, **and focus it** (again for what it displaced) |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page |
+| `F7` | select rows of the right pane by keyboard (a drag copies on its own) |
 | `F4` / `F5` | move focus left / right |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
 | `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
@@ -243,6 +244,38 @@ row of its own.
 `Ctrl+\` exists so abeam can never permanently shadow a binding of the agent you
 are typing at. If a future release of either agent binds `Alt+G`, `Ctrl+\` then
 `Alt+G` still reaches it.
+
+### Copying out of the right pane
+
+abeam turns mouse capture on, which takes your terminal's own drag-select away —
+and a linear drag across a split window would hand you both panes and the border
+between them anyway. So copying is abeam's job.
+
+**Drag over what you want and let go. That copies it.** No key, no mode: on a
+command line, highlighting something is what wanting to take it looks like, and
+the border says `copied 3 rows · ⏎ agent` so you know it went. Press `Enter`
+while the highlight is still up and **the rows go straight into the agent's
+composer, unsent** — which is the round trip the feature exists for: run
+something in the shell view, drag over what it printed, hand it over, and add a
+sentence of your own before you press Enter yourself.
+
+`Ctrl+C` copies too, whenever a highlight is up. It is the only `Ctrl`+letter
+abeam ever takes, and only in that state — with nothing selected it is the
+child's, as always. If you meant to interrupt something, `Esc` first.
+
+`F7` is the same thing without a mouse: it puts a caret on the right pane, the
+scroll keys move it, `v` anchors a selection, and `y` or `Ctrl+C` copies. That is
+also the way in when the right pane is running something that wants the mouse
+itself. While a selection is up nothing reaches the pane behind it, including a
+live shell.
+
+Two things worth knowing. The selection is whole **rows as they are on screen**,
+not a range in the content: scroll under it and the highlight stays where it is,
+naming whatever is there now — so what is highlighted is always exactly what
+will be copied. And the clipboard is reached with OSC 52, which your terminal has
+to honour: Windows Terminal, VS Code, iTerm2, kitty, WezTerm and Alacritty do, a
+legacy Windows console does not, and tmux wants `set -g set-clipboard on`.
+`Enter` needs none of that — it never goes near a clipboard.
 
 ## Worktrees
 
@@ -339,7 +372,7 @@ To release: bump `version` in `[workspace.package]` in `Cargo.toml` — it lives
 there and nowhere else — commit it, then tag and push.
 
 ```
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.4.0 && git push origin v0.4.0
 ```
 
 `release.yml` refuses to run if the tag disagrees with `Cargo.toml`, builds a

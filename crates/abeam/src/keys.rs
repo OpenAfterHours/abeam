@@ -133,6 +133,23 @@ pub enum Action {
     /// [`Action::ShowShell`], for that key's reason — a box you have to press a
     /// second key to type into is not a box you can ask a question in.
     ShowAsk,
+    /// Select rows of the right pane, to copy them or to hand them to the
+    /// agent. Pressed again, it puts the selection away.
+    ///
+    /// An F-key for a reason the three above it only half have. `F2`, `F3` and
+    /// `F6` are F-keys because the `Alt` letters they wanted were taken; this
+    /// one could not have been a letter under *any* namespace, because the pane
+    /// it acts on is the one pane that takes every key it is given. `Alt+S`,
+    /// type, `Alt+S` is the shell's whole round trip, and a selection key that
+    /// only worked in the four read-only views would be missing from the view
+    /// the feature exists for — you select what a command printed.
+    ///
+    /// It takes focus, like [`Action::ShowShell`] and [`Action::ShowAsk`] and
+    /// for their reason: a caret you have to press a second key to move is not
+    /// a caret. What it does *not* do is switch views. The rows it selects are
+    /// the rows already on screen, so dragging another view in front of them
+    /// would be selecting from somewhere nobody was looking.
+    ToggleSelect,
     /// Flip the file reader between its light and dark palettes.
     ///
     /// Global rather than a key the viewer handles, so it works from the left
@@ -211,6 +228,16 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // view spelled `F6` would be a key nobody groups with the other three
         // still stands — this is not a fifth view.
         KeyCode::F(6) if bare => Some(Action::ShowAsk),
+        // F7 for the selection, and the argument is not "one more F-key was
+        // free". It is the only namespace that *can* carry this: the key has to
+        // work while the shell view has focus, and a shell with a live child in
+        // it takes every key including `Esc` and `q`. A letter — bare, or under
+        // the `Alt` both agents use — would either be swallowed by that child
+        // or shadow a binding of the agent on the left. The two F-key audits in
+        // this file's header are what make this one safe, and they are about
+        // the *agent*; what makes it safe in the shell is that abeam claims it
+        // before any pane is offered it, which is what `global` means.
+        KeyCode::F(7) if bare => Some(Action::ToggleSelect),
 
         _ if !alt => None,
 
@@ -277,6 +304,19 @@ pub const HELP: &[(&str, &str)] = &[
     // they are typing at the agent and have a question about the repository
     // rather than about a file.
     ("F6", "ask a second agent, about nothing in particular"),
+    // Next to F6 rather than beside the view keys, because it is not a view: it
+    // acts on whatever is already on screen. "rows" and not "text" is the
+    // honest word — the selection is whole rows of the pane, which is the one
+    // thing about it a reader has to know before they press it.
+    //
+    // The parenthetical is not a footnote about a second way in: dragging is
+    // the *first* way, and this key is what a keyboard has instead. Saying so
+    // here is what stops the overlay reading as though a mode had to be entered
+    // before anything could be copied.
+    (
+        "F7",
+        "select rows of the right pane — or just drag, which copies on its own",
+    ),
     ("Ctrl+\\ or F12", "send the next key to the agent verbatim"),
     ("", ""),
     ("j / k, arrows", "right pane, when focused: scroll a line"),
@@ -381,6 +421,29 @@ pub const HELP: &[(&str, &str)] = &[
     (
         "(in the ask)",
         "every letter is typed; arrows, PgUp/PgDn, Home/End, Ctrl+D/U scroll; Esc clears the draft",
+    ),
+    // The third statement of the box rule, and the one that has to be loudest:
+    // this mode swallows *every* key, over a pane that may have a live shell in
+    // it. A reader who does not know that is a reader typing at a child that is
+    // not listening. The scroll rows near the top of this table are true here —
+    // the same keys, moving a caret rather than a view — which is why only what
+    // is new to this mode is named.
+    (
+        "(selecting)",
+        "the scroll keys move the caret; v anchors, y or Ctrl+C copies, Esc leaves",
+    ),
+    // Its own row because it is the one place in the program where a
+    // `Ctrl`+letter is not the child's, and somebody who does not know that is
+    // somebody whose `Ctrl+C` did not interrupt what they thought it would.
+    // `global` still claims nothing — see the module doc — but the overlay has
+    // to say what the key does where it does it.
+    (
+        "Ctrl+C (selecting)",
+        "copies · to interrupt something instead, leave the selection first",
+    ),
+    (
+        "Enter (selecting)",
+        "put the selected rows in the agent's composer, unsent, and go back to it",
     ),
     // `Enter` has a row above for the three views where it opens something.
     // Here it does two things and neither is running a command: it sends the
@@ -539,6 +602,23 @@ mod tests {
             global(&k(KeyCode::F(6), KeyModifiers::NONE)),
             Some(Action::ShowAsk)
         );
+        assert_eq!(
+            global(&k(KeyCode::F(7), KeyModifiers::NONE)),
+            Some(Action::ToggleSelect)
+        );
+    }
+
+    #[test]
+    fn selecting_is_a_global_because_the_shell_takes_every_letter() {
+        // The assertion the F7 arm rests on, written as the thing a future edit
+        // has to argue with. A live shell claims `Esc`, `q` and every letter,
+        // so a selection key that was pane-local would be missing from the one
+        // view the feature exists for — and no `Alt` letter is available
+        // either, because that namespace belongs to the two agents.
+        assert_eq!(global(&k(KeyCode::Char('v'), KeyModifiers::NONE)), None);
+        assert_eq!(global(&k(KeyCode::Char('y'), KeyModifiers::NONE)), None);
+        assert_eq!(global(&k(KeyCode::Char('v'), KeyModifiers::ALT)), None);
+        assert_eq!(global(&k(KeyCode::Char('y'), KeyModifiers::ALT)), None);
     }
 
     #[test]
@@ -598,7 +678,7 @@ mod tests {
             KeyModifiers::ALT,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ] {
-            for n in [1u8, 2, 3, 4, 5, 6, 12] {
+            for n in [1u8, 2, 3, 4, 5, 6, 7, 12] {
                 assert_eq!(
                     global(&k(KeyCode::F(n), mods)),
                     None,
@@ -619,7 +699,7 @@ mod tests {
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
         for expected in [
             "Alt+G", "Alt+E", "Alt+S", "Alt+A", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4", "F5",
-            "F6",
+            "F6", "F7",
         ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),

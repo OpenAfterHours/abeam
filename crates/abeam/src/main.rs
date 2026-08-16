@@ -25,6 +25,7 @@ mod pane;
 mod panes;
 mod paths;
 mod scroll;
+mod select;
 mod term;
 mod text;
 mod watch;
