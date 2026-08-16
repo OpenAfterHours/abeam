@@ -6278,10 +6278,36 @@ mod tests {
         fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
         selecting(&mut fx.app);
 
-        // The whole pane: anchor at the top and run the caret to the bottom.
-        fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
-        fx.app.handle_key(key(KeyCode::Char('G'))).unwrap();
+        // The row the item is on, and that row alone. Selecting the whole pane
+        // would work too and says less: a test that sends everything on screen
+        // cannot tell "the rows I chose left" from "something left".
+        let row = fx
+            .app
+            .select_rows
+            .iter()
+            .position(|row| row.contains("wire-check-selection"))
+            .expect("the queue never drew the item");
+        for _ in 0..row {
+            fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        }
+        let chosen = fx.app.selection_text().expect("a frame has drawn this pane");
+        assert!(
+            chosen.contains("wire-check-selection"),
+            "the caret is on the wrong row: {chosen:?}"
+        );
+
         fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        // **Before the pty is asked anything.** A refusal — a pane that will not
+        // take a paste, a pty that would not carry it — leaves the mode up with
+        // the reason on the border, and asserting that here is what turns a
+        // twenty-second wait on an empty screen into the sentence that says
+        // why. The wire assertion below is worth nothing without it.
+        assert!(
+            fx.app.select.is_none(),
+            "the send was refused: {:?}",
+            fx.app.select.as_ref().and_then(Select::note)
+        );
 
         reaches_the_agent(&mut fx, "wire-check-selection");
         assert_eq!(
