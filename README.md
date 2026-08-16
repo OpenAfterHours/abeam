@@ -372,7 +372,7 @@ To release: bump `version` in `[workspace.package]` in `Cargo.toml` — it lives
 there and nowhere else — commit it, then tag and push.
 
 ```
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.4.0 && git push origin v0.4.0
 ```
 
 `release.yml` refuses to run if the tag disagrees with `Cargo.toml`, builds a
