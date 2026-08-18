@@ -230,7 +230,27 @@ document is, `n` and `N` walk that document's matches, and `f` reads every file
 under the root for a phrase. The queue view adds `i` to write an item, `a` to
 arm or disarm sending, `d` to delete one, `m` to switch an item between being
 typed into the live session and being dispatched as its own background agent,
-and `Enter` to do the selected one now. None of these collides with the
+`r` to clear the rows it has finished with, and `Enter` to do the selected one
+now.
+
+`d` and `r` ask twice — press again, with the foot line saying so, and *any*
+other key, paste or click is the answer no. They are the two keys here that
+throw work away, and they stopped being reachable only on purpose when a view
+key stopped moving focus: `Alt+A` to glance at the queue from a shell leaves the
+keys in the pane, so the rest of a half-typed command is read as commands, and
+`cargo doc --release` carries a `d` and two `r`s.
+
+`Enter` cannot be taken back either and is **not** guarded, which is a judgement
+about cost rather than a claim that it is safe — it is the pane's ordinary verb,
+it acts only on the row you chose, and it ends every mistyped command there is.
+The guard is `Alt+Q`'s in shape and narrower in reach: `Alt+Q`'s is cleared by
+any key anywhere in the window, this one only by what the pane is offered, which
+is why the shell drops it when the pane leaves the screen. It is a speed bump
+rather than a lock — two `d`s in a row still delete.
+
+`r` is the one place the shared vocabulary above means something else here: it
+refreshes in the files and git views and clears the finished rows in this one.
+None of the rest collides with the
 vocabulary above, and none can reach the agent: the right pane has to be focused
 for any of them to be seen. That exemption is stated once rather than argued
 beside each key, and the place is the module doc at the top of `keys.rs`:

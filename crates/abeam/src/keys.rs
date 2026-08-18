@@ -355,7 +355,7 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     ("n / N", "document: next / previous match, outside the box"),
     ("Backspace or -", "file list: up a directory"),
-    ("r", "refresh · queue: clear what has finished"),
+    ("r", "refresh · queue: clear what has finished (twice)"),
     // Not a fifth global view key: `Alt+W` is Claude's, and a fifth view
     // spelled `F6` would be a key nobody groups with the other three. Why a
     // bare letter is allowed at all is the *intercept* paragraph at the top of
@@ -391,7 +391,7 @@ pub const HELP: &[(&str, &str)] = &[
     // key nobody can learn.
     ("i", "queue: write a new item"),
     ("a", "queue: arm / disarm sending to the agent"),
-    ("d", "queue: delete the selected item"),
+    ("d", "queue: delete the selected item (twice)"),
     ("m", "queue: switch an item between send and dispatch"),
     // One row rather than a caveat on the three scroll rows above and the two
     // letter rows below, all five of which stop being true one keystroke after

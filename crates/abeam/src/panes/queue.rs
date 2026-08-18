@@ -170,6 +170,52 @@ pub struct Item {
     started: bool,
 }
 
+/// A key that throws work away, pressed once and waiting to be meant.
+///
+/// Two of this pane's keys cannot be taken back by anyone who presses them: `d`
+/// throws away something somebody wrote, and `r` throws away the record of what
+/// abeam did with the rest. Both are single bare letters, because every key in
+/// the list is. That was safe while the only way to reach them was to aim at
+/// this pane, and it stopped being the only way when a view key stopped moving
+/// focus: `Alt+A` to glance at the queue from a shell now leaves the keys here,
+/// so the rest of a half-typed command is read as commands. `cargo doc
+/// --release` carries a `d` and two `r`s.
+///
+/// `Enter` cannot be taken back either, and is deliberately not guarded — it is
+/// what the pane is *for*, it acts only on the row the user chose, and a guard
+/// on it would be two presses on the pane's ordinary verb. That is a judgement
+/// about cost, not a claim that it is safe: `Enter` ends every mistyped command
+/// there is, and it grants a [`Due::Asked`], which is the one send that skips
+/// the announced countdown. If that trade is ever revisited, the honest fix is
+/// that delay rather than a second press.
+///
+/// **The guard is `Alt+Q`'s in shape and narrower in reach**, and the
+/// difference is worth stating because the resemblance invites the assumption.
+/// `crate::app` clears a pending quit before it matches anything at all, so
+/// every key, every paste and every mouse press in the window is the answer no.
+/// This one is pane-local: it sees the keys, pastes and clicks this pane is
+/// offered, and nothing else — which is why [`QueuePane::cancel_confirm`]
+/// exists for the shell to call when the pane leaves the screen.
+///
+/// It is a speed bump rather than a lock. Two `d`s in a row still delete, so
+/// `add` and `ladder` get through, and that is the limit of a confirmation
+/// sharing its key with the thing it confirms. What it buys is that the single
+/// stray press — overwhelmingly the common one — changes the screen instead of
+/// the list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Confirm {
+    /// The text of the item the question was asked about.
+    ///
+    /// Carried rather than trusted to `selected`, because `selected` moves
+    /// under things that are not keys — a click, and a paste that appends an
+    /// item and selects it. Without this, `d`, click on another row, `d`
+    /// deleted a row nothing had asked about: one warning, shown about
+    /// something else. Two items with the same text are indistinguishable
+    /// here, and that is the one case where being wrong costs nothing.
+    Delete(String),
+    Clear,
+}
+
 /// The pane.
 pub struct QueuePane {
     root: PathBuf,
@@ -177,6 +223,8 @@ pub struct QueuePane {
     selected: usize,
     /// `Some` while composing a new item; the string is what has been typed.
     composing: Option<String>,
+    /// A destructive key waiting to be pressed a second time. See [`Confirm`].
+    confirm: Option<Confirm>,
     /// Whether [`Mode::Send`] items may go on their own. Off is not "paused
     /// work" — dispatching is unaffected, and so is `Enter` — it is "do not
     /// type at the agent unless I am asking for it".
@@ -235,6 +283,7 @@ impl QueuePane {
             items: Vec::new(),
             selected: 0,
             composing: None,
+            confirm: None,
             armed: false,
             readiness: Readiness::Unknown,
             draft_open: false,
@@ -433,6 +482,22 @@ impl QueuePane {
         });
     }
 
+    /// Forget a question this pane was in the middle of asking.
+    ///
+    /// Called by the shell when the pane leaves the screen, and it has to be
+    /// the shell that calls it: a pane is not told it has been put away, and
+    /// `tick` runs whether or not it is showing, so nothing in here can tell
+    /// the difference. Without it a `d` could be asked on one screen and
+    /// answered on another — glance at the queue, press `d`, `Alt+G` off to
+    /// git, come back an hour later, press `d`, and an item goes on what the
+    /// user experienced as a single press.
+    ///
+    /// This is the whole of the gap between this guard and `Alt+Q`'s, which
+    /// `crate::app` clears before it matches any key at all. See [`Confirm`].
+    pub fn cancel_confirm(&mut self) {
+        self.confirm = None;
+    }
+
     /// Whether the shell has told this pane about a draft. A test seam for the
     /// wiring in `crate::app`, which is the only thing that can set it — and the
     /// attribute comes off the day the shell needs the answer at runtime.
@@ -555,6 +620,37 @@ impl QueuePane {
     /// avoid. Arming is `a` instead, which is free because `i` carries opening
     /// the composer on its own.
     fn list_key(&mut self, key: KeyEvent) -> Handled {
+        // Taken before a single key is matched, so that *any* key is the answer
+        // no -- which is the whole of the guard, and the same shape `Alt+Q`'s
+        // double press has in `crate::app`. A confirmation only some keys
+        // cancelled would be one a typist walks straight through.
+        let cancelled = self.confirm.take();
+        let was_asking = cancelled.is_some();
+        let handled = self.list_key_after(key, cancelled);
+        // A question that was on screen a moment ago and is not now costs a
+        // frame even when the key itself did nothing: leaving `d again to
+        // delete` under the press that cancelled it is the foot line lying
+        // about what the next `d` would do.
+        //
+        // **Except the way out.** A bare `Esc` or `q` is how you leave this
+        // pane — the shell reads an unhandled one as "give focus back to the
+        // agent" — and claiming it to repaint a line would cost the user that
+        // key at the one moment they are most likely to want it, which is
+        // having just realised their keys are somewhere they did not put them.
+        // No frame is lost by declining: handing focus back draws one.
+        let chord = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let leaving = !chord && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
+        if was_asking && !leaving {
+            return Handled::Yes;
+        }
+        handled
+    }
+
+    /// The list's keys, with whatever the press before this one was waiting to
+    /// have confirmed.
+    fn list_key_after(&mut self, key: KeyEvent, confirming: Option<Confirm>) -> Handled {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -583,9 +679,21 @@ impl QueuePane {
                 self.retime();
                 Handled::Yes
             }
-            KeyCode::Char('d') => self.delete(),
+            KeyCode::Char('d') => {
+                // The question has to have been asked about the row this press
+                // would act on, or a click between the two presses turns one
+                // warning into a different item's deletion.
+                let confirmed = match &confirming {
+                    Some(Confirm::Delete(asked)) => self
+                        .items
+                        .get(self.selected)
+                        .is_some_and(|item| &item.text == asked),
+                    _ => false,
+                };
+                self.delete(confirmed)
+            }
             KeyCode::Char('m') => self.switch_mode(),
-            KeyCode::Char('r') => self.clear_finished(),
+            KeyCode::Char('r') => self.clear_finished(matches!(confirming, Some(Confirm::Clear))),
             KeyCode::Enter => self.now(),
             // Esc and q are not ours. The shell reads an unhandled one as
             // "give focus back to the agent", which is the way out of here.
@@ -803,9 +911,22 @@ impl QueuePane {
         Handled::Yes
     }
 
-    fn delete(&mut self) -> Handled {
-        if self.selected >= self.items.len() {
+    /// `d`, twice. The first press arms [`Confirm::Delete`] and says so; this
+    /// is the second one.
+    ///
+    /// `confirmed` is the caller's answer to "was the question asked about
+    /// *this* row", not merely "was a question asked" — see the arm that
+    /// computes it. `selected` moves under a click and under a paste as well as
+    /// under a key, so a confirmation that only remembered that it had been
+    /// armed would delete whichever row happened to be under it by the time the
+    /// second press arrived.
+    fn delete(&mut self, confirmed: bool) -> Handled {
+        let Some(item) = self.items.get(self.selected) else {
             return Handled::No;
+        };
+        if !confirmed {
+            self.confirm = Some(Confirm::Delete(item.text.clone()));
+            return Handled::Yes;
         }
         // The item's announcement goes with it, because it is a field of the
         // item. That is the whole reason `due` lives where it does.
@@ -836,12 +957,22 @@ impl QueuePane {
     /// A dispatched agent that is still running goes too — it is `claude
     /// agents`' to report from then on, and this pane was only ever showing a
     /// borrowed row.
-    fn clear_finished(&mut self) -> Handled {
-        let before = self.items.len();
-        self.items.retain(|i| i.state == ItemState::Pending);
-        if self.items.len() == before {
+    ///
+    /// `r` twice, like `d`, and the emptiness check comes *first* so that `r`
+    /// over a list with nothing finished in it stays the no-op it always was
+    /// rather than arming a confirmation for nothing. What it would clear is
+    /// counted at the second press, not the first: an item that finished in
+    /// between is one more thing abeam has already handed over, which is what
+    /// the key means.
+    fn clear_finished(&mut self, confirmed: bool) -> Handled {
+        if self.items.iter().all(|i| i.state == ItemState::Pending) {
             return Handled::No;
         }
+        if !confirmed {
+            self.confirm = Some(Confirm::Clear);
+            return Handled::Yes;
+        }
+        self.items.retain(|i| i.state == ItemState::Pending);
         self.clamp();
         self.retime();
         Handled::Yes
@@ -957,6 +1088,28 @@ impl QueuePane {
         }
 
         let mut spans = vec![Span::raw(" ")];
+        // **Leading**, for the reason the focus hint leads the border: this
+        // line is clipped from the right, and a question somebody has to answer
+        // with their next keystroke is the last thing on it that may be clipped
+        // away. Yellow, the colour this program keeps for "abeam is in a state
+        // you did not leave it in".
+        if let Some(confirm) = &self.confirm {
+            let said = match confirm {
+                Confirm::Delete(_) => "d again to delete".to_string(),
+                Confirm::Clear => {
+                    let n = self
+                        .items
+                        .iter()
+                        .filter(|i| i.state != ItemState::Pending)
+                        .count();
+                    format!("r again to clear {n} finished")
+                }
+            };
+            spans.push(Span::styled(
+                format!("{said} · "),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         spans.push(if self.armed {
             Span::styled("armed", Style::default().fg(Color::Yellow))
         } else {
@@ -1157,6 +1310,13 @@ impl Pane for QueuePane {
     }
 
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
+        // Before the wheel is offered it, so that both ways of moving this list
+        // give the same answer to a pending question: `Alt+J` arrives as a key
+        // and cancels, and a wheel that did not would be the same gesture with
+        // two meanings. `crate::app` cancels a pending quit on a mouse press
+        // for the reason that covers both — the user has moved on to something
+        // else — and this is that line, one pane down.
+        self.confirm = None;
         if let Some(handled) = self.scroll.mouse(ev) {
             return Ok(handled);
         }
@@ -1217,6 +1377,14 @@ impl Pane for QueuePane {
     /// into the queue, and the reason this pane takes a paste while the other
     /// read-only views decline one.
     fn handle_paste(&mut self, text: &str) -> Result<Handled> {
+        // A paste is a keystroke as far as a pending question is concerned, and
+        // `crate::app` learned that about `Alt+Q` the hard way: "any other key
+        // cancels it" has to include the ones that do not arrive as keys. Here
+        // it is sharper than an ordinary cancel, because a paste *appends an
+        // item and selects it* — so without this, `d`, paste, `d` destroyed the
+        // text that had just been pasted while the row the question named
+        // survived.
+        self.confirm = None;
         // A Windows paste arrives with CRLF in it, and this text is on its way
         // to being typed at an agent one character at a time.
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -1542,6 +1710,8 @@ mod tests {
         p.selected = 1;
 
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
+        // Twice, because `d` asks first now. See [`Confirm`].
+        assert_eq!(p.handle_key(key(KeyCode::Char('d'))).unwrap(), Handled::Yes);
         assert_eq!(p.handle_key(key(KeyCode::Char('d'))).unwrap(), Handled::Yes);
         assert_eq!(texts(&p), ["the item nobody chose"]);
         assert_eq!(
@@ -1896,21 +2066,186 @@ mod tests {
         p.items[0].state = ItemState::Sent;
 
         p.selected = 2;
+        // Twice for each, and the first press of each pair is asserted to have
+        // changed nothing: `d` and `r` throw work away, and see [`Confirm`] for
+        // why they are now one press further from a mistyped shell command.
+        assert_eq!(p.handle_key(key(KeyCode::Char('d'))).unwrap(), Handled::Yes);
+        assert_eq!(p.items.len(), 3, "the first press acted instead of asking");
         assert_eq!(p.handle_key(key(KeyCode::Char('d'))).unwrap(), Handled::Yes);
         assert_eq!(p.selected, 1);
         assert_eq!(p.items.len(), 2);
 
         assert_eq!(p.handle_key(key(KeyCode::Char('r'))).unwrap(), Handled::Yes);
+        assert_eq!(p.items.len(), 2, "the first press acted instead of asking");
+        assert_eq!(p.handle_key(key(KeyCode::Char('r'))).unwrap(), Handled::Yes);
         assert_eq!(p.items.len(), 1, "the sent one was cleared");
         assert_eq!(p.selected, 0);
-        // Nothing finished to clear is not a frame.
+        // Nothing finished to clear is not a frame — and not a question either,
+        // because the emptiness check comes before the arming.
         assert_eq!(p.handle_key(key(KeyCode::Char('r'))).unwrap(), Handled::No);
 
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
         p.handle_key(key(KeyCode::Char('d'))).unwrap();
         assert!(p.items.is_empty());
         assert_eq!(p.handle_key(key(KeyCode::Char('d'))).unwrap(), Handled::No);
         assert_eq!(p.handle_key(key(KeyCode::Tab)).unwrap(), Handled::No);
     }
+
+    #[test]
+    fn a_destructive_key_asks_first_and_any_other_key_is_the_answer_no() {
+        // The half of the guard that is not "press it twice". A confirmation
+        // only *some* keys cancelled would be one a typist walks straight
+        // through, because the keys between two `d`s in a command are exactly
+        // the keys nobody thought about.
+        let mut p = pane();
+        p.stub_item("one", Mode::Send);
+
+        assert_eq!(p.handle_key(key(KeyCode::Char('d'))).unwrap(), Handled::Yes);
+        assert_eq!(
+            p.confirm,
+            Some(Confirm::Delete("one".to_string())),
+            "the first press did not ask, or asked about the wrong row"
+        );
+        assert_eq!(p.items.len(), 1);
+
+        // `Tab` is one of this pane's own keys, which is the strongest version
+        // of "any": if the vocabulary the user is deliberately using did not
+        // cancel, nothing would. With one item it selects nothing new, so the
+        // `Yes` is the wrapper buying a frame for the line it has just cleared
+        // — which is the other half of what this asserts.
+        assert_eq!(p.handle_key(key(KeyCode::Tab)).unwrap(), Handled::Yes);
+        assert_eq!(p.confirm, None, "a key went past the question");
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        assert_eq!(p.items.len(), 1, "the pair was broken and it deleted anyway");
+
+        // ...and the second of an unbroken pair still does the thing, or this
+        // would be a test that the key is dead.
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        assert!(p.items.is_empty());
+    }
+
+    #[test]
+    fn a_command_typed_at_the_queue_by_mistake_takes_no_work_with_it() {
+        // The report the guard exists for. `Alt+A` to glance at what is queued
+        // used to hand the keys back to the agent; it leaves them here now, so
+        // a command meant for the shell arrives as this pane's commands. Every
+        // letter of this one is offered to the pane, and it carries a `d` and
+        // two `r`s.
+        let mut p = pane();
+        p.stub_item("do not lose me", Mode::Send);
+        p.stub_item("or me", Mode::Send);
+        p.items[1].state = ItemState::Sent;
+
+        for c in "cargo doc --release".chars() {
+            p.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        assert_eq!(
+            texts(&p),
+            ["do not lose me", "or me"],
+            "a mistyped command emptied the queue"
+        );
+
+        // What it *did* do is worth being exact about rather than leaving to be
+        // assumed. `a` is a toggle, and this command has two of them, so the
+        // switch is back where it started — with a three second countdown
+        // announcing itself in the left title had it not been.
+        assert!(!p.armed);
+
+        // **The trailing `Enter` is deliberately not typed here, and that is a
+        // limit of this test rather than of the command.** A command is not
+        // mistyped at a shell until it is submitted, and `Enter` is unguarded:
+        // it grants the selected item a `Due::Asked`, the one send that skips
+        // the announced countdown. [`Confirm`] says why that key was left alone
+        // and what the honest fix would be. Two `d`s in a row are the other
+        // thing this does not cover — `add` and `ladder` get through.
+    }
+
+    #[test]
+    fn the_question_leads_the_foot_line_where_it_cannot_be_clipped_away() {
+        // The foot line is clipped from the right and already carries four
+        // other things — armed, the agent's state, the countdown, the dispatch
+        // warning — so a question appended to it is a question nobody is asked.
+        // Narrow on purpose: at this width there is room for the question or
+        // for the state behind it, and the question is the one that has to
+        // survive.
+        let mut p = pane();
+        p.stub_item("one", Mode::Send);
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        let asked = screen(&mut p, 30, 8);
+        assert!(asked.contains("d again to delete"), "{asked}");
+
+        p.handle_key(key(KeyCode::Tab)).unwrap();
+        let quiet = screen(&mut p, 30, 8);
+        assert!(
+            !quiet.contains("d again"),
+            "the question outlived the press that answered it:\n{quiet}"
+        );
+    }
+
+    #[test]
+    fn a_click_between_the_two_presses_is_the_answer_no() {
+        // The question names a row, so the press that answers it has to act on
+        // that row or the warning was about something else. A click moves the
+        // selection and does not arrive as a key, which is how `d`, click, `d`
+        // came to delete an item nothing had asked about — one warning, shown
+        // about the row that survived.
+        let mut p = pane();
+        p.stub_item("keep me", Mode::Send);
+        p.stub_item("and me", Mode::Send);
+        screen(&mut p, 40, 12);
+
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        assert_eq!(p.confirm, Some(Confirm::Delete("keep me".to_string())));
+
+        // The second row of the list, which is a different item from the one
+        // the question named.
+        p.handle_mouse(&click(3, 2)).unwrap();
+        assert_eq!(p.confirm, None, "a click walked past the question");
+        assert_eq!(p.items[p.selected].text, "and me");
+
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        assert_eq!(texts(&p), ["keep me", "and me"], "the click deleted a row");
+    }
+
+    #[test]
+    fn a_paste_between_the_two_presses_does_not_destroy_what_it_pasted() {
+        // Sharper than an ordinary cancel, because a paste appends an item
+        // *and selects it*: before the question carried the row it was asked
+        // about, `d`, paste, `d` threw away the text that had just arrived and
+        // left the row the warning named sitting there.
+        let mut p = pane();
+        p.stub_item("the one it asked about", Mode::Send);
+
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        p.handle_paste("the one it did not").unwrap();
+        assert_eq!(p.confirm, None, "a paste walked past the question");
+
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        assert_eq!(
+            texts(&p),
+            ["the one it asked about", "the one it did not"],
+            "the paste was destroyed by the press before it"
+        );
+    }
+
+    #[test]
+    fn a_question_does_not_survive_the_pane_leaving_the_screen() {
+        // The shell's half, and the whole of the gap between this guard and
+        // `Alt+Q`'s: a pane is not told it has been put away, so without the
+        // call this test stands in for, `d` could be asked on one screen and
+        // answered on another an hour later — a deletion on what the user
+        // experienced as a single press. `crate::app::App::set_right_view` is
+        // the caller, and that wiring is pinned in `app.rs`.
+        let mut p = pane();
+        p.stub_item("one", Mode::Send);
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        assert!(p.confirm.is_some());
+
+        p.cancel_confirm();
+        p.handle_key(key(KeyCode::Char('d'))).unwrap();
+        assert_eq!(texts(&p), ["one"], "the question outlived the screen");
+    }
+
 
     #[test]
     fn a_paste_becomes_one_item_in_the_list_and_more_text_in_the_composer() {

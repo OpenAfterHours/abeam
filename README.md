@@ -175,7 +175,12 @@ into the left pane's session the moment it goes idle, continuing the
 conversation; or **dispatch**, started as its own background agent with none of
 that context, running beside you. `i` writes an item, `m` switches it between
 the two, `a` arms unattended sending, `Enter` does the selected one now, `d`
-deletes. A send waits for the agent's own record to say it is idle and for
+deletes one and `r` clears the rows it has finished with. **Those last two ask
+twice** — press again, and any other key, paste or click is the answer no —
+because a view key leaves your keys in this pane and a command typed at it by
+mistake is made of letters. `Enter` is not guarded: it is the pane's ordinary
+verb and it acts only on the row you chose, but it does end every mistyped
+command there is. A send waits for the agent's own record to say it is idle and for
 nothing to be sitting unsubmitted in its composer, and announces itself in the
 left title first — typing at the agent during that pause defers it.
 
@@ -262,6 +267,9 @@ space / b       a page        Tab / Shift+Tab     the selection
 Ctrl+D / Ctrl+U a half page   Enter               open · queue: do it now
 r  refresh      t  rendered markdown / source     Esc or q   back to the agent
 ```
+
+`r` is the one of those that is not the same everywhere: it refreshes in the
+files and git views, and clears the finished rows in the queue.
 
 **Two views do not answer to that paragraph.** The **shell** takes every plain
 key, because a pane you type into cannot also read what you typed. The **ask**

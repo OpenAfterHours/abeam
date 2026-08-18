@@ -3003,6 +3003,12 @@ impl App {
         // the worst version of this feature: the same highlight over different
         // text, and `Enter` sending whatever happens to be under it now.
         self.select = None;
+        // The queue's `d` and `r` ask before they act, and the question is a
+        // thing on a screen the user is about to stop looking at. A pane is
+        // never told it has been put away — `tick` runs whether or not it is
+        // showing — so the one place that knows is here, beside the selection
+        // this line already drops for the same reason.
+        self.queue.cancel_confirm();
         self.right_view = view;
         // Neither of the two displaceable views is remembered, and `Ask` is in
         // this line for `Diag`'s reason rather than by analogy with it: both are
@@ -3929,6 +3935,66 @@ mod tests {
             "the second send inherited the first one's Enter instead of owing its own"
         );
     }
+
+    #[test]
+    fn a_question_in_the_queue_never_costs_you_the_way_out_of_it() {
+        // The queue claims a frame for keys that did nothing while a question
+        // is up, so that the line it has just cleared is repainted. `Esc` and
+        // `q` are the exception, and not a fussy one: an unhandled one is how
+        // the shell knows you are done with the pane, so swallowing it would
+        // take the way out away at the exact moment somebody has realised
+        // their keys are somewhere they did not put them — which, since a view
+        // key stopped moving focus, is the whole reason the question exists.
+        // No frame is lost by declining, because handing focus back draws one.
+        for out in [key(KeyCode::Esc), key(KeyCode::Char('q'))] {
+            let mut fx = app();
+            fx.app.queue.stub_item("do not lose me", Mode::Send);
+            fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+            screen(&mut fx.app, 120, 24);
+            fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+            fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
+            assert!(screen(&mut fx.app, 120, 24).contains("d again to delete"));
+
+            fx.app.handle_key(out).unwrap();
+            assert_eq!(fx.app.focus, Focus::Left, "{out:?} was swallowed");
+            // ...and it was still the answer no on the way past.
+            let drawn = screen(&mut fx.app, 120, 24);
+            assert!(!drawn.contains("d again"), "{drawn}");
+        }
+    }
+
+
+    #[test]
+    fn the_queues_question_does_not_outlive_the_view_that_asked_it() {
+        // The shell's half of the queue's confirmation, and the half only the
+        // shell can do: a pane is never told it has been put away — `tick` runs
+        // whether or not it is showing — so `set_right_view` is the one place
+        // that knows. Without the call, `d`, `Alt+G`, `Alt+A`, `d` deleted an
+        // item on what the user experienced as a single press, having been
+        // asked about it on a screen they had long since left. The view keys
+        // leave focus in the pane now, which is what makes the sequence a
+        // natural one rather than a contrivance.
+        let mut fx = app();
+        fx.app.queue.stub_item("do not lose me", Mode::Send);
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
+        let asked = screen(&mut fx.app, 120, 24);
+        assert!(asked.contains("d again to delete"), "{asked}");
+
+        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "the view keys moved focus");
+        fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
+        let drawn = screen(&mut fx.app, 120, 24);
+        assert!(
+            drawn.contains("do not lose me"),
+            "a question asked on a screen the user had left was answered here:
+{drawn}"
+        );
+    }
+
 
     #[test]
     fn the_queue_is_a_workspace_view_and_f2_remembers_it() {
