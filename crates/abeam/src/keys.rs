@@ -92,8 +92,10 @@ pub enum Action {
     Quit,
     ShowGit,
     ShowViewer,
-    /// Show the command view *and* focus it — the one binding that moves focus,
-    /// because a command line you cannot type into is a picture of one. Pressed
+    /// Show the command view *and* focus it — the one of the four workspace
+    /// views that moves focus, because a command line you cannot type into is a
+    /// picture of one. ([`Action::ShowAsk`] and [`Action::ToggleSelect`] take
+    /// focus too, and say so below; neither is one of the four.) Pressed
     /// again while it already has focus, it hands focus back, so the round trip
     /// to run `git branch` is one key out and the same key home.
     ShowShell,
@@ -315,7 +317,7 @@ pub const HELP: &[(&str, &str)] = &[
     // before anything could be copied.
     (
         "F7",
-        "select rows of the right pane — or just drag, which copies on its own",
+        "select rows of the right pane, and focus it — or just drag, which copies on its own",
     ),
     ("Ctrl+\\ or F12", "send the next key to the agent verbatim"),
     ("", ""),

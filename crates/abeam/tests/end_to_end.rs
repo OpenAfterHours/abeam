@@ -706,10 +706,15 @@ fn rows_of_the_shell_view_are_selected_and_copied_and_the_child_never_sees_the_k
 
     // And leaving gives the keys back: the same `jjj` now reaches the prompt it
     // was kept away from, which is the other half of the claim and the half a
-    // mode that never exited would pass without. `Esc` lands on the agent, so
-    // `Alt+S` is the way back into the shell.
+    // mode that never exited would pass without.
+    //
+    // No `Alt+S` between the two, and that is the rule rather than a shortcut:
+    // `Esc` out of a selection lands where a second `F7` would, and this
+    // selection took no focus — `Alt+S` had focused the shell long before `F7`
+    // was pressed. Putting the highlight away therefore hands nothing back, so
+    // the keys are the shell's already. `Alt+S` here would have walked *out* to
+    // the agent and typed three letters into a prompt.
     send(&session, b"\x1b");
-    send(&session, &alt('s'));
     send(&session, b"jjj");
     let typed = wait_for(&session, "jjj");
     assert!(typed.contains("jjj"));

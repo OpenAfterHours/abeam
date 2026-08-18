@@ -72,20 +72,33 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `Alt+Z` | zoom: hide / show the right pane |
 | `Alt+Q` | quit (press twice while a child is live) |
 | `F1` | key help overlay |
-| `F2` | right pane → pty diagnostics, and back to what it displaced |
+| `F2` | right pane → pty diagnostics, and back to what it displaced (focus unchanged) |
 | `F3` | file reader → light / dark page (no other view changes) |
 | `F6` | right pane → ask, **nothing attached, and focus it**; again for what it displaced |
 | `F7` | select rows of the right pane by keyboard, **and focus it**; again to put the selection away |
 | `Ctrl+\` or `F12` | literal-next: send the following key to the agent verbatim |
+
+**"Focus unchanged" holds in both directions.** The four rows marked so —
+`Alt+G`, `Alt+E`, `Alt+A` and `F2` — neither take focus nor hand it back:
+`Alt+E` pressed while a shell has your keys leaves them on the right pane, now
+showing the files view, rather than returning you to the agent. abeam used to
+make that second move, leaving a pane you could type into for one you could not,
+and it was the special case those parentheses deny. The argument for dropping it
+is kept in one place — `App::set_right_view`, in `crates/abeam/src/app.rs` — and
+in short it is that the rule turned on whether the pane you were leaving took
+typing *at that instant*, so the same `Alt+E` moved focus while a shell's child
+was alive and left it alone a second after that child exited.
 
 `Alt+E` pressed while the files view is already showing opens the file list, so
 it is never a key that does nothing. It used to reload the open file; reload is
 `r` from inside the pane and the watcher does it unasked, so the second press
 was spending a key on a job already done twice.
 
-`Alt+S` is the one binding that moves focus, and the exception is deliberate: a
-command line you have to press a second key to type into is a picture of a
-command line. It is also the only right-hand view that keeps `Esc` and `q` —
+`Alt+S` is the one workspace view key that moves focus, and the exception is
+deliberate: a command line you have to press a second key to type into is a
+picture of a command line. (`F6` and `F7` move it too, and say so in the table;
+neither is one of the four views `Alt+G`, `Alt+E`, `Alt+S` and `Alt+A` switch
+between.) It is also the only right-hand view that keeps `Esc` and `q` —
 they belong to the shell — so the border advertises the way out instead.
 
 **`Alt+A` was verified the same way, on 2026-08-02, against the same 2.1.220

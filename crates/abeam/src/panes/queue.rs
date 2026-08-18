@@ -1195,9 +1195,9 @@ impl Pane for QueuePane {
     /// press short of the agent — so the border must not promise otherwise.
     fn exit_hint(&self) -> &'static str {
         if self.composing.is_some() {
-            " · esc→list"
+            "esc→list"
         } else {
-            " · esc→agent"
+            "esc→agent"
         }
     }
 
@@ -1931,14 +1931,14 @@ mod tests {
     #[test]
     fn the_border_never_promises_esc_will_reach_the_agent_while_the_composer_is_open() {
         let mut p = pane();
-        assert_eq!(p.exit_hint(), " · esc→agent");
+        assert_eq!(p.exit_hint(), "esc→agent");
         assert!(!p.takes_input());
         assert_eq!(p.cursor(), None);
 
         p.handle_key(key(KeyCode::Char('i'))).unwrap();
-        assert_ne!(p.exit_hint(), " · esc→agent");
+        assert_ne!(p.exit_hint(), "esc→agent");
         assert!(p.exit_hint().contains("esc"), "{}", p.exit_hint());
-        assert!(p.takes_input(), "a paste has somewhere to go now");
+        assert!(p.takes_input(), "the open composer is what plain keys go into");
 
         // And there is a cursor to look at, inside the pane it was drawn in.
         screen(&mut p, 40, 6);

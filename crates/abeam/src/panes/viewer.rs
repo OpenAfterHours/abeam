@@ -1754,9 +1754,15 @@ impl Pane for ViewerPane {
     }
 
     /// Only while a query is being typed — into any of the three boxes.
-    /// Everything else this pane does is a read; in a box `j` is a letter, and
-    /// both things the shell asks this for — where a paste goes, and whether
-    /// leaving hands focus back to the agent — turn on exactly that.
+    /// Everything else this pane does is a read; in a box `j` is a letter.
+    ///
+    /// One thing reads this, per the trait doc: the default `scroll_key`,
+    /// deciding whether a glance binding is the pane's own key or a character
+    /// of the query. This pane overrides that method rather than leaning on the
+    /// default, so what this answer owes is agreement with it — `Alt+J` with a
+    /// box open moves the view and does not step between hits — and nothing
+    /// else. It is not where a paste is routed and it is not what hands focus
+    /// back to the agent; neither of those has ever asked.
     fn takes_input(&self) -> bool {
         self.finding() || self.typing() || self.grepping()
     }
@@ -1795,27 +1801,27 @@ impl Pane for ViewerPane {
     fn exit_hint(&self) -> &'static str {
         if let Mode::Results { back } = self.mode {
             return match (self.grep.typing(), self.grep.has_results(), back) {
-                (true, true, _) => " · esc→results",
-                (_, _, Back::Browse) => " · esc→list",
-                (_, _, Back::Doc) => " · esc→page",
+                (true, true, _) => "esc→results",
+                (_, _, Back::Browse) => "esc→list",
+                (_, _, Back::Doc) => "esc→page",
             };
         }
         if matches!(self.mode, Mode::Browse) {
             return if self.browse.finding() {
-                " · esc→list"
+                "esc→list"
             } else {
-                " · esc→agent"
+                "esc→agent"
             };
         }
         match &self.search {
-            Some(s) if s.typing() && self.pending.is_some() => " · esc→new file",
-            Some(s) if s.typing() && s.hits().is_empty() => " · esc→clear",
+            Some(s) if s.typing() && self.pending.is_some() => "esc→new file",
+            Some(s) if s.typing() && s.hits().is_empty() => "esc→clear",
             // "the hits", not "the document": the reader is already in the
             // document, and what the press buys them is that the marks survive
             // it.
-            Some(s) if s.typing() => " · esc→hits",
-            Some(_) => " · esc→clear",
-            None => " · esc→agent",
+            Some(s) if s.typing() => "esc→hits",
+            Some(_) => "esc→clear",
+            None => "esc→agent",
         }
     }
 
@@ -2592,17 +2598,17 @@ mod tests {
         dir.write("a.md", b"# a\n");
         let mut pane = quiet(dir.path());
         assert!(!pane.takes_input());
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
 
         pane.toggle_browse();
         assert!(!pane.takes_input(), "the list is still only read");
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
 
         pane.handle_key(key(KeyCode::Char('/'))).unwrap();
         assert!(pane.takes_input(), "a query is typing");
         assert_eq!(
             pane.exit_hint(),
-            " · esc→list",
+            "esc→list",
             "Esc closes the find; the agent is one press further than that"
         );
 
@@ -2610,7 +2616,7 @@ mod tests {
         // of step with what Esc would do.
         pane.toggle_browse();
         assert!(!pane.takes_input());
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
     }
 
     #[test]
@@ -3119,15 +3125,15 @@ mod tests {
         let mut pane = needles(&dir);
         laid(&mut pane, 40, 10);
         assert!(!pane.takes_input());
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
 
         query(&mut pane, "needle");
         assert!(pane.takes_input(), "a query is typing");
-        assert_eq!(pane.exit_hint(), " · esc→hits");
+        assert_eq!(pane.exit_hint(), "esc→hits");
 
         assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::Yes);
         assert!(!pane.takes_input(), "the box is shut");
-        assert_eq!(pane.exit_hint(), " · esc→clear");
+        assert_eq!(pane.exit_hint(), "esc→clear");
         assert_eq!(hits(&pane).len(), 3, "and the hits are still there");
         assert_eq!(
             pane.handle_key(key(KeyCode::Char('n'))).unwrap(),
@@ -3137,7 +3143,7 @@ mod tests {
 
         assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::Yes);
         assert!(pane.search.is_none());
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
         assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::No);
     }
 
@@ -3226,7 +3232,7 @@ mod tests {
         query(&mut pane, "haystack");
         pane.handle_key(key(KeyCode::Esc)).unwrap();
         assert!(pane.search.is_none());
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
         assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::No);
 
         // Backspacing past the start of a query is the other way out, and it
@@ -3256,7 +3262,7 @@ mod tests {
         pane.toggle_browse();
         pane.toggle_browse();
         assert!(pane.search.is_none(), "Alt+E left a shut, empty search");
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
 
         // A resize that breaks the matched word across two rows. `line 20` is
         // one word to nobody, and at twelve columns it is two rows.
@@ -3294,16 +3300,16 @@ mod tests {
 
         // Nothing found: this Esc ends the search rather than keeping anything.
         query(&mut pane, "haystack");
-        assert_eq!(pane.exit_hint(), " · esc→clear");
+        assert_eq!(pane.exit_hint(), "esc→clear");
         pane.handle_key(key(KeyCode::Esc)).unwrap();
         query(&mut pane, "needle");
-        assert_eq!(pane.exit_hint(), " · esc→hits");
+        assert_eq!(pane.exit_hint(), "esc→hits");
 
         // A file waiting: this Esc closes the box, and the very next frame
         // takes the file up and ends the search with the document it was about.
         // The `◆` already in the title is what makes the hint read.
         pane.follow(dir.write("fresh.md", b"# fresh\n"));
-        assert_eq!(pane.exit_hint(), " · esc→new file");
+        assert_eq!(pane.exit_hint(), "esc→new file");
         assert!(pane.title().starts_with("◆ "), "{}", pane.title());
         pane.handle_key(key(KeyCode::Esc)).unwrap();
         draw(&mut pane, 40, 10);
@@ -3435,7 +3441,7 @@ mod tests {
         // the count was never about this file.
         pane.show(dir.write("other.md", b"# other\n"));
         assert!(pane.search.is_none());
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
     }
 
     #[test]
@@ -3449,7 +3455,7 @@ mod tests {
         assert!(!pane.takes_input(), "a box nobody can see was still open");
         assert_eq!(
             pane.exit_hint(),
-            " · esc→agent",
+            "esc→agent",
             "the list's answer, not the document's"
         );
 
@@ -3693,7 +3699,7 @@ mod tests {
         );
         assert_eq!(
             pane.exit_hint(),
-            " · esc→agent",
+            "esc→agent",
             "the notice grew an Esc stage of its own"
         );
 
@@ -3704,7 +3710,7 @@ mod tests {
             Handled::Yes
         );
         assert!(pane.title().contains("/** · 2/4"), "{}", pane.title());
-        assert_eq!(pane.exit_hint(), " · esc→clear", "and it is a search again");
+        assert_eq!(pane.exit_hint(), "esc→clear", "and it is a search again");
     }
 
     #[test]
@@ -3739,15 +3745,15 @@ mod tests {
         let dir = TempDir::new("view-result-hint");
         dir.write("a.md", b"# a\n");
         let mut pane = quiet(dir.path());
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
 
         // Raised over the document, with nothing behind the box: one press home.
         pane.handle_key(key(KeyCode::Char('f'))).unwrap();
         assert!(pane.takes_input());
-        assert_eq!(pane.exit_hint(), " · esc→page");
+        assert_eq!(pane.exit_hint(), "esc→page");
         pane.handle_key(key(KeyCode::Esc)).unwrap();
         assert!(matches!(pane.mode, Mode::Doc));
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
 
         // With a query run, the box has something behind it and the press that
         // shuts it is not the press that leaves.
@@ -3757,24 +3763,24 @@ mod tests {
         }
         pane.handle_key(key(KeyCode::Enter)).unwrap();
         assert!(!pane.takes_input(), "Enter ran it and shut the box");
-        assert_eq!(pane.exit_hint(), " · esc→page");
+        assert_eq!(pane.exit_hint(), "esc→page");
         pane.handle_key(key(KeyCode::Char('f'))).unwrap();
-        assert_eq!(pane.exit_hint(), " · esc→results");
+        assert_eq!(pane.exit_hint(), "esc→results");
         pane.handle_key(key(KeyCode::Esc)).unwrap();
-        assert_eq!(pane.exit_hint(), " · esc→page");
+        assert_eq!(pane.exit_hint(), "esc→page");
         pane.handle_key(key(KeyCode::Esc)).unwrap();
         assert!(matches!(pane.mode, Mode::Doc));
 
         // Raised over the list, the same two presses name the list.
         pane.toggle_browse();
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
         pane.handle_key(key(KeyCode::Char('f'))).unwrap();
-        assert_eq!(pane.exit_hint(), " · esc→results");
+        assert_eq!(pane.exit_hint(), "esc→results");
         pane.handle_key(key(KeyCode::Esc)).unwrap();
-        assert_eq!(pane.exit_hint(), " · esc→list");
+        assert_eq!(pane.exit_hint(), "esc→list");
         pane.handle_key(key(KeyCode::Esc)).unwrap();
         assert!(matches!(pane.mode, Mode::Browse));
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
     }
 
     #[test]
@@ -3901,7 +3907,7 @@ mod tests {
             pane.title()
         );
         // And it is still not an `Esc` stage: the next press is the shell's.
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
         assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::No);
         // A new question replaces it rather than stacking beside it.
         query(&mut pane, "a");

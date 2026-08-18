@@ -5,7 +5,18 @@
 //! **Typing goes to the agent.** It is over 95% of keystrokes, so it is the
 //! state the app lives in and the one it must never leave by accident. Nothing
 //! moves focus implicitly — not the file watcher, not a view switch, not a git
-//! refresh. Only `F4`/`F5`, a mouse click, or `Esc` from the right pane.
+//! refresh — and there is one function that moves it at all, [`App::set_focus`],
+//! so "what can take my keys" is a list of its callers rather than an argument.
+//! They are: `F4`/`F5`; `Alt+S` out to the shell and home again; `F6` out to
+//! the ask and back to what it displaced; `F7`, and the `Esc`, `q` or `Enter`
+//! that ends the selection it started; `Alt+Z`, when zooming the right pane off
+//! the screen it was focused on; a mouse click; `Esc` or `q` out of the right
+//! pane; and the two wires that carry a key pressed in one pane into another —
+//! `?` from git or the reader into the ask, and a command chosen in the ask
+//! into a shell. One caller is not a key at all, and it is the exception the
+//! rule above is worded to survive: [`App::ui`] pulls focus back to the agent
+//! on any frame with no right pane in it, because a window narrowed until that
+//! pane is gone would otherwise leave the keys with something nobody can see.
 //!
 //! **Reading the right pane costs nothing.** Switching views and scrolling both
 //! work while the agent still has focus. Focus is needed only to drive a
@@ -391,6 +402,23 @@ pub struct App {
     /// same three keys have to work over all six views, and a selection is
     /// something a pane is copied *from* rather than something it implements.
     select: Option<Select>,
+    /// Whether `F7` moved focus to the right pane *and nothing has moved it
+    /// since*, for the press that puts the selection away again — `F7` or the
+    /// `Esc`/`q` that means the same thing.
+    ///
+    /// Not derivable when that key arrives: `focus == Focus::Right` there cannot
+    /// tell "this key took focus" from "focus was already there", which is how
+    /// `F7` twice from a focused shell used to leave a typist at the agent.
+    ///
+    /// The second half of the sentence is the half that has to be enforced, and
+    /// [`App::set_focus`] is what enforces it: every write to `focus` but
+    /// `F7`'s own clears this. Recording only "focus was `Left` when the
+    /// selection was made" was not enough — `F7`, `F4`, `F5`, `F7` would then
+    /// hand focus to the agent on the strength of a claim `F5` had already
+    /// taken over. It cannot go stale in the other direction either, because a
+    /// selection dropped by anything else leaves the flag behind and the next
+    /// `F7` overwrites it before there is anything to read it.
+    select_took_focus: bool,
     /// The right pane's rows, exactly as the last frame drew them, kept only
     /// while a selection is up.
     ///
@@ -673,6 +701,7 @@ impl App {
             agent_exit: None,
             mouse_owner: None,
             select: None,
+            select_took_focus: false,
             select_rows: Vec::new(),
             drag: None,
             left_inner: Rect::ZERO,
@@ -1319,7 +1348,7 @@ impl App {
             // reason — `set_right_view` has just un-zoomed, so the pane that is
             // about to exist does not exist yet.
             if abeam_layout::split(self.area, self.zoom).right.is_some() {
-                self.focus = Focus::Right;
+                self.set_focus(Focus::Right);
             }
             redraw = true;
         }
@@ -1470,7 +1499,7 @@ impl App {
             // key to correct is not a command line, and the whole promise here
             // is that the reader gets to read it before it runs.
             if abeam_layout::split(self.area, self.zoom).right.is_some() {
-                self.focus = Focus::Right;
+                self.set_focus(Focus::Right);
             }
             return true;
         }
@@ -1908,6 +1937,32 @@ impl App {
 
     // --- events ----------------------------------------------------------
 
+    /// The only place `focus` is written. Everything that moves it comes
+    /// through here — the module doc above lists them — and the reason it is a
+    /// chokepoint rather than sixteen assignments is the line inside it.
+    ///
+    /// `select_took_focus` is `F7`'s claim on focus: "I moved it, so pressing
+    /// me again should move it back." That claim is only true until something
+    /// else moves focus, and *something else* is not a list anybody can keep up
+    /// to date — a mouse click, `F4`, `Alt+Z`, the ask hand-off. So every write
+    /// but `F7`'s own voids it, which makes the memo mean what it says instead
+    /// of meaning "focus was `Left` when this selection was made".
+    ///
+    /// **The `!=` guard is the load-bearing half**, because a write that lands
+    /// on the side focus is already on has moved nothing and must not read as
+    /// though it had. The press that begins a drag inside an already-focused
+    /// right pane is exactly that write. Without the guard: `F7` on a shell
+    /// with a live child, drag over a line of output to copy it, `F7` to put
+    /// the highlight away — and focus stays on the shell, where `Esc` belongs
+    /// to the child and only `Alt+S` gets out. The user pressed one key twice
+    /// and ended somewhere they had no obvious way to leave.
+    fn set_focus(&mut self, to: Focus) {
+        if to != self.focus {
+            self.select_took_focus = false;
+            self.focus = to;
+        }
+    }
+
     fn handle_event(&mut self, ev: Event) -> Result<Flow> {
         match ev {
             Event::Key(key) => {
@@ -2053,7 +2108,7 @@ impl App {
                     if self.right_view == RightView::Ask {
                         self.set_right_view(self.last_workspace_view);
                     }
-                    self.focus = Focus::Left;
+                    self.set_focus(Focus::Left);
                     return Ok(Flow::redraw());
                 }
                 // Nothing came of it — `j` at the end of a document, a letter
@@ -2093,12 +2148,14 @@ impl App {
                 self.set_right_view(RightView::Viewer);
             }
             Action::ShowShell => {
-                // The one action that moves focus, because a command line you
-                // have to press a second key to type into is not a command
-                // line. Pressed again from inside, it is the way home — so the
-                // whole round trip for `git branch` is Alt+S, type, Alt+S.
+                // The one of the four workspace views that moves focus, because
+                // a command line you have to press a second key to type into is
+                // not a command line — `F6` and `F7` move it too, and neither is
+                // a workspace view. Pressed again from inside, it is the way
+                // home — so the whole round trip for `git branch` is Alt+S,
+                // type, Alt+S.
                 if self.right_view == RightView::Shell && self.focus == Focus::Right {
-                    self.focus = Focus::Left;
+                    self.set_focus(Focus::Left);
                 } else {
                     self.set_right_view(RightView::Shell);
                     // Asked of the layout rather than of the last frame.
@@ -2111,7 +2168,7 @@ impl App {
                     // `Alt+S` followed by a typed command in the same batch
                     // would route those keys at a pane that will never appear.
                     if abeam_layout::split(self.area, self.zoom).right.is_some() {
-                        self.focus = Focus::Right;
+                        self.set_focus(Focus::Right);
                     }
                 }
             }
@@ -2150,7 +2207,7 @@ impl App {
                     // something, and leaving it on screen would cost the reader
                     // whatever they were looking at.
                     self.set_right_view(self.last_workspace_view);
-                    self.focus = Focus::Left;
+                    self.set_focus(Focus::Left);
                 } else {
                     self.ask_mut().attach(None);
                     self.set_right_view(RightView::Ask);
@@ -2160,7 +2217,7 @@ impl App {
                     // un-zoomed, so the pane that is about to exist does not
                     // exist yet.
                     if abeam_layout::split(self.area, self.zoom).right.is_some() {
-                        self.focus = Focus::Right;
+                        self.set_focus(Focus::Right);
                     }
                 }
             }
@@ -2195,13 +2252,17 @@ impl App {
 
             // Pressed again it puts the selection away, wherever focus is: the
             // highlight is drawn from the left pane too, so `F7` has to be able
-            // to take it off from there. Focus follows only when it was the
-            // selection that had it, or the key would drag a typist out of the
-            // composer they had gone back to.
+            // to take it off from there. Focus follows only when this key is
+            // still the last thing to have moved it — read from
+            // `select_took_focus`, because the press that dismisses cannot work
+            // that out for itself. Asking whether focus is on the right could
+            // not tell "this key took focus" from "focus was already there", so
+            // `F7` and `F7` again from a focused shell dropped the typist at the
+            // agent instead of back at the prompt they had been at all along.
             Action::ToggleSelect => {
                 if self.select.take().is_some() {
-                    if self.focus == Focus::Right {
-                        self.focus = Focus::Left;
+                    if self.select_took_focus {
+                        self.set_focus(Focus::Left);
                     }
                 } else {
                     // Asking to select is asking to see what you are selecting,
@@ -2212,15 +2273,24 @@ impl App {
                     self.zoom = false;
                     if abeam_layout::split(self.area, self.zoom).right.is_some() {
                         self.select = Some(Select::new());
-                        self.focus = Focus::Right;
+                        // The one write that records the memo instead of
+                        // voiding it, and the only reason `set_focus` is not
+                        // simply told to do so: read the answer *before* the
+                        // move, because moving is what clears it. Inside the
+                        // guard, with the selection it describes — a press that
+                        // draws no selection has moved nothing and must leave
+                        // nothing behind for the next one to read.
+                        let took = self.focus == Focus::Left;
+                        self.set_focus(Focus::Right);
+                        self.select_took_focus = took;
                     }
                 }
             }
 
-            Action::FocusLeft => self.focus = Focus::Left,
+            Action::FocusLeft => self.set_focus(Focus::Left),
             Action::FocusRight => {
                 if self.right_inner.is_some() {
-                    self.focus = Focus::Right;
+                    self.set_focus(Focus::Right);
                 }
             }
             Action::ScrollRight(code) => {
@@ -2234,7 +2304,7 @@ impl App {
             Action::ToggleZoom => {
                 self.zoom = !self.zoom;
                 if self.zoom {
-                    self.focus = Focus::Left;
+                    self.set_focus(Focus::Left);
                 }
             }
             // Every other binding has already cleared it; this is the one that
@@ -2258,7 +2328,11 @@ impl App {
     /// rather than going somewhere.
     ///
     /// The way out is `Esc` or `q`, which is the way out of every read-only
-    /// view, and it lands on the agent for the reason those do.
+    /// view — and it lands where a second `F7` would rather than always on the
+    /// agent, because a mode with two exits to two destinations is a mode whose
+    /// end nobody can predict. `Enter` is the exception, and it is not one:
+    /// [`App::send_selection`] has just put the rows in the agent's composer,
+    /// so the agent is where the user is now typing.
     fn select_key(&mut self, key: KeyEvent) -> Result<Flow> {
         // The motions and `v` are the selection's own. Taken first, so that
         // `Ctrl+D` and `Ctrl+U` — the only chord this vocabulary claims — are
@@ -2307,8 +2381,15 @@ impl App {
             KeyCode::Char('y') => self.copy_selection(),
             KeyCode::Enter => self.send_selection(),
             KeyCode::Esc | KeyCode::Char('q') => {
+                // The same memo `F7` reads, because this is the same door. One
+                // mode with two ways out that landed in two different places is
+                // a mode nobody can predict: `Alt+A`, `F5`, `F7`, `Esc` used to
+                // finish at the agent while `Alt+A`, `F5`, `F7`, `F7` finished
+                // at the queue, and nothing on screen distinguished them.
                 self.select = None;
-                self.focus = Focus::Left;
+                if self.select_took_focus {
+                    self.set_focus(Focus::Left);
+                }
             }
             // Swallowed. See this function's own doc: the child behind this
             // pane must not hear a keystroke aimed at a caret.
@@ -2367,7 +2448,9 @@ impl App {
     ///
     /// It leaves the mode on success, and the confirmation is that the text is
     /// now in the composer where you are looking — which is also where you now
-    /// want to be typing.
+    /// want to be typing. Unconditionally, unlike the two presses that merely
+    /// put a selection away: those consult `select_took_focus` because they
+    /// left the rows where they found them, and this one has moved them.
     fn send_selection(&mut self) {
         let Some(text) = self.selection_text() else {
             return;
@@ -2402,7 +2485,7 @@ impl App {
                 self.draft_open = true;
                 self.queue.set_draft_open(true);
                 self.select = None;
-                self.focus = Focus::Left;
+                self.set_focus(Focus::Left);
             }
         }
     }
@@ -2512,7 +2595,7 @@ impl App {
         if press {
             // Click to focus. Wheel deliberately does not — the whole point of
             // scrolling the right pane is that it does not disturb typing.
-            self.focus = target;
+            self.set_focus(target);
             self.mouse_owner = Some(target);
             // A press anywhere but the right pane is not the start of a
             // selection, and leaving the last one's row lying about would
@@ -2612,7 +2695,7 @@ impl App {
 
         // The right pane can vanish under a narrow window while focused.
         if self.right_inner.is_none() {
-            self.focus = Focus::Left;
+            self.set_focus(Focus::Left);
             // And a selection over a pane that is not on screen is a highlight
             // nobody can see and rows nothing drew. `Alt+Z` while selecting is
             // the ordinary way to get here.
@@ -2768,10 +2851,13 @@ impl App {
     /// Hints live in the border, not a status bar: rows are the scarcest
     /// resource in a two-pane TUI and an agent's UI is hungry for them.
     ///
-    /// The unread mark goes *first* because titles are clipped from the right.
-    /// A git title with a branch name and a change count already fills a 46
-    /// column pane, so a mark appended to it would be invisible exactly when
-    /// the repository is busy — which is exactly when new documents appear.
+    /// Titles are clipped from the right, so the order here is a ranking of
+    /// what must survive a busy repository. A git title with a branch name and
+    /// a change count already fills a 46 column pane. **The focus hint goes
+    /// first** — it is the only thing on screen, cursor included, that says the
+    /// right pane has your keys — and the unread mark second, because a mark
+    /// appended to that title would be invisible exactly when the repository is
+    /// busy, which is exactly when new documents appear.
     ///
     /// The workspace label sits between the mark and the pane's own title, and
     /// **only when the right pane is somewhere other than the agent's root**.
@@ -2784,32 +2870,31 @@ impl App {
     fn right_title(&self, focused: bool) -> Line<'static> {
         let mut spans = vec![Span::raw(" ")];
 
-        if self.right_view != RightView::Viewer && self.viewer.has_pending() {
-            spans.push(Span::styled(
-                "◆ Alt+E · ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-
-        if self.at != 0 {
-            spans.push(Span::styled(
-                format!("{} · ", self.workspace().label),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-
-        spans.push(Span::raw(self.right_pane_ref().title()));
-
-        // The mode's hint replaces the pane's, and does so whether or not the
-        // pane has focus — the highlight is on screen from the left pane too,
-        // and a reader looking at it needs to know what took their keys and how
-        // to give them back. It says what the last `y` did when there is
-        // something to say, because OSC 52 has no reply and this note is the
-        // whole of the acknowledgement.
+        // What has the keys, and how to give them back — **first**, for the
+        // reason the unread mark is near the front and with more riding on it.
+        // A git title carrying a branch name and a change count fills the pane
+        // on its own, so appended this was clipped away on exactly the
+        // repositories somebody would be reading it in — this project's own
+        // branch names are long enough to do it. Clipped, the only thing left
+        // saying the right pane had the keys was the border colour, and there
+        // is no cursor to fall back on: four of the six views draw none, so a
+        // focused read-only pane leaves the window with no cursor anywhere at
+        // all.
+        //
+        // First also means the title *moves* when focus arrives. That is a
+        // stronger signal than a colour changing in place, because it is a
+        // shift the eye catches rather than a shade the reader has to remember
+        // the meaning of.
+        //
+        // One slot rather than two, and the two are mutually exclusive by
+        // construction: either a selection is holding the keys or the pane is,
+        // and a border naming both ways out would be naming one that is not
+        // there. The mode's hint wins, and shows whether or not the pane has
+        // focus — the highlight is on screen from the left pane too, and a
+        // reader looking at it needs to know what took their keys and how to
+        // give them back. It says what the last `y` did when there is something
+        // to say, because OSC 52 has no reply and this note is the whole of the
+        // acknowledgement.
         //
         // Yellow, like the unread mark and the queue's countdown: the two other
         // things in this program that say "abeam is in a state you did not
@@ -2830,23 +2915,45 @@ impl App {
                 None => "v more · y copy · ⏎ agent".to_string(),
             };
             spans.push(Span::styled(
-                format!(" · {said}"),
+                format!("{said} · "),
                 Style::default().fg(Color::Yellow),
             ));
-            spans.push(Span::raw(" "));
-            return Line::from(spans);
-        }
-
-        if focused {
+        } else if focused {
             // Asked of the pane rather than decided here. The way out differs
             // per view and, in two of them, per state — a shell keeps `Esc` for
             // its child until that child exits, and a filter box keeps it until
             // the box closes. The shell cannot know any of that.
+            //
+            // The separator is the shell's, not the pane's. It used to be baked
+            // into every one of the fifty-eight literals behind this call, which
+            // was a pane owning a piece of chrome the module doc on `Pane` says
+            // belongs here — and it is what made moving the hint a rewrite of
+            // six files rather than of this line.
             spans.push(Span::styled(
-                self.right_pane_ref().exit_hint(),
+                format!("{} · ", self.right_pane_ref().exit_hint()),
                 Style::default().fg(Color::DarkGray),
             ));
         }
+
+        if self.right_view != RightView::Viewer && self.viewer.has_pending() {
+            spans.push(Span::styled(
+                "◆ Alt+E · ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        if self.at != 0 {
+            spans.push(Span::styled(
+                format!("{} · ", self.workspace().label),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        spans.push(Span::raw(self.right_pane_ref().title()));
         spans.push(Span::raw(" "));
         Line::from(spans)
     }
@@ -2859,6 +2966,33 @@ impl App {
     /// This is half of that rule. The other half is [`App::new`], because a
     /// session can *open* on the ask — `[defaults] view = "ask"` — and this
     /// function never runs for the first view of all.
+    ///
+    /// **It does not touch focus, and no view key does.** A view switch changes
+    /// what you are looking at, never who is taking your keys. Six of its
+    /// callers do move focus, and every one of them sets it itself on the line
+    /// after it calls this, through [`App::set_focus`] like everything else:
+    /// `Alt+S`; `F6` both ways, the press that raises the ask and the press
+    /// that puts back what the ask displaced; the `Esc` or `q` that leaves the
+    /// ask the same way; the `?` that raises one from git or from the reader;
+    /// and the hand-off that carries a command the reader chose to a shell.
+    ///
+    /// **The live-shell argument lives here.** Other places name it; this is
+    /// where it is made. What used to be in this function handed focus back to
+    /// the agent whenever the view being left took typing and the one arriving
+    /// did not, in the name of "one keystroke, one meaning" — and that is the
+    /// thing it cost. [`Pane::takes_input`] is a question about *this instant*,
+    /// so `Alt+E` out of a shell whose child was alive moved focus and `Alt+E`
+    /// out of the same shell a second after that child exited did not: the same
+    /// key, over the same rows on the same screen, with two destinations.
+    ///
+    /// Not because the pane's state was invisible — a dead shell says so three
+    /// times over, retitling itself `exited (0) · enter restarts · …`, turning
+    /// its `exit_hint` from `alt+s→agent` to `esc→agent`, and dropping its
+    /// cursor. What nothing said was that those three changes had also silently
+    /// changed what the *next view key* was about to do, which is a meaning no
+    /// border can advertise because the key it belongs to is about some other
+    /// pane. Typing at the right pane is a state the user asked for with a key
+    /// that says so, and nothing they did not press takes it away.
     fn set_right_view(&mut self, view: RightView) {
         // Asking for a view is asking to see it. Without this, every view key
         // is a dead key while zoomed, which is a worse surprise than the pane
@@ -2869,7 +3003,6 @@ impl App {
         // the worst version of this feature: the same highlight over different
         // text, and `Enter` sending whatever happens to be under it now.
         self.select = None;
-        let was_typing = self.focus == Focus::Right && self.right_pane().takes_input();
         self.right_view = view;
         // Neither of the two displaceable views is remembered, and `Ask` is in
         // this line for `Diag`'s reason rather than by analogy with it: both are
@@ -2877,15 +3010,6 @@ impl App {
         // that remembered itself would be a key that could never leave.
         if view != RightView::Diag && view != RightView::Ask {
             self.last_workspace_view = view;
-        }
-        // Leaving a pane you were typing into for one you cannot type into
-        // hands focus back to the agent. Without this, `Alt+G` means two
-        // different things depending on where you were: "show git, keep typing
-        // at the agent" from the left, and "show git and you are now driving
-        // it" from the shell — where the next thing typed would be read as
-        // scroll keys. One keystroke, one meaning, from everywhere.
-        if was_typing && !self.right_pane().takes_input() {
-            self.focus = Focus::Left;
         }
     }
 
@@ -3885,8 +4009,8 @@ mod tests {
         screen(&mut app, 120, 24);
         assert_eq!(app.focus, Focus::Left);
 
-        // The one view key that moves focus. A command line you have to press a
-        // second key to type into is not a command line.
+        // The one workspace view key that moves focus. A command line you have
+        // to press a second key to type into is not a command line.
         app.handle_key(alt(KeyCode::Char('s'))).unwrap();
         assert_eq!(app.right_view, RightView::Shell);
         assert_eq!(app.focus, Focus::Right);
@@ -3907,6 +4031,103 @@ mod tests {
         app.handle_key(alt(KeyCode::Char('s'))).unwrap();
         assert_eq!(app.right_view, RightView::Shell);
         assert_eq!(app.focus, Focus::Right);
+    }
+
+    #[test]
+    fn a_view_key_leaves_focus_where_it_found_it() {
+        // Every other view key, and the rule `set_right_view` states and the
+        // keymap prints in the table as "(focus unchanged)". It used to
+        // hold in one direction only: leaving a pane that took typing for one
+        // that did not handed focus back to the agent, so `Alt+E` pressed to
+        // glance at a file while typing in the shell put the next thing typed
+        // two panes away from where it was aimed.
+        //
+        // The ask is the cheap way to a right pane that takes typing — its
+        // composer is live from the first frame, and nothing has to be spawned
+        // to prove it.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        let view_keys = [
+            alt(KeyCode::Char('g')),
+            alt(KeyCode::Char('e')),
+            alt(KeyCode::Char('a')),
+            key(KeyCode::F(2)),
+        ];
+
+        for pressed in view_keys {
+            fx.app.set_right_view(RightView::Ask);
+            fx.app.focus = Focus::Right;
+            screen(&mut fx.app, 120, 24);
+            assert!(
+                fx.app.right_pane().takes_input(),
+                "the ask is not taking typing, so this proves nothing"
+            );
+
+            fx.app.handle_key(pressed).unwrap();
+            assert_ne!(
+                fx.app.right_view,
+                RightView::Ask,
+                "{pressed:?} switched no view, so the assertion below is free"
+            );
+            assert_eq!(
+                fx.app.focus,
+                Focus::Right,
+                "{pressed:?} took the keys off the pane the user was typing into"
+            );
+        }
+
+        // ...and from the agent it does not take focus either, which is the
+        // direction that was always true and the reason the table says so.
+        for pressed in view_keys {
+            fx.app.set_right_view(RightView::Ask);
+            fx.app.focus = Focus::Left;
+            screen(&mut fx.app, 120, 24);
+            fx.app.handle_key(pressed).unwrap();
+            assert_eq!(
+                fx.app.focus,
+                Focus::Left,
+                "{pressed:?} dragged a typist off the agent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_composer_left_open_in_one_view_is_still_yours_when_you_come_back() {
+        // The half of that rule somebody notices. A half-typed queue item is a
+        // draft, and a glance at git on the way past must not cost it the keys:
+        // before this, `Alt+G` here handed focus to the agent and the rest of
+        // the sentence went into the agent's prompt, with the queue's own
+        // composer still open behind it and still showing a cursor.
+        let mut fx = app();
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('i'))).unwrap();
+        assert!(
+            fx.app.right_pane().takes_input(),
+            "the composer never opened, so this proves nothing"
+        );
+
+        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "a glance at git cost the draft its keys"
+        );
+
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        assert!(
+            fx.app.right_pane().takes_input(),
+            "the composer was shut by a view switch"
+        );
+        for c in "still-mine".chars() {
+            fx.app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        let text = screen(&mut fx.app, 120, 24);
+        assert!(
+            text.contains("still-mine"),
+            "what was typed went somewhere else: {text}"
+        );
     }
 
     #[test]
@@ -3985,6 +4206,79 @@ mod tests {
             asked = app.tick_panes();
         }
         assert!(asked, "a visible shell's output must ask for a frame");
+    }
+
+    /// A shell in the workspace on screen, spawned by a frame and known to be
+    /// up. `A_PLAIN_SHELL` for the reason the test above gives: what these are
+    /// about is the shell's routing, not which shell.
+    fn a_live_shell(fx: &mut Fixture) {
+        fx.app.spaces[0].shell =
+            ShellPane::new(fx.dir.path().to_path_buf(), Some(A_PLAIN_SHELL.into()));
+        // A frame before the key, because `Alt+S` asks the layout whether there
+        // is a right pane to focus and `area` is whatever the last frame drew.
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        screen(&mut fx.app, 120, 24); // the frame that spawns it
+        assert!(fx.app.shell().is_live(), "the frame never spawned a child");
+        assert_eq!(fx.app.focus, Focus::Right, "Alt+S is the key that focuses");
+    }
+
+    #[test]
+    fn a_view_key_out_of_a_live_shell_leaves_focus_in_the_right_pane() {
+        // The report, with a real child in it: typing at a prompt in the shell
+        // view, `Alt+E` to look something up in a file, and focus was yanked to
+        // the agent — so what was typed next went to the agent rather than to
+        // the pane that had just come up in front of the user.
+        let mut fx = app();
+        a_live_shell(&mut fx);
+
+        fx.app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        assert_eq!(fx.app.right_view, RightView::Viewer);
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "a glance at a file threw the typist back at the agent"
+        );
+    }
+
+    #[test]
+    fn a_view_key_out_of_the_shell_means_the_same_thing_live_or_dead() {
+        // The argument `set_right_view` makes, run: the deleted rule turned on
+        // `takes_input`, which is a question about *this instant*, so the same
+        // `Alt+E` over the same rows on the same screen moved focus with the
+        // child alive and left focus alone once it had exited. This is the two
+        // halves side by side.
+        let mut fx = app();
+        a_live_shell(&mut fx);
+        fx.app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "with the child alive");
+
+        // Typed at the pane rather than through the app: `exit` is the child's
+        // business and the shell's key routing is not what is under test.
+        fx.app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        for c in "exit".chars() {
+            fx.app.shell_mut().handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        fx.app.shell_mut().handle_key(key(KeyCode::Enter)).unwrap();
+        // A `try_wait` is the only thing that reaps a child, and `tick_panes`
+        // is where abeam does one — so this is the wait, not a sleep.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fx.app.shell().is_live() && Instant::now() < deadline {
+            fx.app.tick_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!fx.app.shell().is_live(), "the child never left");
+        assert!(
+            !fx.app.right_pane().takes_input(),
+            "a dead shell that still takes typing would make the two halves one"
+        );
+
+        fx.app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "the same key over the same pane, and a different destination"
+        );
     }
 
     #[test]
@@ -4901,6 +5195,61 @@ mod tests {
             "a write in the agent's root is now another workspace's news"
         );
     }
+
+    #[test]
+    fn the_focus_hint_leads_the_border_where_a_long_title_cannot_clip_it() {
+        // The border is the only thing on screen that says the right pane has
+        // the keys. Four of the six views draw no cursor, so a focused
+        // read-only pane leaves the window without one anywhere at all — and
+        // this hint used to be appended, behind a title that fills the 46
+        // columns on its own. On a busy repository, or a document with a long
+        // name, it was clipped off the end and the border colour was the whole
+        // of the signal. Nothing pinned where it sat, which is why it could be.
+        let mut fx = app();
+        let long = fx
+            .dir
+            .path()
+            .join("a-design-document-with-a-name-long-enough-to-fill-the-border.md");
+        std::fs::write(&long, "# hello").unwrap();
+        fx.app.viewer.show(long);
+        fx.app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+
+        let title = |fx: &Fixture, focused: bool| -> String {
+            fx.app
+                .right_title(focused)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        // Unfocused it is not there at all: the border promises a way out only
+        // while there are keys to give back.
+        let idle = title(&fx, false);
+        assert!(!idle.contains("esc→agent"), "{idle}");
+
+        // Focused, it leads — and the pane's own title comes after it, which is
+        // the half an assertion on `contains` alone would pass without.
+        let held = title(&fx, true);
+        assert!(held.starts_with(" esc→agent · "), "{held}");
+        let hint = held.find("esc→agent").expect("the hint is not in the border");
+        let name = held.find("a-design-document").expect("the title is not either");
+        assert!(hint < name, "the hint fell in behind the title: {held}");
+
+        // And the half that is the point of the ordering. The pane is 46
+        // columns and this title is longer, so its tail is clipped off the
+        // border — the hint is on screen because it is not in that tail.
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        let drawn = screen(&mut fx.app, 120, 24);
+        assert!(
+            !drawn.contains("fill-the-border.md"),
+            "the title was never clipped, so this proves nothing:
+{drawn}"
+        );
+        assert!(drawn.contains("esc→agent"), "{drawn}");
+    }
+
 
     #[test]
     fn the_border_names_the_workspace_only_when_it_is_not_the_agents() {
@@ -6147,11 +6496,231 @@ mod tests {
             "a caret you cannot move is a picture of one"
         );
 
-        // And the same key puts it away, landing on the agent — the round trip
-        // `Alt+S` taught.
+        // And the same key puts it away, landing on the agent — the round
+        // trip `Alt+S` taught, and the agent is where this press came from.
+        // Where it lands when it came from somewhere else is the test below.
         fx.app.handle_key(key(KeyCode::F(7))).unwrap();
         assert!(fx.app.select.is_none());
         assert_eq!(fx.app.focus, Focus::Left);
+    }
+
+    #[test]
+    fn f7_hands_focus_back_only_when_f7_is_what_took_it() {
+        // `F7` twice is a round trip, so it has to end where it started. From
+        // the agent it takes focus and gives it back, which is the test above.
+        // From a pane you were already typing into it took nothing — and gave
+        // focus to the agent anyway, dropping a typist two panes from the
+        // prompt they were at. The press that puts a selection away cannot tell
+        // those two cases apart from `focus == Focus::Right`, so the press that
+        // *made* it records which one it was.
+        let mut fx = app();
+        reading(&mut fx, |_| unstarted());
+        fx.app.set_right_view(RightView::Ask);
+        fx.app.focus = Focus::Right;
+        screen(&mut fx.app, 120, 24);
+
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert!(fx.app.select.is_some(), "no selection to put away");
+        assert_eq!(fx.app.focus, Focus::Right);
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert!(fx.app.select.is_none());
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "F7 gave away focus it had never taken"
+        );
+
+        // And a selection dropped by something *else* leaves nothing behind for
+        // the next one to read: `Alt+A` takes this one away without touching
+        // focus, so the `F7` after it is a press from the right pane like any
+        // other and owes the agent nothing.
+        fx.app.focus = Focus::Left;
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "that press does take focus");
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        assert!(fx.app.select.is_none(), "a selection outlived its pane");
+        assert_eq!(fx.app.focus, Focus::Right);
+
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "a dropped selection left its claim on focus behind"
+        );
+    }
+
+    #[test]
+    fn a_drag_over_a_pane_f7_already_focused_does_not_cost_f7_its_way_home() {
+        // The trap, and it closes on a live shell, which is what this one pays
+        // for a child to have: `F7` from the agent, a drag over a line of
+        // output to take it, `F7` to put the highlight away — and focus stayed
+        // on the shell. `Esc` there is the child's, so the only key out is
+        // `Alt+S`, and whatever is typed first is a command at a prompt nobody
+        // was aiming at. The drag was blamed for a focus move it never made:
+        // `F7` had already moved focus, so the press that began the drag found
+        // focus on the right and moved nothing.
+        let mut fx = app();
+        a_live_shell(&mut fx);
+        // Home first — this sequence starts where the app lives.
+        fx.app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Left, "Alt+S is the way back");
+
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "F7 is what takes focus here");
+
+        let inner = fx.app.right_inner.expect("a right pane");
+        let at = |kind, row: u16| MouseEvent {
+            kind,
+            column: inner.x + 1,
+            row: inner.y + row,
+            modifiers: KeyModifiers::NONE,
+        };
+        fx.app
+            .handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 0))
+            .unwrap();
+        fx.app
+            .handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 1))
+            .unwrap();
+        fx.app
+            .handle_mouse(at(MouseEventKind::Up(MouseButton::Left), 1))
+            .unwrap();
+        assert!(
+            fx.app.shell().is_live(),
+            "the child exited, so this is not the pane the trap needs"
+        );
+
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert!(fx.app.select.is_none(), "the highlight is still up");
+        assert_eq!(
+            fx.app.focus,
+            Focus::Left,
+            "a drag left the typist on a live shell with only Alt+S out"
+        );
+    }
+
+    #[test]
+    fn a_focus_key_pressed_over_a_selection_takes_f7s_claim_on_focus_with_it() {
+        // `F7`, `F4`, `F5`, `F7`. The selection deliberately survives `F4` —
+        // the highlight is drawn from the left pane too — so the last press has
+        // a memo to read, and a memo recording only "focus was on the agent
+        // when this selection was made" was still saying `F7` had taken focus
+        // long after `F5` took it over. It then handed focus to the agent on
+        // the strength of a move somebody else made.
+        let mut fx = app();
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+        assert_eq!(fx.app.focus, Focus::Left);
+
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "F7 is what takes focus here");
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Left);
+        assert!(
+            fx.app.select.is_some(),
+            "F4 put the selection away, so there is nothing left to test"
+        );
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "F5 is what took focus now");
+
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert!(fx.app.select.is_none());
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "F7 gave away focus that F5 had taken"
+        );
+    }
+
+    #[test]
+    fn esc_out_of_a_selection_lands_where_a_second_f7_would() {
+        // One mode, one meaning, however you leave it. `Esc` used to hand focus
+        // to the agent unconditionally while `F7` consulted the memo, so
+        // `Alt+A`, `F5`, `F7`, `Esc` finished at the agent and `Alt+A`, `F5`,
+        // `F7`, `F7` finished at the queue — two keys that mean "put this away"
+        // landing two panes apart, with nothing on screen to say which one you
+        // had pressed.
+        let mut fx = app();
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+
+        // Made from the agent: `F7` took focus, so both exits give it back.
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right);
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(fx.app.select.is_none(), "Esc left the highlight up");
+        assert_eq!(
+            fx.app.focus,
+            Focus::Left,
+            "Esc kept the focus F7 had borrowed"
+        );
+
+        // Made from a pane that already had focus: `F7` took nothing, and
+        // neither exit may give away what it did not take.
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right);
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(fx.app.select.is_none());
+        assert_eq!(
+            fx.app.focus,
+            Focus::Right,
+            "Esc out of a selection dropped a reader two panes from the queue"
+        );
+
+        // And `q`, which is the other half of the same arm rather than a
+        // second way out that could drift from it.
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('q'))).unwrap();
+        assert!(fx.app.select.is_none());
+        assert_eq!(fx.app.focus, Focus::Right, "q and Esc are one arm");
+    }
+
+    #[test]
+    fn enter_ends_at_the_agent_however_the_selection_started() {
+        // The one thing a selection does that *is* a focus move, and it stays:
+        // `Enter` puts the rows in the agent's composer, and the composer is
+        // where the user now wants to be typing. True however the selection
+        // began — the rows have gone somewhere else, which is a different
+        // question from which pane the key was pressed in — so this is the case
+        // the test above must not be read as covering.
+        let mut fx = app();
+        stays(&mut fx);
+        fx.app.queue.stub_item("wire-check-handback", Mode::Send);
+        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+
+        // Focused first, and selected second: this is the selection that took
+        // no focus, and the one the round trip above leaves in the right pane.
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right);
+        fx.app.handle_key(key(KeyCode::F(7))).unwrap();
+        screen(&mut fx.app, 120, 24);
+
+        // The row the item is on, for the reason the wire test below gives: a
+        // selection of blank rows is refused with a note and would leave focus
+        // exactly where this test wants to find it.
+        let row = fx
+            .app
+            .select_rows
+            .iter()
+            .position(|row| row.contains("wire-check-handback"))
+            .expect("the queue never drew the item");
+        for _ in 0..row {
+            fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        }
+
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(
+            fx.app.select.is_none(),
+            "the send was refused: {:?}",
+            fx.app.select.as_ref().and_then(Select::note)
+        );
+        assert_eq!(
+            fx.app.focus,
+            Focus::Left,
+            "the rows went to the agent and left the typist behind"
+        );
     }
 
     #[test]

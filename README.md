@@ -229,7 +229,7 @@ pinning it. Everything else you type goes to the agent untouched.
 | `F6` | right pane → ask, nothing attached, **and focus it** (again for what it displaced) |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page |
-| `F7` | select rows of the right pane by keyboard (a drag copies on its own) |
+| `F7` | select rows of the right pane by keyboard, **and focus it** (a drag copies on its own) |
 | `F4` / `F5` | move focus left / right |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
 | `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
@@ -237,6 +237,21 @@ pinning it. Everything else you type goes to the agent untouched.
 | `Alt+Q` | quit (twice while a child is live) |
 | `F1` | key help overlay |
 | `Ctrl+\` or `F12` | send the *next* key to the agent verbatim |
+
+A view key leaves focus where it found it. `Alt+G`, `Alt+E`, `Alt+A` and `F2`
+change what the right pane is showing without moving your keys: if you were
+typing at the agent you still are, and if the right pane had them the view that
+arrives has them. Two other things go with the switch — a view key un-zooms, so
+that asking to see something always shows it, and it drops any highlight you had
+up rather than leaving one hanging over text it no longer names. And "keeps
+them" is about the *slot*, not the pane: the shell you were typing at is not on
+screen any more, so what you type next goes to whatever is.
+
+You can always tell which it is. While the right pane holds your keys its
+border *leads* with the way out — `esc→agent`, or `alt+s→agent` at a live
+shell — ahead of the pane's own title, so a long branch name cannot clip it
+off the end. Nothing else on screen says it: four of the six views draw no
+cursor, so a focused one leaves the window with no cursor anywhere at all.
 
 Once the right pane has focus, plain keys work — deliberately the same
 vocabulary as Claude's own transcript view:
