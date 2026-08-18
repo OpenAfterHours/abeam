@@ -60,7 +60,7 @@ use std::time::Duration;
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{
-    DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache, new_debouncer,
+    DebounceEventResult, DebouncedEvent, Debouncer, NoCache, new_debouncer_opt,
 };
 
 /// One save from an editor is several filesystem events, and an agent writing a
@@ -293,7 +293,7 @@ fn sift<I: IntoIterator<Item = DebouncedEvent>>(root: &Path, events: I) -> Chang
 
 pub struct Watch {
     // Held only to keep the watcher alive; dropping it stops the thread.
-    _debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     rx: Receiver<Change>,
 }
 
@@ -314,7 +314,52 @@ impl Watch {
             }
         };
 
-        let mut debouncer = new_debouncer(DEBOUNCE, None, debounced).ok()?;
+        // `NoCache`, spelled out, rather than the `new_debouncer` convenience —
+        // and this is the whole of abeam's startup time rather than a taste.
+        //
+        // `new_debouncer` hands the debouncer a `RecommendedCache`, which on
+        // Windows and macOS is `FileIdMap` and on Linux is already this. The
+        // watch call below then goes through `FileIdMap::add_path`, which
+        // *synchronously walks the entire tree* — `WalkDir` at unlimited depth,
+        // `get_file_id` on every entry — before it returns. On Windows a file
+        // id is a `CreateFileW` plus a `GetFileInformationByHandle`, so that is
+        // one file open per entry, each of them inspected by the virus scanner
+        // on the way past. Measured on this repository with a populated
+        // `target/`: 34,279 entries, and `debouncer.watch()` took **5.0 s**.
+        // The whole of the rest of abeam's startup is 40 ms, and every one of
+        // those 5 s is spent after `term::setup` has switched to the alternate
+        // screen — so what it looks like from outside is `uvx abeam` finishing
+        // its download and then a blank terminal for five seconds. It scales
+        // with whatever build output happens to be lying around, which is why
+        // it is worse on a machine that has been working than on a fresh clone.
+        //
+        // What the cache buys is rename stitching, and abeam does not use it.
+        // The debouncer pairs a rename when `trackers_match || file_ids_match`;
+        // notify's Windows backend sets no tracker (`src/windows.rs` maps
+        // `FILE_ACTION_RENAMED_OLD_NAME`/`_NEW_NAME` straight to
+        // `RenameMode::From`/`To` with no `attrs`), so on Windows the file ids
+        // are the only thing that can pair one. Paired, a rename arrives as one
+        // event with `paths = [from, to]`; unpaired, as two events carrying one
+        // path each. `is_change` admits both kinds and `classify` below records
+        // every path it is handed — so the set of paths reaching the panes is
+        // the same either way, which is what `classify`'s own comment about a
+        // rename firing under both names already assumes. Identical news, five
+        // seconds cheaper.
+        //
+        // Cheap to get wrong in the other direction, so: this is not a case of
+        // filtering the walk down to the paths `in_noise` would keep. There is
+        // no walk left to filter. The scan was never what made the watcher
+        // work — `ReadDirectoryChangesW` on the root is — it only ever
+        // pre-populated a lookup table for events abeam throws the distinction
+        // away from.
+        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+            DEBOUNCE,
+            None,
+            debounced,
+            NoCache::new(),
+            notify::Config::default(),
+        )
+        .ok()?;
         debouncer.watch(root, RecursiveMode::Recursive).ok()?;
         Some(Self {
             _debouncer: debouncer,
