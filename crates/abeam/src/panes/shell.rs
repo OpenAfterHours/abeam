@@ -26,8 +26,9 @@
 //! `Esc` goes from what [`Pane::handle_key`] returned, so a live child claims
 //! it by reporting `Yes` and a dead one lets it through to mean what it means
 //! everywhere else; and it takes what the border promises from
-//! [`Pane::takes_input`], which is likewise a question about this instant. The
-//! single frame on which that answer is stale is the first: the border is drawn
+//! [`Pane::exit_hint`], which is answered from the same live-or-not question
+//! and is likewise about this instant rather than about the type. The single
+//! frame on which that answer is stale is the first: the border is drawn
 //! before `render`, and `render` is what spawns, so the frame that starts the
 //! shell still advertises `esc→agent` — for the few milliseconds until the new
 //! session's first output asks for another one.
@@ -535,9 +536,9 @@ impl Pane for ShellPane {
     /// would be one more place for the two to disagree.
     fn exit_hint(&self) -> &'static str {
         if self.is_live() {
-            " · alt+s→agent"
+            "alt+s→agent"
         } else {
-            " · esc→agent"
+            "esc→agent"
         }
     }
 

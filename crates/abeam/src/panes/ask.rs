@@ -1834,9 +1834,10 @@ impl Pane for AskPane {
     ///
     /// A question about this instant, per the trait docs, and here the instant
     /// that matters is the one where there is nothing to ask: an unavailable
-    /// ask takes nothing, so leaving it hands focus back to the agent and a
-    /// paste has nowhere to go — both of which are true of it and of no other
-    /// state this pane has.
+    /// ask has no composer, takes nothing and claims no key at all — the one
+    /// state of this pane in which `q` is the shell's rather than a letter
+    /// pushed into a question. Not `Esc`, which the doc below is three-valued
+    /// about: an empty composer falls that one through as well.
     fn takes_input(&self) -> bool {
         self.ready().is_ok()
     }
@@ -1856,9 +1857,9 @@ impl Pane for AskPane {
     /// while there is not, because the composer is live either way.
     fn exit_hint(&self) -> &'static str {
         if self.ready().is_ok() && !self.composing.is_empty() {
-            " · esc→clear"
+            "esc→clear"
         } else {
-            " · esc→agent"
+            "esc→agent"
         }
     }
 
@@ -2277,9 +2278,12 @@ mod tests {
         }
         assert_eq!(p.handle_paste("a question").unwrap(), Handled::No);
         assert_eq!(p.handle_mouse(&wheel_up()).unwrap(), Handled::No);
-        assert!(!p.takes_input(), "a paste has nowhere to go");
+        assert!(
+            !p.takes_input(),
+            "it says typing goes into it, with no composer to put any in"
+        );
         assert_eq!(p.cursor(), None, "and there is nothing to type into");
-        assert_eq!(p.exit_hint(), " · esc→agent");
+        assert_eq!(p.exit_hint(), "esc→agent");
         assert_eq!(p.take_question(), None);
         assert_eq!(p.launch(), None);
 
@@ -3384,17 +3388,17 @@ mod tests {
     #[test]
     fn the_border_names_a_way_out_that_is_true_in_every_state_including_composing() {
         let mut p = live();
-        assert_eq!(p.exit_hint(), " · esc→agent");
+        assert_eq!(p.exit_hint(), "esc→agent");
         assert!(p.takes_input(), "the composer is live from the first frame");
 
         typed(&mut p, "half a question");
-        assert_ne!(p.exit_hint(), " · esc→agent", "esc clears the draft first");
+        assert_ne!(p.exit_hint(), "esc→agent", "esc clears the draft first");
         assert!(p.exit_hint().contains("esc"), "{}", p.exit_hint());
 
         // And it goes back the moment the draft does, one press short of the
         // agent rather than a press away from it.
         p.handle_key(key(KeyCode::Esc)).unwrap();
-        assert_eq!(p.exit_hint(), " · esc→agent");
+        assert_eq!(p.exit_hint(), "esc→agent");
 
         // There is a cursor to look at, inside the pane it was drawn in.
         screen(&mut p, 40, 8);

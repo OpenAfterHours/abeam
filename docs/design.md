@@ -334,9 +334,11 @@ at all. The arrows go to the agent now. `docs/keymap.md` has the evidence, and
 the argument about which side should yield.
 
 Reading the right pane costs nothing: switching views and scrolling both work
-while the agent still has focus. You only need focus to drive a selection — or
-to type, which is what `Alt+S` is for and the only reason a view key moves
-focus.
+while the agent still has focus. You need focus to type into the pane — which is
+what `Alt+S` and `F6` are for, and the only reason a view key ever moves focus —
+or to drive a selection, which is `F7`'s, and `F7` switches no view: it acts on
+whatever is already showing. Every other view key leaves focus exactly where it
+found it, in both directions.
 
 Once the right pane *is* focused, plain keys work, deliberately the same
 vocabulary as Claude's own transcript view — which Copilot's diff mode shares

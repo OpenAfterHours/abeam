@@ -847,8 +847,8 @@ impl Pane for GitPane {
     /// answer to.
     fn exit_hint(&self) -> &'static str {
         match self.mode {
-            Mode::Worktrees => " · esc→git",
-            Mode::Status => " · esc→agent",
+            Mode::Worktrees => "esc→git",
+            Mode::Status => "esc→agent",
         }
     }
 }
@@ -2665,7 +2665,7 @@ mod tests {
     #[test]
     fn w_opens_the_worktree_list_and_esc_gives_back_the_status_list() {
         let (mut pane, _asks, _answers) = detached(ONE);
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
         assert!(!pane.wants_worktrees(), "nothing has asked for anything");
 
         assert_eq!(
@@ -2679,7 +2679,7 @@ mod tests {
         assert!(pane.title().contains("worktrees"), "{}", pane.title());
         assert_eq!(
             pane.exit_hint(),
-            " · esc→git",
+            "esc→git",
             "Esc here is one press short of the agent, and the border is the \
              only place that is written down"
         );
@@ -2688,7 +2688,7 @@ mod tests {
         // Claimed rather than falling through to the shell as "back to the
         // agent", which is what every other Esc in this pane does.
         assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::Yes);
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
 
         // ...and `w` is the way out as well as the way in.
         pane.handle_key(key(KeyCode::Char('w'))).unwrap();
@@ -2696,7 +2696,7 @@ mod tests {
             pane.handle_key(key(KeyCode::Char('w'))).unwrap(),
             Handled::Yes
         );
-        assert_eq!(pane.exit_hint(), " · esc→agent");
+        assert_eq!(pane.exit_hint(), "esc→agent");
         assert!(!pane.takes_input());
         assert!(pane.wants_worktrees(), "and the flag is sticky");
     }
@@ -2719,7 +2719,7 @@ mod tests {
         assert_eq!(pane.take_workspace_request(), None);
         assert_eq!(
             pane.exit_hint(),
-            " · esc→agent",
+            "esc→agent",
             "what a switch is for is the other worktree's git"
         );
 

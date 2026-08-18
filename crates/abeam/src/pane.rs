@@ -106,11 +106,20 @@ pub trait Pane {
     /// has exited takes nothing, and a read-only view with a filter box open
     /// takes everything until the box closes.
     ///
-    /// Two things read it, and both are about what the *user* should be told or
-    /// handed next — never about how an event is dispatched. Leaving such a
-    /// pane for one that does not take typing hands focus back to the agent, so
-    /// `Alt+G` means the same thing from everywhere. And a pane that takes
-    /// typing has somewhere for a paste to go.
+    /// **One thing reads it: the default [`scroll_key`](Pane::scroll_key)
+    /// above.** A glance binding arrives as the bare key it would have been, so
+    /// something has to decide whether that key belongs to the pane or to what
+    /// is being typed into it, and this is that decision and nothing else.
+    ///
+    /// Two other readers were claimed here and neither is real. The shell used
+    /// to hand focus back to the agent when a view switch left a pane that took
+    /// typing for one that did not; that rule is gone, and the argument against
+    /// it is kept once, in `App::set_right_view` — in short, an answer about
+    /// *this instant* gave one view key two destinations. And a paste has never
+    /// been gated on this at all: [`handle_paste`](Pane::handle_paste) is
+    /// offered to whichever pane has focus and declined by returning `No`,
+    /// which is what leaves a read-only pane with a filter box open somewhere
+    /// to put a pasted path.
     ///
     /// Dispatch is [`Handled`]'s job. A pane that wants a key says so by
     /// claiming it, and no second predicate is consulted — one that could
@@ -141,8 +150,19 @@ pub trait Pane {
     ///
     /// The border is the only place this is written down, so it has to be true
     /// in every state the pane can be in, including the ones it passes through.
+    ///
+    /// **The words only — no separator, no padding.** The shell draws this at
+    /// the *front* of the border, ahead of the pane's own title, because a
+    /// title clipped at 46 columns took the hint with it and left the border
+    /// colour as the only thing saying where the keys had gone. Where it sits
+    /// is the shell's decision and can change again; that it reads as one
+    /// phrase is this method's. Every literal behind this call used to open
+    /// with a ` · ` of its own, which put fifty-eight copies of a punctuation
+    /// decision in six files and made the placement above a rewrite of all of
+    /// them — the module doc at the top of this file says the shell owns the
+    /// chrome, and a separator is chrome.
     fn exit_hint(&self) -> &'static str {
-        " · esc→agent"
+        "esc→agent"
     }
 
     /// Pane-relative `(col, row)` of a text cursor, or `None` for no cursor.

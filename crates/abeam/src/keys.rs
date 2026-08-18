@@ -92,8 +92,10 @@ pub enum Action {
     Quit,
     ShowGit,
     ShowViewer,
-    /// Show the command view *and* focus it — the one binding that moves focus,
-    /// because a command line you cannot type into is a picture of one. Pressed
+    /// Show the command view *and* focus it — the one of the four workspace
+    /// views that moves focus, because a command line you cannot type into is a
+    /// picture of one. ([`Action::ShowAsk`] and [`Action::ToggleSelect`] take
+    /// focus too, and say so below; neither is one of the four.) Pressed
     /// again while it already has focus, it hands focus back, so the round trip
     /// to run `git branch` is one key out and the same key home.
     ShowShell,
@@ -315,7 +317,7 @@ pub const HELP: &[(&str, &str)] = &[
     // before anything could be copied.
     (
         "F7",
-        "select rows of the right pane — or just drag, which copies on its own",
+        "select rows of the right pane, and focus it — or just drag, which copies on its own",
     ),
     ("Ctrl+\\ or F12", "send the next key to the agent verbatim"),
     ("", ""),
@@ -353,7 +355,7 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     ("n / N", "document: next / previous match, outside the box"),
     ("Backspace or -", "file list: up a directory"),
-    ("r", "refresh · queue: clear what has finished"),
+    ("r", "refresh · queue: clear what has finished (twice)"),
     // Not a fifth global view key: `Alt+W` is Claude's, and a fifth view
     // spelled `F6` would be a key nobody groups with the other three. Why a
     // bare letter is allowed at all is the *intercept* paragraph at the top of
@@ -389,7 +391,7 @@ pub const HELP: &[(&str, &str)] = &[
     // key nobody can learn.
     ("i", "queue: write a new item"),
     ("a", "queue: arm / disarm sending to the agent"),
-    ("d", "queue: delete the selected item"),
+    ("d", "queue: delete the selected item (twice)"),
     ("m", "queue: switch an item between send and dispatch"),
     // One row rather than a caveat on the three scroll rows above and the two
     // letter rows below, all five of which stop being true one keystroke after
