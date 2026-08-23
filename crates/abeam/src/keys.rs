@@ -22,9 +22,10 @@
 //! does not have to re-derive its own exemption in a comment beside itself.
 //!
 //! Every binding below was checked against Claude Code's own keymap, read
-//! out of its binary, and against GitHub Copilot CLI's, read from GitHub's
-//! published tables and from Ink's source. See `docs/keymap.md` for both
-//! inventories, and for how much weaker the second one is than the first.
+//! out of its binary, against GitHub Copilot CLI's, read from GitHub's
+//! published tables and from Ink's source, and against Codex CLI's defaults.
+//! See `docs/keymap.md` for all three inventories, and for the different
+//! confidence each one earns.
 //!
 //! Weaker in one way that belongs here rather than only there, because this is
 //! the file that claims the keys: `Alt+G`, `Alt+S`, `Alt+J`, `Alt+K`,
@@ -33,6 +34,12 @@
 //! flag the handler is free to ignore — so for those six the invariant is
 //! unrefuted rather than verified, and only a strings audit of the Copilot
 //! binary can settle it.
+//!
+//! Codex adds a different limit: its `/keymap` command can remap TUI actions,
+//! including to function keys. This table is clear of Codex's **defaults**, not
+//! of every user configuration. `Alt+A` is not clear even by that standard:
+//! Codex uses it to open its agent-session overview, so abeam yielded it and
+//! moved the queue to `F8`.
 //!
 //! The short version of why the namespace is `Alt`:
 //!
@@ -70,8 +77,9 @@
 //! whoever is listening.
 //!
 //! The replacement is `F4`/`F5`, and it is an F-key rather than two more Alt
-//! letters because F-keys are the only namespace abeam has that is
-//! *structurally* safe in both agents rather than merely unclaimed in both:
+//! letters because F-keys were the only namespace abeam had that was
+//! *structurally* safe in the two agents supported at the time rather than
+//! merely unclaimed in both:
 //!
 //! - Claude binds no function key in any context, in the 2.1.220 binary.
 //! - Copilot CLI is an Ink application, and `useInput` — the hook an Ink app
@@ -84,6 +92,13 @@
 //!
 //! That is a stronger claim than "we could not find it documented", which is
 //! precisely the evidence that would have cleared `Alt+F` in Claude.
+//!
+//! Codex can see and remap F-keys, so that structural claim no longer extends
+//! to every hosted agent. The shipped Codex binary exposes its default
+//! `Alt+A` action and no `F8` action in its strings; that absence is weaker
+//! evidence than the collision itself. `F8` is the least disruptive
+//! replacement for the queue, but a user who remaps Codex to `F8` must use
+//! literal-next or choose a non-colliding Codex binding.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -100,7 +115,7 @@ pub enum Action {
     /// to run `git branch` is one key out and the same key home.
     ShowShell,
     /// Show the queue: work lined up for the agent. A workspace view like git
-    /// and the reader, and reached the same way — it does *not* take focus,
+    /// and the reader, reached with `F8` — it does *not* take focus,
     /// because the common case is glancing at what is still to come while the
     /// agent works and you keep typing at it.
     ShowQueue,
@@ -215,13 +230,12 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // F6 for the ask, and an F-key rather than an `Alt` letter for a
         // stronger version of F2's and F3's reason. The letters this key would
         // want are gone twice over: `?` is not reachable under `Alt` on every
-        // layout, `Alt+A` is the queue, and the classic readline meta set that
-        // caught `Alt+F` covers most of what is left. And there is now a second
-        // agent to clear a binding against, which is the part that decides it —
-        // no function key appears in any published Copilot shortcut table, and
-        // Copilot CLI is an Ink application whose `useInput` cannot describe one
-        // to a handler at all. `Alt` is the namespace both agents actually use;
-        // the F-keys are the one namespace both leave alone.
+        // layout, `Alt+A` is Codex's, and the classic readline meta set that
+        // caught `Alt+F` covers most of what is left. Copilot CLI is an Ink
+        // application whose `useInput` cannot describe a function key to a
+        // handler at all; Claude binds none, and Codex's defaults leave F6
+        // alone. Codex can remap it, which is the custom-keymap limitation the
+        // module documentation and docs/keymap.md disclose.
         //
         // It joins F2 rather than the four view keys, and the grouping is real
         // rather than a leftover: `Diag` and `Ask` are the two views that
@@ -234,12 +248,19 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // free". It is the only namespace that *can* carry this: the key has to
         // work while the shell view has focus, and a shell with a live child in
         // it takes every key including `Esc` and `q`. A letter — bare, or under
-        // the `Alt` both agents use — would either be swallowed by that child
-        // or shadow a binding of the agent on the left. The two F-key audits in
-        // this file's header are what make this one safe, and they are about
+        // the `Alt` the agents use — would either be swallowed by that child or
+        // shadow a binding of the agent on the left. The default-keymap audits
+        // in this file's header are what make this one safe, and they are about
         // the *agent*; what makes it safe in the shell is that abeam claims it
         // before any pane is offered it, which is what `global` means.
         KeyCode::F(7) if bare => Some(Action::ToggleSelect),
+        // Codex owns the queue's former `Alt+A`: its default global keymap uses
+        // that key to open the agent-session overview. No Codex `F8` action
+        // surfaced in the shipped binary's strings. Unlike Claude and Copilot,
+        // Codex can distinguish and remap function keys, so this is absence
+        // evidence rather than a structural guarantee; docs/keymap.md records
+        // the audited build and the custom-keymap limitation.
+        KeyCode::F(8) if bare => Some(Action::ShowQueue),
 
         _ if !alt => None,
 
@@ -253,17 +274,6 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // held to the same standard as `g` and `e`, and re-checked against the
         // installed binary when the command view landed. See docs/keymap.md.
         KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ShowShell),
-        // `a` for the agenda of work still to come. Held to the same standard
-        // as `g`, `e` and `s`, and cleared the same way: `meta+a` and `alt+a`
-        // are both absent from the 2.1.220 binary — zero matches, where the
-        // undeclared readline bindings that caught `Alt+F` do appear as text —
-        // and `a` is not in the classic readline meta set (`b f d l u c t r y
-        // n p`) that Claude's prompt editor handles without declaring. It is a
-        // letter rather than an F-key because it joins a set: `Alt+G`, `Alt+E`,
-        // `Alt+S`, `Alt+A` are the four workspace views, and a fourth spelled
-        // `F6` would be a key nobody groups with the other three.
-        KeyCode::Char('a') | KeyCode::Char('A') => Some(Action::ShowQueue),
-
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('z') | KeyCode::Char('Z') => Some(Action::ToggleZoom),
         // There is no arm here for `Alt+←` or `Alt+→`, and the gap is the
@@ -284,7 +294,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("Alt+G", "right pane: git"),
     ("Alt+E", "right pane: files (again for the file list)"),
     ("Alt+S", "right pane: a shell, focused (again to leave)"),
-    ("Alt+A", "right pane: the queue of work for the agent"),
+    ("F8", "right pane: the queue of work for the agent"),
     ("F4 / F5", "move focus left / right"),
     ("Alt+J / Alt+K", "scroll right pane, without focusing it"),
     (
@@ -526,8 +536,8 @@ mod tests {
 
     #[test]
     fn the_agents_alt_bindings_are_left_alone() {
-        // Plural, since abeam gained a second agent: Alt is claimed by both of
-        // them, in different places, and abeam has to clear both.
+        // Plural because Alt is claimed by all three agents in different
+        // places, and abeam has to clear every one.
 
         // `b f d y v m p o t w` and Alt+arrows-up/down are Claude's, several of
         // them undeclared readline bindings in its prompt editor.
@@ -554,6 +564,17 @@ mod tests {
                 global(&k(code, KeyModifiers::ALT)),
                 None,
                 "Alt+{arrow} is Copilot's word-motion; abeam's focus keys are F4 and F5"
+            );
+        }
+
+        // Codex's default global keymap uses Alt+A to open the agent-session
+        // overview. This was abeam's queue key before Codex became a built-in;
+        // the queue moved to F8 rather than shadowing a hosted agent action.
+        for c in ['a', 'A'] {
+            assert_eq!(
+                global(&k(KeyCode::Char(c), KeyModifiers::ALT)),
+                None,
+                "Alt+{c} is Codex's open-agents binding; abeam's queue key is F8"
             );
         }
     }
@@ -608,6 +629,10 @@ mod tests {
             global(&k(KeyCode::F(7), KeyModifiers::NONE)),
             Some(Action::ToggleSelect)
         );
+        assert_eq!(
+            global(&k(KeyCode::F(8), KeyModifiers::NONE)),
+            Some(Action::ShowQueue)
+        );
     }
 
     #[test]
@@ -616,7 +641,7 @@ mod tests {
         // has to argue with. A live shell claims `Esc`, `q` and every letter,
         // so a selection key that was pane-local would be missing from the one
         // view the feature exists for — and no `Alt` letter is available
-        // either, because that namespace belongs to the two agents.
+        // either, because that namespace belongs to the agents.
         assert_eq!(global(&k(KeyCode::Char('v'), KeyModifiers::NONE)), None);
         assert_eq!(global(&k(KeyCode::Char('y'), KeyModifiers::NONE)), None);
         assert_eq!(global(&k(KeyCode::Char('v'), KeyModifiers::ALT)), None);
@@ -632,8 +657,8 @@ mod tests {
         assert_eq!(global(&k(KeyCode::Char('?'), KeyModifiers::SHIFT)), None);
         // And `Alt+?` is not it either. It is a shifted key under `Alt`, which
         // is a shape neither agent's keymap has been audited against — and `Alt`
-        // is the namespace both of them actually use, where the F-keys are the
-        // one namespace both leave alone.
+        // is the namespace all of them actually use. The default keymaps leave
+        // F6 alone; Codex's remapping support is documented separately.
         assert_eq!(global(&k(KeyCode::Char('?'), KeyModifiers::ALT)), None);
         assert_eq!(
             global(&k(
@@ -665,11 +690,11 @@ mod tests {
 
     #[test]
     fn a_modified_f_key_belongs_to_the_agent() {
-        // Not "to Claude" any more: the bare F-keys are cleared in both agents,
-        // and by different arguments — absent from Claude's binary, and beyond
-        // what Ink's `useInput` can even describe to a Copilot handler. Neither
-        // argument was ever made about a *modified* F-key, so those stay the
-        // agent's, whichever agent it is.
+        // Not "to Claude" any more: the bare F-keys are cleared against every
+        // agent's default keymap, by different arguments — absent from Claude's
+        // binary, beyond what Ink's `useInput` can describe to a Copilot
+        // handler, and unbound by default in Codex. None of those audits cleared
+        // a *modified* F-key, so those stay the agent's, whichever agent it is.
         //
         // Ctrl+F12 is the one that shows what the cost of guessing would be:
         // swallowing it would arm literal-next with nothing on screen to say so,
@@ -680,7 +705,7 @@ mod tests {
             KeyModifiers::ALT,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ] {
-            for n in [1u8, 2, 3, 4, 5, 6, 7, 12] {
+            for n in [1u8, 2, 3, 4, 5, 6, 7, 8, 12] {
                 assert_eq!(
                     global(&k(KeyCode::F(n), mods)),
                     None,
@@ -700,8 +725,8 @@ mod tests {
         }
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
         for expected in [
-            "Alt+G", "Alt+E", "Alt+S", "Alt+A", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4", "F5",
-            "F6", "F7",
+            "Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4", "F5", "F6", "F7",
+            "F8",
         ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),

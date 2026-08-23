@@ -2402,8 +2402,8 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => {
                 // The same memo `F7` reads, because this is the same door. One
                 // mode with two ways out that landed in two different places is
-                // a mode nobody can predict: `Alt+A`, `F5`, `F7`, `Esc` used to
-                // finish at the agent while `Alt+A`, `F5`, `F7`, `F7` finished
+                // a mode nobody can predict: `F8`, `F5`, `F7`, `Esc` used to
+                // finish at the agent while `F8`, `F5`, `F7`, `F7` finished
                 // at the queue, and nothing on screen distinguished them.
                 self.select = None;
                 if self.select_took_focus {
@@ -4015,7 +4015,7 @@ mod tests {
         // The shell's half of the queue's confirmation, and the half only the
         // shell can do: a pane is never told it has been put away — `tick` runs
         // whether or not it is showing — so `set_right_view` is the one place
-        // that knows. Without the call, `d`, `Alt+G`, `Alt+A`, `d` deleted an
+        // that knows. Without the call, `d`, `Alt+G`, `F8`, `d` deleted an
         // item on what the user experienced as a single press, having been
         // asked about it on a screen they had long since left. The view keys
         // leave focus in the pane now, which is what makes the sequence a
@@ -6657,7 +6657,7 @@ mod tests {
         );
 
         // And a selection dropped by something *else* leaves nothing behind for
-        // the next one to read: `Alt+A` takes this one away without touching
+        // the next one to read: `F8` takes this one away without touching
         // focus, so the `F7` after it is a press from the right pane like any
         // other and owes the agent nothing.
         fx.app.focus = Focus::Left;
@@ -6762,7 +6762,7 @@ mod tests {
     fn esc_out_of_a_selection_lands_where_a_second_f7_would() {
         // One mode, one meaning, however you leave it. `Esc` used to hand focus
         // to the agent unconditionally while `F7` consulted the memo, so
-        // `Alt+A`, `F5`, `F7`, `Esc` finished at the agent and `Alt+A`, `F5`,
+        // `F8`, `F5`, `F7`, `Esc` finished at the agent and `F8`, `F5`,
         // `F7`, `F7` finished at the queue — two keys that mean "put this away"
         // landing two panes apart, with nothing on screen to say which one you
         // had pressed.

@@ -22,13 +22,28 @@
 > The GitHub Copilot CLI sections at the foot of this document carry their own
 > provenance, and it is weaker. The two are not interchangeable and are kept
 > apart for that reason.
+>
+> The Codex section carries a third provenance: the official npm package
+> `@openai/codex@0.149.0-win32-x64`, downloaded but not installed on 2026-08-23.
+> Its `codex.exe` reports **codex-cli 0.149.0**, is 297,362,224 bytes, and has
+> SHA-256 `14B7E6B2356E82D1D9275579EAA588757B4E0A501B65DCC19FCCDF77BD83DC00`.
+> The binary evidence was checked against OpenAI's complete `built_in_defaults`
+> table at the matching `rust-v0.149.0` source tag. No authenticated session was
+> available, so modal behaviour was not audited live.
 
 ## The invariant
 
-**Nothing abeam intercepts may be a key any supported agent can act on.** The
+**Against each agent's shipped default keymap, nothing abeam intercepts may be
+a key that agent can act on.** The
 plural is the whole difficulty: a binding is safe only if it is a no-op in
 *every* agent abeam can host, so gaining an agent can retire a key that was
-safe when there was one. It has already retired one.
+safe when there was one. It has already retired two: Copilot took the Alt
+arrows, and Codex took `Alt+A`.
+
+User overrides are outside that guarantee. Claude and Codex both support
+custom keymaps, and abeam does not load or merge their configuration. No static
+abeam table can be collision-free against arbitrary remappings; literal-next
+(`Ctrl+\` or `F12`) is the recovery path when an override overlaps one.
 
 Every abeam binding below was checked against the Claude inventory below and is
 a verified no-op in Claude today. Against Copilot CLI the same check has been
@@ -37,8 +52,12 @@ weaker, and it found one collision: `Alt+Left` and `Alt+Right`, which GitHub
 declares as word-motion in its own command reference. **abeam gave them up.**
 Focus movement is `F4` and `F5`, and the arrows go to the agent.
 
-That removed the one breach this audit knew about, and yielding a key verifies
-nothing else, so be exact about what the invariant is worth in each agent. In
+Codex found the second collision. Its default global keymap binds `Alt+A` to
+opening the shared agent-session overview. **abeam gave it up too.** The queue
+is now `F8`; no `F8` collision surfaced in the audited shipped artefacts.
+
+Those changes removed the two breaches this audit knew about, and yielding a
+key verifies nothing else, so be exact about what the invariant is worth. In
 Claude it is **verified**: the inventory came out of the installed binary,
 which is the only reason it caught `Alt+F`. In Copilot it is **unrefuted**,
 which is a weaker thing entirely — six of abeam's bindings, `Alt+G`, `Alt+S`,
@@ -52,7 +71,11 @@ broken for one agent", and not "verified for both". Only the Copilot binary can
 settle the six; "Known gaps, against Copilot" at the foot of this document says
 so again, and the README's disclosure bullet is the third place. The evidence
 for the collision, and the reasoning about which side should yield, are under
-"The collision, and how it was settled" below.
+"The collision, and how it was settled" below. Codex is a fourth confidence
+level: its shipped Windows binary establishes the `Alt+A` collision and its
+default F-key gap, but Codex also lets users remap TUI actions with `/keymap`.
+The strict invariant therefore applies to Codex's defaults, not to an arbitrary
+`tui.keymap` in a user's `config.toml`; literal-next remains the escape hatch.
 
 Typing at the agent is byte-for-byte what the pty spike did.
 
@@ -65,7 +88,7 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `Alt+G` | right pane → git view (focus unchanged) |
 | `Alt+E` | right pane → files / markdown view (focus unchanged) |
 | `Alt+S` | right pane → a shell, **and focus it**; again to hand focus back |
-| `Alt+A` | right pane → the queue of work for the agent (focus unchanged) |
+| `F8` | right pane → the queue of work for the agent (focus unchanged) |
 | `F4` / `F5` | move focus left / right |
 | `Alt+J` / `Alt+K` | scroll right pane one line — **without focusing it** |
 | `Alt+PageDown` / `Alt+PageUp` | scroll right pane one page — without focusing it |
@@ -79,7 +102,7 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `Ctrl+\` or `F12` | literal-next: send the following key to the agent verbatim |
 
 **"Focus unchanged" holds in both directions.** The four rows marked so —
-`Alt+G`, `Alt+E`, `Alt+A` and `F2` — neither take focus nor hand it back:
+`Alt+G`, `Alt+E`, `F8` and `F2` — neither take focus nor hand it back:
 `Alt+E` pressed while a shell has your keys leaves them on the right pane, now
 showing the files view, rather than returning you to the agent. abeam used to
 make that second move, leaving a pane you could type into for one you could not,
@@ -97,24 +120,23 @@ was spending a key on a job already done twice.
 `Alt+S` is the one workspace view key that moves focus, and the exception is
 deliberate: a command line you have to press a second key to type into is a
 picture of a command line. (`F6` and `F7` move it too, and say so in the table;
-neither is one of the four views `Alt+G`, `Alt+E`, `Alt+S` and `Alt+A` switch
+neither is one of the four views `Alt+G`, `Alt+E`, `Alt+S` and `F8` switch
 between.) It is also the only right-hand view that keeps `Esc` and `q` —
 they belong to the shell — so the border advertises the way out instead.
 
-**`Alt+A` was verified the same way, on 2026-08-02, against the same 2.1.220
-binary**: `rg -a 'meta\+a\b|alt\+a\b'` over `claude.exe` returns **zero
-matches**, where the undeclared readline bindings that caught `Alt+F` do appear
-as text — so this is the strong form of the test rather than the absence of
-documentation that would have cleared `Alt+F`. `a` is also outside the classic
-readline meta set (`b f d l u c t r y n p`) that Claude's prompt editor handles
-without declaring.
+**The queue moved from `Alt+A` to `F8` for Codex.** `Alt+A` really was clear in
+Claude 2.1.220 — the earlier binary audit found zero `meta+a`/`alt+a` matches —
+and Copilot's documentation-derived audit found none either. Codex 0.149.0's
+shipped keymap instead places the literal `alt-a` beside
+`tui.keymap.global.open_agents`, its shared agent-session overview. Keeping the
+four view keys as an Alt-letter set is less important than preserving an action
+in the hosted agent, so abeam yielded as it did for Copilot's Alt arrows.
 
-It is a letter and not an F-key on purpose, and the reason is the set rather
-than the key: `Alt+G`, `Alt+E`, `Alt+S` and `Alt+A` are the four workspace
-views, and a fourth spelled `F6` would be a binding nobody groups with the
-other three. The F-key argument in `keys.rs` is about what is *structurally*
-safe in both agents, and it is still the right answer for a key that has no
-set to join — which is why `F2` and `F3` are F-keys and this is not.
+`F8` is unused in the three audited default keymaps. For Claude and Copilot the
+old structural F-key arguments still apply; Codex can distinguish F-keys and
+allows users to remap them. The claim for Codex is therefore only about the
+default keymap. A custom Codex `tui.keymap` can collide with `F8` (or any other
+abeam key), and abeam does not currently read that file.
 
 **`Alt+S` was verified the same way the rest of this table was**, against
 2.1.220: absent from every declared `context/bindings` block (`meta+s` and
@@ -140,17 +162,15 @@ looks would defeat the point.
 
 `F6` is an F-key by the same argument as `F2` and `F3`, and by one more that
 neither of them had to make. The letters an "ask" binding would reach for are
-gone twice over — `Alt+A` is the queue, `Alt+Q` is quit, and `?` is a shifted
-key whose `Alt` form no audit here has looked at in either agent — and by the
-time this landed there were two agents to clear a binding against rather than
-one. `Alt` is the namespace both of them actually use; the F-keys are the one
-namespace both leave alone, and the Copilot half of that is *structural* rather
+gone twice over — `Alt+A` is Codex's, `Alt+Q` is quit, and `?` is a shifted
+key whose `Alt` form no audit here has looked at in every agent. When this
+landed there were two agents to clear; Codex's default now clears it too. The
+Claude and Copilot F-key arguments are *structural* rather
 than merely unrefuted (see "Why Ink settles the function keys and unsettles the
-letters"). It joins `F2` rather than the four `Alt` view keys, and that grouping
+letters"). It joins `F2` rather than the four view keys, and that grouping
 is real: the diagnostics and the ask are the two views that displace another and
-put it back, and neither is remembered as a workspace view. The `Alt+A`
-paragraph above still stands — a fifth *view* spelled `F6` would be a key nobody
-groups with the other four — because this is not a fifth view.
+put it back, and neither is remembered as a workspace view. This is not a fifth
+view; the queue's forced move to `F8` does not change that grouping.
 
 It is the global half of a pane-local `?`, and the two are deliberately
 different keys rather than two spellings of one. `?` means "about the file I am
@@ -236,7 +256,7 @@ now.
 `d` and `r` ask twice — press again, with the foot line saying so, and *any*
 other key, paste or click is the answer no. They are the two keys here that
 throw work away, and they stopped being reachable only on purpose when a view
-key stopped moving focus: `Alt+A` to glance at the queue from a shell leaves the
+key stopped moving focus: `F8` to glance at the queue from a shell leaves the
 keys in the pane, so the rest of a half-typed command is read as commands, and
 `cargo doc --release` carries a `d` and two `r`s.
 
@@ -735,3 +755,41 @@ which is the whole of what abeam controls.
   implement it, so inside abeam Copilot falls back to legacy encoding. That is
   what makes the `Ctrl+\` and function-key reasoning above apply; it would need
   re-checking the day abeam gains Kitty support.
+
+## Codex CLI's bindings, as of the audited build
+
+The official OpenAI documentation establishes two facts that change the shape
+of this audit: Codex exposes `/keymap`, and bindings persist under
+`tui.keymap.<context>.<action>` in `config.toml`. Contexts include `global`,
+`chat`, `composer`, `editor`, `pager`, `list` and `approval`; function keys are
+valid remap targets. There is therefore no agent-independent claim that a key
+left unused by Codex's defaults will remain unused in every Codex installation.
+
+The static audit used the official Windows npm artefact recorded in the
+provenance block above and OpenAI's complete `built_in_defaults` table at the
+matching
+[`rust-v0.149.0` source tag](https://github.com/openai/codex/blob/rust-v0.149.0/codex-rs/tui/src/keymap.rs).
+The binary contains `alt-a` beside `tui.keymap.global.open_agents`; the source
+confirms that binding and contains no function-key default. That makes `Alt+A`
+a direct collision with abeam's former queue binding and clears bare `F8` as
+its replacement against this version's complete shipped defaults.
+
+| Key | Verdict against Codex 0.149.0 defaults | Why |
+| --- | --- | --- |
+| `Alt+A` | **collision — abeam yielded** | Codex opens its shared agent-session overview; abeam now forwards the key. |
+| `F8` | no default binding | The complete matching default table contains no function-key binding; Codex can still bind it through a custom keymap. |
+| Other abeam globals | clear in the default table | No collision appears in the complete matching `built_in_defaults`; this was not a live authenticated-modal audit. |
+
+### Known gaps, against Codex
+
+- **No live TUI audit was run.** `codex` was not installed or authenticated on
+  this machine. The official package was downloaded without installation and
+  inspected statically, so modal behaviour and the complete input path through
+  abeam's PTY remain to be exercised.
+- **Custom keymaps can invalidate the default audit.** A user can assign `F8`
+  or another abeam key to a Codex action. abeam does not parse Codex's layered
+  configuration and cannot promise the strict invariant for arbitrary
+  `tui.keymap` overrides. Literal-next (`Ctrl+\` or `F12`) is the recovery path.
+- **The audit is Windows-only.** A Linux Codex binary and Linux terminal path
+  were not inspected. Run `keyprobe`, then host Codex and use literal-next to
+  exercise every abeam global in the composer, lists, pager and approval UI.

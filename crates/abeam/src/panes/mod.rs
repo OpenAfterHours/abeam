@@ -28,7 +28,7 @@ pub enum RightView {
     Shell,
     /// Work lined up for the agent: typed into the live session when it goes
     /// idle, or dispatched as background agents. A workspace view like the
-    /// three above — `F2` remembers it, and it is reached by `Alt+A`.
+    /// three above — `F2` remembers it, and it is reached by `F8`.
     Queue,
     /// The pty instrument. Not one of the workspace views — it is reached by a
     /// toggle that remembers what it displaced, because you go there to answer
@@ -46,7 +46,7 @@ pub enum RightView {
     /// arrive at from another one has to remember which, so it is left out of
     /// `App::last_workspace_view` exactly as `Diag` is. `F6` is a global key
     /// and does not change that: it is `Diag`'s `F2` rather than the queue's
-    /// `Alt+A`, which is the same distinction seen from the key's side.
+    /// `F8`, which is the same distinction seen from the key's side.
     ///
     /// It is per workspace, beside the shell, because the child's working
     /// directory belongs to the child — see `crate::app::Space`. Everything
