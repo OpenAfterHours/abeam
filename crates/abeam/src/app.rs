@@ -3626,7 +3626,6 @@ mod tests {
         // dangerous answer: `Idle` is the only state that lets a send leave.
         let mut fx = app();
         let _records = records(&mut fx, "idle");
-        stays(&mut fx);
         fx.app.agent = "codex".to_string();
         assert_eq!(fx.app.probe.readiness(), Readiness::Idle);
 
@@ -3638,12 +3637,22 @@ mod tests {
             Some("queue 1"),
             "Claude's idle record announced an automatic Codex send"
         );
+        assert_eq!(
+            fx.app.queue.take_send_request(),
+            None,
+            "Codex produced an automatic send request"
+        );
 
         // The manual route reads the same readiness and must stay closed too.
+        // Assert at the queue drain rather than through a live pty: the pty's
+        // bracketed-paste gate is independent, and would make either answer
+        // look safe while adding a long-lived child to this process-heavy suite.
         fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
-        assert!(!fx.app.pump_queue(), "Codex received a queued prompt");
-        assert!(!agent_screen(&fx).contains("never sent to codex"));
-        assert_eq!(keys_sent(&fx), 0);
+        assert_eq!(
+            fx.app.queue.take_send_request(),
+            None,
+            "Codex produced a manually requested send"
+        );
     }
 
     #[test]
