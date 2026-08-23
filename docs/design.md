@@ -51,6 +51,7 @@ abeam -p "fix the tests"  # ...and `claude -p "fix the tests"`
 abeam agent               # ...and `claude agent`, subcommands included
 
 abeam +copilot --resume   # GitHub Copilot CLI, with its own --resume
+abeam +codex [args]       # OpenAI Codex CLI; every argument is forwarded
 abeam +bash               # anything else on PATH
 abeam +help               # abeam's own help; `--help` is the agent's
 abeam -- +1 more thing    # `--` stops abeam reading, and goes to the agent too
@@ -64,9 +65,10 @@ next section says what those lines do without one.
 A `+` token is read only in the first position and there is at most one: a
 prompt may begin with a `+`, and `abeam config set +x` is a real command line.
 `+name` is resolved exactly as the old positional was — if it names an agent
-abeam knows, `claude` or `copilot`, or a preset out of your config file, matched
-without regard to case, abeam looks that entry's executables up on `PATH`;
-anything else is a program name and means what `abeam bash` used to mean. Spaces
+abeam knows, `claude`, `copilot` or `codex`, or a preset out of your config
+file, matched without regard to case, abeam looks that entry's executables up
+on `PATH`; anything else is a program name and means what `abeam bash` used to
+mean. Spaces
 around the name are trimmed, so `abeam "+claude "` is `abeam +claude` rather
 than a hunt for a program with a space on the end of it. Two words behind the
 sigil are reserved and only two, `+help` and `+version`, and like every other
@@ -110,15 +112,27 @@ spelling every other line here teaches — is refused with the correction printe
 rather than accepted with the `+` quietly dropped. The sigil says which token on
 a command line is abeam's, and there is no token to mark inside a variable.
 
-**`abeam claude` and `abeam copilot` are refused rather than reinterpreted**,
-with exit code 2 and a message naming both readings and both ways out. They
-hosted those agents for the whole of abeam's life before this, they are written
-that way in every older copy of this document, and what you would otherwise get
-is `claude claude` — the agent's own complaint about an argument it does not
-have, on a screen that never mentions abeam. That refusal is permanent, not a
-migration aid, and it is a fixed lookup in abeam's own table rather than a `PATH`
-probe: a refusal that depended on what happened to be installed would accept a
-command line on your machine and reject it on a build server.
+**`abeam claude`, `abeam copilot` and `abeam codex` are refused rather than
+reinterpreted**, with exit code 2 and a message naming both readings and both
+ways out. That refusal is permanent, not a migration aid, and it is a fixed
+lookup in abeam's own table rather than a `PATH` probe: a refusal that depended
+on what happened to be installed would accept a command line on your machine
+and reject it on a build server.
+
+Codex is a first-class **interactive host**, not a claim that Claude-specific
+side channels generalise. `abeam +codex [args]` forwards the line unchanged to
+the Codex TUI in the left pty. Ask is unavailable. The readiness probe reads
+Claude's session records, so under Codex it deliberately reports `Unknown`:
+queue send items cannot drain automatically **or** through `Enter`, and must be
+typed in the left pane instead. Background dispatch and its roster are
+Claude-only and stay unavailable. This fails closed rather than treating a
+neighbouring Claude record in the same repository as Codex's state.
+
+The prerequisite is the official CLI on `PATH` — `npm i -g @openai/codex` —
+and a direct `codex` run signed in with ChatGPT or an API key. abeam neither
+installs Codex nor owns its credentials; OpenAI's [CLI
+setup](https://learn.chatgpt.com/docs/codex/cli) and [authentication
+guide](https://learn.chatgpt.com/docs/auth) are authoritative for both.
 
 The message rewrites the **first token** and leaves the rest of your line
 described rather than quoted, which is a correction: it used to print your whole
@@ -256,18 +270,29 @@ host  = "claude"     # an agent abeam knows, or any program on PATH
 args  = ["agent"]
 view  = "queue"
 theme = "dark"
+
+[preset.openai]
+host  = "codex"
+view  = "files"
 ```
 
 `[defaults]` is how every session on the machine opens. A **preset** is a name
 behind the sigil that behaves exactly like a built-in agent: `abeam +fleet
 --resume` starts `claude agent --resume` with the queue showing,
 `ABEAM_AGENT=fleet abeam` does the same, and `+help` lists `fleet` beside
-`claude` and `copilot`. A preset's own `args` go in *front* of what you typed,
+`claude`, `copilot` and `codex`. The `openai` example resolves to the built-in
+Codex host: `abeam +openai [args]` starts Codex and forwards those arguments
+after any preset `args`. A preset's own `args` go in *front* of what you typed,
 because a subcommand is the first word of the line it belongs to — behind them,
 `abeam +fleet --resume` would be `claude --resume agent`, which is a different
 command in every agent abeam hosts. Its four opening keys override `[defaults]`
 field by field, so the preset above moves the view and leaves the rest where the
 defaults put them.
+
+`codex` joining the built-in table reserves that name. An existing
+`[preset.codex]` is now refused as ambiguous and must be renamed —
+`[preset.openai]` above is one possible migration — with callers changed to the
+new `+name`.
 
 Three rules, each of them a refusal you will see rather than a surprise you
 will not:
@@ -280,8 +305,8 @@ will not:
   config file — bought, otherwise, with a cycle check on the path that decides
   which program starts.
 - **A preset may not take a name abeam already answers** — `claude`, `copilot`,
-  `help` or `version`. It would be a name with two meanings and one of them
-  unreachable, with nothing on screen saying which of the two ran. Two presets
+  `codex`, `help` or `version`. It would be a name with two meanings and one of
+  them unreachable, with nothing on screen saying which of the two ran. Two presets
   whose names differ only in case are refused for the same reason, since every
   name behind a `+` is matched without regard to case.
 - **A preset name is refused in front of the sigil too.** `abeam fleet` gets the
@@ -306,19 +331,22 @@ Everything abeam binds lives under `Alt` and the F-keys, with one exception:
 `Ctrl+\`, the escape hatch at the foot of the table, which has to be reachable
 on the day an `Alt` key stops being safe and so cannot live in the namespace it
 exists to rescue. (`F12` is its alias, for layouts that put backslash behind
-AltGr.) **Nothing abeam claims is a key the hosted agent can act on** — the
-audit behind that is `docs/keymap.md`, and `crates/abeam/src/keys.rs` has tests
-pinning it. Everything else you type goes to the agent untouched.
+AltGr.) The shipped defaults of each supported agent are audited in
+`docs/keymap.md`, and `crates/abeam/src/keys.rs` pins abeam's side. Codex also
+supports custom `tui.keymap` bindings, so a local configuration can assign an
+abeam key such as `F8`; literal-next is the recovery path when it does.
 
 | Key | |
 | --- | --- |
 | `Alt+G` | right pane → git |
 | `Alt+E` | right pane → files / markdown (again for the file list) |
 | `Alt+S` | right pane → a shell, **and focus it** (again to hand focus back) |
+| `F8` | right pane → the queue |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page |
 | `F4` / `F5` | move focus left / right |
 | `F6` | right pane → **ask**, with nothing attached, **and focus it** (again for what it displaced) |
+| `F7` | select rows of the right pane by keyboard, **and focus it** |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
 | `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
 | `Alt+Z` | zoom: hide / show the right pane |
@@ -380,8 +408,9 @@ which set a key joins, and it still holds.)
 
 `?` is the second key in that vocabulary that is not about reading, and the table
 above is right to leave it out for exactly the reason it leaves out `w`. In the
-document the reader is showing, or in the git view, it opens **ask** — a second
-copy of your agent in the right pane, described under "The panes" — with the
+document the reader is showing, or in the git view, it opens **ask** — a
+second-agent pane where the hosted provider supports it, described under "The
+panes" — with the
 file you were looking at attached to the first question, and `Esc` puts back the
 view it displaced the way `F2` does out of the diagnostics. Those two views and
 no others: the file list and the `f` results own every key while they are up, so
@@ -398,9 +427,9 @@ a file at all — it is about the repository, and there is no pane to press `?` 
 without first switching to one you did not want to look at. So `F6` opens the
 ask from anywhere, focused, with no context on it, and a second press puts back
 what it displaced. It is an F-key rather than an `Alt` letter for the reason
-`F2` and `F3` are: every plausible letter is Claude's or Copilot's, and the
-F-keys are the one namespace both agents leave alone. Showing it is also the
-only way to take an attached file back **off** — an attachment survives until the
+`F2` and `F3` are: every plausible letter is already occupied somewhere in the
+supported agents' default maps, while this F-key is clear in the audited
+defaults. Showing it is also the only way to take an attached file back **off** — an attachment survives until the
 question it rides on has gone, so before this, `?` on the wrong file left you
 asking about it or clearing the whole conversation. Nothing is hidden by that:
 the row naming the attachment is what disappears.
@@ -503,8 +532,8 @@ the queue's `Enter` is a separate pass: rows off a screen are not a message
 somebody wrote, and the one who decides they are is the one at the keyboard.
 
 `Ctrl+\` exists so abeam can never permanently shadow a binding of the agent you
-are typing at. If a future Claude or Copilot release binds `Alt+G`, `Ctrl+\`
-then `Alt+G` still reaches it.
+are typing at. If a future agent release or Codex custom keymap binds `Alt+G`,
+`Ctrl+\` then `Alt+G` still reaches it.
 
 ## The panes
 
@@ -664,13 +693,13 @@ what somebody has watched happen — and read what comes out of it as a model's
 answer, which can be fluent, specific and wrong. [Status](status.md) says
 both of those again, with the rest of what this pane costs.
 
-**It is whichever agent you are hosting**, and the two are not the same pane
-under the skin. Everything from here to "`Enter` never runs anything" describes
-the Claude one, which is the one that has been probed; "Asking Copilot instead"
-below is the other, and is a shorter section because there is less that can
-honestly be said about it. abeam will not quietly start a Claude for you when
-you asked for Copilot — it hosts the agent you named — and against a program
-that is neither, the pane says so and names the two it can drive.
+**Ask supports Claude and Copilot, and no other host.** The two are not the same
+pane under the skin. Everything from here to "`Enter` never runs anything"
+describes the Claude one, which is the one that has been probed; "Asking Copilot
+instead" below is the other, and is a shorter section because there is less that
+can honestly be said about it. abeam will not quietly start a Claude for a Codex
+session: under Codex, as under any unsupported program, the pane says Ask is
+unavailable and names the providers it can drive.
 
 The read-only claim is a flag rather than a promise. The child is started with
 `--tools "Read,Grep,Glob"`, which is an allowlist over the built-in set: what is

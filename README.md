@@ -5,9 +5,9 @@ One window for an AI coding session.
 Your agent runs in the left pane — hosted in a pty, parsed and drawn by abeam,
 not passed through to your terminal. The right pane shows the state of the git
 worktree, the document the agent just wrote, a shell to run things in, work
-lined up for the agent, or a second copy of your agent you can ask about the
-file in front of you. A file watcher drives the first two, so neither has to be
-asked.
+lined up for the agent, or, where that provider is supported, a second copy you
+can ask about the file in front of you. A file watcher drives the first two, so
+neither has to be asked.
 
 It replaces a three-window setup: the agent in one terminal, git in another, and
 an editor open purely to read the markdown it produced. The difference from
@@ -66,6 +66,10 @@ You also need:
     -g @github/copilot` on Linux, or `gh copilot` once on either to fetch it.
     The npm package wants Node 22 or newer, which is why `gh copilot` is worth
     knowing: it is the route that works where the other two do not.
+  - **OpenAI Codex CLI** — `npm i -g @openai/codex`, then run `codex` once and
+    sign in with ChatGPT or an API key. See OpenAI's [CLI
+    setup](https://learn.chatgpt.com/docs/codex/cli) and [authentication
+    guide](https://learn.chatgpt.com/docs/auth).
 
 ## Run it
 
@@ -87,6 +91,7 @@ abeam -p "fix the tests"  # ...and `claude -p "fix the tests"`
 abeam agent               # ...and `claude agent`, subcommands included
 
 abeam +copilot --resume   # GitHub Copilot CLI, with its own --resume
+abeam +codex [args]       # OpenAI Codex CLI; every argument is forwarded
 abeam +bash               # anything else on PATH
 abeam +help               # abeam's own help; `--help` is the agent's
 abeam -- +1 more thing    # `--` stops abeam reading, and goes to the agent too
@@ -94,13 +99,19 @@ abeam -- +1 more thing    # `--` stops abeam reading, and goes to the agent too
 
 A `+` token is read only in first position, and there is at most one — so a
 prompt may begin with a `+`, and `abeam config set +x` is a real command line.
-Behind the sigil you can write an agent abeam knows (`claude`, `copilot`), a
-preset from your config file, or any program on `PATH`. Case does not matter.
-Two names are reserved: `+help` and `+version`.
+Behind the sigil you can write an agent abeam knows (`claude`, `copilot`,
+`codex`), a preset from your config file, or any program on `PATH`. Case does
+not matter. Two names are reserved: `+help` and `+version`.
 
-`abeam claude` and `abeam copilot` — without the sigil — are **refused** with a
-message naming both readings, rather than being reinterpreted. They used to host
-those agents, and what you would otherwise get now is `claude claude`.
+`abeam claude`, `abeam copilot` and `abeam codex` — without the sigil — are
+**refused** with a message naming both readings, rather than being
+reinterpreted. Use the corresponding `+name` form to select an agent.
+
+Codex support is deliberately narrow: `abeam +codex [args]` hosts the ordinary
+interactive Codex TUI in the left pty. Ask is unavailable. Claude's readiness
+record cannot establish whether Codex is idle, so queue **send** items are
+blocked both automatically and when you press `Enter`; type the item in the
+left pane instead. Background dispatch is Claude-only and is unavailable too.
 
 `ABEAM_AGENT` names what to host when no `+` token did, and a `+` overrides it
 for one run. It holds a **name**, not a command line, so `ABEAM_AGENT=copilot`
@@ -169,7 +180,7 @@ come back as the lines they were written as, not as the rows the pane was too
 narrow to fit them in. See [Copying out of the right
 pane](#copying-out-of-the-right-pane).
 
-**queue** (`Alt+A`) — work lined up for the agent, for the gap between having a
+**queue** (`F8`) — work lined up for the agent, for the gap between having a
 thought and being able to act on it. Items go one of two ways: **send**, typed
 into the left pane's session the moment it goes idle, continuing the
 conversation; or **dispatch**, started as its own background agent with none of
@@ -184,8 +195,9 @@ command there is. A send waits for the agent's own record to say it is idle and 
 nothing to be sitting unsubmitted in its composer, and announces itself in the
 left title first — typing at the agent during that pause defers it.
 
-**ask** (`?` from the document or the git view, `F6` from anywhere) — a second
-copy of your agent, in the right pane, which **may read and may not write**. For
+**ask** (`?` from the document or the git view, `F6` from anywhere) — for Claude
+and Copilot, a second copy of your agent in the right pane which **may read and
+may not write**. For
 the question that is about what is on screen — what does this call do, where is
 this written, is this the only caller — without spending the conversation on the
 left. `?` attaches the file you were looking at and shows you that it has; `F6`
@@ -210,7 +222,8 @@ other tool exists for that session — and the pane draws the list the child
 reports back, so what is on screen is what it actually got. Under Copilot the
 guarantee is weaker and made the other way round, with `--deny-tool`; that half
 has never been run by anyone, the pane says so on its opening screen, and
-[status](docs/status.md) has the detail.
+[status](docs/status.md) has the detail. Under Codex, Ask is unavailable rather
+than starting a different provider or guessing at a safe non-interactive mode.
 
 **pty diagnostics** (`F2`) — what the emulation layer is doing: alt-screen,
 application cursor, bracketed paste, mouse mode, byte counts, sizes, and the
@@ -221,16 +234,17 @@ each field.
 ## Keys
 
 Everything abeam binds lives under `Alt` and the F-keys, with one exception:
-`Ctrl+\`, the escape hatch. **Nothing abeam claims is a key the hosted agent can
-act on** — `docs/keymap.md` is the audit behind that, and there are tests
-pinning it. Everything else you type goes to the agent untouched.
+`Ctrl+\`, the escape hatch. `docs/keymap.md` is the audit behind the table.
+Codex's shipped defaults leave `F8` unused, but Codex keymaps are configurable,
+so a local `tui.keymap` can still collide. Press `Ctrl+\` or `F12`, then the key,
+to send it to Codex untouched.
 
 | Key | |
 | --- | --- |
 | `Alt+G` | right pane → git |
 | `Alt+E` | right pane → files (again for the file list) |
 | `Alt+S` | right pane → a shell, **and focus it** (again to hand focus back) |
-| `Alt+A` | right pane → the queue |
+| `F8` | right pane → the queue |
 | `F6` | right pane → ask, nothing attached, **and focus it** (again for what it displaced) |
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page |
@@ -243,7 +257,7 @@ pinning it. Everything else you type goes to the agent untouched.
 | `F1` | key help overlay |
 | `Ctrl+\` or `F12` | send the *next* key to the agent verbatim |
 
-A view key leaves focus where it found it. `Alt+G`, `Alt+E`, `Alt+A` and `F2`
+A view key leaves focus where it found it. `Alt+G`, `Alt+E`, `F8` and `F2`
 change what the right pane is showing without moving your keys: if you were
 typing at the agent you still are, and if the right pane had them the view that
 arrives has them. Two other things go with the switch — a view key un-zooms, so
@@ -279,7 +293,7 @@ arrows, PgUp/PgDn, Home/End and `Ctrl+D`/`Ctrl+U`. The F1 overlay says so in a
 row of its own.
 
 `Ctrl+\` exists so abeam can never permanently shadow a binding of the agent you
-are typing at. If a future release of either agent binds `Alt+G`, `Ctrl+\` then
+are typing at. If a future release of an agent binds `Alt+G`, `Ctrl+\` then
 `Alt+G` still reaches it.
 
 ### Copying out of the right pane
@@ -353,13 +367,23 @@ host  = "claude"     # an agent abeam knows, or any program on PATH
 args  = ["agent"]
 view  = "queue"
 theme = "dark"
+
+[preset.openai]
+host  = "codex"
+view  = "files"
 ```
 
 `[defaults]` is how every session on the machine opens. A **preset** is a name
 behind the sigil that behaves exactly like a built-in agent: `abeam +fleet
 --resume` starts `claude agent --resume` with the queue showing, and `+help`
-lists `fleet` beside `claude` and `copilot`. A preset's own `args` go in *front*
-of what you typed, because a subcommand is the first word of its line.
+lists `fleet` and `openai` beside `claude`, `copilot` and `codex`. `abeam
++openai [args]` resolves the preset to the built-in Codex host and forwards the
+typed arguments after any preset `args`. A preset's own `args` go in *front* of
+what you typed, because a subcommand is the first word of its line.
+
+**Migration:** `codex` is now a built-in, so an existing `[preset.codex]` is
+reserved and the configuration is refused. Rename that preset (for example to
+`[preset.openai]`) and invoke the new name behind `+`.
 
 Three things are refused rather than quietly worked around: a preset whose
 `host` names another preset (there is no chaining, so there is no cycle to
@@ -380,12 +404,16 @@ Working, and used. Not finished. The full account is in
 before you install it.
 
 - **Windows with Claude Code is the combination that gets used daily.**
-  Everything else ships on tests rather than on use.
+  The Codex exception below is an unauthenticated smoke test; every other
+  combination ships on tests rather than on use.
 - **Nobody has driven abeam on Linux by hand.** CI builds, tests and lints both
   targets on every push, and the six manual pass criteria in
   `docs/conpty-findings.md` have been confirmed on Windows only.
 - **abeam has never been run with GitHub Copilot CLI.** Not once. The selection,
   the launcher and the failure messages are tested; a session is not.
+- **Codex 0.149.0 has been hosted through abeam on Windows without signing
+  in.** Its welcome/sign-in screen, navigation, resize and quit path worked.
+  Authenticated modes and every Linux path remain untested.
 - **Nobody has typed a question into the ask pane**, and the Copilot half of it
   has never been run by any process at all. What comes back from it is a model's
   answer, which can be fluent, specific and wrong about the file it read.
@@ -448,7 +476,7 @@ each decision, rather than in this README.
 | Document | |
 | --- | --- |
 | [docs/status.md](docs/status.md) | what is done, what is not, and what nobody has watched work |
-| [docs/keymap.md](docs/keymap.md) | the keyboard audit: every key abeam claims, and why it is safe in both agents |
+| [docs/keymap.md](docs/keymap.md) | the keyboard audit against Claude, Copilot and Codex, including custom-map gaps |
 | [docs/design.md](docs/design.md) | worktree routing, the draw loop, the layout |
 | [docs/conpty-findings.md](docs/conpty-findings.md) | **read before touching the pty layer.** Five constraints that look like things to tidy up and are not |
 
