@@ -967,13 +967,15 @@ mod tests {
     fn only_the_agent_that_has_bg_can_dispatch_and_the_rest_are_told_why() {
         let root = std::env::temp_dir();
 
-        for hosting in ["copilot", "Copilot", "COPILOT"] {
+        for hosting in [
+            "copilot", "Copilot", "COPILOT", "codex", "Codex", "CODEX",
+        ] {
             let Unavailable(why) =
                 Dispatcher::new(root.clone(), hosting).expect_err("`--bg` is Claude's");
 
             // The agent in front of the reader, by the name they typed.
             // "Background dispatch is unavailable" with no subject reads as a
-            // bug in abeam rather than as a fact about Copilot.
+            // bug in abeam rather than as a fact about the hosted agent.
             assert!(why.contains(hosting), "got: {why}");
             assert!(why.contains("--bg"), "the flag this is about: {why}");
             assert!(why.contains("Claude"), "whose flag it is: {why}");

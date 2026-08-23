@@ -1163,7 +1163,15 @@ impl App {
         }
         self.readiness_at = Instant::now();
 
-        let mut readiness = self.probe.readiness();
+        // The probe reads Claude's session records. A record in the same
+        // repository is not evidence about a Codex, Copilot or generic program
+        // hosted beside it, and mistaking its `idle` for theirs would let the
+        // queue type without knowing whether the actual agent is ready.
+        let mut readiness = if self.has_claude_state() {
+            self.probe.readiness()
+        } else {
+            crate::agentstate::Readiness::Unknown
+        };
         // Downgraded rather than reported separately, because `Unknown` already
         // means exactly this: abeam cannot establish that a send would be safe.
         // Without bracketed paste every newline in a sent block submits, so a
@@ -1781,7 +1789,18 @@ impl App {
     /// [`worktrees_wanted`](Self::worktrees_wanted) for why there are two
     /// reasons now and why neither replaced the other.
     fn roster_is_wanted(&self) -> bool {
-        self.dispatched_any || self.worktrees_wanted
+        self.has_claude_state() && (self.dispatched_any || self.worktrees_wanted)
+    }
+
+    /// Whether Claude's private session state describes the hosted process.
+    ///
+    /// `Hosted::agent` carries the built-in a preset resolves to, so a Claude
+    /// preset arrives here as `claude`; a program named outright keeps its own
+    /// spelling and must not acquire Claude-only capabilities by resemblance.
+    /// This one predicate gates both consumers of that state: interactive
+    /// readiness and the background-agent roster.
+    fn has_claude_state(&self) -> bool {
+        self.agent == "claude"
     }
 
     /// The queue's two wires out, and the results of both coming back.
@@ -3601,6 +3620,33 @@ mod tests {
     }
 
     #[test]
+    fn claude_readiness_never_arms_the_queue_for_codex() {
+        // A Claude record in this repository is a plausible neighbour, not a
+        // readiness signal for the Codex in the hosted pty. This is the
+        // dangerous answer: `Idle` is the only state that lets a send leave.
+        let mut fx = app();
+        let _records = records(&mut fx, "idle");
+        stays(&mut fx);
+        fx.app.agent = "codex".to_string();
+        assert_eq!(fx.app.probe.readiness(), Readiness::Idle);
+
+        fx.app.queue.stub_item("never sent to codex", Mode::Send);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        polled(&mut fx);
+        assert_eq!(
+            fx.app.queue.title_note().as_deref(),
+            Some("queue 1"),
+            "Claude's idle record announced an automatic Codex send"
+        );
+
+        // The manual route reads the same readiness and must stay closed too.
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(!fx.app.pump_queue(), "Codex received a queued prompt");
+        assert!(!agent_screen(&fx).contains("never sent to codex"));
+        assert_eq!(keys_sent(&fx), 0);
+    }
+
+    #[test]
     fn anything_typed_at_the_agent_opens_a_draft_and_only_a_busy_agent_ends_one() {
         let mut fx = app();
         let records = records(&mut fx, "idle");
@@ -5190,6 +5236,20 @@ mod tests {
         let mut fx = app();
         fx.app.dispatched_any = true;
         assert!(fx.app.roster_is_wanted(), "the older reason still counts");
+
+        // Both reasons describe Claude-only state. A neighbouring Claude may
+        // have records in this repository while another provider is hosted;
+        // neither reason may turn those records into that provider's roster.
+        for agent in ["codex", "copilot", "some-program"] {
+            let mut fx = app();
+            fx.app.agent = agent.to_string();
+            fx.app.dispatched_any = true;
+            fx.app.worktrees_wanted = true;
+            assert!(
+                !fx.app.roster_is_wanted(),
+                "Claude's roster was enabled while hosting {agent}"
+            );
+        }
     }
 
     // --- pointing the right pane somewhere else ----------------------------
