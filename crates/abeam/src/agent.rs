@@ -1796,6 +1796,7 @@ mod tests {
             chose(&[], Some("copilot")),
             ("agent:copilot".into(), vec![])
         );
+        assert_eq!(chose(&[], Some("codex")), ("agent:codex".into(), vec![]));
         // ...or any program, exactly as ABEAM_SHELL may — including one named
         // as a path, which is passed on as it was written.
         assert_eq!(
@@ -1828,6 +1829,11 @@ mod tests {
         assert_eq!(
             chose(&["+copilot", "--resume"], Some("claude")),
             ("agent:copilot".into(), args(&["--resume"]))
+        );
+        assert_eq!(
+            chose(&["+claude"], Some("codex")),
+            ("agent:claude".into(), vec![]),
+            "a sigil overrides ABEAM_AGENT=codex"
         );
 
         // PowerShell leaves an emptied variable behind as an empty string, and

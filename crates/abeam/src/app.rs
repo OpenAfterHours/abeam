@@ -3995,7 +3995,7 @@ mod tests {
         for out in [key(KeyCode::Esc), key(KeyCode::Char('q'))] {
             let mut fx = app();
             fx.app.queue.stub_item("do not lose me", Mode::Send);
-            fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+            fx.app.handle_key(key(KeyCode::F(8))).unwrap();
             screen(&mut fx.app, 120, 24);
             fx.app.handle_key(key(KeyCode::F(5))).unwrap();
             fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
@@ -4022,7 +4022,7 @@ mod tests {
         // natural one rather than a contrivance.
         let mut fx = app();
         fx.app.queue.stub_item("do not lose me", Mode::Send);
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         screen(&mut fx.app, 120, 24);
         fx.app.handle_key(key(KeyCode::F(5))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
@@ -4030,7 +4030,7 @@ mod tests {
         assert!(asked.contains("d again to delete"), "{asked}");
 
         fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         assert_eq!(fx.app.focus, Focus::Right, "the view keys moved focus");
         fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
         let drawn = screen(&mut fx.app, 120, 24);
@@ -4047,7 +4047,7 @@ mod tests {
         let mut app = app();
         screen(&mut app, 120, 24);
 
-        app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        app.handle_key(key(KeyCode::F(8))).unwrap();
         assert_eq!(app.right_view, RightView::Queue);
         // Pointedly not like Alt+S: the common case is glancing at what is
         // still queued while the agent works and you keep typing at it.
@@ -4057,6 +4057,13 @@ mod tests {
         assert_eq!(app.right_view, RightView::Diag);
         app.handle_key(key(KeyCode::F(2))).unwrap();
         assert_eq!(app.right_view, RightView::Queue);
+
+        // The key this replaced is Codex's. It must pass through the whole App
+        // route to the hosted agent, not merely be absent from `keys::global`.
+        let sent = keys_sent(&app);
+        app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        assert_eq!(app.right_view, RightView::Queue);
+        assert!(keys_sent(&app) > sent, "Alt+A did not reach the agent");
     }
 
     /// The whole wire for F3: the global table resolves it, `act` dispatches it,
@@ -4162,7 +4169,7 @@ mod tests {
         let view_keys = [
             alt(KeyCode::Char('g')),
             alt(KeyCode::Char('e')),
-            alt(KeyCode::Char('a')),
+            key(KeyCode::F(8)),
             key(KeyCode::F(2)),
         ];
 
@@ -4211,7 +4218,7 @@ mod tests {
         // the sentence went into the agent's prompt, with the queue's own
         // composer still open behind it and still showing a cursor.
         let mut fx = app();
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         screen(&mut fx.app, 120, 24);
         fx.app.handle_key(key(KeyCode::F(5))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('i'))).unwrap();
@@ -4227,7 +4234,7 @@ mod tests {
             "a glance at git cost the draft its keys"
         );
 
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         assert!(
             fx.app.right_pane().takes_input(),
             "the composer was shut by a view switch"
@@ -6663,7 +6670,7 @@ mod tests {
         fx.app.focus = Focus::Left;
         fx.app.handle_key(key(KeyCode::F(7))).unwrap();
         assert_eq!(fx.app.focus, Focus::Right, "that press does take focus");
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         assert!(fx.app.select.is_none(), "a selection outlived its pane");
         assert_eq!(fx.app.focus, Focus::Right);
 
@@ -6734,7 +6741,7 @@ mod tests {
         // long after `F5` took it over. It then handed focus to the agent on
         // the strength of a move somebody else made.
         let mut fx = app();
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         screen(&mut fx.app, 120, 24);
         assert_eq!(fx.app.focus, Focus::Left);
 
@@ -6767,7 +6774,7 @@ mod tests {
         // landing two panes apart, with nothing on screen to say which one you
         // had pressed.
         let mut fx = app();
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         screen(&mut fx.app, 120, 24);
 
         // Made from the agent: `F7` took focus, so both exits give it back.
@@ -6813,7 +6820,7 @@ mod tests {
         let mut fx = app();
         stays(&mut fx);
         fx.app.queue.stub_item("wire-check-handback", Mode::Send);
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         screen(&mut fx.app, 120, 24);
 
         // Focused first, and selected second: this is the selection that took
@@ -6869,7 +6876,7 @@ mod tests {
         // over different text, with `Enter` sending whatever is under it now.
         let mut fx = app();
         selecting(&mut fx.app);
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         assert!(fx.app.select.is_none(), "a selection outlived its pane");
     }
 
@@ -6932,7 +6939,7 @@ mod tests {
         // the shell's prompt is the case that matters, and it is the same line
         // of code.
         let mut fx = app();
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         screen(&mut fx.app, 120, 24);
         fx.app.handle_key(key(KeyCode::F(5))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('i'))).unwrap();
@@ -6970,7 +6977,7 @@ mod tests {
         // The queue, because it draws text this test chose. Any pane would do:
         // what is under test is that the rows on screen are what leaves.
         fx.app.queue.stub_item("wire-check-selection", Mode::Send);
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         selecting(&mut fx.app);
 
         // The row the item is on, and that row alone. Selecting the whole pane
@@ -7083,7 +7090,7 @@ mod tests {
         // and the terminal on the other end is nobody's to assert about.
         let mut fx = app();
         fx.app.queue.stub_item("wire-check-drag", Mode::Send);
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         screen(&mut fx.app, 120, 24);
         let inner = fx.app.right_inner.expect("a right pane");
 
@@ -7155,7 +7162,7 @@ mod tests {
         // every key anyway.
         let mut fx = app();
         fx.app.queue.stub_item("wire-check-ctrl-c", Mode::Send);
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         selecting(&mut fx.app);
         fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('G'))).unwrap();
@@ -7234,7 +7241,7 @@ mod tests {
         // this asks about.
         let mut fx = app();
         fx.app.queue.stub_item("wire-check-drawn", Mode::Send);
-        fx.app.handle_key(alt(KeyCode::Char('a'))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
         selecting(&mut fx.app);
 
         let row = fx

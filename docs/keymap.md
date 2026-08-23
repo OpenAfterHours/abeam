@@ -784,8 +784,9 @@ its replacement against this version's complete shipped defaults.
 
 - **The live audit stopped at authentication.** The official 0.149.0 binary was
   hosted through abeam on Windows with an isolated `CODEX_HOME`: its welcome
-  and sign-in UI rendered, Down-arrow navigation worked, a 120×40 → 100×32
-  resize redrew it, and the two-step `Alt+Q` quit completed. No account was
+  and sign-in UI rendered, a 120×40 → 100×32 outer resize completed with the
+  UI still navigable, Down-arrow selection worked, and the two-step `Alt+Q`
+  quit completed. No account was
   connected and no prompt was submitted, so authenticated composer, approval,
   pager and agent-session modes remain untested.
 - **Custom keymaps can invalidate the default audit.** A user can assign `F8`

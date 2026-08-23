@@ -999,6 +999,21 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_can_host_codex_and_inherits_the_codex_launch_contract() {
+        let table = config(
+            "[preset.fast]\nhost = \"codex\"\nargs = [\"--search\", \"--model\", \"model-name\"]\n",
+        )
+        .table();
+        let fast = crate::agent::find_within("fast", table).expect("the preset is in the table");
+        let codex = crate::agent::find("codex").expect("Codex is a built-in");
+
+        assert_eq!(fast.hosts, "codex");
+        assert_eq!(fast.candidates, codex.candidates);
+        assert_eq!(fast.install, codex.install);
+        assert_eq!(fast.args, ["--search", "--model", "model-name"]);
+    }
+
+    #[test]
     fn a_preset_whose_host_is_a_program_is_a_path_lookup_and_says_where_it_came_from() {
         let mut config = config("[preset.nu]\nhost = \"nu\"\n");
         config.path = Some(PathBuf::from("/home/philm/.config/abeam/abeam.toml"));

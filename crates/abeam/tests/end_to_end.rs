@@ -398,7 +398,7 @@ fn the_codex_executable_shape_and_arguments_survive_the_real_binary_and_pty() {
     let dir = Dir::new("codex");
     let session = abeam_with_codex(&dir);
 
-    let text = wait_for(&session, "codex-pty-ready");
+    let text = wait_for(&session, "arg2=[a prompt with spaces]");
     assert!(text.contains("arg1=[--search]"), "first argument changed: {text}");
     assert!(
         text.contains("arg2=[a prompt with spaces]"),
@@ -415,9 +415,42 @@ fn the_codex_executable_shape_and_arguments_survive_the_real_binary_and_pty() {
 #[test]
 #[ignore = "requires ABEAM_TEST_CODEX pointing at an official Codex CLI binary"]
 fn an_official_codex_reaches_its_auth_ui_resizes_and_quits_cleanly() {
-    let executable = PathBuf::from(
+    let named = PathBuf::from(
         std::env::var_os("ABEAM_TEST_CODEX")
             .expect("set ABEAM_TEST_CODEX to an official Codex CLI executable"),
+    );
+    let located = if named.is_absolute() {
+        named.clone()
+    } else {
+        let here = std::env::current_dir()
+            .expect("read the test working directory")
+            .join(&named);
+        if here.is_file() {
+            here
+        } else {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join(&named)
+        }
+    };
+    assert!(
+        located.is_file(),
+        "ABEAM_TEST_CODEX is not a file: {located:?}"
+    );
+    // Preserve the final filename and symlink: npm commonly exposes `codex` as
+    // a link, and resolving the file itself could move PATH to a vendor
+    // directory that has the target binary but no executable named `codex`.
+    let executable = std::fs::canonicalize(
+        located
+            .parent()
+            .expect("the Codex executable has a parent directory"),
+    )
+    .expect("resolve the Codex executable's parent")
+    .join(
+        located
+            .file_name()
+            .expect("the Codex executable has a filename"),
     );
     let bin = executable
         .parent()
@@ -447,7 +480,6 @@ fn an_official_codex_reaches_its_auth_ui_resizes_and_quits_cleanly() {
     .expect("spawn abeam with the official Codex binary");
 
     wait_for(&session, "Welcome to Codex");
-    let before = screen(&session);
     session.resize(32, 100).expect("resize abeam's outer pty");
     assert_eq!(session.size(), (32, 100));
     wait_for(&session, "Sign in with ChatGPT");
@@ -455,8 +487,7 @@ fn an_official_codex_reaches_its_auth_ui_resizes_and_quits_cleanly() {
     // Navigation is safe before authentication and proves Codex still parses
     // its ordinary legacy-terminal input after the resize.
     send(&session, b"\x1b[B");
-    let after = screen(&session);
-    assert_ne!(before, after, "Codex did not react to a Down-arrow key");
+    wait_for(&session, "> 2. Sign in with Device Code");
 
     send(&session, &alt('q'));
     wait_for(&session, "Alt+Q again to quit");
