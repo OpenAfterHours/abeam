@@ -297,6 +297,13 @@ const COPILOT_INSTALL: &str = "Install it with `winget install GitHub.Copilot`, 
 const COPILOT_INSTALL: &str = "Install it with `npm i -g @github/copilot`, or run \
                                `gh copilot` once to fetch it.";
 
+/// How to install the Codex CLI on every platform abeam supports.
+///
+/// OpenAI publishes the same npm package and `codex` executable on Windows and
+/// Linux, so unlike Copilot this instruction does not need a platform split.
+const CODEX_INSTALL: &str = "Install it with `npm i -g @openai/codex`, then run \
+                            `codex` to sign in.";
+
 /// The agents abeam knows, and the only place their names are written down.
 ///
 /// Half of the table a `+` token is read against, and the only half abeam
@@ -334,6 +341,13 @@ pub const AGENTS: &[Agent] = &[
         // package managers do not: the npm package wants Node 22, which plenty
         // of machines are not on yet.
         install: COPILOT_INSTALL,
+    },
+    Agent {
+        name: "codex",
+        args: &[],
+        hosts: "codex",
+        candidates: &["codex"],
+        install: CODEX_INSTALL,
     },
 ];
 
