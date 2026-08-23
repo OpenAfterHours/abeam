@@ -157,6 +157,20 @@ fn plant(dir: &Dir) {
     std::fs::copy(&real, dir.0.join(PLANTED)).expect("plant a shell in the repository");
 }
 
+/// Plant the executable shape the official npm package gives Codex on Windows.
+///
+/// The batch file stays alive after reporting its arguments so the assertion
+/// observes a hosted interactive process, not a launch that happened to print
+/// before failing. Going through `.cmd` also exercises the launcher route the
+/// real `@openai/codex` package uses on this platform.
+#[cfg(windows)]
+fn plant_codex(dir: &Dir) {
+    dir.write(
+        "codex.cmd",
+        "@echo off\r\necho codex-pty-ready\r\necho arg1=[%~1]\r\necho arg2=[%~2]\r\n:wait\r\nset /p line=\r\necho codex-input=[%line%]\r\ngoto wait\r\n",
+    );
+}
+
 /// See the Windows twin above. The mode is set outright rather than left to
 /// `fs::copy`, which does carry it across on this platform: the premise of the
 /// test is that *nothing but abeam's resolver* stands between this file and a
@@ -173,6 +187,23 @@ fn plant(dir: &Dir) {
         .permissions();
     mode.set_mode(0o755);
     std::fs::set_permissions(&planted, mode).expect("make the planted shell executable");
+}
+
+/// Plant the extensionless executable shape npm gives Codex on Unix.
+#[cfg(unix)]
+fn plant_codex(dir: &Dir) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let planted = dir.0.join("codex");
+    dir.write(
+        "codex",
+        "#!/bin/sh\nprintf 'codex-pty-ready\\n'\nprintf 'arg1=[%s]\\n' \"$1\"\nprintf 'arg2=[%s]\\n' \"$2\"\nwhile IFS= read -r line; do printf 'codex-input=[%s]\\n' \"$line\"; done\n",
+    );
+    let mut mode = std::fs::metadata(&planted)
+        .expect("stat the planted Codex shim")
+        .permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&planted, mode).expect("make the Codex shim executable");
 }
 
 /// The `PATH` abeam is given while a shell is planted in the repository, or
@@ -286,6 +317,31 @@ fn abeam(dir: &Dir) -> PtySession {
     .expect("spawn abeam in a pty")
 }
 
+/// Start the real abeam binary through its first-class Codex selection.
+fn abeam_with_codex(dir: &Dir) -> PtySession {
+    plant_codex(dir);
+    let path = std::env::join_paths(
+        std::iter::once(dir.0.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )),
+    )
+    .expect("construct an absolute PATH for the Codex shim")
+    .to_string_lossy()
+    .into_owned();
+
+    PtySession::spawn(
+        PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
+            .arg("+codex")
+            .arg("--search")
+            .arg("a prompt with spaces")
+            .cwd(&dir.0)
+            .env("PATH", path)
+            .env("ABEAM_SHELL", SHELL)
+            .size(40, 120),
+    )
+    .expect("spawn abeam with Codex in a pty")
+}
+
 /// Everything currently on screen, wrapped rows rejoined.
 ///
 /// `contents()` rather than `rows()` deliberately, and it is the one place in
@@ -335,6 +391,84 @@ fn send(session: &PtySession, bytes: &[u8]) {
 /// binding it in fact never received.
 fn alt(c: char) -> Vec<u8> {
     vec![0x1b, c as u8]
+}
+
+#[test]
+fn the_codex_executable_shape_and_arguments_survive_the_real_binary_and_pty() {
+    let dir = Dir::new("codex");
+    let session = abeam_with_codex(&dir);
+
+    let text = wait_for(&session, "codex-pty-ready");
+    assert!(text.contains("arg1=[--search]"), "first argument changed: {text}");
+    assert!(
+        text.contains("arg2=[a prompt with spaces]"),
+        "a spaced Codex argument did not survive the launch: {text}"
+    );
+
+    // A ready line alone could have come from a child that exited immediately.
+    // The response to input sent through abeam proves the interactive child is
+    // still hosted and that the whole input path reaches it.
+    send(&session, b"still-hosted\r");
+    wait_for(&session, "codex-input=[still-hosted]");
+}
+
+#[test]
+#[ignore = "requires ABEAM_TEST_CODEX pointing at an official Codex CLI binary"]
+fn an_official_codex_reaches_its_auth_ui_resizes_and_quits_cleanly() {
+    let executable = PathBuf::from(
+        std::env::var_os("ABEAM_TEST_CODEX")
+            .expect("set ABEAM_TEST_CODEX to an official Codex CLI executable"),
+    );
+    let bin = executable
+        .parent()
+        .expect("the Codex executable has a parent directory");
+    let dir = Dir::new("codex-live");
+    let codex_home = dir.0.join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("create an isolated Codex home");
+    let path = std::env::join_paths(
+        std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )),
+    )
+    .expect("construct PATH for the official Codex binary")
+    .to_string_lossy()
+    .into_owned();
+
+    let mut session = PtySession::spawn(
+        PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
+            .arg("+codex")
+            .arg("--no-alt-screen")
+            .cwd(&dir.0)
+            .env("PATH", path)
+            .env("CODEX_HOME", codex_home.to_string_lossy())
+            .env("ABEAM_SHELL", SHELL)
+            .size(40, 120),
+    )
+    .expect("spawn abeam with the official Codex binary");
+
+    wait_for(&session, "Welcome to Codex");
+    let before = screen(&session);
+    session.resize(32, 100).expect("resize abeam's outer pty");
+    assert_eq!(session.size(), (32, 100));
+    wait_for(&session, "Sign in with ChatGPT");
+
+    // Navigation is safe before authentication and proves Codex still parses
+    // its ordinary legacy-terminal input after the resize.
+    send(&session, b"\x1b[B");
+    let after = screen(&session);
+    assert_ne!(before, after, "Codex did not react to a Down-arrow key");
+
+    send(&session, &alt('q'));
+    wait_for(&session, "Alt+Q again to quit");
+    send(&session, &alt('q'));
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        if session.try_wait().expect("poll abeam after quit").is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("abeam did not exit after the confirmed quit");
 }
 
 #[test]

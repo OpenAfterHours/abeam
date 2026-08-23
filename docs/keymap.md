@@ -782,10 +782,12 @@ its replacement against this version's complete shipped defaults.
 
 ### Known gaps, against Codex
 
-- **No live TUI audit was run.** `codex` was not installed or authenticated on
-  this machine. The official package was downloaded without installation and
-  inspected statically, so modal behaviour and the complete input path through
-  abeam's PTY remain to be exercised.
+- **The live audit stopped at authentication.** The official 0.149.0 binary was
+  hosted through abeam on Windows with an isolated `CODEX_HOME`: its welcome
+  and sign-in UI rendered, Down-arrow navigation worked, a 120×40 → 100×32
+  resize redrew it, and the two-step `Alt+Q` quit completed. No account was
+  connected and no prompt was submitted, so authenticated composer, approval,
+  pager and agent-session modes remain untested.
 - **Custom keymaps can invalidate the default audit.** A user can assign `F8`
   or another abeam key to a Codex action. abeam does not parse Codex's layered
   configuration and cannot promise the strict invariant for arbitrary
