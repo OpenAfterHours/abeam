@@ -177,7 +177,7 @@ pub struct Item {
 /// abeam did with the rest. Both are single bare letters, because every key in
 /// the list is. That was safe while the only way to reach them was to aim at
 /// this pane, and it stopped being the only way when a view key stopped moving
-/// focus: `Alt+A` to glance at the queue from a shell now leaves the keys here,
+/// focus: `F8` to glance at the queue from a shell now leaves the keys here,
 /// so the rest of a half-typed command is read as commands. `cargo doc
 /// --release` carries a `d` and two `r`s.
 ///
@@ -2126,7 +2126,7 @@ mod tests {
 
     #[test]
     fn a_command_typed_at_the_queue_by_mistake_takes_no_work_with_it() {
-        // The report the guard exists for. `Alt+A` to glance at what is queued
+        // The report the guard exists for. `F8` to glance at what is queued
         // used to hand the keys back to the agent; it leaves them here now, so
         // a command meant for the shell arrives as this pane's commands. Every
         // letter of this one is offered to the pane, and it carries a `d` and

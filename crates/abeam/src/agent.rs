@@ -297,6 +297,13 @@ const COPILOT_INSTALL: &str = "Install it with `winget install GitHub.Copilot`, 
 const COPILOT_INSTALL: &str = "Install it with `npm i -g @github/copilot`, or run \
                                `gh copilot` once to fetch it.";
 
+/// How to install the Codex CLI on every platform abeam supports.
+///
+/// OpenAI publishes the same npm package and `codex` executable on Windows and
+/// Linux, so unlike Copilot this instruction does not need a platform split.
+const CODEX_INSTALL: &str = "Install it with `npm i -g @openai/codex`, then run \
+                            `codex` to sign in.";
+
 /// The agents abeam knows, and the only place their names are written down.
 ///
 /// Half of the table a `+` token is read against, and the only half abeam
@@ -334,6 +341,13 @@ pub const AGENTS: &[Agent] = &[
         // package managers do not: the npm package wants Node 22, which plenty
         // of machines are not on yet.
         install: COPILOT_INSTALL,
+    },
+    Agent {
+        name: "codex",
+        args: &[],
+        hosts: "codex",
+        candidates: &["codex"],
+        install: CODEX_INSTALL,
     },
 ];
 
@@ -1212,6 +1226,7 @@ mod tests {
     fn every_agent_abeam_knows_is_findable_and_the_default_is_one_of_them() {
         assert_eq!(find("claude").expect("claude is known").name, "claude");
         assert_eq!(find("copilot").expect("copilot is known").name, "copilot");
+        assert_eq!(find("codex").expect("codex is known").name, "codex");
         // A name that is not in the table is not half-matched into one: it is a
         // program, and `abeam +powershell` has to keep meaning what `abeam
         // powershell` meant.
@@ -1224,6 +1239,7 @@ mod tests {
         // folds case and on one that does not.
         assert_eq!(find("Claude").expect("Claude is claude").name, "claude");
         assert_eq!(find("COPILOT").expect("COPILOT is copilot").name, "copilot");
+        assert_eq!(find("CODEX").expect("CODEX is codex").name, "codex");
 
         // The one invariant a `&'static str` default cannot carry itself.
         assert!(
@@ -1278,6 +1294,13 @@ mod tests {
         let claude = find("claude").unwrap().install;
         assert!(claude.contains("npm i -g @anthropic-ai/claude-code"));
         assert!(!claude.contains("winget"), "got: {claude}");
+
+        // Codex uses one documented npm package and one executable spelling
+        // on both platforms. The second half ensures the failure path also
+        // tells a newly installed user how authentication begins.
+        let codex = find("codex").unwrap().install;
+        assert!(codex.contains("npm i -g @openai/codex"), "got: {codex}");
+        assert!(codex.contains("run `codex` to sign in"), "got: {codex}");
     }
 
     // --- the flip ---------------------------------------------------------
@@ -1343,6 +1366,7 @@ mod tests {
     fn a_leading_plus_token_selects_and_nothing_else_does() {
         // A name in the table picks that agent...
         assert_eq!(chose(&["+copilot"], None), ("agent:copilot".into(), vec![]));
+        assert_eq!(chose(&["+codex"], None), ("agent:codex".into(), vec![]));
         // ...and one that is not is a program, which is the whole of what the
         // positional used to do and all that moved.
         assert_eq!(chose(&["+pwsh"], None), ("program:pwsh".into(), vec![]));
@@ -1360,6 +1384,10 @@ mod tests {
             ("agent:copilot".into(), args(&["--resume"]))
         );
         assert_eq!(
+            chose(&["+codex", "--search"], None),
+            ("agent:codex".into(), args(&["--search"]))
+        );
+        assert_eq!(
             chose(&["+claude", "--help"], None),
             ("agent:claude".into(), args(&["--help"])),
             "`abeam +claude --help` is a question for Claude"
@@ -1367,6 +1395,7 @@ mod tests {
 
         // Folded, like the table it is read against.
         assert_eq!(chose(&["+COPILOT"], None), ("agent:copilot".into(), vec![]));
+        assert_eq!(chose(&["+CODEX"], None), ("agent:codex".into(), vec![]));
         assert_eq!(chose(&["+Claude"], None), ("agent:claude".into(), vec![]));
 
         // ...and trimmed, which the table lookup itself is not: it folds case
@@ -1767,6 +1796,7 @@ mod tests {
             chose(&[], Some("copilot")),
             ("agent:copilot".into(), vec![])
         );
+        assert_eq!(chose(&[], Some("codex")), ("agent:codex".into(), vec![]));
         // ...or any program, exactly as ABEAM_SHELL may — including one named
         // as a path, which is passed on as it was written.
         assert_eq!(
@@ -1799,6 +1829,11 @@ mod tests {
         assert_eq!(
             chose(&["+copilot", "--resume"], Some("claude")),
             ("agent:copilot".into(), args(&["--resume"]))
+        );
+        assert_eq!(
+            chose(&["+claude"], Some("codex")),
+            ("agent:claude".into(), vec![]),
+            "a sigil overrides ABEAM_AGENT=codex"
         );
 
         // PowerShell leaves an emptied variable behind as an empty string, and
@@ -1892,7 +1927,7 @@ mod tests {
         // Two halves do that. The exact line, which fails if the separator, the
         // order or the label changes and if a name is dropped from `AGENTS`...
         assert!(
-            help.contains("Agents: claude, copilot"),
+            help.contains("Agents: claude, copilot, codex"),
             "the agents line is not what a reader was promised: {help}"
         );
         // ...and the same function over a table that is *not* `AGENTS`, which

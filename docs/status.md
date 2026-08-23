@@ -47,11 +47,12 @@ actionable. Add each target when someone can run it.
 Working, and used. Not finished.
 
 **Done.** The pty host layer, proven by a spike that ran a real Claude session
-against it on 2026-08-01. All five right-hand views, the file list, the
+against it on 2026-08-01. All six right-hand views, the file list, the
 rendered/source toggle, the watcher driving what it should, and the three
 searches under the reader — a file by its name, a phrase on the page, a phrase
 in every file under the root. Focus, zoom, help, the diagnostics view, and the
-literal-next escape hatch. Agent selection and the launcher underneath it. The
+literal-next escape hatch. Agent selection for Claude, Copilot and Codex and the
+launcher underneath it. The
 Unix port, in the sense that the whole workspace builds, tests and lints clean
 for both `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see
 "Platforms" for the sense in which it is not done. Mermaid flowcharts and
@@ -59,7 +60,19 @@ sequence diagrams, drawn rather than shown as source. Copying rows out of the
 right pane: a drag copies when you let go, `Ctrl+C` copies whatever is
 highlighted, `F7` is the keyboard's way in, and `Enter` puts the rows in the
 agent's composer without sending them — with the limits listed at the foot of
-this document. 769 tests on Windows, and `clippy --all-targets` clean on both.
+this document. The Windows test suite, and `clippy --all-targets` clean on both.
+
+Codex support means the interactive TUI in the left pty. The official Windows
+Codex 0.149.0 binary was hosted through abeam with an isolated `CODEX_HOME`:
+the welcome/sign-in UI rendered, Down-arrow navigation worked, a 120×40 →
+100×32 outer resize completed with the UI still navigable, and the two-step
+`Alt+Q` quit completed. No account was connected and no prompt was submitted.
+
+One configuration name changes meaning on upgrade: `codex` is now built in, so
+an existing `[preset.codex]` is refused and must be renamed, with its callers
+changed to the new `+name`. A preset may still use `host = "codex"`; that
+resolves to the built-in provider and keeps the capability boundaries described
+above.
 
 Two of those changed Windows behaviour on the way past, and both are worth
 seeing before you upgrade rather than after.
@@ -253,9 +266,9 @@ work, on either platform.
   `sessionId` that was ours — without that the remembered path is a pid, and a
   pid comes round again. What the strictness costs is the case in the heading:
   readiness answers `Unknown` for the whole session, the automatic send never
-  fires, the queue pane goes on saying it is waiting for the agent to be idle,
-  and the queue drains by hand. That is the direction this module fails in on
-  purpose.
+  fires, and `Enter` cannot send the item either. The queue pane goes on saying
+  the state is unknown; the way through is to type the item in the left pane.
+  That is the direction this module fails in on purpose.
 - **`paths` compares spellings and does not normalise them**, and two things
   follow that somebody will otherwise reach for a fix to. `..` is left where it
   is, so `under(C:\a, C:\a\..\b\x.md)` is true and a containment rule can in
@@ -473,6 +486,21 @@ work, on either platform.
   typing anything. Refusing is the safe direction — nothing appears, rather than
   a command running unread — and the command is still on screen in the answer
   above, which is what the message points at.
+- **Codex support stops at the interactive pty boundary.** Install the official
+  CLI with `npm i -g @openai/codex`, then run `codex` directly and authenticate
+  with ChatGPT or an API key before `abeam +codex [args]`. abeam does not own or
+  alter that authentication. Ask is unavailable; Claude's readiness record is
+  inapplicable, so queue send items are blocked both automatically and on
+  `Enter` and must be typed in the left pane; background dispatch is
+  Claude-only. The Windows 0.149.0 sign-in screen was exercised as recorded
+  above, but authenticated composer, approval, pager and agent-session modes
+  remain untested. No Codex path has been run on Linux.
+
+  Codex's shipped 0.149.0 defaults collided with the former `Alt+A` queue key,
+  so abeam yielded it and the queue is now `F8`. Codex can bind `F8` through a
+  custom `tui.keymap`; abeam does not parse that configuration, and
+  literal-next (`Ctrl+\` or `F12`) is the recovery path. `docs/keymap.md` has the
+  provenance and the remaining live-audit checklist.
 - **abeam has never been run with Copilot CLI.** Not once, not for a minute. It
   is not installed on the machine abeam is developed on and cannot easily be:
   the npm package wants Node 22 and this box has v20.14.0, and neither `winget
@@ -666,12 +694,12 @@ work, on either platform.
   terminal and that desktop, and no amount of reading an agent's source answers
   it. Run the probe in the terminal you launch abeam from before assuming the
   table holds; `docs/keymap.md` has the procedure.
-- **Keybindings are not configurable**, and neither are the split ratio or
-  either drawing interval: those are constants in the source. There is a config
+- **abeam's keybindings are not configurable**, and neither are the split ratio
+  nor either drawing interval: those are constants in the source. There is a config
   file now — see "Configuration" — and it holds presets and the four things a
   session opens with, which is where the reader's light/dark choice went. It
-  says nothing about keys. Claude's own bindings are user-configurable and
-  abeam's should be too before anyone else uses it. Copilot's are not, which
+  says nothing about keys. Claude's and Codex's bindings are user-configurable
+  and abeam's should be too before anyone else uses it. Copilot's are not, which
   makes that the mirror image of the same gap rather than a reason to be relaxed
   about it. The two environment variables are unchanged beside it: `ABEAM_AGENT`
   names the agent, preset or program to host when no `+` token did, and
@@ -801,15 +829,16 @@ work, on either platform.
   would report this too. Only a routed `.cmd` or `.bat` is affected — a native
   `claude.exe` is started directly and gets no such variable, and on Linux
   nothing is ever routed, so nothing is ever set.
-- **The `Alt` keys abeam claims are free** — verified against one audited Claude
-  build (2026-07-25), and merely not refuted by Copilot's published tables,
-  which is one claim resting on two quite different strengths of evidence. The
+- **The `Alt` keys abeam claims are free in the audited shipped defaults** —
+  verified against one Claude build (2026-07-25) and Codex 0.149.0, and merely
+  not refuted by Copilot's published tables, which is one claim resting on
+  different strengths of evidence. Codex custom keymaps are outside it. The
   `Alt` *namespace* is not free on Copilot's side, and saying so is the whole
   finding this change rests on: those tables declare `Alt+←`/`Alt+→` as
   word-motion and `Alt+Enter` as newline, and the changelog adds an undeclared
   `Alt+D`. abeam binds none of the three, so what is true is the narrower thing
-  — free where abeam is standing, not free. Neither audit is a promise about
-  the next release of either agent, and gaining an agent can retire a key that
+  — free where abeam is standing, not free. No audit is a promise about the
+  next release of an agent, and gaining an agent can retire a key that
   was safe while there was only one, as `Alt+←`/`Alt+→` has already
   demonstrated. `Ctrl+\` is the mitigation.
 

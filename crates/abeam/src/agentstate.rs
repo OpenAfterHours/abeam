@@ -53,8 +53,9 @@
 //! This shape is Claude's private business, not a published API. `version` and
 //! `peerProtocol` are in the record because Claude expects to change it. So:
 //! every field is optional, an unreadable or unfamiliar record is
-//! [`Readiness::Unknown`], and `Unknown` means the queue falls back to the
-//! manual drain rather than guessing. A probe that guesses is worse than one
+//! [`Readiness::Unknown`], and `Unknown` means queued Send items remain blocked
+//! rather than guessing. The person at the keyboard can still type their text
+//! in the left pane. A probe that guesses is worse than one
 //! that admits it does not know â€” the failure it would cause is a prompt typed
 //! into a busy agent.
 //!
@@ -72,11 +73,11 @@
 //! is a false `idle`. [`Readiness::Unknown`] is always available and always
 //! cheap, and it is the right answer to every one of them.
 //!
-//! None of this is true of any other agent. Copilot publishes nothing like it,
-//! so a Copilot session reports `Unknown` forever and drains by hand. That is
-//! why readiness is asked of *this* module rather than of `Pane`: it is
-//! knowledge about one agent, and `crate::agent`'s table is where per-agent
-//! knowledge lives.
+//! None of this is true of any other agent. Copilot and Codex publish nothing
+//! like it, so those sessions report `Unknown` forever and queued Send items
+//! remain blocked. That is why readiness is asked of *this* module rather than
+//! of `Pane`: it is knowledge about one agent, and the app/provider boundary is
+//! where that per-agent knowledge belongs.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -236,8 +237,8 @@ impl Session {
     /// blocked agent has stopped: its output has gone quiet, and every cheap
     /// heuristic abeam could reach for would call that finished. What it is
     /// actually doing is waiting for a person. So it is `Unknown` rather than
-    /// `Idle`, and the queue falls back to its manual drain, which is the right
-    /// place for a decision somebody is already standing in front of.
+    /// `Idle`, and a queued Send remains blocked; the person at the keyboard can
+    /// type its text in the left pane once they have made that decision.
     pub fn readiness(&self) -> Readiness {
         // Case-insensitively, because what is being matched is Claude's own
         // vocabulary in a record it wrote and not a name on a filesystem â€”
@@ -550,7 +551,7 @@ impl Probe {
     /// The cost of the strict half is worth naming: a session that had *already*
     /// moved before the probe ever found it is not found at all, and the answer
     /// is `Unknown` for the session. That is the pre-widening behaviour for that
-    /// one case — the queue drains by hand — and it is the direction this module
+    /// one case — the queued Send stays blocked — and it is the direction this
     /// fails in on purpose.
     pub fn set_worktrees(&mut self, worktrees: Vec<PathBuf>) {
         self.worktrees = worktrees;
@@ -2193,9 +2194,10 @@ mod tests {
 
     #[test]
     fn a_probe_with_nowhere_to_look_answers_unknown_rather_than_guessing() {
-        // The ordinary state on a machine hosting some other agent: Copilot
-        // publishes nothing like this, so there is no directory and no record,
-        // and the queue drains by hand for the whole session.
+        // The ordinary state on a machine hosting some other agent: Copilot and
+        // Codex publish nothing in Claude's session directory, so there is no
+        // record abeam may use. Queue Send items remain blocked in both
+        // automatic and Enter-triggered modes; the user types in the left pane.
         //
         // Built by hand rather than through [`Probe::over`], and this is the
         // one test that has to be: `over` takes a directory, and what is being

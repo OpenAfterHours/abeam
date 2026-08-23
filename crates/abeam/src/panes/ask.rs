@@ -2326,12 +2326,19 @@ mod tests {
 
     #[test]
     fn only_an_agent_with_a_print_mode_can_be_asked_and_the_rest_are_told_why() {
-        // [`ASKABLE`] is two names long and `crate::agent::AGENTS` is the same
-        // two, so what reaches this refusal is a *program* abeam is hosting
-        // rather than an agent it knows — `abeam +pwsh`, a preset over a shell,
-        // a path named outright. Each of those is a session with no print mode
-        // to drive, and the pane has to say which and offer the way through.
-        for hosting in ["pwsh", "bash", "not-an-agent"] {
+        // [`ASKABLE`] is deliberately narrower than `crate::agent::AGENTS`:
+        // Codex is a supported interactive host, but has no Ask integration in
+        // this release. Programs abeam does not know reach the same refusal.
+        // Each is a session with no print-mode adapter to drive, and the pane
+        // has to say which one and offer the way through.
+        for hosting in [
+            "codex",
+            "Codex",
+            "CODEX",
+            "pwsh",
+            "bash",
+            "not-an-agent",
+        ] {
             let Unavailable(why) = resolve(hosting).expect_err("this pane knows two");
             assert!(why.contains(hosting), "the agent in front of them: {why}");
             // Both of the ones that would have worked, named rather than
