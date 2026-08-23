@@ -449,8 +449,11 @@ fn a_dropped_session_does_not_leave_the_childs_children_running() {
 #[test]
 fn output_rings_the_waker_and_a_session_nobody_installed_one_on_still_works() {
     let rings = Arc::new(AtomicU32::new(0));
-    let session =
-        PtySession::spawn(shell_running("echo abeam-waker-marker").size(24, 80)).expect("spawn");
+    // Keep the child waiting for input until the waker is installed. A one-shot
+    // `/bin/sh -c 'echo ...'` can write and exit between `spawn` returning and
+    // this thread reaching `wake_on_output`; ConPTY's startup handshake used to
+    // hide that race when this test was Windows-only.
+    let session = PtySession::spawn(shell_staying(None).size(24, 80)).expect("spawn");
 
     session.wake_on_output({
         let rings = Arc::clone(&rings);
@@ -458,6 +461,9 @@ fn output_rings_the_waker_and_a_session_nobody_installed_one_on_still_works() {
             rings.fetch_add(1, Ordering::Relaxed);
         }
     });
+    session
+        .write(b"echo abeam-waker-marker\r")
+        .expect("write to the child");
 
     until("the waker to be rung", || rings.load(Ordering::Relaxed) > 0);
 
@@ -466,8 +472,9 @@ fn output_rings_the_waker_and_a_session_nobody_installed_one_on_still_works() {
     assert!(session.take_dirty(), "rung without anything to show for it");
 
     // The reader thread is the only caller, so a ring per read is the most that
-    // can have happened, and one `echo` is one or two of those. This is not
-    // about the exact number: it is that nothing is ringing in a loop.
+    // can have happened, and a shell starting plus one `echo` is only a handful
+    // of those. This is not about the exact number: it is that nothing is
+    // ringing in a loop.
     let rung = rings.load(Ordering::Relaxed);
     assert!(rung <= 8, "{rung} rings for one line of output");
 
