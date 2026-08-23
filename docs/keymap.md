@@ -188,8 +188,8 @@ every key it is given — a shell with a live child in it claims `Esc`, `q` and
 every letter, which is why the border there advertises `Alt+S` as the way out —
 so a pane-local key would be missing from the view the whole feature exists for.
 You select what a command printed. That leaves only what `global` claims before
-any pane is offered anything, and inside `global` only the namespace both agents
-leave alone.
+any pane is offered anything, and inside `global` only a key that the audited
+shipped defaults for Claude, Copilot and Codex leave alone.
 
 It is also not the way most people will copy anything, and the table above is
 right to be the only place it looks central. **A drag in the right pane selects
@@ -414,8 +414,8 @@ nobody should reopen on the grounds that the original reason has gone.
   is literal-next aimed at the key itself — `Ctrl+\` then `Ctrl+\` — which
   writes `0x1c` into the child's pty, where a program that has *not* put that
   pty into raw mode gets `SIGQUIT` for its foreground process group instead of a
-  keystroke. Both agents put their terminal into raw mode, so both ought to read
-  it as an ordinary byte; neither has been tried. `F12` is the alias that
+  keystroke. Claude and Copilot put their terminal into raw mode, so both ought
+  to read it as an ordinary byte; neither has been tried. `F12` is the alias that
   sidesteps all of it, and this is now a better half of why it exists than the
   AltGr layouts it was written for.
 - `Ctrl+Shift+B` (toggleBrief) and `Ctrl+Shift+C` (selection:copy) are
