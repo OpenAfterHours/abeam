@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abeam"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "abeam-pty",
  "anyhow",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "abeam-pty"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "crossterm",
