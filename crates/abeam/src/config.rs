@@ -977,7 +977,7 @@ mod tests {
 
         // Appended rather than merged: abeam's own agents keep their places, so
         // nothing a user writes can change what `+claude` means.
-        assert_eq!(names(table), vec!["claude", "copilot", "fleet"]);
+        assert_eq!(names(table), vec!["claude", "copilot", "codex", "fleet"]);
 
         let fleet = crate::agent::find_within("fleet", table).expect("the preset is in the table");
         // The host's candidates, because the thing that would be missing really
@@ -1020,7 +1020,7 @@ mod tests {
     fn a_preset_may_not_take_a_name_abeam_already_answers() {
         // A built-in, which is the case that matters: `[preset.claude]` would
         // make the real Claude unreachable and nothing on screen would say so.
-        for name in ["claude", "Claude", "COPILOT"] {
+        for name in ["claude", "Claude", "COPILOT", "codex", "CODEX"] {
             let refused = read(&format!("[preset.{name}]\nhost = \"claude\"\n"))
                 .expect_err("a built-in's name is not a preset's to take");
             assert!(refused.contains(name), "the conflict is named: {refused}");
