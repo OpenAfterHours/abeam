@@ -596,6 +596,62 @@ impl AskPane {
         self.pending.take()
     }
 
+    /// The question `Enter` turned what was typed into, if it turned it into
+    /// one at all.
+    ///
+    /// **A peek, where every other seam out of this pane drains — and it is
+    /// test-only for exactly that reason.** [`AskPane::submit`] refuses a
+    /// question while an answer is still arriving, and *claims* the key when it
+    /// does: `Handled::No` would let `Enter` fall through to the shell, which
+    /// reads it as "done with this pane". So the refusal is invisible to the
+    /// caller. A test that presses `Enter` and checks only that the key was
+    /// handled therefore passes for a question that never left the composer,
+    /// and then fails three steps later in an assertion about session ids that
+    /// names nothing which happened — which is what `crate::app`'s ask tests
+    /// did on two CI runs, in two different places, for one dropped question.
+    /// This is the fact those assertions should have been made of.
+    ///
+    /// **The text and not a `bool`, which is a correction rather than a
+    /// convenience.** `pending.is_some()` answers "is *a* question waiting",
+    /// and the caller means "is *this* one" — so two questions asked with no
+    /// drain between them would have passed for the second having been taken,
+    /// on the strength of the first still sitting here. That is the same defect
+    /// as the one this accessor exists to catch, one level up.
+    ///
+    /// What comes back is what will be *sent*, which is not always what was
+    /// typed: an attached context puts the path under the question on a line of
+    /// its own (see [`AskPane::submit`]), so a caller comparing against what
+    /// somebody typed wants `starts_with` rather than equality. That is a fact
+    /// about this pane's disclosure rule and not a caller being lax.
+    #[cfg(test)]
+    pub(crate) fn question_waiting(&self) -> Option<&str> {
+        self.pending.as_deref()
+    }
+
+    /// Whether another question would be taken rather than refused, asked
+    /// **without draining anything**.
+    ///
+    /// The not-draining is the whole reason this exists rather than the tests
+    /// reading liveness off the session. "The child has gone" and "the pane
+    /// will take another question" are two different facts, and they become
+    /// true in either order: the first when `AskSession::poll` sees stdout
+    /// close — or earlier still, when a write to a pipe whose other end has
+    /// gone clears `live` without anything having been polled at all — and the
+    /// second only when the `Turn` that closes the open exchange reaches
+    /// [`AskPane::on_event`]. A test that waits for the first and then asks is
+    /// racing the second, and loses it by dropping the question. This is the
+    /// condition the next question actually has to get past.
+    ///
+    /// It touches nothing, which is what makes it usable by
+    /// `a_question_asked_on_the_pass_that_notices_the_child_has_gone_still_goes`
+    /// next door: that test's whole subject is the pass where the child's
+    /// ending is *still in the channel*, so a readiness question that drained
+    /// anything to answer would delete the test rather than steady it.
+    #[cfg(test)]
+    pub(crate) fn ready_for_a_question(&self) -> bool {
+        !self.streaming()
+    }
+
     /// Whether the reader has asked to start again, in which case the app must
     /// drop the child as well as let this pane empty itself.
     ///

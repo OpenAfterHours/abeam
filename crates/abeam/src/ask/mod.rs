@@ -1064,7 +1064,7 @@ fn trimmed(line: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
     use crate::launch;
-    use crate::testutil::TempDir;
+    use crate::testutil::{TempDir, until};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -1518,9 +1518,22 @@ mod tests {
 
         drop(session);
 
-        assert!(
-            !alive(pid),
-            "process {pid} outlived the session that started it"
+        // Polled rather than sampled once, and it is the same correction
+        // `crate::app`'s `a_live_reader_does_not_hold_the_door_at_quit_and_is
+        // _killed_anyway` needed: **ending a process is not synchronous**, so a
+        // sample taken the instant after a drop can still see it. See
+        // `crate::testutil::until` for the platform detail.
+        //
+        // This one has been safe *by accident* rather than by design, which is
+        // why it outlived the fix next door. On Unix `ClaudeSession::drop`
+        // calls `wait`, and a reaped child is gone by the time `kill(pid, 0)`
+        // asks — so the bare assertion could never fail here. The Windows half
+        // of `alive` has no such luck: `TerminateProcess` returns before the
+        // kernel has finished, and `tasklist` goes on listing the pid. The two
+        // assertions are the same shape and now go wrong the same way.
+        until(
+            &format!("process {pid} to go with the session that started it"),
+            || !alive(pid),
         );
     }
 
