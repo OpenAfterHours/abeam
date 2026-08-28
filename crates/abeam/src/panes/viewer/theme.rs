@@ -105,8 +105,14 @@ impl Mode {
 pub struct Theme {
     pub bg: Color,
     pub fg: Color,
-    /// Everything the pane says in its own voice: gutters, line numbers, the
-    /// hashes on a heading, hints. Recessive, never invisible.
+    /// Everything the pane says in its own voice rather than the document's:
+    /// quote and code gutters, diagram frames, line numbers, the rules under a
+    /// heading, front-matter keys, the host a long link is elided to, hints.
+    /// Recessive, never invisible — several of those are the *only* thing
+    /// marking where a block begins and ends. It used to say "the hashes on a
+    /// heading" here; `markdown` stopped drawing those when the rules took the
+    /// job over, and the rules are in this colour for the same reason the
+    /// gutters are.
     pub dim: Color,
     /// Inline `code` spans.
     pub code: Color,
