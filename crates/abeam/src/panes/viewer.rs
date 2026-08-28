@@ -138,6 +138,7 @@
 //! and [`ViewerPane::missed`].
 
 mod browse;
+mod docs;
 mod files;
 mod grep;
 mod list;
@@ -224,6 +225,24 @@ struct Doc {
     body: Body,
     truncated: bool,
     bytes: u64,
+    /// Which runs of lines are code and which are documentation. See [`docs`].
+    ///
+    /// Scanned once, here, when the body is loaded — rather than by
+    /// `source_lines` each time it runs. That is not a micro-optimisation: a
+    /// window drag re-lays the document out on every frame, and the scan
+    /// allocates a `String` per doc block, so doing it there would put a
+    /// block's worth of garbage per block per frame on the thread that pumps
+    /// the agent's pty. Held beside the body it was derived from and replaced
+    /// by the same `show` that replaces it, which is the only arrangement in
+    /// which the two cannot disagree.
+    regions: Vec<docs::Region>,
+    /// Whether any of the above is documentation.
+    ///
+    /// A bool and not a scan of `regions`, because [`Pane::title`] asks this
+    /// question on **every frame** — it decides whether the title says
+    /// `· rendered` and whether a missed phrase is offered `t` as the way out —
+    /// and a file the length of this one has a few hundred regions to walk.
+    has_docs: bool,
 }
 
 enum State {
@@ -573,6 +592,14 @@ impl ViewerPane {
                 truncated,
                 bytes,
             }) => {
+                // Scanned before the body is moved into place, and only ever
+                // here. A markdown file gets a scan too and it costs one
+                // extension test: `docs::regions` has no rules for `.md` and
+                // hands back a single code region, which is exactly what raw
+                // markdown — which goes down `source_lines` like any other
+                // source — wants to be given.
+                let regions = docs::regions(&text, &path);
+                let has_docs = regions.iter().any(docs::Region::is_doc);
                 let body = if crate::watch::is_markdown(&path) {
                     Body::Markdown(text)
                 } else {
@@ -583,6 +610,8 @@ impl ViewerPane {
                     body,
                     truncated,
                     bytes,
+                    regions,
+                    has_docs,
                 })
             }
             Err(why) => State::Failed { path, why },
@@ -772,13 +801,34 @@ impl ViewerPane {
         matches!(self.mode, Mode::Results { .. }) && self.grep.typing()
     }
 
-    /// Rendered markdown, or the source it was rendered from.
+    /// Does the document on screen have a second form for `t` to swap to?
     ///
-    /// Only markdown has two forms. On anything else this is a key the pane has
-    /// no answer for and says so, rather than reporting that it acted and
-    /// leaving a reader pressing something that visibly does nothing.
+    /// Two documents do. Markdown, which is rendered and has a source behind
+    /// it; and a source file with documentation in it, which is drawn with its
+    /// doc comments rendered as prose in place and has the file itself behind
+    /// *that*. Everything else — a `.txt`, a `.rs` with no doc comment in it,
+    /// the empty screen, the unreadable notice — has one form and only one.
+    ///
+    /// One predicate rather than the same `matches!` written twice, because
+    /// [`ViewerPane::toggle_raw`] decides whether the key acts and
+    /// [`Pane::title`] decides whether the title advertises it, and a pane that
+    /// says `· rendered` over a document `t` declines to toggle is naming a key
+    /// that does nothing. Cheap enough to be asked from `title` every frame:
+    /// an extension test and a bool that was worked out when the file loaded.
+    fn two_forms(&self) -> bool {
+        matches!(&self.state, State::Doc(d) if crate::watch::is_markdown(&d.path) || d.has_docs)
+    }
+
+    /// Rendered, or the source it was rendered from.
+    ///
+    /// Offered only where there is genuinely something on the other side — see
+    /// [`ViewerPane::two_forms`]. A `.rs` with no doc comment in it renders
+    /// identically to its own source, so a `t` there would report that it acted
+    /// and change nothing on screen, which is worse than a key that declines:
+    /// the reader is left pressing it again, and each press re-renders the
+    /// agent's whole screen.
     fn toggle_raw(&mut self) -> Handled {
-        if !matches!(&self.state, State::Doc(d) if crate::watch::is_markdown(&d.path)) {
+        if !self.two_forms() {
             return Handled::No;
         }
 
@@ -807,6 +857,12 @@ impl ViewerPane {
         // strength of an argument for the opposite move. The notice survives the
         // trip instead, and is still true: `settle_search` will restate it, and
         // the remedy it names changes with the form under it.
+        //
+        // The direction is right for a source file with doc regions too, and for
+        // the same reason rather than a second one: rendering a `///` block eats
+        // the markers, reflows the prose and drops the URL behind a link, so it
+        // is the form a phrase can go missing from, and the raw file is the form
+        // the sweep actually read.
         if !self.raw
             && let Some((query, ordinal)) = self.missed.take()
         {
@@ -999,7 +1055,14 @@ impl ViewerPane {
                         (markdown::render(text, width, self.theme), 0)
                     }
                     Body::Markdown(text) | Body::Source(text) => {
-                        source_lines(text, &doc.path, width, self.theme)
+                        // `raw` is one question asked of both bodies — "show me
+                        // the text as it is" — so it is one branch rather than
+                        // two. An empty region list is how `source_lines` is
+                        // told not to interleave, and `docs::regions` never
+                        // returns one, so "the reader pressed t" and "this file
+                        // has nothing to render" cannot be confused.
+                        let regions: &[docs::Region] = if self.raw { &[] } else { &doc.regions };
+                        source_lines(text, &doc.path, regions, width, self.theme)
                     }
                 };
                 // Measured before the notice below is appended, because the
@@ -1367,15 +1430,23 @@ impl Pane for ViewerPane {
         // given nothing to press.
         //
         // The remedy goes on the miss rather than beside it, and each body gets
-        // the one that is true of it. Rendered markdown names `t`, because the
+        // the one that is true of it. Anything *rendered* names `t`, because the
         // commonest reason to find nothing in a rendering is that the thing was
         // rendered away and `t` is where it went. Everything else names the
-        // width, because a wrap is the only way a phrase the sweep found can be
-        // missing from the rows it was wrapped into.
+        // width, because a wrap is then the only way a phrase the sweep found
+        // can be missing from the rows it was wrapped into.
+        //
+        // "Rendered" is no longer a synonym for "markdown", and that is the one
+        // clause here that changed. A `.py` drawn with its docstrings rendered
+        // in place has eaten its own `"""`, reflowed the prose between them and
+        // dropped the URL behind a link, exactly as a `.md` does — so a phrase
+        // inside a docstring's markdown syntax genuinely is not on the drawn
+        // page, and `t` is genuinely where it went. The question is therefore
+        // "does this document have a second form, and is the rendered one up",
+        // which is [`ViewerPane::two_forms`] and `!raw`; the body's *type* was
+        // only ever standing in for that.
         let miss = match &self.state {
-            State::Doc(doc) if matches!(doc.body, Body::Markdown(_)) && !self.raw => {
-                " · t for source"
-            }
+            State::Doc(_) if self.two_forms() && !self.raw => " · t for source",
             State::Doc(_) => " · widen if a wrap split it",
             _ => "",
         };
@@ -1398,13 +1469,20 @@ impl Pane for ViewerPane {
             }
             State::Doc(doc) => {
                 let trunc = if doc.truncated { " · truncated" } else { "" };
-                // Which of the two forms is on screen, but only for the file
-                // that has two: saying "rendered" about a `.rs` would be
-                // advertising a toggle that is not there.
-                let form = match &doc.body {
-                    Body::Markdown(_) if self.raw => " · source",
-                    Body::Markdown(_) => " · rendered",
-                    Body::Source(_) => "",
+                // Which of the two forms is on screen, but only for a file that
+                // has two. That used to mean markdown and nothing else, on the
+                // grounds that saying "rendered" about a `.rs` would advertise a
+                // toggle that is not there — and the premise, not the rule, is
+                // what has changed: a `.rs` with doc comments in it *is*
+                // rendered, and `t` really does show the source. What the word
+                // has to track is whether the toggle exists, so it asks the same
+                // predicate the toggle itself asks. A `.rs` with no doc comment
+                // anywhere still says nothing, because for that file the old
+                // sentence is still exactly true.
+                let form = match (self.two_forms(), self.raw) {
+                    (false, _) => "",
+                    (true, true) => " · source",
+                    (true, false) => " · rendered",
                 };
                 // Read left to right, this is what the reader gives up last
                 // first: the file name, then which form of it, then the query,
@@ -1874,40 +1952,202 @@ impl Pane for ViewerPane {
 /// about which line it is on. Zero in a pane too narrow to have drawn one, and
 /// then there is nothing to step over rather than four columns to step over
 /// anyway. See [`search::Margin`].
+///
+/// `regions` is [`docs`]' partition of the same text, and it is what makes this
+/// more than a pager: a run of lines that is a doc comment or a docstring is
+/// rendered as markdown *in place*, between the code it is about, instead of
+/// being shown as the `///` and `"""` somebody typed. An empty slice means
+/// "draw it all as code", which is what `t` and raw markdown both want; see
+/// [`ViewerPane::build`].
+///
+/// The two halves are capped separately and deliberately are not capped
+/// together. Past `source::HIGHLIGHT_MAX_BYTES` the code comes back as plain
+/// text — that cap is a time budget on syntect, which is the expensive half at
+/// about 370 KB/s — and the documentation goes on being rendered. That is the
+/// choice, and the reason is that the cap governing markdown is
+/// `load::MAX_BYTES`, which was set from the cost of laying markdown out and is
+/// still being honoured: the doc regions are a *fraction* of a file already
+/// bounded by it, and rendering is several times cheaper per byte than
+/// highlighting. Giving up both at one threshold would mean a 100 KB Python
+/// file showing its docstrings as `"""` while a 100 KB `.md` next to it renders
+/// fine, with nothing on screen to explain the difference.
 fn source_lines(
     text: &str,
     path: &Path,
+    regions: &[docs::Region],
     width: usize,
     mode: theme::Mode,
 ) -> (Vec<Line<'static>>, usize) {
+    // **One highlighter pass over the whole file, sliced afterwards.** Not a
+    // highlighter per code region, and this is the sharpest constraint in the
+    // function: `syntect::easy::HighlightLines` carries the grammar's context
+    // stack from one line to the next, so a fresh one started after each
+    // docstring would resume at the top level in the middle of an `impl` or a
+    // class body and colour everything below the first doc comment as whatever
+    // it now believes it is looking at. Slicing rows costs nothing; restarting
+    // is wrong, and wrong in a way nobody would report as a bug — it just looks
+    // like the theme going odd half way down long files.
     let rows = source::highlight_file(text, path, mode);
-    let numbers = width >= LINE_NUMBER_MIN_WIDTH;
-    let digits = if numbers {
-        rows.len().to_string().len().max(3)
+    let mut page = Page::new(rows, width, mode);
+    let count = page.rows.len();
+
+    let whole = [docs::Region::code(0, count)];
+    let regions = if regions.is_empty() {
+        &whole[..]
     } else {
-        0
+        regions
     };
 
-    let mut out = Vec::with_capacity(rows.len());
-    for (i, row) in rows.into_iter().enumerate() {
-        let (first, cont) = if numbers {
-            (
-                vec![Span::styled(
-                    format!("{:>digits$} ", i + 1),
-                    mode.theme().dim(),
-                )],
-                vec![Span::raw(format!("{:>digits$} ", ""))],
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        out.extend(wrap::hard_wrap(row, width, &first, &cont));
+    let mut next = 0;
+    for region in regions {
+        let start = region.start.min(count);
+        let end = region.end.min(count);
+        // `docs::regions` promises a partition and is tested for it. Closing the
+        // gap anyway is what keeps a broken promise a cosmetic bug rather than a
+        // line of somebody's file that is simply not on the page — and it costs
+        // an empty range per region in the case where the promise holds.
+        page.code(next..start);
+        match &region.kind {
+            docs::Kind::Code => page.code(start..end),
+            docs::Kind::Doc { text, indent } => page.doc(start..end, text, *indent),
+        }
+        next = end.max(next);
     }
-    // The gutter is the number plus the space after it, and every row wears it
-    // — a wrapped continuation gets a blank one of exactly the same width,
-    // which is what makes one number describe the whole layout.
-    let gutter = if numbers { digits + 1 } else { 0 };
-    (out, gutter)
+    page.code(next..count);
+
+    let gutter = page.gutter();
+    (page.out, gutter)
+}
+
+/// The rows of a source file being built, and the one thing that draws the
+/// line-number gutter.
+///
+/// A type rather than three locals threaded through two loops, because the
+/// gutter is the pane's own margin and [`search::Margin`] only holds if *every*
+/// row wears one of exactly the same width — the numbered first row of a source
+/// line, its blank continuations, and now the rows a rendered doc block turns
+/// into. One place decides how wide it is and one place draws it, so the three
+/// cannot drift apart.
+struct Page {
+    /// The highlighted file, one entry per source line, emptied as it is used.
+    rows: Vec<Vec<Span<'static>>>,
+    out: Vec<Line<'static>>,
+    width: usize,
+    mode: theme::Mode,
+    /// Digits in the number column, or zero in a pane too narrow to spend the
+    /// columns on one.
+    digits: usize,
+}
+
+impl Page {
+    fn new(rows: Vec<Vec<Span<'static>>>, width: usize, mode: theme::Mode) -> Self {
+        let digits = if width >= LINE_NUMBER_MIN_WIDTH {
+            rows.len().to_string().len().max(3)
+        } else {
+            0
+        };
+        Page {
+            out: Vec::with_capacity(rows.len()),
+            rows,
+            width,
+            mode,
+            digits,
+        }
+    }
+
+    /// The gutter is the number plus the space after it, and every row wears it
+    /// — a wrapped continuation gets a blank one of exactly the same width,
+    /// which is what makes one number describe the whole layout.
+    fn gutter(&self) -> usize {
+        if self.digits == 0 { 0 } else { self.digits + 1 }
+    }
+
+    fn numbered(&self, line: usize) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::styled(
+            format!("{line:>digits$} "),
+            self.mode.theme().dim(),
+        )]
+    }
+
+    fn blank(&self) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::raw(format!("{:>digits$} ", ""))]
+    }
+
+    /// Source lines, numbered and hard-wrapped: the whole of what this function
+    /// used to do, and byte for byte what it still does for a file with no
+    /// documentation in it.
+    fn code(&mut self, range: std::ops::Range<usize>) {
+        for i in range {
+            let row = std::mem::take(&mut self.rows[i]);
+            let first = self.numbered(i + 1);
+            let cont = self.blank();
+            self.out
+                .extend(wrap::hard_wrap(row, self.width, &first, &cont));
+        }
+    }
+
+    /// A doc block, rendered as markdown where the comment was.
+    fn doc(&mut self, range: std::ops::Range<usize>, text: &str, indent: usize) {
+        let avail = self.width.saturating_sub(self.gutter() + indent);
+        if avail == 0 {
+            // Nothing left to lay prose out in — a pane narrower than its own
+            // gutter plus a deeply indented block. Falling back to the source
+            // lines is not a degradation to apologise for: it is the same rows
+            // `t` would show, at the one width where the rendering has no room
+            // to be different, and it keeps every line of the file on the page.
+            self.code(range);
+            return;
+        }
+
+        // **N source lines become M rendered rows, and M is not N.** A paragraph
+        // reflows to the pane's width, a fence keeps its shape, a list grows a
+        // hanging indent — so there is no mapping from a rendered row back to
+        // the line it came from, and a number per row would have to be invented.
+        // The block's first line number goes on its first row and the rest get a
+        // blank one, which is not a new rule: it is exactly how `code` above
+        // numbers a source line too wide to fit, and the precedent a reader has
+        // already learned from every wrapped line in the file.
+        //
+        // No extra glyph marks the block either. The number column already owns
+        // the left margin, and what says "this is prose" is the prose — the
+        // heading, the bullet, the reflow — plus the indent it keeps, which is
+        // the indent of the code it belongs to.
+        let first = range.start + 1;
+        let pad = " ".repeat(indent);
+        let body = markdown::render(text, avail, self.mode);
+        let rendered = body.len();
+        for (n, mut line) in body.into_iter().enumerate() {
+            let mut prefix = if n == 0 {
+                self.numbered(first)
+            } else {
+                self.blank()
+            };
+            if indent > 0 {
+                prefix.push(Span::raw(pad.clone()));
+            }
+            // Spliced into the line rather than rebuilt from its spans, so
+            // whatever the renderer decided about the line as a whole survives
+            // being moved across the gutter.
+            line.spans.splice(0..0, prefix);
+            self.out.push(line);
+        }
+        if rendered == 0 {
+            // A block that renders to no rows at all — `///` with nothing after
+            // it, a docstring holding only whitespace. It still gets a row,
+            // because the alternative is a line number that never appears and a
+            // pair of lines the reader can see in the source and not in the
+            // rendering.
+            self.out.push(Line::from(self.numbered(first)));
+        }
+    }
 }
 
 /// A letter with nothing held down with it.
@@ -2068,6 +2308,220 @@ mod tests {
         let mut pane = quiet(dir.path());
         pane.show(&path);
         assert_eq!(laid(&mut pane, 20, 10)[0], "let x = 1;");
+    }
+
+    // --- documentation rendered where it stands ---------------------------
+
+    /// A `.rs` and a `.py` saying the same thing, one with a doc comment and
+    /// one with a docstring. Written out rather than generated because what is
+    /// being tested is what a reader sees, and a fixture nobody can read is a
+    /// poor witness to that.
+    fn documented(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let rs = dir.write(
+            "add.rs",
+            b"/// Adds two numbers.\n\
+              ///\n\
+              /// Really **does** add them.\n\
+              fn add(a: i32, b: i32) -> i32 {\n\
+              \x20   a + b\n\
+              }\n",
+        );
+        let py = dir.write(
+            "add.py",
+            b"def add(a, b):\n\
+              \x20   \"\"\"Add two numbers.\n\
+              \n\
+              \x20   Args:\n\
+              \x20       a: the first.\n\
+              \x20   \"\"\"\n\
+              \x20   return a + b\n",
+        );
+        (rs, py)
+    }
+
+    #[test]
+    fn a_doc_comment_is_drawn_as_prose_in_the_middle_of_the_code_it_describes() {
+        // The whole feature in one assertion: the markers are gone, the `**`
+        // around `does` did what `**` means, and the function underneath is
+        // still highlighted source with its own numbers.
+        let dir = TempDir::new("view-docs-rs");
+        let (rs, _) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&rs);
+
+        assert_eq!(
+            laid(&mut pane, 40, 20),
+            [
+                "  1 Adds two numbers.",
+                "    ",
+                "    Really does add them.",
+                "  4 fn add(a: i32, b: i32) -> i32 {",
+                "  5     a + b",
+                "  6 }",
+                "  7 ",
+            ]
+        );
+        // The code is still coloured, which is the thing that would break if the
+        // highlighter were restarted per region rather than sliced.
+        assert!(
+            pane.lines[3]
+                .spans
+                .iter()
+                .skip(1)
+                .any(|s| s.style.fg.is_some()),
+            "the code after the doc block lost its highlighting"
+        );
+    }
+
+    #[test]
+    fn a_docstring_is_rendered_at_the_column_the_code_put_it_at() {
+        // Two things at once, and they are the two the design turns on. The
+        // block keeps the indent of the `def` it belongs to, so the prose reads
+        // as part of the function rather than as a chapter heading; and four
+        // spaces under `Args:` — CommonMark's indented-code marker, and the
+        // commonest shape in Python — is prose rather than a grey slab.
+        let dir = TempDir::new("view-docs-py");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+
+        assert_eq!(
+            laid(&mut pane, 40, 20),
+            [
+                "  1 def add(a, b):",
+                "  2     Add two numbers.",
+                "        ",
+                "        Args: a: the first.",
+                "  7     return a + b",
+                "  8 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_doc_block_carries_the_number_of_its_first_line_and_nothing_else() {
+        // N source lines become M rendered rows and M is not N, so there is no
+        // number to put on rows two and after. The blank is not a new rule: it
+        // is what a wrapped continuation has always worn, and the reader has
+        // already learned it from every line too wide to fit.
+        let dir = TempDir::new("view-docs-number");
+        let (rs, _) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&rs);
+        let lines = laid(&mut pane, 40, 20);
+
+        let numbers: Vec<&str> = lines.iter().map(|l| l[..4].trim()).collect();
+        assert_eq!(numbers, ["1", "", "", "4", "5", "6", "7"]);
+        // Three source lines of documentation, three rendered rows — and the
+        // count agreeing here is a coincidence of this fixture, which is why the
+        // assertion above is about the numbers and not about the arithmetic.
+        assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn every_row_of_a_rendered_block_still_wears_the_pane_s_own_margin() {
+        // [`search::Margin`] is a single width applied to a single prefix of the
+        // rows, so it only means anything if every row wears the same one. A doc
+        // row that skipped the gutter, or wore a narrower one, would put `/`
+        // four columns out for the rest of the document.
+        let dir = TempDir::new("view-docs-margin");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+        laid(&mut pane, 40, 20);
+
+        assert_eq!(pane.margin.width, 4);
+        assert_eq!(pane.margin.rows, pane.lines.len());
+        for (i, line) in pane.lines.iter().enumerate() {
+            let row: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                row.len() >= 4 && row[..4].trim().chars().all(|c| c.is_ascii_digit()),
+                "row {i} does not open with a gutter: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_file_with_nothing_to_render_is_laid_out_exactly_as_it_was_before() {
+        // The promise to everyone who is not reading a `.rs` or a `.py`, and to
+        // most of the ones who are: a file with no documentation in it must come
+        // out of the interleaving path identical to what the plain one produced.
+        // Pinned by handing the same file down both paths, because "identical to
+        // what it used to do" is not otherwise a thing a test can hold on to.
+        let dir = TempDir::new("view-docs-none");
+        let body = b"fn main() {\n    println!(\"hi\");\n}\n";
+        dir.write("plain.rs", body);
+        let path = dir.path().join("plain.rs");
+        let text = String::from_utf8_lossy(body).into_owned();
+
+        let regions = docs::regions(&text, &path);
+        assert!(!regions.iter().any(docs::Region::is_doc));
+        for width in [12, 20, 30, 40, 80] {
+            let interleaved = source_lines(&text, &path, &regions, width, theme::Mode::Dark);
+            let plain = source_lines(&text, &path, &[], width, theme::Mode::Dark);
+            assert_eq!(interleaved, plain, "at width {width}");
+        }
+    }
+
+    #[test]
+    fn a_rendered_block_fits_the_pane_at_every_width_it_can_be_given() {
+        // Including the widths where there is no room to render into at all —
+        // below `LINE_NUMBER_MIN_WIDTH` the gutter goes, and below the block's
+        // own indent the prose has nowhere to go and falls back to the source.
+        // Neither may panic and neither may draw past the edge, because the
+        // pane is dragged through every one of these on the way to a new size.
+        let dir = TempDir::new("view-docs-widths");
+        let (rs, py) = documented(&dir);
+        for path in [rs, py] {
+            let mut pane = quiet(dir.path());
+            pane.show(&path);
+            for width in 1..=60usize {
+                pane.ensure_layout(width);
+                for line in &pane.lines {
+                    assert!(
+                        wrap::spans_width(&line.spans) <= width,
+                        "{} drew past {width} columns",
+                        path.display()
+                    );
+                }
+            }
+            // And a real frame at the sizes that have no columns to spare.
+            let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            for (w, h) in [(0, 0), (1, 1), (2, 20), (5, 6), (29, 4)] {
+                term.draw(|f| pane.render(f, Rect::new(0, 0, w, h)))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_too_big_to_highlight_still_renders_the_documentation_in_it() {
+        // The two caps are separate on purpose. `HIGHLIGHT_MAX_BYTES` is a time
+        // budget on syntect, which is the expensive half; markdown is several
+        // times cheaper per byte and is already bounded by `load::MAX_BYTES`.
+        // Dropping both at one threshold would show a big `.py`'s docstrings as
+        // `"""` while a `.md` of the same size beside it rendered, and nothing
+        // on screen would say why.
+        let dir = TempDir::new("view-docs-big");
+        let mut body = b"/// Adds two numbers.\n".to_vec();
+        while body.len() < source::HIGHLIGHT_MAX_BYTES + 1024 {
+            body.extend_from_slice(b"let x = 1;\n");
+        }
+        let path = dir.write("big.rs", &body);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let lines = laid(&mut pane, 40, 20);
+
+        assert!(lines[0].ends_with("Adds two numbers."), "{:?}", lines[0]);
+        assert!(lines[1].ends_with("let x = 1;"), "{:?}", lines[1]);
+        // And the code really is past the cap: plain, not highlighted. Past the
+        // gutter, which is the pane's own and dim on purpose.
+        let coloured = pane.lines[1]
+            .spans
+            .iter()
+            .skip(1)
+            .any(|s| s.style.fg.is_some());
+        assert!(!coloured, "it was highlighted, so this proves nothing");
     }
 
     // --- the four things that must never panic ---------------------------
@@ -2726,9 +3180,14 @@ mod tests {
     }
 
     #[test]
-    fn a_source_file_has_no_second_form_to_toggle_to() {
+    fn a_source_file_with_no_documentation_in_it_has_no_second_form_to_toggle_to() {
         // `Handled::No` rather than a no-op that claims to have acted: a frame
-        // here re-renders the agent's whole screen.
+        // here re-renders the agent's whole screen, and a reader who cannot see
+        // what the key did presses it again.
+        //
+        // The gate is what the file *contains* and not what it is called. This
+        // `main.rs` renders to itself, so there is nothing on the other side of
+        // `t` and the title must not advertise one either.
         let dir = TempDir::new("view-raw-rs");
         let path = dir.write("main.rs", b"fn main() {}\n");
         let mut pane = quiet(dir.path());
@@ -2738,12 +3197,88 @@ mod tests {
             Handled::No
         );
         assert!(!pane.raw, "and the pane's idea of raw is unchanged");
+        laid(&mut pane, 40, 10);
+        let title = pane.title();
+        assert!(!title.contains("rendered"), "{title}");
+        assert!(!title.contains("source"), "{title}");
 
         // Nor is there anything to toggle on a screen with no document on it.
         let mut empty = quiet(dir.path());
         assert_eq!(
             empty.handle_key(key(KeyCode::Char('t'))).unwrap(),
             Handled::No
+        );
+    }
+
+    #[test]
+    fn t_shows_a_documented_source_file_as_it_was_actually_written() {
+        // The other half of the gate. A `.py` whose docstrings are rendered has
+        // a second form in exactly the sense markdown does — prose on one side,
+        // the text somebody typed on the other — so the key acts and the title
+        // says which side is up.
+        let dir = TempDir::new("view-raw-docs");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+        laid(&mut pane, 40, 20);
+        assert!(pane.title().contains("· rendered"), "{}", pane.title());
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('t'))).unwrap(),
+            Handled::Yes
+        );
+        assert_eq!(
+            laid(&mut pane, 40, 20),
+            [
+                "  1 def add(a, b):",
+                "  2     \"\"\"Add two numbers.",
+                "  3 ",
+                "  4     Args:",
+                "  5         a: the first.",
+                "  6     \"\"\"",
+                "  7     return a + b",
+                "  8 ",
+            ],
+            "every line back, numbered one for one"
+        );
+        assert!(pane.title().contains("· source"), "{}", pane.title());
+
+        // And back, because a toggle that only goes one way is a mode.
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        assert_eq!(laid(&mut pane, 40, 20)[1], "  2     Add two numbers.");
+    }
+
+    #[test]
+    fn a_phrase_hidden_by_a_rendered_docstring_is_offered_the_key_that_shows_it() {
+        // The notice names the remedy that is true of the body under it, and
+        // `t` is now true of more bodies than markdown. `"""` is in this file
+        // and not on this page — the rendering ate it, exactly as it eats `**`
+        // in a `.md` — so telling the reader to widen the pane would be sending
+        // them after something no width will bring back.
+        let dir = TempDir::new("view-docs-miss");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+        laid(&mut pane, 40, 20);
+
+        query(&mut pane, "\"\"\"");
+        assert!(
+            pane.title().contains("no match · t for source"),
+            "{}",
+            pane.title()
+        );
+
+        // A file with nothing rendered gets the other remedy, unchanged: there
+        // is no second form to send anybody to, and a wrap is then the only way
+        // a phrase can be missing.
+        let plain = dir.write("plain.rs", b"fn main() {}\n");
+        pane.show(&plain);
+        laid(&mut pane, 40, 20);
+        query(&mut pane, "zzz");
+        assert!(
+            pane.title().contains("no match · widen if a wrap split it"),
+            "{}",
+            pane.title()
         );
     }
 
