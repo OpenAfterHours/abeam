@@ -752,9 +752,13 @@ work, on either platform.
   `f` matches the lines in a file and `/` matches the rows the pane drew, and
   those are the same text for most files and not for all: a line too wide for
   the pane is wrapped, and a match straddling the break is not on the drawn page
-  at all. It is reachable in a plain source file by dragging the pane narrower,
-  and no width fixes it in rendered markdown, where the source syntax is not on
-  the page at all. A drawn mermaid diagram is the sharpest case of that same
+  at all. It is reachable in an undocumented source file by dragging the pane
+  narrower, and no width fixes it in rendered markdown — or in a rendered
+  docstring, which puts a `.rs` and a `.py` in the same position — where the
+  source syntax is not on the page at all. Rendering also makes the disagreement
+  run the other way, which it did not before documentation was drawn as prose: a
+  docstring whose two lines draw as one row holds a phrase for `/` that `f`
+  cannot find in the file. A drawn mermaid diagram is the sharpest case of that same
   rule: a node label wrapped inside its own box is not one run of text on any
   row, and the mermaid source `f` matched is not on the page in any form, so
   `t` rather than the width is the whole remedy there. Neither is silent — the page names the remedy its own body

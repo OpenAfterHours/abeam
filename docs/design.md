@@ -378,7 +378,9 @@ both rather than exactly serving both. The vocabulary itself: `j`/`k` and
 arrows for a line, `space`/`b` and PgDn/PgUp for a page,
 `Ctrl+D`/`Ctrl+U` for a half page, `g`/`G` and Home/End for the ends,
 `Tab`/`Shift+Tab` for the selection, `Enter` to open, `r` to refresh. `t` swaps
-rendered markdown for its source, and `Backspace` climbs a directory in the file
+the rendering for what was typed — markdown, or a source file whose docstrings
+are being drawn as prose — `o` opens the outline of the document, and
+`Backspace` climbs a directory in the file
 list. Three keys search, and they ask three different questions rather than one
 question three ways: `/` in the file list is *which file is called this*, `/` in
 the document is *where is it on this page* — `n` and `N` walk the matches — and
@@ -553,9 +555,22 @@ after this is the whole of that.
 
 **files** — read-only markdown and source, and a way to reach any of it.
 Markdown is rendered, not shown as source: headings, lists, tables, quotes, GFM
-alerts, footnotes, syntax-highlighted fenced code, and mermaid diagrams. `t`
+alerts, footnotes, YAML front matter as a key/value header, images as their alt
+text, syntax-highlighted fenced code, and mermaid diagrams. `t`
 swaps that for the source it was rendered from, highlighted and numbered like
 any other file, and back.
+
+**No markup is left on the page, and the level of a heading is carried by its
+shape rather than by its hue.** The `#`s are gone — they were the last literal
+syntax in a rendering that had dropped every other kind — and what replaces them
+is structural, because `theme.rs`'s rule is that colour alone is not a signal
+every reader receives: a full-width rule under a title, a shorter one under a
+section, nothing under a sub-section, and a `▸`/`▹`/`▫` pip on the three levels
+below that, which `Theme::heading` gives one colour between them. Below twelve
+usable columns all of it goes, as every other decoration in that renderer does,
+and the words get the cells back. A link whose destination will not fit is cut
+to its host with a `…` saying so, rather than silently, because `github.com` and
+a forty-character issue URL are otherwise the same four words on the page.
 
 A ` ```mermaid ` fence is the one of those that is *redrawn* rather than
 styled, and it is here because it was the conspicuous hole: syntect has no
@@ -571,7 +586,28 @@ a node spelled in syntax this does not know — keeps the code block it has alwa
 had, and `t` still reaches the source, which is the only way to read a diagram
 abeam declined to draw. What never happens is the fourth thing: a drawing with
 an edge missing from it. The source is always true, and a diagram that has
-quietly lost a node is worse than one nobody drew. Source files get highlighting and a line-number gutter. Everything is
+quietly lost a node is worse than one nobody drew.
+
+Source files get highlighting and a line-number gutter — and, in Rust and
+Python, **their documentation rendered where it stands**. A run of `///` or
+`//!`, a `/** */`, a `"""` docstring on a `def` or a `class`: each is markdown
+by the time it reaches the page, laid out at the column the code put it at,
+between the highlighted lines it describes. The scanner that finds them is a
+line pass rather than a parser, so it is exact in Rust and a heuristic in
+Python; measured against `ast` over four and a half thousand real files of the
+standard library it names a docstring wrongly about once in six hundred, and the
+blocks it takes that `ast` calls code are f-strings, which it takes on purpose.
+A block that would swallow a line at or below its own owner's indent is refused
+outright, so the mistake it can make is to render a string as prose and not to
+hide code behind one. `t` is always one key from what was actually typed. No other
+language has one, which is a scope line rather than a principle.
+
+The gutter is what that costs, and it is paid openly. A docstring of twelve
+lines does not become twelve rows of prose, so a number per row would be an
+invention; a rendered block carries the first and the last file line its words
+come from, and a `┊` on the rows between. Three glyphs rather than two, because
+a blank number already meant “continuation of the row above” and one signal
+cannot make two claims. Everything is
 pre-wrapped to the pane's exact width and scrolled by physical row, so
 jump-to-end lands where you asked. On startup it opens the newest markdown under
 the root; after that it follows what gets written. If something arrives while
@@ -648,6 +684,38 @@ the only one of the four whose remedy is a key already on screen — what it lef
 out is in files the list did reach, and `Enter` on any row of one of them shows
 all of them.
 
+`o` is the fourth mode of this pane and the one that is not a search: the
+document's own shape, as a list you can jump into. Markdown headings come from
+the renderer itself — recorded at the moment a heading is emitted, so the row is
+the row rather than a guess made afterwards by looking for bold text — and a
+Rust or Python file's definitions come from a line scanner. `Enter` jumps and
+`Esc` leaves you exactly where you were, which is the rule every box in this
+pane already follows.
+
+Two things about it are worth stating rather than leaving to be found. **An
+entry is a row of the laid-out document, so it goes stale exactly as a search
+hit does**, and for the same reason it is rebuilt in the one place the rows are
+— a width change re-wraps every paragraph and `t` swaps the document for a form
+that shares no rows with it at all, and an entry left over from the previous
+layout would land `Enter` somewhere the reader did not choose, silently. And
+**markdown shown as its source has no outline**, though its headings are plainly
+there as `#` lines a scanner would find in twenty lines of code. That is
+deliberate: `pulldown_cmark` is what decides what a heading is in this pane, and
+a line scanner is not, so where the two disagree — a `#` inside a fence, a setext
+heading, a `#` in an indented code block — one document would list two different
+tables of its own contents depending on which key was last pressed, with nothing
+on screen to say which was right. `t` is one keystroke back to the form that has
+one. Where there is nothing to list, `o` declines rather than opening an empty
+list, which is the same promise `t` makes on a file with no second form.
+
+The title carries a breadcrumb of the section the reader has scrolled into, and
+it sits **after** the position, which is to say last, which is to say it is the
+first thing a narrow border clips. That ordering is the whole of its design: the
+title is clipped from the right and `· rendered` has to outlast the query
+because it is the answer to “why can I not find `**`”, whereas a breadcrumb
+answers nothing — it is a convenience, and a convenience must not take an answer
+down with it.
+
 **The two searches do not agree about what a match is, and the pane says so
 rather than hiding it.** `f` matches the lines in a file; `/` matches the rows
 the pane drew, which is what lets one search serve rendered prose, its source
@@ -657,11 +725,16 @@ the same thing on both sides of `t`, and a mapping is what searching the source
 would have needed. Those are the same text for most files and not for all. A
 line too wide for the pane is wrapped, so a match that straddles the break is
 one the drawn page does not have; that is not a markdown problem, and dragging
-the pane narrower is enough to reach it in a plain source file. In rendered
-markdown the source syntax is not on the page at any width, so `**` cannot be
-found there at all. So a page with no match for the phrase names the way out
-that is true for the body in front of you — `· t for source` on rendered
-markdown, `· widen if a wrap split it` on anything else — and a result that
+the pane narrower is enough to reach it in an undocumented source file. In
+rendered markdown the source syntax is not on the page at any width, so `**`
+cannot be found there at all, and a rendered docstring puts a `.rs` or a `.py`
+in the same position — the `"""` is not on that page either. It now runs in the
+*other* direction too, which it never did before documentation was rendered: a
+docstring holding `Must be a` on one line and `non-empty string` on the next
+draws as one row, so `/` finds a phrase there that `f` cannot find in the file.
+So a page with no match for the phrase names the way out
+that is true for the body in front of you — `· t for source` on anything with a
+second form, `· widen if a wrap split it` on anything else — and a result that
 lands on a different match from the one you chose says `· not the 3rd` rather
 than a confident `2/2` about a question nobody asked. Retiring the gap needs
 rows grouped by the source line they came from: `source_lines` knows that
