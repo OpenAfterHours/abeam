@@ -130,6 +130,75 @@
 //!
 //! numpydoc needs nothing either way: `Parameters` over a row of `-` is a
 //! setext H2 and renders as a heading for free.
+//!
+//! ## Markup put round a doctest, and nothing moved
+//!
+//! Dedent is still the only pass that *takes anything off*, and the paragraph
+//! above is still the whole of what it takes. [`doctests`] is a different
+//! shape of thing and the difference is the point: it inserts lines — a fence,
+//! or the blank one a run needs to stop being a paragraph's lazy continuation —
+//! and leaves every line the author wrote byte for byte where it was.
+//!
+//! It exists because a doctest written the way PEP 257, CPython, numpy and
+//! essentially every real docstring writes it — flush with the prose around it
+//! — arrives at CommonMark, after dedent, with its `>>> ` at column zero, and
+//! at column zero that is three nested blockquote markers rather than a
+//! prompt. The prompts are eaten, consecutive statements merge into one
+//! reflowed paragraph and the sample is drawn as a quotation. That is the
+//! failure the deleted pass was charged with, reached by the *common* shape
+//! rather than by a rewriting, and it was on this page all along: the
+//! regression test that guards it indents its fixture four columns further
+//! than the docstring body, which is an indented code block and renders
+//! correctly for reasons that have nothing to do with the bug.
+//!
+//! Why this is allowed where the deleted pass was not, in one sentence: that
+//! pass had to decide of an *arbitrary* indented line whether the author meant
+//! the indentation, with nothing in the line to decide it from, and this one
+//! acts on a marker — `>>> ` is `doctest.PS1`, the one construct in a
+//! docstring that is executed rather than read, and where the marker is absent
+//! this pass does nothing whatever.
+//!
+//! Measured the same way as everything else here, over the 4,610 `.py` files of
+//! a 3.12 install: 34,933 doc blocks, of which **753 gain a fence** and 631
+//! more hold a prompt the blank-line branch answered instead. Not one prompt
+//! below the threshold came out unfenced, not one region moved an edge, and
+//! `first`/`last` stayed inside their region in every block — which is the
+//! ordering inside [`doc`] holding, not a coincidence. The one shape the guard
+//! turns away in numbers is an RST section underline: `~~~~~~~~` is a tilde
+//! fence to CommonMark, so a docstring ruled that way is already a code block
+//! from the underline down and is left exactly as it is found, which is the
+//! only answer that does not put a stray ``` on the page.
+//!
+//! ## What a Google-style `Args:` block still costs, and why
+//!
+//! It reflows into one sentence — `Args: name: what to call it. size: how many
+//! cells wide.` — and that is asked about often enough to be worth writing down
+//! rather than rediscovering. Three transforms were tried against
+//! `markdown::render` and all three were refused:
+//!
+//! - **A bullet at each entry's own column** — the additive one, and the one
+//!   that sounds right — renders `Args: - name: x - size: y`. A list marker
+//!   four columns in cannot interrupt a paragraph any more than an indented
+//!   code block can, so the run-on survives with two characters of noise per
+//!   entry added to it. That is `normalise`'s exact failure, paying for a
+//!   benefit it does not deliver, and it is why the pass above was measured
+//!   before it was written.
+//! - **A bullet within three columns of the label**, which does make a list,
+//!   has to pull each entry left and re-indent its continuation lines to keep
+//!   them in the item. That is moving the author's text by an amount read off
+//!   its surroundings, which is the whole of what this module says it does not
+//!   do.
+//! - **A blank line under the label**, which is additive and does separate the
+//!   entries, makes the block indented code and hangs a `│ ` gutter on it —
+//!   and `markdown` says in as many words that that gutter is a claim the lines
+//!   behind it are code. A parameter list is not code. It is also the demotion
+//!   this module already charges `normalise` with, run the other way.
+//!
+//! So the reader gets a run-on with every parameter present, in order, in the
+//! author's words, on the lines the gutter names, and `t` one key away. Bad
+//! reading and nothing lost, which is the side of the line this pane can live
+//! on; the doctest above was on the other side of it, with two statements
+//! merged into one row and both prompts deleted.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -250,6 +319,12 @@ fn partition(docs: Vec<Region>, lines: usize) -> Vec<Region> {
     out
 }
 
+/// `Copy` because [`doc`] takes one: the rules for turning a block's lines into
+/// the text a renderer sees are not the same in the two languages, and a `bool`
+/// standing in for "is this Python" would have to be read twice — once as PEP
+/// 257's first-line rule and once as [`doctests`] — with nothing saying they are
+/// the same question.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Lang {
     Rust,
     Python,
@@ -312,14 +387,14 @@ fn rust(lines: &[&str]) -> Vec<Region> {
                 }
                 i += 1;
             }
-            out.push(doc(start, i, indent, body, false));
+            out.push(doc(start, i, indent, body, Lang::Rust));
             continue;
         }
 
         if is_block_open(rest)
             && let Some((end, body)) = rust_block(lines, i, indent)
         {
-            out.push(doc(i, end, indent, body, false));
+            out.push(doc(i, end, indent, body, Lang::Rust));
             i = end;
             continue;
         }
@@ -517,7 +592,7 @@ fn python(lines: &[&str]) -> Vec<Region> {
                 Some(header) => indent > header,
             };
             if allowed && let Some((end, body)) = docstring(lines, i, rest, outer) {
-                out.push(doc(i, end, indent, body, true));
+                out.push(doc(i, end, indent, body, Lang::Python));
                 i = end;
                 continue;
             }
@@ -779,18 +854,15 @@ fn tail_is_clear(tail: &str, comment: &str) -> bool {
 
 /// Turn a block's stripped lines into a region.
 ///
-/// `first_is_special` is Python's: the first line of a docstring sits on the
-/// same physical line as its opening quotes, so it has no indentation to share
-/// with the rest and PEP 257 leaves it out of the common-indent calculation.
-/// Rust's line comments all start at the same column, so it does not apply.
-fn doc(
-    start: usize,
-    end: usize,
-    indent: usize,
-    mut body: Vec<String>,
-    first_is_special: bool,
-) -> Region {
-    dedent(&mut body, first_is_special);
+/// Two of the three things done here are Python's. The first line of a
+/// docstring sits on the same physical line as its opening quotes, so it has no
+/// indentation to share with the rest and PEP 257 leaves it out of the
+/// common-indent calculation; Rust's line comments all start at the same column,
+/// so that does not apply. And [`doctests`] is a Python construct by
+/// definition. Rust gets `dedent` and nothing else.
+fn doc(start: usize, end: usize, indent: usize, mut body: Vec<String>, lang: Lang) -> Region {
+    let python = lang == Lang::Python;
+    dedent(&mut body, python);
     // **`body[n]` is what file line `start + n` contributed**, and that holds
     // for every shape this module builds one out of: a run of `///` lines is
     // one entry per line, a `/** … */` block opens with the text after the
@@ -799,6 +871,12 @@ fn doc(
     // makes the two indices below a line number rather than a guess. A future
     // rule that folded two source lines into one entry would break that
     // quietly, so it would have to carry the offsets itself.
+    //
+    // [`doctests`] adds lines and therefore breaks that mapping outright, which
+    // is why it runs *below* this and not above it. The ordering is the whole
+    // guarantee: `first` and `last` are read off the body while it is still one
+    // entry per source line, and what the pass does afterwards is invisible to
+    // them. Move the call up and the gutter starts numbering rows by a fence.
     let first = body.iter().position(|l| !l.is_empty()).unwrap_or(0);
     let last = body.iter().rposition(|l| !l.is_empty()).unwrap_or(first);
     // A docstring's closing `"""` sits on its own line and leaves an empty one
@@ -815,6 +893,9 @@ fn doc(
     // one fact instead of two.
     body.truncate(last + 1);
     body.drain(..first.min(body.len()));
+    if python {
+        doctests(&mut body);
+    }
     Region {
         start,
         end,
@@ -859,6 +940,121 @@ fn dedent(body: &mut [String], first_is_special: bool) {
             line.drain(..common);
         }
     }
+}
+
+/// CommonMark's block-start threshold: four columns is an indented code block,
+/// and anything less is read as whatever the line says it is.
+const CODE_INDENT: usize = 4;
+
+/// Give a doctest the markup that makes CommonMark draw it as the code it is.
+///
+/// **The failing shape is the common one.** A doctest is written flush with the
+/// prose around it — PEP 257's own example, CPython's, numpy's — so after
+/// [`dedent`] its `>>> ` is at column zero, where CommonMark reads three nested
+/// blockquote markers. The prompts are eaten, `>>> a()` and `>>> b()` reflow
+/// into one paragraph, and the sample is drawn behind a `▏ ` quote gutter. A
+/// doctest indented *further* than the body around it is the one shape that
+/// works already, because four columns is an indented code block; that is the
+/// shape the regression test in `viewer` was written with, which is why it went
+/// on passing over the top of this.
+///
+/// **Why acting on `>>> ` is not the deleted `normalise` in another coat.** That
+/// pass was asked, of an arbitrary line indented four columns, whether the
+/// author meant the indentation — and nothing in such a line answers it. Four
+/// columns is a Google-style `Args:` entry, a doctest, a literal block and a
+/// nested list, and the pass moved all four the same way because it could not
+/// tell them apart. `>>> ` at the start of a line is not that kind of evidence.
+/// It is `doctest.PS1`, spelled with its trailing space, and it marks the one
+/// thing in a docstring that is *executed* rather than read; CommonMark has no
+/// construct that produces it, because three levels of quotation are written
+/// `> > >`. Where the marker is absent this function does nothing at all, which
+/// is the property the deleted pass could not have.
+///
+/// And nothing here moves a character. The two branches insert lines:
+///
+/// - **Below the threshold** — the broken case — a fence at the run's own
+///   indent. A fenced block *can* interrupt a paragraph, so `Example:` on the
+///   line above needs no blank line inserted under it, and CommonMark strips
+///   exactly the fence's own indent off the lines inside, so the sample reaches
+///   the page at the column the author put it at relative to its label.
+/// - **At or past it** the run is already a code block *unless* a paragraph is
+///   running into it, in which case it is that paragraph's lazy continuation.
+///   The one thing missing is the blank line that lets the code block start, so
+///   that is the one thing added — no fence, so this branch and the branch
+///   above draw the same, which they should: `>>> f()` indented and `>>> f()`
+///   flush are the same doctest, and `doctest` itself says so by stripping the
+///   indentation before it compiles the example.
+///
+/// The fence carries no info string on purpose. Handing syntect `python` for a
+/// block whose every line begins with a prompt colours the prompts as operators
+/// and the expected output as whatever it parses to; and the indented branch
+/// above has no way to carry a language at all, so a language here would make
+/// the two branches differ in the one respect they must not.
+///
+/// **Guarded like the rest of this module: all or nothing.** A block with a
+/// fence anywhere in it is left entirely alone. An author who has written a
+/// fence is writing markdown deliberately, their sample is already code, and a
+/// second opinion inserted into a block that has one can only be inserted
+/// somewhere it does not belong — inside their fence, where it is not markup
+/// but text. This is [`undecorate`]'s rule and it is refused for the same
+/// reason.
+///
+/// What it does not reach is a doctest nested inside a list item, where the
+/// column that decides these questions is the item's content column rather than
+/// zero. The fence branch survives that by accident and the blank-line branch
+/// does not. That is a line scanner's limit rather than an oversight — this
+/// module is deliberately not a block parser — and the cost is one sample that
+/// draws as it draws today.
+fn doctests(body: &mut Vec<String>) {
+    if body.iter().any(|l| {
+        let t = l.trim_start_matches(' ');
+        t.starts_with("```") || t.starts_with("~~~")
+    }) {
+        return;
+    }
+    let mut i = 0;
+    while i < body.len() {
+        if !is_prompt(&body[i]) {
+            i += 1;
+            continue;
+        }
+        let base = indent_of(&body[i]);
+        // `doctest.DocTestParser`'s own rule for where an example ends: the
+        // expected output runs to a blank line, and a line that comes back left
+        // of the prompt was never part of it. Both are needed — the blank is
+        // what separates a sample from the prose under it, and the indent is
+        // what stops a sample indented under `Examples:` from swallowing the
+        // paragraph that follows the section.
+        let mut end = i + 1;
+        while end < body.len() {
+            let line = &body[end];
+            if line.trim().is_empty() || indent_of(line) < base {
+                break;
+            }
+            end += 1;
+        }
+        if base < CODE_INDENT {
+            let pad = " ".repeat(base);
+            body.insert(end, format!("{pad}```"));
+            body.insert(i, format!("{pad}```"));
+            i = end + 2;
+        } else if i > 0 && !body[i - 1].trim().is_empty() {
+            body.insert(i, String::new());
+            i = end + 1;
+        } else {
+            i = end;
+        }
+    }
+}
+
+/// `doctest.PS1`, at the start of a line and with the space that is part of it.
+///
+/// The space is not pedantry. It is what tells a prompt from `>>>` used as an
+/// arrow or as the tail of a `<<<<<<<` conflict marker, and it costs nothing:
+/// a prompt with no space after it is a line with no statement on it, which is
+/// not what any of this is here to keep.
+fn is_prompt(line: &str) -> bool {
+    line.trim_start_matches(' ').starts_with(">>> ")
 }
 
 /// The line as the pane will draw it. Tabs are expanded through
@@ -1097,13 +1293,147 @@ mod tests {
             docs_of(&scan(src, "a.py")),
             ["Do it.\n\nArgs:\n    x: the thing."]
         );
+    }
 
-        // And the case the same rewriting broke: `>>> ` is four columns of
-        // indentation holding a `>`, and at two columns it is three nested
-        // blockquote markers instead. What arrives at the renderer has to still
-        // be a doctest.
-        let doctest = "def f():\n    \"\"\"Do it.\n\n    >>> f()\n    1\n    \"\"\"\n";
-        assert_eq!(docs_of(&scan(doctest, "a.py")), ["Do it.\n\n>>> f()\n1"]);
+    #[test]
+    fn a_doctest_written_flush_with_its_prose_is_fenced_rather_than_quoted() {
+        // **The shape every real docstring uses.** PEP 257 writes a doctest
+        // level with the paragraph above it, so after `dedent` the `>>> ` is at
+        // column zero — where CommonMark reads three nested blockquote markers,
+        // eats every prompt, reflows the statements into one paragraph and
+        // draws the lot as a quotation. A fence at the run's own indent is what
+        // stops that, and it adds two lines without moving a character of the
+        // sample.
+        let flush = "def f():\n    \"\"\"Do it.\n\n    >>> f()\n    >>> g()\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(flush, "a.py")),
+            ["Do it.\n\n```\n>>> f()\n>>> g()\n```"]
+        );
+
+        // The expected output belongs to the sample and is fenced with it: it
+        // runs to the blank line, which is `doctest`'s own rule for where an
+        // example ends.
+        let output = "def f():\n    \"\"\"Do it.\n\n    >>> f()\n    1\n\n    And that is all.\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(output, "a.py")),
+            ["Do it.\n\n```\n>>> f()\n1\n```\n\nAnd that is all."]
+        );
+
+        // Two examples separated by a blank line are two samples, not one with a
+        // hole in it.
+        let two =
+            "def f():\n    \"\"\"Do it.\n\n    >>> f()\n    1\n\n    >>> g()\n    2\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(two, "a.py")),
+            ["Do it.\n\n```\n>>> f()\n1\n```\n\n```\n>>> g()\n2\n```"]
+        );
+    }
+
+    #[test]
+    fn a_doctest_indented_under_its_label_gets_the_blank_line_and_not_a_fence() {
+        // At four columns the run is already an indented code block *unless* a
+        // paragraph is running into it — and `Example:` on the line above is
+        // exactly that, which makes the sample a lazy continuation of the label
+        // and the whole section one run-on line. One blank line is the entire
+        // repair, and it leaves the sample looking the same as the flush one
+        // does, which is right: they are the same doctest.
+        let tight =
+            "def f():\n    \"\"\"Do it.\n\n    Example:\n        >>> f()\n        1\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(tight, "a.py")),
+            ["Do it.\n\nExample:\n\n    >>> f()\n    1"]
+        );
+
+        // With the blank line already there, nothing is added: CommonMark was
+        // going to draw this as code anyway, and a second opinion could only
+        // change it.
+        let loose = "def f():\n    \"\"\"Do it.\n\n    Example:\n\n        >>> f()\n        1\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(loose, "a.py")),
+            ["Do it.\n\nExample:\n\n    >>> f()\n    1"]
+        );
+
+        // And the paragraph under a section is not swallowed as expected
+        // output: a line back at the label's own column is left of the prompt,
+        // which is where `doctest` ends an example too. Nothing is inserted
+        // *after* the run because nothing needs to be — a line back at column
+        // zero ends an indented code block by itself.
+        let after = "def f():\n    \"\"\"Do it.\n\n    Example:\n        >>> f()\n    Prose again.\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(after, "a.py")),
+            ["Do it.\n\nExample:\n\n    >>> f()\nProse again."]
+        );
+    }
+
+    #[test]
+    fn a_block_that_already_has_a_fence_is_left_entirely_alone() {
+        // All or nothing, which is [`undecorate`]'s rule and is refused for the
+        // same reason: an author who has written a fence is writing markdown
+        // deliberately, and the only places left to insert a second opinion are
+        // places it would arrive as text rather than as markup — inside theirs.
+        let fenced =
+            "def f():\n    \"\"\"Do it.\n\n    ```python\n    >>> f()\n    ```\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(fenced, "a.py")),
+            ["Do it.\n\n```python\n>>> f()\n```"]
+        );
+
+        // A fence anywhere in the block, not merely one round the sample: this
+        // is asked of the whole block precisely so it cannot be asked wrongly of
+        // a part of it.
+        let elsewhere = "def f():\n    \"\"\"Do it.\n\n    ```\n    x = 1\n    ```\n\n    >>> f()\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(elsewhere, "a.py")),
+            ["Do it.\n\n```\nx = 1\n```\n\n>>> f()"]
+        );
+    }
+
+    #[test]
+    fn a_quotation_stays_a_quotation_and_rust_is_never_touched() {
+        // The marker is `>>> ` and nothing near it. One `>` is a block quote the
+        // author wrote and means, two is a nested one, and `>>>` with no space
+        // is not a prompt — none of them is a doctest and none of them is
+        // rewritten.
+        let quoted = "def f():\n    \"\"\"Do it.\n\n    > Somebody said this.\n    >> And this.\n    >>>not this either.\n    \"\"\"\n";
+        assert_eq!(
+            docs_of(&scan(quoted, "a.py")),
+            ["Do it.\n\n> Somebody said this.\n>> And this.\n>>>not this either."]
+        );
+
+        // Rust has no doctests to find. `/// >>> f()` in a Rust doc comment is
+        // somebody quoting a Python session, and this pass never runs on it.
+        assert_eq!(
+            docs_of(&scan("/// Do it.\n///\n/// >>> f()\nfn f() {}\n", "a.rs")),
+            ["Do it.\n\n>>> f()"]
+        );
+    }
+
+    #[test]
+    fn fencing_a_doctest_moves_neither_the_regions_edges_nor_its_line_numbers() {
+        // The pass adds lines to the *text handed to the renderer*, and the
+        // gutter numbers rows from `first` and `last`, which are read off the
+        // body while it is still one entry per source line. If that ordering
+        // ever reverses, the first row of a sample wears the number of a fence
+        // that is not in the file — so it is pinned here rather than left to
+        // `doc`'s comment.
+        let src = "def f():\n    \"\"\"Do it.\n\n    >>> f()\n    1\n    \"\"\"\n    return 1\n";
+        let got = scan(src, "a.py");
+        let Kind::Doc { first, last, .. } = got[1].kind else {
+            panic!("the docstring is a doc region");
+        };
+        assert_eq!((got[1].start, got[1].end), (1, 6));
+        assert_eq!((first, last), (1, 4), "the summary's line and the sample's");
+        assert_eq!(got[2], Region::code(6, 8));
+
+        // And the partition still puts the file back, which is the property the
+        // pane leans its weight on.
+        let lines: Vec<&str> = src.split('\n').collect();
+        let back: Vec<&str> = got
+            .iter()
+            .flat_map(|r| &lines[r.start..r.end])
+            .copied()
+            .collect();
+        assert_eq!(back.join("\n"), src);
     }
 
     #[test]
