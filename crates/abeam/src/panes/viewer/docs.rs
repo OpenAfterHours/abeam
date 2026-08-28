@@ -325,12 +325,22 @@ fn partition(docs: Vec<Region>, lines: usize) -> Vec<Region> {
 /// 257's first-line rule and once as [`doctests`] — with nothing saying they are
 /// the same question.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Lang {
+pub(super) enum Lang {
     Rust,
     Python,
 }
 
-fn language(path: &Path) -> Option<Lang> {
+/// Which source language a path is, or `None` for one this module has no rules
+/// for.
+///
+/// `pub(super)` rather than private, and it is the one answer to "which
+/// language is this file" that `panes::viewer` has. `mod docs;` is itself
+/// private, so this widens nothing outside that module — the same reach
+/// [`regions`] and [`Region`] already have — and what it buys is that
+/// [`outline::symbols`](super::outline::symbols) cannot come to disagree with
+/// this one about what a `.pyi` is. A language added here is a language both
+/// halves of the pane learn in the same commit.
+pub(super) fn language(path: &Path) -> Option<Lang> {
     let ext = path.extension()?.to_str()?;
     if ext.eq_ignore_ascii_case("rs") {
         return Some(Lang::Rust);
