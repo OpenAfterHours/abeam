@@ -4,13 +4,19 @@
 //! view or the startup walk hands it. This is the one part of the pane a
 //! person drives, and driving it has to be *cheap* and *stable*.
 //!
-//! Cheap, because `render` runs on every keystroke the agent receives. Reading a
-//! directory is the only work here that touches the disk, and it happens when
-//! the reader moves or asks — never from `render`, and never for more than
-//! [`MAX_ENTRIES`] rows. Both bounds matter: this runs on the thread that
-//! pumps the agent's pty, so a `read_dir` per frame would put a syscall behind
-//! every character typed at the agent next door, and an uncapped one would put
-//! a fifty-thousand-entry sort there.
+//! Cheap, because `render` runs on every keystroke the agent receives. Every
+//! read of the disk here happens when the reader moves or asks — never from
+//! `render`, and never for more than [`MAX_ENTRIES`] rows. Both bounds matter:
+//! this runs on the thread that pumps the agent's pty, so a `read_dir` per
+//! frame would put a syscall behind every character typed at the agent next
+//! door, and an uncapped one would put a fifty-thousand-entry sort there.
+//!
+//! Reading the directory is the bulk of it but no longer the whole of it:
+//! [`list`] also asks [`in_repository`], which stats up to two markers per
+//! ancestor, and `open_dir` asks `files::is_worktree` once. Both are on the
+//! same call as a walk that `parents(true)` already makes `ignore` stat every
+//! ancestor for, so they are noise beside it — but "the only work that touches
+//! the disk" would be a false sentence to reason from.
 //!
 //! Stable, because nothing here may move on its own. A file arriving from the
 //! watcher waits while the list is up — see `ViewerPane::render` — so the row
@@ -48,6 +54,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::DEFAULT_VIEWPORT;
+use super::files::in_repository;
 use super::list::Cursor;
 use super::theme;
 use crate::pane::Handled;
@@ -188,6 +195,14 @@ pub struct Browser {
     aligned: Option<PathBuf>,
     /// When `r` last re-read the directory. `None` until it has.
     read_at: Option<Instant>,
+    /// Whether the directory on screen is one the *index* refuses — see
+    /// [`Browser::title`], which is the only reader.
+    ///
+    /// Cached here rather than asked in `title`, because `title` is called once
+    /// per frame and the question costs a `stat` and sometimes a read.
+    /// `open_dir` is where the listing is read, and is the only place this can
+    /// go stale from.
+    unindexed: bool,
 }
 
 impl Browser {
@@ -209,6 +224,7 @@ impl Browser {
             indexed: false,
             aligned: None,
             read_at: None,
+            unindexed: false,
         }
     }
 
@@ -290,6 +306,38 @@ impl Browser {
         true
     }
 
+    /// What the border says: where the listing is, how much is in it, and — in
+    /// one word — whether the two searches can see it.
+    ///
+    /// ## `unindexed`, and why a word on the border is the fix
+    ///
+    /// `/` and `f` answer over `super::files`'s index, and that index refuses a
+    /// directory that is a worktree of another repository while this listing
+    /// walks straight into it. So `.claude/` → `worktrees/` → `other/` is four
+    /// `Enter`s from the root, and a phrase plainly visible in `NOTES.md` on
+    /// screen comes back from `f` as a confident **"0 matches"** — no `+`,
+    /// because `grep::Report::short` and `partial` are both false. Nothing is
+    /// broken and nothing says so, which is this program's own definition of
+    /// the worst state a pane can be in: `Scan::cut`, `Report::clipped` and the
+    /// `+` were each built to stop exactly that, and the split between the two
+    /// walks adds a third way for the corpus to be narrower than the tree.
+    ///
+    /// The affected set is wider than `.claude`, which is why this is not a
+    /// note about Claude Code's layout: a worktree at a non-dot path —
+    /// `<root>/wt/feature` — used to be in the index and is not now.
+    ///
+    /// One word, because the pane is forty-odd columns and the title is clipped
+    /// from the right. `crate::workspace`'s `unwatched` is the precedent and
+    /// the same idea: a pane that is merely limited is indistinguishable from a
+    /// broken one unless something admits which it is.
+    ///
+    /// It goes **before** the count rather than after it, which is this
+    /// function's own rule applied rather than a new one. The count is already
+    /// described here as "the part that can be spared" when the title is
+    /// clipped, and in a deep path — `.claude/worktrees/other/` is twenty-four
+    /// columns before anything else — something is going to be. Between losing
+    /// how many files are in a directory and losing the fact that the searches
+    /// cannot see it, the count is the cheaper thing to lose.
     pub fn title(&self) -> String {
         match &self.find {
             // The query first, prefixed with the key that opened it, because a
@@ -311,7 +359,12 @@ impl Browser {
                     .filter(|e| e.kind != Kind::Parent)
                     .count();
                 let more = if self.cut { "+" } else { "" };
-                format!("{} · {n}{more} {}", self.here(), plural(n, "item", "items"))
+                let mark = if self.unindexed { "unindexed · " } else { "" };
+                format!(
+                    "{} · {mark}{n}{more} {}",
+                    self.here(),
+                    plural(n, "item", "items")
+                )
             }
         }
     }
@@ -572,6 +625,10 @@ impl Browser {
     fn open_dir(&mut self, dir: &Path, select: Option<&Path>) {
         self.dir = dir.to_path_buf();
         (self.entries, self.cut) = list(&self.root, &self.dir, MAX_ENTRIES);
+        // Asked here because here is where the directory changes, and asked at
+        // all because `/` and `f` are about to answer over a corpus that does
+        // not contain it. See [`Browser::title`].
+        self.unindexed = super::files::is_worktree(&self.dir);
         self.listing.sel = select
             .and_then(|want| self.entries.iter().position(|e| e.path == want))
             .unwrap_or(0);
@@ -765,6 +822,50 @@ impl Browser {
 ///
 /// `max` is a parameter rather than [`MAX_ENTRIES`] read directly, so that the
 /// cap can be tested without materialising two thousand files to test it with.
+///
+/// ## Dot-names, and the one flag that is shared with the startup walk
+///
+/// `.claude`, `.github` and `.gitignore` are things a reader walking a
+/// repository is looking for, and `hidden(true)` was hiding all three to keep
+/// out `.git` — one flag doing a second job by accident. `.git` is on
+/// `crate::watch`'s noise list and is refused by name below, so the flag can be
+/// dropped.
+///
+/// Dropped **where gitignore is there to replace it**, and nowhere else, which
+/// is the whole of [`in_repository`]. With no repository above the root,
+/// `ignore` can match no gitignore rule above the root, and `hidden(true)` is
+/// the only thing keeping `.ssh` and `.aws/credentials` off a listing of
+/// somebody's home directory. The startup walk asks the same question through
+/// the same function on purpose: a directory this listing offers and the find
+/// cannot reach reads as a broken find rather than as two rules that stopped
+/// agreeing.
+///
+/// ## What this walk does *not* borrow: the worktree rule
+///
+/// `super::files` also refuses a directory that is a worktree of another
+/// repository, and this one deliberately does not. The two are answering
+/// different questions. That walk builds the **index** — `Tab`, the find,
+/// `super::grep`'s corpus — which is "the files of this workspace". This one is
+/// **navigation**, and pruning navigation takes a place away from someone who
+/// is walking to it. So the file list can be walked *into* a neighbouring
+/// agent's worktree, on purpose, while the index stays scoped to this
+/// workspace.
+///
+/// It also has to be that way for a reason this pane cannot avoid.
+/// [`Browser::align_to`] filters the document's directory only on
+/// `starts_with(&self.root)`, so during the ten seconds `crate::workspace`
+/// discovery can take, the router really can park this listing *inside* a
+/// nested worktree. Depth 0 is exempt, so the listing itself would render — but
+/// [`Browser::up`] would then open the parent and fail to re-select the
+/// directory just left, because the rule had pruned it, and landing on the
+/// place you came from is an invariant `up` states in so many words.
+///
+/// `in_noise` is called in the loop rather than through `filter_entry`, which is
+/// the opposite of what the startup walk does and for a reason that only holds
+/// here: at `max_depth(1)` there is nothing to prune. This walk yields `dir` and
+/// its children and descends into none of them, so a refusal saves no
+/// traversal, and `filter_entry` would be a second way of writing the same
+/// thing.
 fn list(root: &Path, dir: &Path, max: usize) -> (Vec<Entry>, bool) {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -772,7 +873,10 @@ fn list(root: &Path, dir: &Path, max: usize) -> (Vec<Entry>, bool) {
 
     let walk = ignore::WalkBuilder::new(dir)
         .max_depth(Some(1))
-        .hidden(true)
+        // The root, not `dir`: whether gitignore is live is a fact about the
+        // repository this window is showing, and a subdirectory of it must not
+        // reach a different answer on the way down.
+        .hidden(!in_repository(root))
         .git_ignore(true)
         .git_global(true)
         .parents(true)
@@ -780,15 +884,20 @@ fn list(root: &Path, dir: &Path, max: usize) -> (Vec<Entry>, bool) {
 
     for entry in walk.flatten() {
         let path = entry.path();
-        // Depth 0 is `dir` itself.
+        let file_type = entry.file_type();
+        let is_dir = file_type.is_some_and(|t| t.is_dir());
+        // Depth 0 is `dir` itself, which `in_noise` would refuse whenever
+        // someone has navigated into one of the noisy names on purpose.
+        // `ignore` exempts depth 0 from its own `filter_entry` for the same
+        // reason — this is that exemption written out, for the one walk that
+        // filters in the loop.
         if path == dir || in_noise(root, path) {
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let file_type = entry.file_type();
-        let kind = if file_type.is_some_and(|t| t.is_dir()) {
+        let kind = if is_dir {
             Kind::Dir
         } else if file_type.is_some_and(|t| t.is_file()) {
             Kind::File
@@ -1152,10 +1261,175 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), b"*.key\n").expect("write ignore");
 
         let b = browser(&dir, &[]);
-        // `target` and `node_modules` are `crate::watch`'s noise list; the key
-        // file is `.gitignore`'s doing; `.gitignore` itself and `.git` are
-        // hidden. A file list nobody has to scroll past build output.
-        assert_eq!(labels(&b), ["kept.md"]);
+        // `target` and `node_modules` are `crate::watch`'s noise list, which
+        // `.git` is on too; the key file is `.gitignore`'s doing. What is
+        // *not* filtered is `.gitignore` itself: it is a file of this
+        // repository's rules, and hiding it was only ever a side effect of the
+        // flag that kept `.git` out of the walk. A file list nobody has to
+        // scroll past build output, and one that is not lying about what is
+        // there.
+        assert_eq!(labels(&b), [".gitignore", "kept.md"]);
+    }
+
+    #[test]
+    fn a_dotfolder_and_a_dotfile_are_offered_because_that_is_where_the_work_is() {
+        // `hidden(true)` made this pane unable to walk to `.claude`, `.github`
+        // or `.gitignore` at all — no row, no `Enter`, and no way to tell the
+        // absence from an empty directory. The one flag was doing two jobs and
+        // only one of them on purpose.
+        let dir = tree(
+            "browse-dotted",
+            &[
+                ".gitignore",
+                ".claude/plan.md",
+                ".github/workflows/ci.yml",
+                "README.md",
+            ],
+        );
+
+        let mut b = browser(&dir, &[]);
+        assert_eq!(
+            labels(&b),
+            [".claude/", ".github/", ".gitignore", "README.md"]
+        );
+
+        // ...and it can be walked into, which is the half a listing alone does
+        // not prove.
+        b.select(0);
+        assert!(moved(b.enter()));
+        assert_eq!(labels(&b), ["..", "plan.md"]);
+    }
+
+    #[test]
+    fn outside_a_repository_the_listing_keeps_its_hidden_guard() {
+        // The other half of the same decision, and the reason it is a decision
+        // rather than a flag flip. `abeam +bash` in `$HOME` is documented, and
+        // `ignore` applies no gitignore rule at all without a repository in the
+        // ancestry — so out here `hidden(true)` is the only thing between this
+        // pane and a row labelled `.ssh/`, one `Enter` from `id_ed25519`.
+        //
+        // A bare `TempDir` rather than `tree`, deliberately: `tree` fabricates a
+        // `.git`, which is exactly the fact under test.
+        let dir = TempDir::new("browse-homedir");
+        assert!(
+            !super::super::files::in_repository(dir.path()),
+            "the temp directory has a repository above it; this test cannot say anything"
+        );
+        std::fs::create_dir_all(dir.path().join(".ssh")).expect("create .ssh");
+        std::fs::write(dir.path().join(".ssh").join("id_ed25519"), b"KEY\n").expect("write");
+        std::fs::write(dir.path().join("notes.md"), b"# notes\n").expect("write");
+
+        let b = browser(&dir, &[]);
+        assert_eq!(labels(&b), ["notes.md"]);
+    }
+
+    #[test]
+    fn whether_gitignore_is_live_is_asked_of_the_root_and_not_of_the_listing() {
+        // `list` passes `root` to `in_repository`, not `dir`, and this is the
+        // case that tells the two apart: a root that is *not* a repository,
+        // holding a subdirectory that is. Asked of `dir`, walking into `proj/`
+        // would silently start showing dot-names — a listing whose rules change
+        // as you move through it, in a window whose other walk had not changed
+        // its mind.
+        let dir = TempDir::new("browse-nested-repo");
+        assert!(
+            !super::super::files::in_repository(dir.path()),
+            "the temp directory has a repository above it; this test cannot say anything"
+        );
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(proj.join(".git")).expect("create nested repo");
+        std::fs::write(proj.join(".gitignore"), b"*.key\n").expect("write");
+        std::fs::write(proj.join("kept.md"), b"# kept\n").expect("write");
+
+        let (entries, _) = list(dir.path(), &proj, MAX_ENTRIES);
+        let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
+        assert_eq!(
+            labels,
+            ["..", "kept.md"],
+            "the root decides, not the listing"
+        );
+    }
+
+    #[test]
+    fn dot_git_costs_the_listing_neither_a_row_nor_a_slot() {
+        // Two assertions in one, because the second is the one a row count
+        // cannot show. `.git` is off the listing — `crate::watch`'s noise list,
+        // now that `hidden` is not doing it — and it is refused *before* the
+        // cap is charged for it, so a directory of two files under a cap of two
+        // is not reported as cut short.
+        let dir = tree("browse-dotgit", &["a.md", "b.md"]);
+        std::fs::create_dir_all(dir.path().join(".git").join("objects"))
+            .expect("create .git/objects");
+        std::fs::write(
+            dir.path().join(".git").join("objects").join("deadbeef"),
+            b"x",
+        )
+        .expect("write a loose object");
+
+        let (entries, cut) = list(dir.path(), dir.path(), 2);
+        let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
+        assert_eq!(labels, ["a.md", "b.md"]);
+        assert!(
+            !cut,
+            "`.git` was counted against the cap before being dropped"
+        );
+    }
+
+    #[test]
+    fn a_neighbouring_worktree_can_be_walked_into_even_though_it_is_not_indexed() {
+        // The asymmetry between the two walks, pinned from this side. The
+        // startup walk refuses a worktree of another repository, because the
+        // index means "this workspace's files" and a neighbouring agent's
+        // scratch markdown is not that. Navigation is a different question: a
+        // directory that is *there* and cannot be opened is a file list lying
+        // about the disk, and `Browser::up` promises to land back on the
+        // directory just left — a promise it cannot keep for a directory the
+        // listing had pruned.
+        let dir = tree("browse-worktree", &[".claude/plan.md"]);
+        let other = dir.path().join(".claude").join("worktrees").join("other");
+        std::fs::create_dir_all(&other).expect("create the neighbour's worktree");
+        // A **file**, holding what git puts in a worktree root, so the fixture
+        // is one of the directories `super::files` really does prune.
+        std::fs::write(other.join(".git"), b"gitdir: /repo/.git/worktrees/other\n")
+            .expect("write the worktree's .git file");
+        std::fs::write(other.join("NOTES.md"), b"# not ours\n").expect("write");
+
+        let worktrees = dir.path().join(".claude").join("worktrees");
+        let (entries, _) = list(dir.path(), &worktrees, MAX_ENTRIES);
+        let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
+        assert_eq!(labels, ["..", "other/"]);
+
+        // ...and walking in there says so on the border, in one word. `/` and
+        // `f` are about to answer "0 matches" over a corpus that does not
+        // contain this directory, with no `+` and nothing else admitting it —
+        // which is the state `Scan::cut` and `Report::clipped` both exist to
+        // prevent, arriving by a third road.
+        let mut b = browser(&dir, &[]);
+        b.select(0); // `.claude/`
+        assert!(moved(b.enter()));
+        b.select(1); // `worktrees/`, after `..`
+        assert!(moved(b.enter()));
+        assert!(
+            !b.title().contains("unindexed"),
+            "the directory *above* a worktree is indexed: {}",
+            b.title()
+        );
+        b.select(1); // `other/`
+        assert!(moved(b.enter()));
+        assert_eq!(b.title(), ".claude/worktrees/other/ · unindexed · 1 item");
+
+        // ...and `align_to` really can park the listing *inside* one, because
+        // it filters on `starts_with(&self.root)` and nothing else, so the ten
+        // seconds `crate::workspace` discovery is allowed is ten seconds this
+        // can happen in. Rooted there, the walk lists it: depth 0 is exempt.
+        let (entries, _) = list(dir.path(), &other, MAX_ENTRIES);
+        let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
+        assert_eq!(labels, ["..", "NOTES.md"]);
+
+        // And the index, over the same tree, does not contain any of it — which
+        // is what makes this a split rather than a hole.
+        let indexed = super::super::files::scan(dir.path(), super::super::files::MAX_ENTRIES);
+        assert_eq!(indexed.files, [".claude/plan.md"]);
     }
 
     #[test]

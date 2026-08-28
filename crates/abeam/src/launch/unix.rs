@@ -194,10 +194,6 @@ mod tests {
     use crate::testutil::TempDir;
     use abeam_pty::PtyConfig;
     use std::ffi::OsStr;
-    // The tests set modes; `startable` no longer reads them, because what it
-    // asks the kernel is whether *this* process may execute the file rather
-    // than what the file's bits say.
-    use std::os::unix::fs::PermissionsExt;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().copied().map(String::from).collect()
@@ -263,7 +259,7 @@ mod tests {
         // planted directory: the current directory belongs to the whole test
         // binary, and two hundred other tests are running beside this one.
         let dir = TempDir::new("launch-planted");
-        dir.write_exec("abeam-planted", b"#!/bin/sh\n");
+        dir.write_exec_unrun("abeam-planted", b"#!/bin/sh\n");
         let planted = "abeam-planted";
 
         for hostile in ["::", ":", ".", ".:", "./tools", "..", ""] {
@@ -327,7 +323,10 @@ mod tests {
         // interpreter or an environment variable, so if either ever appears in
         // one of these fields something has been added that does not belong.
         let dir = TempDir::new("launch-exec");
-        let exe = dir.write_exec("abeam-direct", b"#!/bin/sh\nexit 0\n");
+        // `write_exec_unrun`, because "started directly" here is a claim about
+        // the `Launch` this resolves to and not about a process: the assertions
+        // below read fields, and nothing in this test execs anything.
+        let exe = dir.write_exec_unrun("abeam-direct", b"#!/bin/sh\nexit 0\n");
         let launch = resolve(&exe.to_string_lossy(), &args(&["--flag", "a b"])).unwrap();
 
         assert_eq!(launch.program, exe);
@@ -352,7 +351,7 @@ mod tests {
         // This is also the shape of the file that broke abeam on Windows: one
         // extensionless script, which is exactly what `npm i -g` installs.
         let dir = TempDir::new("launch-shebang");
-        let script = dir.write_exec("abeam-shim", b"#!/bin/sh\necho hello\n");
+        let script = dir.write_exec_unrun("abeam-shim", b"#!/bin/sh\necho hello\n");
         let launch = resolve(&script.to_string_lossy(), &args(&["one", "a&b"])).unwrap();
 
         assert_eq!(
@@ -418,7 +417,13 @@ mod tests {
         // one file — extensionless, executable, `#!/usr/bin/env node` on the
         // first line — and getting from the name to the program is finding it.
         let dir = TempDir::new("launch-npm");
-        let shim = dir.write_exec("abeam-agent", b"#!/usr/bin/env node\n");
+        // `write_exec_unrun` and not the probing twin, which matters more here
+        // than anywhere else in this file: the first line names an interpreter
+        // this crate has nothing to do with, so a probe would start whatever
+        // `node` is on the machine, with an empty script, as a side effect of
+        // writing a file. Nothing in this test runs the shim — it is found and
+        // resolved, which is what `npm i -g` layout means.
+        let shim = dir.write_exec_unrun("abeam-agent", b"#!/usr/bin/env node\n");
 
         // The way `abeam +abeam-agent` would reach it, with the process's own
         // `PATH` left alone — it is shared with every test running beside this.
@@ -445,7 +450,7 @@ mod tests {
         let earlier = TempDir::new("launch-shadow-earlier");
         let later = TempDir::new("launch-shadow-later");
         let unusable = earlier.write("abeam-agent", b"#!/bin/sh\n");
-        let usable = later.write_exec("abeam-agent", b"#!/bin/sh\n");
+        let usable = later.write_exec_unrun("abeam-agent", b"#!/bin/sh\n");
 
         assert_eq!(
             walk(
@@ -497,7 +502,7 @@ mod tests {
         // The hint still works when it is what it is supposed to be, so the
         // refusal above is the check rather than the hint being ignored.
         let dir = TempDir::new("launch-hint");
-        let exe = dir.write_exec("abeam-hinted", b"#!/bin/sh\n");
+        let exe = dir.write_exec_unrun("abeam-hinted", b"#!/bin/sh\n");
         assert_eq!(
             find("abeam-hinted", Some(exe.clone())).expect("an absolute hint"),
             exe
@@ -515,14 +520,18 @@ mod tests {
     fn shim(dir: &TempDir) -> PathBuf {
         let home = dir.path().join("with space");
         std::fs::create_dir_all(&home).expect("a directory with a space in it");
-        let script = home.join("abeam-shim");
-        std::fs::write(&script, b"#!/bin/sh\necho \"ABEAM-SHIM-OK [$@]\"\n").expect("write a shim");
-        let mut mode = std::fs::metadata(&script)
-            .expect("stat the shim")
-            .permissions();
-        mode.set_mode(0o755);
-        std::fs::set_permissions(&script, mode).expect("chmod the shim");
-        script
+        // Through `TempDir::write_exec` rather than the `write` and
+        // `set_permissions` of its own that these six lines used to be. The
+        // execute bit is now the smaller half of what that call does: it is
+        // also the only thing that waits out the `ETXTBSY` window a shim
+        // written and then *started* by a parallel test suite opens — see
+        // `crate::testutil::past_text_file_busy`. This is one of the few
+        // places that really does start what it wrote, so a shim written by
+        // hand here would be a shim outside that.
+        dir.write_exec(
+            "with space/abeam-shim",
+            b"#!/bin/sh\necho \"ABEAM-SHIM-OK [$@]\"\n",
+        )
     }
 
     /// Run one and give back the screen it printed on.

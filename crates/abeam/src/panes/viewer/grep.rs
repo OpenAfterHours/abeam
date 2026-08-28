@@ -416,8 +416,9 @@ impl Grep {
     /// directory listing is disk nobody asked for.
     /// `cut` is `files::Scan::cut` — the walk stopped short of the tree, so no
     /// count over this list can be a definite one. It has to be handed over
-    /// rather than inferred: `files::MAX_ENTRIES` bounds *entries visited* and
-    /// `in_noise` filters afterwards, so a list far below `files::MAX_FILES` can
+    /// rather than inferred, because neither cap is visible from the list:
+    /// `files::MAX_ENTRIES` bounds *entries visited* and every directory is an
+    /// entry that is never a file, so a list far below `files::MAX_FILES` can
     /// still be all a truncated walk produced.
     pub fn set_index(&mut self, files: Arc<[String]>, cut: bool) {
         let first = !self.indexed;
@@ -1238,7 +1239,7 @@ mod tests {
         let ask = Ask {
             generation: 1,
             root: dir.path().to_path_buf(),
-            files: files::scan(dir.path()).files.into(),
+            files: files::scan(dir.path(), files::MAX_ENTRIES).files.into(),
             needle: needle.to_string(),
         };
         run(&ask)
@@ -1491,7 +1492,7 @@ mod tests {
         let ask = Ask {
             generation: 7,
             root: dir.path().to_path_buf(),
-            files: files::scan(dir.path()).files.into(),
+            files: files::scan(dir.path(), files::MAX_ENTRIES).files.into(),
             needle: "needle".to_string(),
         };
         // As if the reader had typed another query while this one was running.
@@ -1521,7 +1522,7 @@ mod tests {
         let ask = Ask {
             generation: 1,
             root: dir.path().to_path_buf(),
-            files: files::scan(dir.path()).files.into(),
+            files: files::scan(dir.path(), files::MAX_ENTRIES).files.into(),
             needle: "needle".to_string(),
         };
         let alive = AtomicU64::new(1);
@@ -1924,7 +1925,10 @@ mod tests {
         g.run();
         assert!(g.hits.is_empty());
 
-        g.set_index(files::scan(dir.path()).files.into(), false);
+        g.set_index(
+            files::scan(dir.path(), files::MAX_ENTRIES).files.into(),
+            false,
+        );
         // The worker is real here, so wait for it rather than assuming a
         // schedule.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);

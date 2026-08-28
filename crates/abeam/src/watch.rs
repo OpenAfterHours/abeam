@@ -71,8 +71,50 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// Directories `.gitignore` often does not mention but nobody wants to read.
 /// The gitignore-aware walk gets this for free from `ignore`; the watcher has
 /// no such help and has to be told.
+///
+/// **`".git"` is now the only thing keeping the object store out of the file
+/// window, and it must not be removed.** It used to have a second guard:
+/// `crate::panes::viewer::files` walked with `hidden(true)`, and `.git` begins
+/// with a dot. That walk shows dot-names now, and neither of the rules that
+/// replaced the flag catches this one — `ignore` reads `.git` to find ignore
+/// files but never prunes it, and the worktree rule tests a directory for a
+/// `.git` *inside* it, of which `.git` has none. Reasoning "`.git` is a VCS
+/// directory, and the walk has a rule about those" and deleting the line would
+/// spend `files::MAX_ENTRIES` on loose objects and leave the index an arbitrary
+/// prefix of the repository.
+///
+/// `.jj` is here for the same two reasons `.git` is, one per reader. For the
+/// walk: `ignore` 0.4.31 knows the name only well enough to decide that
+/// gitignore applies (`dir.rs`) and never skips it, so in a colocated jujutsu
+/// repository `.jj/repo/store` — the whole object store — sits at depth 1 with
+/// nothing else refusing it. The worktree rule cannot help there either, since
+/// `.jj/repo/store/git` is a *bare* git directory and so has no `.git` entry to
+/// find. For the watcher: `.jj/working_copy` is rewritten by every `jj`
+/// command, exactly as `.git/index.lock` is by every `git` one, which is the
+/// argument this module already makes at the top for `.git`.
+///
+/// The reflex to add more should be resisted, but the reason is narrower than
+/// it looks and worth stating exactly. `files::in_repository` guarantees that
+/// gitignore is **consulted** wherever the file window drops its hidden-file
+/// guard. It guarantees nothing about what gitignore *lists*. `.tox`,
+/// `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.gradle`, `.yarn` and
+/// `.turbo` are ignored by essentially every project that has them, so they are
+/// covered in practice and do not belong here — but "in practice" is the whole
+/// of that claim, and a name gitignore does not list is covered by nothing.
+///
+/// So there is a known gap rather than a closed set: **`.svn` and `.hg` are not
+/// on this list.** An `.svn` pristine store is a second copy of the whole tree,
+/// and it was previously kept out of the walk by `hidden` rather than by
+/// anything here. It is written down instead of added because adding a name
+/// blinds the *watcher* to it too, and nobody has yet wanted a Subversion
+/// checkout open in this window. Someone who does should add it here knowing
+/// that is the trade, not discover the tree doubled.
+///
+/// That is the shape of the cost in general: this list is the one place where
+/// being wrong is silent.
 const NOISE: &[&str] = &[
     ".git",
+    ".jj",
     "target",
     "node_modules",
     ".venv",
@@ -434,6 +476,15 @@ mod tests {
         assert!(in_noise(root, &root.join("target/doc/index.md")));
         assert!(in_noise(root, &root.join("a/node_modules/x/readme.md")));
         assert!(!in_noise(root, &root.join("docs/design.md")));
+        // A colocated jujutsu checkout rewrites `.jj/working_copy` on every
+        // command, exactly as git rewrites `.git/index.lock` — and the walk has
+        // nothing else that would refuse `.jj/repo/store`, since `ignore` knows
+        // the name only well enough to decide that gitignore applies.
+        assert!(in_noise(root, &root.join(".jj/working_copy/checkout")));
+        assert!(in_noise(
+            root,
+            &root.join(".jj/repo/store/git/objects/pack")
+        ));
     }
 
     #[test]

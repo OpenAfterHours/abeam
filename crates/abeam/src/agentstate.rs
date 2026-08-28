@@ -295,8 +295,17 @@ pub fn sessions_dir() -> Option<PathBuf> {
 /// path that names nothing a Windows program ever wrote to. So it is the
 /// fallback for the machine that has only that one, not a second opinion about
 /// a machine that has both.
+///
+/// Reachable from the crate rather than private to this module, because a
+/// second question has the same answer:
+/// `crate::panes::viewer::files::in_repository` stops its ancestry walk at the
+/// home directory, so that a `git init ~` for dotfiles cannot switch the file
+/// window's hidden-file guard off in the one directory that guard was written
+/// for. Two readings of "where is home" is two places for the answer to drift,
+/// and the platform reasoning above is the whole of why that drift would be
+/// expensive.
 #[cfg(windows)]
-fn home() -> Option<PathBuf> {
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
@@ -314,7 +323,7 @@ fn home() -> Option<PathBuf> {
 /// would beat the only variable that is right. A fallback that cannot be
 /// correct is not a fallback, so there is one variable here.
 #[cfg(unix)]
-fn home() -> Option<PathBuf> {
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 

@@ -3226,7 +3226,7 @@ mod tests {
     use crate::ask::Flavour;
     use crate::launch::Launch;
     use crate::panes::queue::Mode;
-    use crate::testutil::TempDir;
+    use crate::testutil::{TempDir, until};
     use abeam_pty::PtyConfig;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
@@ -5825,6 +5825,27 @@ mod tests {
 
     /// Ask a question the way somebody asks one: typed into the pane, then
     /// `Enter`. The app drains it on the next [`App::pump`].
+    ///
+    /// **The last assertion is the load-bearing one, and it is here rather
+    /// than in any single test on purpose.** `handle_key` answering `Ok` says
+    /// only that the key was read, and `crate::panes::ask::submit` deliberately
+    /// *claims* `Enter` when it refuses a question — a `Handled::No` there
+    /// would hand the key to the shell, which takes it as "done with this
+    /// pane". So a question refused mid-answer looked exactly like a question
+    /// sent, all the way through this helper, and the failure surfaced three
+    /// steps later as an `assert_ne!` about session ids that named nothing
+    /// which had happened. Checking that the pane is actually holding a
+    /// question turns every instance of that class — for every test that asks
+    /// one — into a failure that says which question was dropped, at the line
+    /// that dropped it.
+    ///
+    /// It checks *this* question rather than that some question is waiting,
+    /// because the weaker form has the defect it was written to catch: two of
+    /// these with no [`App::pump`] between them would pass for a dropped
+    /// second question on the strength of the first still being held.
+    /// `starts_with` rather than equality because an attached context rides
+    /// under the question on a line of its own — see
+    /// `AskPane::question_waiting`, which is where that rule is written down.
     fn asked(fx: &mut Fixture, question: &str) {
         for c in question.chars() {
             fx.app.spaces[0]
@@ -5836,6 +5857,15 @@ mod tests {
             .ask
             .handle_key(key(KeyCode::Enter))
             .expect("enter sends");
+        let waiting = fx.app.spaces[0].ask.question_waiting();
+        assert!(
+            waiting.is_some_and(|held| held.starts_with(question)),
+            "the pane took `Enter` and did not turn {question:?} into a question; \
+             what it is holding instead is {waiting:?}. A `None` there is \
+             `submit` refusing while an answer is still arriving — see \
+             `AskPane::ready_for_a_question` for the wait this test owes before \
+             asking again"
+        );
     }
 
     fn session_id(fx: &Fixture) -> String {
@@ -6004,6 +6034,28 @@ mod tests {
         asked(&mut fx, "one");
         fx.app.pump();
         let first = session_id(&fx);
+
+        // The first answer is landed by hand, for the reason
+        // `a_question_asked_on_the_pass_that_notices_the_child_has_gone_still_goes`
+        // gives where it lands the same event by hand: a pane in the middle of
+        // an answer refuses the next question — see `crate::panes::ask::submit` —
+        // and [`a_reader_that_stays`] answers nothing ever, so without this the
+        // pane streams for the rest of the test.
+        //
+        // It did, and "two" was therefore dropped on *every* run this test has
+        // ever made. Nothing said so: `submit` claims `Enter` when it refuses,
+        // so the helper saw a key handled, and the `assert_eq!` below then
+        // compared an id with itself because nothing had been drained that
+        // could have changed it. A reader who asks a second question has had
+        // the first answered, so this is that fact rather than a way around the
+        // refusal.
+        fx.app.spaces[0].ask.on_event(crate::ask::AskEvent::Turn {
+            text: "ok".to_string(),
+            cost_usd: None,
+            duration_ms: None,
+            error: None,
+        });
+
         asked(&mut fx, "two");
         fx.app.pump();
         assert_eq!(session_id(&fx), first, "the conversation was restarted");
@@ -6019,13 +6071,32 @@ mod tests {
         assert_ne!(second, first);
 
         // Wait for it to go, the way the loop would: `poll` is what notices.
+        //
+        // **And for the pane, which is a second condition rather than the same
+        // one written twice.** What "four" has to get past is
+        // `crate::panes::ask::submit`, and that refuses while the exchange
+        // "three" opened is still open — which ends when the `Turn` reaches the
+        // pane, not when the child goes. The two clear in either order, and the
+        // order that loses is the ordinary one here: `a_reader_that_leaves`
+        // prints and exits at once, so the write of "three" can land on a pipe
+        // whose far end has already gone, and `AskSession::ask` clears `live`
+        // on a failed write without anything having been polled. Waiting on
+        // liveness alone then ended this loop on its first check, with the
+        // answer still sitting in the channel and the pane still streaming, and
+        // "four" was swallowed — reported once as the `assert_ne!` below
+        // failing with two equal ids and once as `session_id` finding no
+        // session at all, which is one bug wearing two faces.
         let deadline = Instant::now() + Duration::from_secs(20);
         while fx.app.spaces[0]
             .ask_session
             .as_ref()
             .is_some_and(AskSession::is_live)
+            || !fx.app.spaces[0].ask.ready_for_a_question()
         {
-            assert!(Instant::now() < deadline, "the shim never exited");
+            assert!(
+                Instant::now() < deadline,
+                "the shim never exited, or its answer never reached the pane"
+            );
             fx.app.pump();
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -6093,6 +6164,20 @@ mod tests {
              which is the state this test is about"
         );
 
+        // And the pane will take one, asked of the pane rather than inferred
+        // from the child. `ready_for_a_question` drains nothing, which is the
+        // only reason it can be asked *here*, on the pass whose whole subject
+        // is an ending that has not been drained — a readiness question that
+        // polled to answer would delete this test rather than steady it. What
+        // made it true is the answer landed by hand above, and saying so here
+        // is what stops an edit that removes that from turning this back into
+        // a question silently dropped three lines from the assertion about it.
+        assert!(
+            fx.app.spaces[0].ask.ready_for_a_question(),
+            "the pane is still mid-answer, so the question below would be \
+             refused rather than sent"
+        );
+
         asked(&mut fx, "two");
         fx.app.pump();
         assert_ne!(
@@ -6129,9 +6214,15 @@ mod tests {
         );
 
         drop(fx);
-        assert!(
-            !alive(pid),
-            "process {pid} outlived the abeam that started it"
+        // Polled rather than sampled once — see `crate::testutil::until`, whose
+        // twin caller is `crate::ask`'s
+        // `the_child_dies_with_the_session_because_nothing_here_detaches_it`.
+        // Both drop something and then ask the operating system whether it
+        // really went, and neither can be told; that is the whole of why the
+        // wait is shared.
+        until(
+            &format!("process {pid} to go with the abeam that started it"),
+            || !alive(pid),
         );
     }
 

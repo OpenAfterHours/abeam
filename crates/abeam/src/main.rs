@@ -554,7 +554,7 @@ mod unix_tests {
         // With the execute bit, because that is the whole of what makes a file
         // a program here — the Windows twin can write two bytes and be believed,
         // and this one cannot.
-        dir.write_exec("tools/abeam-rel", b"#!/bin/sh\nexit 0\n");
+        dir.write_exec_unrun("tools/abeam-rel", b"#!/bin/sh\nexit 0\n");
 
         let typed = "./tools/abeam-rel";
         let hosted =

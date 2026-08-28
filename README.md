@@ -152,6 +152,12 @@ switching under you.
 A second `Alt+E` opens the **file list**, a gitignore-aware browser starting
 where the open file lives. `Enter` descends or opens, `Backspace` climbs.
 
+Inside a repository it shows dot-named files too — `.claude`, `.github`,
+`.gitignore` — because that is where a good deal of the work lives, and
+gitignore is there to keep the rest out. Started somewhere that is *not* a
+repository, gitignore is inert, so they stay hidden as before: nothing else
+would keep `.ssh` off the list.
+
 Three keys search, and they ask three different questions:
 
 | Key | Where | Question |
@@ -159,6 +165,12 @@ Three keys search, and they ask three different questions:
 | `/` | file list | which file is called this |
 | `/` | document | where is it on this page (`n` / `N` walk the matches) |
 | `f` | either | which files say this — reads every file under the root |
+
+`f` reads every file under the root *except* directories that are worktrees of
+another repository, which the file list will still walk you into. Standing in
+one, the file list's border says `unindexed`, because a search that answered
+`0 matches` there would be answering about a corpus rather than about the
+tree — use `w` to move the window to that worktree instead.
 
 Only `f` touches the disk, and it is the only one whose box waits for `Enter`
 rather than narrowing as you type. `Enter` on a result opens that file with the

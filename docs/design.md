@@ -581,9 +581,21 @@ switching under you.
 A second `Alt+E` opens the **file list**: a gitignore-aware directory browser
 starting wherever the open file lives. `Enter` descends or opens, `Backspace`
 climbs — and lands on the directory you just left, so walking back up is a place
-rather than a reset. `/` finds a file by name anywhere under the root, matched
-as a subsequence over its path and ranked so a hit in the file name beats one in
-a directory name; `Esc` cancels the find and stays put, because being thrown out
+rather than a reset.
+
+Inside a repository the list shows dot-named files — `.claude`, `.github`,
+`.gitignore` — because that is where a good deal of the work lives, and because
+gitignore is there to keep the rest out. Started somewhere that is *not* a
+repository, gitignore is inert and nothing else would keep `.ssh` off the list,
+so they stay hidden exactly as before. The same rule governs the startup walk,
+which means `.claude/*.md` and `.github/**/*.md` are in `Tab`'s recency list
+now: on a fresh clone, where every file shares one checkout timestamp and
+"newest" is whatever order the filesystem hands back, the pane can open on a
+workflow file, an issue template or one of `.claude/commands/*.md`. The first
+write of any kind sorts it out.
+
+`/` finds a file by name anywhere under the root, matched as a subsequence over
+its path and ranked so a hit in the file name beats one in a directory name; `Esc` cancels the find and stays put, because being thrown out
 of the pane by the key that means "never mind" is the worst thing a filter box
 can do. The list is the second half of the never-switch-under-you rule: a
 document arriving from the watcher waits while you are walking a tree, exactly
@@ -621,11 +633,17 @@ that file with the document search already looking for the same phrase, at the
 match that row counted, which is what makes the two one feature rather than two
 that happen to rhyme. It does not walk the tree again — the startup walk's list
 is shared, since a second gitignore walk would double the cost of startup to
-re-derive what the first one had in its hand — so it inherits that walk's caps,
-reads at most the first half-megabyte of any file, keeps at most a screenful of
-matches from each, and stops at a total. Every one of those is visible when it
-is hit: a count that is a prefix of the truth is written `137+` rather than
-`137`, and the per-file cap is named outright as `· 18 files cut`, because it is
+re-derive what the first one had in its hand — so it inherits that walk's caps
+and its one exclusion, reads at most the first half-megabyte of any file, keeps
+at most a screenful of matches from each, and stops at a total. The exclusion is
+that the index holds the files of *this* workspace, so a directory that is a
+worktree of another repository is not in it — while the file list will happily
+walk you into one. Standing in such a directory, the list's border says
+`unindexed`, for the same reason the `+` and `· 18 files cut` exist: a search
+that came back `0 matches` there would be answering about the corpus rather than
+about the tree, and a pane that is merely limited must never look like a pane
+that is right. Every one of the caps is visible when it is hit too: a count that
+is a prefix of the truth is written `137+` rather than `137`, and the per-file cap is named outright as `· 18 files cut`, because it is
 the only one of the four whose remedy is a key already on screen — what it left
 out is in files the list did reach, and `Enter` on any row of one of them shows
 all of them.
@@ -935,6 +953,24 @@ every root contains a nested one the moment a worktree exists, so without it the
 agent's own workspace would go silent the first time anybody added one — the
 routing bug arriving through the back door, in the one workspace that is always
 on the list.
+
+The same argument decides what the **file window** does about them, and it
+decides it two different ways on purpose. The index behind `/` and `f` means
+"the files of this workspace", so it stops at a nested worktree exactly as
+`git status` does. The file list means "what is on the disk here", and pruning
+that would take away a place you can see and are walking to — so it descends,
+and marks the border `unindexed` while you are standing there. The two
+deliberately disagree, and `w` is how you stop having to care: move the window
+to that worktree and its files are the index.
+
+Recognising one is git's own marker rather than a guess about `.claude`. A
+worktree root carries a `.git` **file** whose `gitdir:` ends `worktrees/<id>`;
+a submodule's ends `modules/<path>` and stays in the index, because
+`git worktree list` never names one and the router hands its writes to this
+workspace. It is the penultimate component of that path and nothing else — the
+obvious version, "a `worktrees` component somewhere", reads a path the user
+chose, and `git worktree add` writes an absolute one, so a checkout living under
+any directory called `modules` would have turned the rule off silently.
 
 With that settled, the worktrees are worth showing. `w` in the git view — plain
 `w`, with the right pane focused — lists every worktree git knows about: the

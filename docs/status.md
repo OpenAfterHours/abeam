@@ -50,8 +50,10 @@ Working, and used. Not finished.
 against it on 2026-08-01. All six right-hand views, the file list, the
 rendered/source toggle, the watcher driving what it should, and the three
 searches under the reader — a file by its name, a phrase on the page, a phrase
-in every file under the root. Focus, zoom, help, the diagnostics view, and the
-literal-next escape hatch. Agent selection for Claude, Copilot and Codex and the
+in every file under the root except directories that are worktrees of another
+repository, which the file list will still walk you into and marks `unindexed`
+on its border while you stand there. Focus, zoom, help, the diagnostics view,
+and the literal-next escape hatch. Agent selection for Claude, Copilot and Codex and the
 launcher underneath it. The
 Unix port, in the sense that the whole workspace builds, tests and lints clean
 for both `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see
@@ -229,6 +231,19 @@ work, on either platform.
   of your own is quietly dropped. Shortening the window would mean a second
   watch, on `.git/worktrees`, and one recursive watch is a decision the watcher
   makes on purpose.
+- **A nested worktree that `git worktree list` never names is pruned from the
+  index and routed to this workspace anyway, permanently.** The file window
+  keeps a worktree of another repository out of `/`, `f` and `Tab` by reading
+  the `.git` file git left in it, which needs no discovery and so cannot be ten
+  seconds late. `workspace::owner` routes by the discovered list. For a worktree
+  of *this* repository the two agree as soon as the poll catches up. For one
+  belonging to a **different** repository — somebody dropped a checkout of
+  another project inside the root — git never names it here, so the two never
+  agree: the index excludes it for ever while the router hands its writes to
+  this workspace, and `follow` can put a document on screen that `/` says does
+  not exist. That is the ten-second window above made permanent for a rare case.
+  Worth writing down rather than discovering: the fix is the same one the border
+  already points at, which is `w`.
 - **A worktree outside the repository root is listed, switchable, and not
   watched.** `git worktree add ../elsewhere` is ordinary, and abeam shows it and
   will point the right pane at it — but the single recursive watch covers the
