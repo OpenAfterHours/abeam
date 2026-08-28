@@ -348,7 +348,14 @@ pub const HELP: &[(&str, &str)] = &[
     // directory — a live child's cwd is the child's — so this is the one place
     // the two halves of the window deliberately disagree about where they are.
     ("Enter (worktrees)", "point the right pane at that worktree"),
-    ("t", "files: rendered markdown / its source"),
+    // Not "rendered markdown", which is what this said and what it stopped
+    // meaning: a `.py` or a `.rs` with documentation in it is rendered too, and
+    // a reader looking for the key that put their `"""` back was reading a row
+    // about a file type they did not have open. The two words are the two forms
+    // the pane holds, in the order the key toggles them, and neither names a
+    // language — which is what keeps this row true the next time the list of
+    // languages grows.
+    ("t", "files: the rendering / what was typed"),
     // The three searches are three questions, and the rows name them as
     // questions: two keys that both ended "under the root" differed by five
     // characters read at a glance, which is not a difference anyone reads.

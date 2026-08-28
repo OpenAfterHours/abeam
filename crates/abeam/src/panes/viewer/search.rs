@@ -31,27 +31,51 @@
 //! `(row, character, length)` — the row being the unit the pane already scrolls
 //! by, so a hit needs no translation to be scrolled to or drawn on.
 //!
-//! The alternative — searching the source text and mapping offsets back — works
-//! for a `.rs` file and cannot work at all for rendered markdown. Rendering
-//! reflows prose, drops fence markers and turns a table into a grid, so there
-//! is no offset that means the same thing on both sides; the same argument
-//! `ViewerPane::toggle_raw` already makes about the scroll position. Searching
-//! the rows is the one approach that is identical for rendered markdown, raw
-//! markdown and a highlighted source file without the markdown renderer having
-//! to grow a second output. It is also the honest semantic for a pane whose
-//! whole job is to show you a document: you find what is on screen.
+//! The alternative — searching the source text and mapping offsets back —
+//! cannot work anywhere the pane renders. Rendering reflows prose, drops fence
+//! markers and turns a table into a grid, so there is no offset that means the
+//! same thing on both sides; the same argument `ViewerPane::toggle_raw` already
+//! makes about the scroll position. That used to be a statement about markdown,
+//! with a `.rs` given as the case it worked for. It is not any more: a run of
+//! `///` lines and a Python docstring are rendered where they stand, so the
+//! reflow is in the source files too and the exception has no members left
+//! except a file with no documentation in it. Searching the rows is the one
+//! approach that is identical for every form of every document without the
+//! markdown renderer having to grow a second output. It is also the honest
+//! semantic for a pane whose whole job is to show you a document: you find what
+//! is on screen.
 //!
-//! Two consequences, neither hidden:
+//! Three consequences, none hidden:
 //!
 //! - **A match that straddles a wrap is missed.** `parse` split as `par` /
 //!   `se` across two rows is two rows, and nothing here joins them. The cost is
 //!   a hit the reader can see and the search cannot, which is the failure mode
 //!   worth having: it is visible and it is one `n` away from the next real hit,
 //!   where a phantom hit at a row-join would be neither.
-//! - **In rendered markdown you cannot find what was rendered away** — `**`,
-//!   the URL behind a link, the backticks around code. They are not on screen.
+//! - **In anything rendered you cannot find what was rendered away** — `**`,
+//!   the URL behind a link, the backticks around code, and in a source file the
+//!   `///` and `"""` that marked the prose as prose. They are not on screen.
 //!   `t` shows the source, and the title says which form is up, which is why
 //!   `· rendered` is the last thing the title gives up while a search is open.
+//! - **And a rendered document can hold matches the file does not.** This is
+//!   the direction that was not here before, because before it could not
+//!   happen. Reflow *joins* lines: a `.rs` holding `/// Must be a` over `///
+//!   non-empty string` draws as one row reading `Must be a non-empty string`,
+//!   so `/a non-empty` finds a phrase that `f` — which reads the file's logical
+//!   lines — cannot. Losing a match to a wrap and gaining one to a reflow are
+//!   the same fact seen from two sides, and the second is the more surprising
+//!   because a search over a document is not normally expected to out-find a
+//!   search over the bytes.
+//!
+//!   It also blunts the [`Search::label`] `· not the 3rd` notice, and that is
+//!   worth naming where the notice is argued for rather than leaving it to be
+//!   discovered. That sentence fires on `want != self.at`, and [`Search::find`]
+//!   only ever clamps `at` *downwards* — the reasoning being that a page can
+//!   hold fewer matches than the file but never more. A page that holds more
+//!   lands on a real match that is not the one the reader chose and says a
+//!   confident `n/m` about it. Recorded rather than fixed: making it right
+//!   means the two searches agreeing on what a match is over *the same text*,
+//!   which is the change the module doc is already holding out for below.
 //!
 //! And one place the rule is bent, because following it there produced a worse
 //! one. A source file's line numbers are on screen, so `/42` would find every
@@ -92,25 +116,35 @@
 //! the version of that bug nobody would ever guess at.
 //!
 //! What the two legitimately differ about is *what* they search, and the gap is
-//! wider than it first looks. The grep reads a file's **logical lines**; this
-//! reads the **physical rows** those lines were wrapped into. Rendered markdown
-//! makes that obvious — rendering reflows prose and drops syntax, so `**` is in
-//! one and not the other — but it is true of a plain `.rs` file too, and there
-//! it is invisible until it bites: a source line wider than the pane is
-//! hard-broken by `source_lines`, and a match straddling the break is a match
-//! `f` reports and `/` cannot find, *in the same file*. Widen the pane and it
-//! appears. See [the cost this module opens with](self#what-is-searched-and-why-it-is-the-rows);
-//! this is that same cost arriving from the repository search's side, and it is
-//! why `ViewerPane::missed` has to name a remedy for every body form rather
-//! than only for markdown.
+//! wider than it first looks — wider, now, than this paragraph used to say. The
+//! grep reads a file's **logical lines**; this reads the **physical rows** they
+//! were laid out into. Two things happen on the way, and they pull in opposite
+//! directions:
+//!
+//! - **Wrapping splits**, so `f` finds what `/` cannot. A source line wider
+//!   than the pane is hard-broken by `source_lines` and a match straddling the
+//!   break is not addressable here. Widen the pane and it appears.
+//! - **Rendering joins**, so `/` finds what `f` cannot. Two `///` lines become
+//!   one reflowed row, and a phrase that spans them exists on the page and in
+//!   no line of the file. Narrow the pane and it goes away again.
+//!
+//! The second is new, and it is why "the page can only ever have *fewer*
+//! matches than the file" is no longer a thing this module may assume — it was
+//! true while only markdown was rendered, because a `.md`'s own source was not
+//! what `f` searched either. Now that a `.rs` is rendered in place, one file's
+//! text is being read two ways at once and neither count bounds the other. See
+//! [the cost this module opens with](self#what-is-searched-and-why-it-is-the-rows)
+//! for what that does to `· not the 3rd`, and `ViewerPane::missed` for why the
+//! remedy in the title has to be named for every body form rather than only for
+//! markdown.
 //!
 //! ## The known limitation, and the change that would retire it
 //!
-//! Both halves of that — the wrap-split miss, and `f` finding what `/` cannot —
-//! are one root cause: hits are indexed by physical row, so a match that spans
-//! two rows is not addressable at all. Grouping rows by the logical line they
-//! came from would fix both at once, and `source_lines` already knows that
-//! grouping because it wraps the lines itself.
+//! All of that — the wrap-split miss, `f` finding what `/` cannot, and `/`
+//! finding what `f` cannot — is one root cause: hits are indexed by physical
+//! row, and the row is not a unit the file has. Grouping rows by the logical
+//! line they came from would fix the first two at once, and `source_lines`
+//! already knows that grouping because it wraps the lines itself.
 //!
 //! It is not done here, and the reason is `markdown::render`, which does not: a
 //! rendered paragraph is reflowed prose with no line it can point back at. So
@@ -418,6 +452,18 @@ impl Search {
     /// alone reads as a complete answer to a question they did not ask. The
     /// remedy is not repeated here — the reader can see the matches that are
     /// there, and `miss` is the sentence for a page with none.
+    ///
+    /// **And the notice is weaker than it reads, in one direction it was built
+    /// assuming could not happen.** It fires on `want != self.at`, and `find`
+    /// only ever clamps `at` downwards — which was sound while a page could
+    /// only ever hold *fewer* matches than the file it came from. Rendering a
+    /// source file in place broke that: reflow joins two lines into one row and
+    /// a phrase spanning them is a match on the page and no match in the file,
+    /// so the ordinal `Enter` asked for can land on the wrong occurrence with
+    /// nothing here disagreeing, under a confident `n/m`. Named rather than
+    /// patched, because a fix that only moved the arithmetic would still be
+    /// counting two different things — see this module's doc for the change
+    /// that retires it.
     pub fn label(&self, miss: &str) -> String {
         if self.query.is_empty() {
             return "/".to_string();
