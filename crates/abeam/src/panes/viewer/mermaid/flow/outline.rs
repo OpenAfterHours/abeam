@@ -5,6 +5,15 @@
 //! ways, and nothing here is shared with it beyond `wrap`. That is why this
 //! lives under `flow/` rather than beside it.
 //!
+//! There is a second `outline` module in this pane and it is unrelated:
+//! `panes::viewer::outline` is the document's headings and a source file's
+//! definitions, as a list `o` puts on screen to jump into. The two never meet —
+//! nothing here knows about headings and nothing there knows about diagrams —
+//! but "outline" is the user-facing word for that one and the name is not going
+//! to be given up, so this is the paragraph a grep lands in that says which is
+//! which. Its module doc carries the same paragraph pointing back here, and it
+//! has to: a signpost on one side of a fork is not a signpost.
+//!
 //! The same argument `markdown::emit_table_as_records` makes about a grid: at
 //! forty columns a four-cell-wide box is not a diagram, it is a puzzle, and the
 //! reader is better served by the data laid out plainly than by a picture of it

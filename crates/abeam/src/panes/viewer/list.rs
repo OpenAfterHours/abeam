@@ -177,6 +177,20 @@ impl Cursor {
     /// on to match its own — `Enter`, `/`, `r` — and so `Esc` and `q` fall
     /// through to the shell as "give focus back to the agent".
     ///
+    /// **One of the four callers takes `Esc` back before it gets there**, and
+    /// it is worth naming because the sentence above is otherwise read as a
+    /// promise this type makes rather than as what it does. `outline::View` is
+    /// a layer over the document rather than a view of its own: `Esc` there has
+    /// somewhere to go that is not the agent, so it means "back to the page"
+    /// and never reaches the shell. It is the same shape `GitPane`'s worktree
+    /// list has, and it makes the same two choices — `Esc` claimed, `q` left
+    /// alone — so `q` in the outline still falls through exactly as this says.
+    /// The other three callers take neither.
+    ///
+    /// `crate::scroll::key` carries this sentence with no carve-out and needs
+    /// none: the outline routes only the *glance* keys through `Scroll::key`,
+    /// and `Esc` is not one of them.
+    ///
     /// `Ctrl`+letter is `None` as well, apart from the two claimed here. It is
     /// the agent's everywhere else in the program and must not be swallowed by
     /// the plain-letter arms, so it is handed back for the caller to decline

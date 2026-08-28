@@ -383,10 +383,17 @@ pub const HELP: &[(&str, &str)] = &[
     // there.
     //
     // "if it has any" is doing real work rather than hedging. The key declines
-    // on a `.txt`, on a `.json` and on markdown shown as its source — see
-    // `panes::viewer::outline` — and this table is the only place that can say
-    // so, because a title already carrying the name, the form, the query and
-    // the position has no room to advertise a key per document.
+    // on a `.txt` and on a `.json` — see `panes::viewer::outline` — and this
+    // table is the only place that can say so, because a title already carrying
+    // the name, the form, the query and the position has no room to advertise a
+    // key per document.
+    //
+    // Markdown used to be in that list of refusals, in its `t` form, and is
+    // not any more: the source of a document is parsed by the same parser that
+    // renders it, so `o` answers in both forms and the reader does not pay a
+    // table of contents for pressing `t`. Which is why this row says "document"
+    // and not "rendered document" — the word here has to be about the reader's
+    // mode, and there is no form of a markdown file where the key is dead.
     (
         "o",
         "document: jump to a heading or a definition, if it has any",
