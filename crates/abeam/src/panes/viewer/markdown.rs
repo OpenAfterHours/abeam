@@ -20,6 +20,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use super::outline::Entry;
 use super::theme::{Mode, Theme};
 use super::{mermaid, source};
 use crate::text::wrap::{self, pad_to, spans_width};
@@ -124,9 +125,34 @@ pub fn options() -> Options {
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
 }
 
+/// The rows, for every caller that only wants rows.
+///
+/// A wrapper over [`render_outlined`] rather than a second walk of the parser,
+/// so there is exactly one state machine and no way for the rows a reader sees
+/// and the rows an outline points at to have come from different runs of it.
+/// `super::Page::doc` and `crate::panes::ask` are the callers that genuinely
+/// have nowhere to put an outline — a doc block is a fragment of a file whose
+/// structure the file's own scanner already describes, and the ask pane has no
+/// outline view — and neither should have to say so at the call site.
 pub fn render(source: &str, width: usize, mode: Mode) -> Vec<Line<'static>> {
+    render_outlined(source, width, mode).0
+}
+
+/// The rows, and where each heading landed among them.
+///
+/// The entries are recorded **by the renderer, as it emits the heading**, which
+/// is the only moment the row is knowable: how many rows a document has by the
+/// time it reaches its third `##` depends on how every paragraph before it
+/// wrapped, so anything that worked the answer out afterwards would be
+/// re-deriving the layout from the layout. See [`super::outline`] for what an
+/// entry's `row` is worth and for how long.
+pub(super) fn render_outlined(
+    source: &str,
+    width: usize,
+    mode: Mode,
+) -> (Vec<Line<'static>>, Vec<Entry>) {
     if width == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut r = Renderer::new(width, mode);
     for event in Parser::new_ext(source, options()) {
@@ -178,6 +204,9 @@ struct Renderer {
     /// held separately and picked by name.
     mode: Mode,
     out: Vec<Line<'static>>,
+    /// Where each heading landed in `out`, recorded as it was emitted. See
+    /// [`render_outlined`].
+    outline: Vec<Entry>,
 
     /// Inline spans of the block being built, not yet wrapped.
     spans: Vec<Span<'static>>,
@@ -214,6 +243,7 @@ impl Renderer {
             theme: mode.theme(),
             mode,
             out: Vec::new(),
+            outline: Vec::new(),
             spans: Vec::new(),
             style: Style::default(),
             styles: Vec::new(),
@@ -231,9 +261,9 @@ impl Renderer {
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn finish(mut self) -> (Vec<Line<'static>>, Vec<Entry>) {
         self.flush_inline();
-        self.out
+        (self.out, self.outline)
     }
 
     // --- events ----------------------------------------------------------
@@ -485,6 +515,40 @@ impl Renderer {
 
                 let content = std::mem::take(&mut self.spans);
                 let content = restyle(content, self.theme.heading(level as u8));
+
+                // **Recorded here, and here is the only place it can be.**
+                // `self.out.len()` is the row this heading's first line is
+                // about to become, which is knowable at this instant and at no
+                // other: how many rows the document has by now depends on how
+                // every paragraph above it wrapped.
+                //
+                // Before the rows *and* before the rule, so a jump lands on the
+                // words rather than on the `━` under them — a reader taken to a
+                // heading's underline sees the section above it filling the
+                // pane and the heading itself off the top edge, which is the
+                // one landing this feature exists to avoid.
+                //
+                // The text is taken from `content` rather than from the drawn
+                // rows, because those carry the quote gutter, the list marker
+                // and the pip that whatever this heading is nested in has
+                // already paid for. Those are the pane talking about the
+                // document; the outline is a list of the document's own names.
+                //
+                // A heading with no text at all — `#` on its own, which is
+                // legal — is left out. It is the same judgement the rule below
+                // makes two dozen lines down: there is nothing to draw and
+                // nothing to name, and a blank row in a jump list is a target
+                // the reader cannot choose between.
+                let text: String = content.iter().map(|s| s.content.as_ref()).collect();
+                let text = text.trim();
+                if !text.is_empty() {
+                    self.outline.push(Entry {
+                        row: self.out.len(),
+                        level: level as u8,
+                        text: text.to_string(),
+                    });
+                }
+
                 let rows = wrap::wrap_spans(content, self.width, &first, &rest);
                 // The widest row this heading actually drew, which is what an
                 // H2's rule is measured against. Taken before the rows are
@@ -2012,7 +2076,7 @@ mod tests {
             r.event(event);
         }
         assert_eq!(
-            text(&r.finish()),
+            text(&r.finish().0),
             ["│ date = 2024-01-01T00:00:00", "", "body"]
         );
     }
@@ -2332,5 +2396,95 @@ sequenceDiagram
         assert_fits(&out, 8);
         assert_eq!(out.len(), 6);
     }
-}
 
+    /// `(row, level, text)` for every heading the renderer reported.
+    fn outlined(md: &str, width: usize) -> Vec<(usize, u8, String)> {
+        render_outlined(md, width, Mode::Dark)
+            .1
+            .into_iter()
+            .map(|e| (e.row, e.level, e.text))
+            .collect()
+    }
+
+    #[test]
+    fn a_heading_reports_the_row_its_words_are_on_and_not_the_rule_under_them() {
+        let md = "# Title\n\nsome prose\n\n## Section\n\nmore prose\n";
+        let (rows, entries) = render_outlined(md, 40, Mode::Dark);
+        let rows = text(&rows);
+        // The rule is a row of its own and it is the row *after* the heading,
+        // so an entry pointing at it would land the reader with the section
+        // above filling the pane and the title itself off the top edge.
+        assert_eq!(rows[0], "Title");
+        assert_eq!(rows[1], "━".repeat(40));
+        assert_eq!(rows[5], "Section");
+        assert_eq!(rows[6], "─".repeat("Section".len()));
+        assert_eq!(
+            outlined(md, 40),
+            [(0, 1, "Title".into()), (5, 2, "Section".into())]
+        );
+        // And the entries are what the pane will index `rows` with.
+        for (row, ..) in &entries.iter().map(|e| (e.row,)).collect::<Vec<_>>() {
+            assert!(*row < rows.len());
+        }
+    }
+
+    #[test]
+    fn a_heading_wide_enough_to_wrap_reports_only_the_row_it_starts_on() {
+        // Nineteen columns and a heading that cannot fit on one of them. Three
+        // rows come out of it and exactly one entry, pointing at the first —
+        // the row with the beginning of the sentence on it, which is the row a
+        // reader jumping to this section wants at the top of the pane.
+        let md = "## Four four four four four\n\nbody\n";
+        let (rows, entries) = render_outlined(md, 19, Mode::Dark);
+        assert!(text(&rows)[0].starts_with("Four"), "{:?}", text(&rows));
+        assert!(text(&rows)[1].starts_with("four"), "{:?}", text(&rows));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].row, 0);
+        // The whole heading, not the part that fitted on the first row: the
+        // outline is a list of the document's own names, and a name cut off at
+        // the pane's width would change as the window was dragged.
+        assert_eq!(entries[0].text, "Four four four four four");
+    }
+
+    #[test]
+    fn a_heading_inside_a_list_or_a_quote_is_reported_without_what_encloses_it() {
+        // The prefixes on the drawn row — the bullet, the quote gutter, the pip
+        // — are the pane talking about the document. They belong to whatever the
+        // heading is nested in rather than to the heading, so they are not part
+        // of its name and would make two `## Notes` in different places read as
+        // two different sections.
+        let md = "- item\n\n  ## In a list\n\n> ### In a quote\n";
+        let out = text(&render(md, 40, Mode::Dark));
+        assert!(out.iter().any(|l| l.contains("▏ In a quote")), "{out:?}");
+        assert_eq!(
+            outlined(md, 40)
+                .into_iter()
+                .map(|(_, level, t)| (level, t))
+                .collect::<Vec<_>>(),
+            [(2, "In a list".into()), (3, "In a quote".into())]
+        );
+    }
+
+    #[test]
+    fn a_heading_with_no_words_in_it_is_not_a_row_of_the_outline() {
+        // `#` on its own is a legal ATX heading. It draws no rule, for the
+        // reason `H1_RULE` gives, and it names nothing — so a row in a jump
+        // list for it would be a blank line the reader cannot tell from any
+        // other blank line.
+        assert!(outlined("#\n\nbody\n", 40).is_empty());
+        assert_eq!(outlined("# Real\n", 40).len(), 1);
+    }
+
+    #[test]
+    fn a_headings_inline_markup_is_not_part_of_its_name() {
+        // The text is taken from the spans the renderer is about to draw, which
+        // is after `**` and backticks have been eaten — so the outline says
+        // what the page says rather than what the file says. That is the same
+        // choice `search` makes about a rendered document, and it is the one
+        // that keeps `o` and the page agreeing.
+        assert_eq!(
+            outlined("## The `Page` **type**\n", 40),
+            [(0, 2, "The Page type".into())]
+        );
+    }
+}

@@ -48,10 +48,18 @@
 //! about to press `Enter` on would be replaced, mid-reach, by a document they
 //! did not ask for.
 //!
-//! ## Three things to look at, one pane
+//! The outline is the fifth, and it is the plainest of them: `o` puts the
+//! document's own headings — or a source file's definitions — on screen as a
+//! list to jump into, and while that list is up the reader is choosing a place
+//! in *this* document. A file arriving would replace the document those places
+//! are places in, so the row under the selection would name somewhere that no
+//! longer exists. Same door, same lock, and the `◆` in `title` again.
 //!
-//! [`Mode`] is the document, the list, or the results of a search over every
-//! file under the root. `Alt+E` — [`ViewerPane::toggle_browse`] — moves between
+//! ## Four things to look at, one pane
+//!
+//! [`Mode`] is the document, the list, the results of a search over every file
+//! under the root, or the outline of the document. `Alt+E` —
+//! [`ViewerPane::toggle_browse`] — moves between
 //! the first two in both directions, and `Enter` on a file moves one way,
 //! because a list that stayed up after you chose something would need a second
 //! key to show you what you chose. They are the same reading position from
@@ -75,7 +83,16 @@
 //! each batch would pin the view and take the wheel away. That one line is what
 //! holds it, which is why it is pointed at from here.
 //!
-//! The list itself lives in [`browse`] and the search in [`grep`], because a
+//! The outline is a layer over the document as well, and carries nothing back
+//! because there is nowhere else it could have been opened from: `o` is a
+//! question about the document on screen, so the file list — which has no
+//! document — cannot ask it. `Esc`, `q` and a second `o` put the reader back
+//! exactly where they were, and `Enter` moves them and leaves. It is the one
+//! mode whose rows are *indexes into another mode's rows*, which is the whole
+//! of what [`outline`] is careful about.
+//!
+//! The list itself lives in [`browse`], the search in [`grep`] and the outline
+//! in [`outline`], because a
 //! selectable, filterable directory tree is a pane's worth of code on its own,
 //! a worker thread that reads the repository is another, and this file is long
 //! enough. What being *in* a list means — which row is chosen, and keeping it on
@@ -149,6 +166,7 @@ mod list;
 mod load;
 pub(crate) mod markdown;
 mod mermaid;
+mod outline;
 mod search;
 mod source;
 pub(crate) mod theme;
@@ -203,11 +221,23 @@ const LINE_NUMBER_MIN_WIDTH: usize = 30;
 /// four columns is too much to spend when there are twenty-nine.
 const DOC_ROW: &str = "┊";
 
-/// Which of the three things the pane is showing. See the module doc.
+/// Which of the four things the pane is showing. See the module doc.
 #[derive(Clone, Copy)]
 enum Mode {
     Doc,
     Browse,
+    /// The headings, or the definitions, of the document behind it. Raised by
+    /// `o` from the document view and only from there, and it carries nothing
+    /// back because there is only one place to come back to.
+    ///
+    /// That asymmetry with [`Mode::Results`] is the whole of the difference
+    /// between them and is worth naming rather than noticing. The results are a
+    /// question about the *repository*, so they can sensibly be asked from
+    /// either settled view and have to remember which. An outline is a list of
+    /// the places in one document, so there is no document-less view it could
+    /// be asked from: `f` in the file list means something there, `o` would
+    /// mean nothing.
+    Outline,
     /// The search over every file under the root. Raised by `f` over either of
     /// the other two, and it remembers which — `Esc` out of it has to put the
     /// reader back where they pressed the key, and dropping somebody who was
@@ -268,6 +298,40 @@ struct Doc {
     /// `· rendered` and whether a missed phrase is offered `t` as the way out —
     /// and a file the length of this one has a few hundred regions to walk.
     has_docs: bool,
+    /// The definitions in the body, as `(source line, level, label)`. See
+    /// [`outline::symbols`].
+    ///
+    /// Scanned once when the body is loaded, beside `regions` and for the same
+    /// reason: none of the three fields depends on the pane's width, and a
+    /// window drag re-lays the document out on every frame. Scanning from
+    /// `build` instead would put a `String` per definition per frame — a
+    /// thousand of them in a file this size — on the thread that pumps the
+    /// agent's pty, for an answer that cannot have changed.
+    ///
+    /// What is *not* cached is the [`outline::Entry`] list built from this,
+    /// because that carries a row and a row is only ever right for one layout.
+    /// The split is the whole design: the width-independent half is scanned
+    /// once here, and the width-dependent half is rebuilt in `ensure_layout`
+    /// with the rows it indexes.
+    symbols: Vec<(usize, u8, String)>,
+}
+
+/// What one pass of [`ViewerPane::build`] produced.
+///
+/// A struct rather than the tuple this was, and the reason is not that three is
+/// one more than two. All three describe *the same rows*: the margin says how
+/// many columns at the left of them belong to the pane rather than to the
+/// document, and the outline says which of them a heading or a definition
+/// starts at. Neither means anything beside a different set of rows, and both
+/// are silent when wrong — a stale margin makes `/42` search the gutter, a
+/// stale outline lands `Enter` in the wrong paragraph. Returned as one value so
+/// the three arrive and are stored together, which is the version of "these are
+/// only ever right together" that a caller cannot get half of.
+#[derive(Default)]
+struct Layout {
+    lines: Vec<Line<'static>>,
+    margin: Margin,
+    outline: Vec<outline::Entry>,
 }
 
 enum State {
@@ -324,6 +388,26 @@ pub struct ViewerPane {
     /// is the single place that rebuilds one, which is why it is also the single
     /// place that refinds the other.
     search: Option<Search>,
+
+    /// The headings or definitions of the rows above, in reading order.
+    ///
+    /// Held beside `lines` and rebuilt with them, for the reason the field
+    /// above gives about the hits and [`outline`] restates about these: every
+    /// entry is an index into that vector, so the two are only ever right
+    /// together. It comes out of the same `build` call the rows do rather than
+    /// being derived from them afterwards — a heading is recorded by the
+    /// renderer at the instant it emits one, and a definition's row is recorded
+    /// by [`source_lines`] in the pass that emits it — so there is no
+    /// arrangement in which one exists without the other.
+    outline: Vec<outline::Entry>,
+    /// Where the reader is in that list while [`Mode::Outline`] is up.
+    ///
+    /// Beside the entries rather than holding them, which is `list::Cursor`'s
+    /// own rule and here it is load-bearing: the selection is an index the
+    /// cursor clamps against whatever count it is handed, so a rebuild that
+    /// changed the number of entries moves the selection rather than reaching
+    /// past the end of the list.
+    picker: outline::View,
     /// A phrase this pane is looking for in this document and cannot show, with
     /// the ordinal that was asked for.
     ///
@@ -414,6 +498,8 @@ impl ViewerPane {
             margin: Margin::default(),
             dirty: true,
             search: None,
+            outline: Vec::new(),
+            picker: outline::View::new(DEFAULT_VIEWPORT),
             missed: None,
             scroll,
             ask: None,
@@ -511,8 +597,15 @@ impl ViewerPane {
         // to leave somebody looking at. The mode is otherwise left alone —
         // somebody who was walking a directory is put in the new root's
         // directory, which is what `Browser::new` has just arranged.
-        if let Mode::Results { back } = self.mode {
-            self.mode = back.mode();
+        //
+        // The outline goes for the sharper version of the same reason: its rows
+        // are places in a document that is about to be `State::Empty`, so it
+        // would be a list of nothing with an `Enter` that scrolls a page the
+        // reader cannot see.
+        match self.mode {
+            Mode::Results { back } => self.mode = back.mode(),
+            Mode::Outline => self.mode = Mode::Doc,
+            Mode::Doc | Mode::Browse => {}
         }
         self.missed = None;
         self.root = root.clone();
@@ -625,6 +718,11 @@ impl ViewerPane {
                 // source — wants to be given.
                 let regions = docs::regions(&text, &path);
                 let has_docs = regions.iter().any(docs::Region::is_doc);
+                // Scanned here for `regions`' reason rather than a second one:
+                // it does not depend on the width, and everything that runs per
+                // frame does. A `.md` gets a scan too and it costs one
+                // extension test, exactly as the line above does.
+                let symbols = outline::symbols(&text, &path);
                 let body = if crate::watch::is_markdown(&path) {
                     Body::Markdown(text)
                 } else {
@@ -637,6 +735,7 @@ impl ViewerPane {
                     bytes,
                     regions,
                     has_docs,
+                    symbols,
                 })
             }
             Err(why) => State::Failed { path, why },
@@ -748,7 +847,11 @@ impl ViewerPane {
             self.grep.close_box();
         }
         self.mode = match self.mode {
-            Mode::Doc => {
+            // The outline is peeled off the same way and then `Alt+E` means
+            // what it has always meant. It is a layer over the document, so the
+            // view underneath it is the document — which is the arm below, and
+            // which is why this one falls into it rather than restating it.
+            Mode::Doc | Mode::Outline => {
                 // Open the list beside the document on screen. Whether that
                 // means moving is [`Browser::align_to`]'s judgement, not ours:
                 // it is the difference between a list that is a place and a
@@ -801,6 +904,87 @@ impl ViewerPane {
         self.mode = Mode::Results { back };
         self.grep.open();
         Handled::Yes
+    }
+
+    /// `o`, from the document view and from nowhere else.
+    ///
+    /// Pane-local and exempt from the invariant at the top of `crate::keys` for
+    /// the reason stated there and cited by `f` and `t` above: it is only ever
+    /// delivered to a focused pane with the document showing, so no agent is
+    /// listening for it. It is free — no `Char('o')` is claimed anywhere in the
+    /// program — and inside every box in this pane it is a letter, because the
+    /// box is asked first.
+    ///
+    /// **Declines a document with nothing to list**, which is
+    /// [`ViewerPane::toggle_raw`]'s rule applied rather than a new one: a pane
+    /// that advertises a key which does nothing is worse than one that
+    /// declines, because the reader is left pressing it again. An empty list
+    /// with a sentence in it would be the same failure dressed as an answer —
+    /// it costs a frame, it costs the reader the document they were looking at,
+    /// and `Esc` is then a key they have to press to undo a key that told them
+    /// nothing.
+    ///
+    /// Nothing anywhere advertises `o` per document, and it cannot: the title
+    /// is a line that already carries the name, the form, the query and the
+    /// position, and the F1 overlay is one table for the whole program. What
+    /// makes that acceptable is the same thing that makes `t`'s silence
+    /// acceptable — declining costs nothing and says so instantly.
+    ///
+    /// Before the first frame there is no layout and therefore no outline, so
+    /// `o` declines there too. That is `show_at`'s "skipped before the first
+    /// frame" again: a key drained from the same batch as the one that opened
+    /// the pane has nothing to be a list of yet.
+    fn open_outline(&mut self) -> Handled {
+        if self.outline.is_empty() {
+            return Handled::No;
+        }
+        // Opened on the entry the breadcrumb has been naming, and told the
+        // pane's real height — see [`outline::View::open`].
+        self.picker
+            .open(&self.outline, self.scroll.offset, self.scroll.viewport());
+        // The box does not survive leaving the document; the hits do. Exactly
+        // the trade `toggle_browse` makes one method up, and for the same
+        // reason: a box open behind a list would keep `takes_input` and
+        // `exit_hint` answering for a query nobody can see.
+        self.close_search();
+        self.mode = Mode::Outline;
+        Handled::Yes
+    }
+
+    /// Fold what the outline did back into the pane.
+    fn absorb_outline(&mut self, out: outline::Outcome) -> Handled {
+        match out {
+            outline::Outcome::Ignored => Handled::No,
+            outline::Outcome::Moved => Handled::Yes,
+            outline::Outcome::Leave => {
+                // Where the reader was, exactly. Nothing is done to `scroll`,
+                // which is the whole of what "never mind never costs you your
+                // place" is implemented as.
+                self.mode = Mode::Doc;
+                Handled::Yes
+            }
+            outline::Outcome::Jump(row) => {
+                // The heading goes to the *top* of the pane rather than being
+                // centred the way a search hit is, and the two differ because
+                // the moves differ. A hit is a word inside a paragraph and the
+                // reader needs to see what is either side of it to tell whether
+                // it is the one they wanted; a heading is the start of a
+                // section, and everything worth reading is below it. Centring
+                // one would spend half the pane on the section the reader has
+                // just chosen to leave.
+                //
+                // `Scroll::to` clamps to the last full page, so a heading in
+                // the final screenful lands part way down the pane instead of
+                // at the top — still on screen, which is the promise, and the
+                // only alternative is scrolling past the end of the document.
+                self.scroll.to(row);
+                // The list has answered its question. Staying in it would mean
+                // pressing another key to see what was chosen — `browse`'s
+                // rule, two lists along.
+                self.mode = Mode::Doc;
+                Handled::Yes
+            }
+        }
     }
 
     /// Is a find box open? The border and the paste route both ask, and both
@@ -974,7 +1158,10 @@ impl ViewerPane {
     /// Lay the document out for `width`, if it is not already.
     ///
     /// The one place `lines` is rebuilt, and therefore the one place the hits
-    /// can be refound. Nothing else rebuilds them: `t`, `F3`, `r`, `set_theme`,
+    /// can be refound *and the one place the outline can be*. Both are vectors
+    /// of indexes into the rows, so both are wrong the instant the rows change,
+    /// and both are made out of this one call rather than wired to the routes
+    /// that reach it. Nothing else rebuilds them: `t`, `F3`, `r`, `set_theme`,
     /// `set_root`, a reload, a file taken up by the watcher and a window drag
     /// all say so by setting `dirty` or by arriving with a new width, and then
     /// wait for this. Counting those routes and wiring each one would be a list
@@ -990,7 +1177,18 @@ impl ViewerPane {
         if !self.dirty && width == self.laid_out {
             return;
         }
-        (self.lines, self.margin) = self.build(width);
+        // Destructured from one value rather than assigned from a tuple, which
+        // is what a third member turned this into: `(a, b, c) = f()` at a call
+        // site three hundred lines from the function is a positional puzzle,
+        // and the three are one thing anyway — see [`Layout`].
+        let Layout {
+            lines,
+            margin,
+            outline,
+        } = self.build(width);
+        self.lines = lines;
+        self.margin = margin;
+        self.outline = outline;
         self.laid_out = width;
         self.dirty = false;
         if let Some(search) = self.search.as_mut() {
@@ -1041,14 +1239,17 @@ impl ViewerPane {
         self.missed = None;
     }
 
-    /// The rows, and how much of them is the pane's own margin rather than the
-    /// document. See [`search::Margin`].
-    fn build(&self, width: usize) -> (Vec<Line<'static>>, Margin) {
+    /// One layout of the document: the rows, and the two things that are only
+    /// ever true of *these* rows. See [`search::Margin`] and [`outline`].
+    fn build(&self, width: usize) -> Layout {
         if width == 0 {
-            return (Vec::new(), Margin::default());
+            return Layout::default();
         }
         let t = self.theme.theme();
-        let plain = |lines| (lines, Margin::default());
+        let plain = |lines| Layout {
+            lines,
+            ..Layout::default()
+        };
         match &self.state {
             State::Empty => plain(empty_hint(width, self.watching, t)),
             State::Failed { path, why } => {
@@ -1077,9 +1278,13 @@ impl ViewerPane {
                 // file, gutter and all: syntect has a Markdown grammar, and a
                 // reader looking at the source of a document wants to see the
                 // line numbers they are about to talk about.
-                let (mut lines, gutter) = match &doc.body {
+                let (mut lines, gutter, outline) = match &doc.body {
                     Body::Markdown(text) if !self.raw => {
-                        (markdown::render(text, width, self.theme), 0)
+                        // The renderer's own answer, because it is the only
+                        // thing that knows which row a heading landed on. See
+                        // [`markdown::render_outlined`].
+                        let (lines, outline) = markdown::render_outlined(text, width, self.theme);
+                        (lines, 0, outline)
                     }
                     Body::Markdown(text) | Body::Source(text) => {
                         // `raw` is one question asked of both bodies — "show me
@@ -1089,7 +1294,39 @@ impl ViewerPane {
                         // returns one, so "the reader pressed t" and "this file
                         // has nothing to render" cannot be confused.
                         let regions: &[docs::Region] = if self.raw { &[] } else { &doc.regions };
-                        source_lines(text, &doc.path, regions, width, self.theme)
+                        // The definitions were scanned when the file loaded and
+                        // are in *source lines*; what is asked for here is the
+                        // row each of those lines came out on, which only the
+                        // pass that emits the rows can say. Handed in as a
+                        // sorted list of lines and answered in the same order,
+                        // so the mapping costs one cursor rather than a lookup
+                        // per line of the file. `.md` shown as source arrives
+                        // here with an empty list, which is the whole of how
+                        // "markdown-as-source has no outline" is implemented —
+                        // see [`outline`] for why that is the answer.
+                        let want: Vec<usize> = doc.symbols.iter().map(|(at, ..)| *at).collect();
+                        let (lines, gutter, at) =
+                            source_lines(text, &doc.path, regions, width, self.theme, &want);
+                        // A symbol that was never drawn as a code row has no
+                        // row to name. It should not happen — a definition
+                        // inside a doc region would mean `docs` had swallowed a
+                        // line of code — and it is dropped rather than clamped,
+                        // because a wrong row in a jump list is the one thing
+                        // this feature must not produce and there is no such
+                        // thing as an approximately right one.
+                        let outline = doc
+                            .symbols
+                            .iter()
+                            .zip(at)
+                            .filter_map(|((_, level, text), row)| {
+                                row.map(|row| outline::Entry {
+                                    row,
+                                    level: *level,
+                                    text: text.clone(),
+                                })
+                            })
+                            .collect();
+                        (lines, gutter, outline)
                     }
                 };
                 // Measured before the notice below is appended, because the
@@ -1110,7 +1347,11 @@ impl ViewerPane {
                         t.dim(),
                     ));
                 }
-                (lines, margin)
+                Layout {
+                    lines,
+                    margin,
+                    outline,
+                }
             }
         }
     }
@@ -1417,6 +1658,24 @@ impl Pane for ViewerPane {
             let mark = if self.pending.is_some() { "◆ " } else { "" };
             return format!("{mark}{}", self.grep.title());
         }
+        if matches!(self.mode, Mode::Outline) {
+            // Fourth door, same mark and the same reason: this pane is on
+            // screen and still holding a file back, so the shell has no border
+            // to mark. Bare like the results' mark rather than naming a key,
+            // because three keys release it — `Esc`, `q` and a second `o` —
+            // and a mark that named one of them would be advertising the least
+            // likely of the three.
+            let mark = if self.pending.is_some() { "◆ " } else { "" };
+            let name = match &self.state {
+                State::Doc(doc) => self.label(&doc.path),
+                // Unreachable: `o` declines an empty outline and only a
+                // document can have one. Answered rather than asserted, for the
+                // reason `docs::partition` gives — an assertion on the draw path
+                // is a panic in the agent's pane, and this is a viewer.
+                _ => String::new(),
+            };
+            return format!("{mark}{}", self.picker.title(&self.outline, &name));
+        }
         if matches!(self.mode, Mode::Browse) {
             // The one place this pane marks a pending file itself, and it has
             // to be: the shell draws `◆ Alt+E` only on the border of the view
@@ -1511,6 +1770,14 @@ impl Pane for ViewerPane {
                     (true, true) => " · source",
                     (true, false) => " · rendered",
                 };
+                // Which section the reader is in, when the document knows. See
+                // [`outline::crumb`] for the eliding; where it *sits* is
+                // decided immediately below and is the whole of what this line
+                // has to get right.
+                let crumb = match outline::crumb(&self.outline, self.scroll.offset) {
+                    Some(crumb) => format!(" · {crumb}"),
+                    None => String::new(),
+                };
                 // Read left to right, this is what the reader gives up last
                 // first: the file name, then which form of it, then the query,
                 // then where they are in it. A title is clipped from the right,
@@ -1519,8 +1786,35 @@ impl Pane for ViewerPane {
                 // the 46 columns this pane is routinely given, sitting second
                 // to last meant it was clipped off exactly when a long query
                 // was missing, which is the one moment it exists for.
+                //
+                // **The breadcrumb goes after the position, which is to say
+                // last, which is to say it is the first thing lost.** That is
+                // the rule above applied and not an exception to it. Every
+                // other part of this line is an *answer*: the name says which
+                // file, the form says why a phrase cannot be found, the notice
+                // says the search came up empty, the truncation says the file
+                // does not end where the rows do. The breadcrumb answers
+                // nothing — the reader can see the heading by scrolling to it,
+                // and `o` lists every one of them — so it is a convenience, and
+                // a convenience that can displace an answer is a bug in the
+                // ordering rather than a feature of the title.
+                //
+                // Which puts it to the right of `· 62%`, and that is deliberate
+                // rather than a place left over. Sitting *before* the position
+                // — which reads better, and is where a first draft put it —
+                // would mean a narrow border clipping the position away while a
+                // half-eaten section name survived, and "where am I in this
+                // file" is a question with an answer where "which section is
+                // this" is a nicety. The cost of being last is that a slightly
+                // clipped title shows a truncated crumb; the cost of being
+                // second to last is that it takes an answer down with it.
+                //
+                // It has a length cap of its own — [`outline::CRUMB_MAX`] — for
+                // the case the ordering cannot cover: a long chain in a *wide*
+                // border is never clipped at all, so nothing would stop it
+                // running past everything the title says put together.
                 format!(
-                    "{mark}{}{form}{find}{trunc} · {}",
+                    "{mark}{}{form}{find}{trunc} · {}{crumb}",
                     self.label(&doc.path),
                     self.position()
                 )
@@ -1563,6 +1857,34 @@ impl Pane for ViewerPane {
         // they never asked for.
         if matches!(self.mode, Mode::Results { .. }) {
             self.grep.render(f, inner);
+            return;
+        }
+
+        // The fourth, closed the same way and for a reason that is one of the
+        // other three rather than a new one: somebody choosing a section of
+        // *this* document is using the pane, and the file that arrived is a
+        // different document — so the row they were about to press `Enter` on
+        // would name a place in a page that no longer exists.
+        if matches!(self.mode, Mode::Outline) {
+            // **The document is laid out anyway, from in here.** It is not on
+            // screen, so this looks like work for nothing, and it is the one
+            // thing holding invariant that an outline row can never be stale:
+            // the entries index `lines`, the pane can be dragged narrower while
+            // this list is up, and skipping the layout would leave rows built
+            // for a width the reader has already left. `Enter` would then land
+            // by the old wrapping. It costs what a drag over the document
+            // already costs and nothing more, because `ensure_layout` returns
+            // immediately when neither the width nor `dirty` has moved.
+            let text_width = inner.width - scroll::bar_width(inner.width);
+            self.ensure_layout(text_width as usize);
+            // And measured, for the half of the same reason that is easy to
+            // miss: `Scroll::to` clamps against the row count a frame last told
+            // it, so an `Enter` after a drag would be aimed at a row of the new
+            // layout and clamped by the old one's length. A pane dragged
+            // narrower makes the document *longer*, so the clamp would land the
+            // reader short of the heading with nothing on screen to say why.
+            self.scroll.measure(self.lines.len(), inner.height as usize);
+            self.picker.render(f, inner, &self.outline, self.theme);
             return;
         }
 
@@ -1692,6 +2014,16 @@ impl Pane for ViewerPane {
             return Ok(self.absorb_result(out));
         }
 
+        // And the outline owns every key while it is up, for the same reason:
+        // `j` there moves a selection rather than the page, and a pane cannot
+        // hand the same key to two vocabularies and hope. Unlike the two lists
+        // above it, it claims `Esc` and `q` as well — see [`outline::View::key`]
+        // for why, and `exit_hint` for what the border therefore has to say.
+        if matches!(self.mode, Mode::Outline) {
+            let out = self.picker.key(&self.outline, key);
+            return Ok(self.absorb_outline(out));
+        }
+
         // The list owns every key while it is up, including the scroll ones:
         // there they move a selection rather than an offset, and a pane cannot
         // hand the same key to two vocabularies and hope.
@@ -1758,6 +2090,11 @@ impl Pane for ViewerPane {
             // each other on the same screen because the question a reader has
             // is often the second one after the first has come up empty.
             _ if bare(key, 'f') => self.open_results(Back::Doc),
+            // Not a search at all, which is why it is not in that sentence: `/`
+            // and `f` are questions about words, and this is the document's own
+            // table of contents. See [`ViewerPane::open_outline`], including
+            // why it declines rather than opening an empty list.
+            _ if bare(key, 'o') => self.open_outline(),
             KeyCode::Char('n') => self.step_hit(true),
             KeyCode::Char('N') => self.step_hit(false),
             // `?` for the ask view, about the document on screen. Pane-local
@@ -1815,6 +2152,10 @@ impl Pane for ViewerPane {
             let out = self.grep.mouse(ev);
             return Ok(self.absorb_result(out));
         }
+        if matches!(self.mode, Mode::Outline) {
+            let out = self.picker.mouse(&self.outline, ev);
+            return Ok(self.absorb_outline(out));
+        }
         if matches!(self.mode, Mode::Browse) {
             let out = self.browse.mouse(ev);
             return Ok(self.absorb(out));
@@ -1844,6 +2185,12 @@ impl Pane for ViewerPane {
         if matches!(self.mode, Mode::Results { .. }) {
             return Ok(self.grep.scroll_view(key));
         }
+        // A third list, and the rule is the list's rather than this view's:
+        // `Down` in the outline moves the row `Enter` would jump to, and a
+        // glance from the other side of the window must not re-aim it.
+        if matches!(self.mode, Mode::Outline) {
+            return Ok(self.picker.scroll_view(key));
+        }
         if matches!(self.mode, Mode::Browse) {
             return Ok(self.browse.scroll_view(key));
         }
@@ -1872,13 +2219,17 @@ impl Pane for ViewerPane {
         self.finding() || self.typing() || self.grepping()
     }
 
-    /// Seven answers, and the border has to be true in every one of them
+    /// Eight answers, and the border has to be true in every one of them
     /// because it is the only place the way out is written down. It names what
     /// *this* press does, not where the sequence ends, which is what makes a
     /// three-press `Esc` describable one press at a time.
     ///
+    /// The eighth is the outline, and it is the only one of them with a single
+    /// unconditional answer: it has no box to close first and only the document
+    /// behind it, so `esc→page` is true of every state it can be in.
+    ///
     /// The results, which are a layer over one of the other two views, are worth
-    /// three of the seven. `esc→results` closes their box onto the matches
+    /// three of the eight. `esc→results` closes their box onto the matches
     /// behind it. With nothing behind it — the box has never been run — the same
     /// press leaves the whole view, and where it leaves *to* is the half a
     /// single answer could not have covered: `esc→list` when `f` was pressed in
@@ -1910,6 +2261,14 @@ impl Pane for ViewerPane {
                 (_, _, Back::Browse) => "esc→list",
                 (_, _, Back::Doc) => "esc→page",
             };
+        }
+        // `esc→page`, the same words the results use when `f` was pressed in the
+        // document, because it is the same journey and the border has one
+        // vocabulary or it has none. It is unconditional where the others are
+        // not: this view has no box to close first and nothing behind it but
+        // the document, so there is only ever one thing the press can do.
+        if matches!(self.mode, Mode::Outline) {
+            return "esc→page";
         }
         if matches!(self.mode, Mode::Browse) {
             return if self.browse.finding() {
@@ -2009,13 +2368,30 @@ impl Pane for ViewerPane {
 /// highlighting. Giving up both at one threshold would mean a 100 KB Python
 /// file showing its docstrings as `"""` while a 100 KB `.md` next to it renders
 /// fine, with nothing on screen to explain the difference.
+/// `want` is a sorted list of source lines the caller needs the *row* of, and
+/// the third return value answers it in the same order — `None` for a line this
+/// pass never drew as a code row.
+///
+/// It is here rather than in a second walk of the file because this is the only
+/// function that knows the answer. A source line becomes one row or five,
+/// depending on the width; a run of them inside a doc region becomes a
+/// paragraph with no line-to-row mapping at all. Both facts are decided as the
+/// rows are emitted and are gone by the time the `Vec<Line>` comes back, so
+/// anything asking afterwards would be re-deriving the layout from the layout —
+/// which is the mistake [`search`] argues at length about mapping source
+/// offsets back onto rendered rows.
+///
+/// Answered with a cursor that only ever moves forwards, because `want` is
+/// sorted and the regions are walked in order: the cost is one comparison per
+/// wanted line for the whole file, not a lookup per line of it.
 fn source_lines(
     text: &str,
     path: &Path,
     regions: &[docs::Region],
     width: usize,
     mode: theme::Mode,
-) -> (Vec<Line<'static>>, usize) {
+    want: &[usize],
+) -> (Vec<Line<'static>>, usize, Vec<Option<usize>>) {
     // **One highlighter pass over the whole file, sliced afterwards.** Not a
     // highlighter per code region, and this is the sharpest constraint in the
     // function: `syntect::easy::HighlightLines` carries the grammar's context
@@ -2026,7 +2402,7 @@ fn source_lines(
     // is wrong, and wrong in a way nobody would report as a bug — it just looks
     // like the theme going odd half way down long files.
     let rows = source::highlight_file(text, path, mode);
-    let mut page = Page::new(rows, width, mode);
+    let mut page = Page::new(rows, width, mode, want);
     let count = page.rows.len();
 
     let whole = [docs::Region::code(0, count)];
@@ -2059,7 +2435,7 @@ fn source_lines(
     page.code(next..count);
 
     let gutter = page.gutter();
-    (page.out, gutter)
+    (page.out, gutter, page.at)
 }
 
 /// The rows of a source file being built, and the one thing that draws the
@@ -2071,7 +2447,7 @@ fn source_lines(
 /// line, its blank continuations, and now the rows a rendered doc block turns
 /// into. One place decides how wide it is and one place draws it, so the three
 /// cannot drift apart.
-struct Page {
+struct Page<'w> {
     /// The highlighted file, one entry per source line, emptied as it is used.
     rows: Vec<Vec<Span<'static>>>,
     out: Vec<Line<'static>>,
@@ -2080,10 +2456,22 @@ struct Page {
     /// Digits in the number column, or zero in a pane too narrow to spend the
     /// columns on one.
     digits: usize,
+    /// Source lines somebody wants the row of, sorted, and how far down that
+    /// list this page has got. See [`source_lines`].
+    want: &'w [usize],
+    next: usize,
+    /// The answer, one slot per entry of `want`, filled as the rows are emitted
+    /// and left `None` for a line that was never drawn as code.
+    at: Vec<Option<usize>>,
 }
 
-impl Page {
-    fn new(rows: Vec<Vec<Span<'static>>>, width: usize, mode: theme::Mode) -> Self {
+impl<'w> Page<'w> {
+    fn new(
+        rows: Vec<Vec<Span<'static>>>,
+        width: usize,
+        mode: theme::Mode,
+        want: &'w [usize],
+    ) -> Self {
         let digits = if width >= LINE_NUMBER_MIN_WIDTH {
             rows.len().to_string().len().max(3)
         } else {
@@ -2095,6 +2483,28 @@ impl Page {
             width,
             mode,
             digits,
+            want,
+            next: 0,
+            at: vec![None; want.len()],
+        }
+    }
+
+    /// Source line `line` starts at row `row`. Called from the one place a row
+    /// is emitted for a numbered source line, and from nowhere else.
+    ///
+    /// The cursor is dragged past every wanted line below `line` on the way,
+    /// which is what leaves a definition inside a doc region — or past the end
+    /// of the file — with the `None` it deserves rather than with the row of
+    /// whatever came next. Written as "skip, then take" rather than as a search
+    /// because `want` is sorted and the caller walks the file forwards, so the
+    /// whole mapping costs one pass over the shorter of the two lists.
+    fn mark(&mut self, line: usize, row: usize) {
+        while self.next < self.want.len() && self.want[self.next] < line {
+            self.next += 1;
+        }
+        while self.next < self.want.len() && self.want[self.next] == line {
+            self.at[self.next] = Some(row);
+            self.next += 1;
         }
     }
 
@@ -2146,6 +2556,11 @@ impl Page {
     /// documentation in it.
     fn code(&mut self, range: std::ops::Range<usize>) {
         for i in range {
+            // Before the wrap, so the row recorded is the one the line's
+            // *first* row lands on. A jump aimed at a wrapped continuation
+            // would put the head of the definition off the top of the pane,
+            // which is the same landing the heading arm in `markdown` refuses.
+            self.mark(i, self.out.len());
             let row = std::mem::take(&mut self.rows[i]);
             let first = self.numbered(i + 1);
             let cont = self.blank();
@@ -2728,8 +3143,8 @@ mod tests {
         let regions = docs::regions(&text, &path);
         assert!(!regions.iter().any(docs::Region::is_doc));
         for width in [12, 20, 30, 40, 80] {
-            let interleaved = source_lines(&text, &path, &regions, width, theme::Mode::Dark);
-            let plain = source_lines(&text, &path, &[], width, theme::Mode::Dark);
+            let interleaved = source_lines(&text, &path, &regions, width, theme::Mode::Dark, &[]);
+            let plain = source_lines(&text, &path, &[], width, theme::Mode::Dark, &[]);
             assert_eq!(interleaved, plain, "at width {width}");
         }
     }
@@ -2788,8 +3203,8 @@ mod tests {
             let regions = docs::regions(&text, &path);
             for width in 0..floor {
                 assert_eq!(
-                    source_lines(&text, &path, &regions, width, theme::Mode::Dark),
-                    source_lines(&text, &path, &[], width, theme::Mode::Dark),
+                    source_lines(&text, &path, &regions, width, theme::Mode::Dark, &[]),
+                    source_lines(&text, &path, &[], width, theme::Mode::Dark, &[]),
                     "{} at width {width}",
                     path.display()
                 );
@@ -5181,5 +5596,435 @@ mod tests {
             pane.scroll.offset, 1,
             "the pane does not inspect kind, the shell does"
         );
+    }
+
+    // --- the outline ------------------------------------------------------
+
+    /// A document with enough headings to nest and enough prose between them
+    /// that the rows move when the pane's width does.
+    const SECTIONED: &[u8] = b"# Design\n\n\
+        This paragraph is long enough that the width it is wrapped to \
+        decides how many rows it takes up on the page.\n\n\
+        ## The panes\n\n\
+        Another paragraph of the same kind, so that every heading after \
+        this one sits at a different row in a narrow pane.\n\n\
+        ### ask\n\nA third.\n\n### git\n\nA fourth.\n\n## Keys\n\nA fifth.\n";
+
+    #[test]
+    fn the_outline_is_rebuilt_with_the_rows_so_that_a_stale_entry_cannot_exist() {
+        // The invariant the whole feature rests on. An entry's `row` indexes
+        // `lines`, and `lines` is re-wrapped whenever the width changes — so
+        // the entries must be rebuilt out of the same call, not carried across.
+        // Carried across, every jump after a window drag would land at the row
+        // the *old* wrapping put the heading at, silently.
+        let dir = TempDir::new("view-outline-rebuild");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        laid(&mut pane, 60, 20);
+        let wide: Vec<(usize, u8, String)> = pane
+            .outline
+            .iter()
+            .map(|e| (e.row, e.level, e.text.clone()))
+            .collect();
+        assert_eq!(
+            wide.iter().map(|e| e.2.as_str()).collect::<Vec<_>>(),
+            ["Design", "The panes", "ask", "git", "Keys"]
+        );
+
+        let rows = laid(&mut pane, 24, 20);
+        let narrow: Vec<(usize, u8, String)> = pane
+            .outline
+            .iter()
+            .map(|e| (e.row, e.level, e.text.clone()))
+            .collect();
+
+        // The same headings, at the same levels, naming the same sections.
+        assert_eq!(
+            wide.iter().map(|e| (e.1, &e.2)).collect::<Vec<_>>(),
+            narrow.iter().map(|e| (e.1, &e.2)).collect::<Vec<_>>()
+        );
+        // At different rows, which is the half that proves they were rebuilt
+        // rather than merely still correct by luck.
+        assert_ne!(
+            wide.iter().map(|e| e.0).collect::<Vec<_>>(),
+            narrow.iter().map(|e| e.0).collect::<Vec<_>>()
+        );
+        // And every one of them still points at its own heading.
+        for (row, _, text) in &narrow {
+            assert!(*row < rows.len(), "{text} is at {row} of {}", rows.len());
+            let first = text.split(' ').next().expect("a word");
+            assert!(
+                rows[*row].contains(first),
+                "row {row} is {:?}, not {text}",
+                rows[*row]
+            );
+        }
+    }
+
+    #[test]
+    fn o_declines_a_document_with_nothing_to_list() {
+        // `toggle_raw`'s rule, applied to a second key: a pane that advertises
+        // a key which does nothing is worse than one that declines, because the
+        // reader is left pressing it again. An empty list with a sentence in it
+        // would cost them the document they were looking at to say nothing.
+        let dir = TempDir::new("view-outline-bare");
+        let path = dir.write("notes.txt", b"just some prose\nand a second line\n");
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        laid(&mut pane, 40, 10);
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::No
+        );
+        assert!(matches!(pane.mode, Mode::Doc));
+        // And markdown shown as its source is the same answer, which is the
+        // decision `outline`'s module doc records: the headings are `#` lines
+        // there, and `pulldown_cmark` is what decides what a heading is.
+        let md = dir.write("design.md", SECTIONED);
+        pane.show(&md);
+        laid(&mut pane, 40, 10);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::Yes,
+            "rendered, it has one"
+        );
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        laid(&mut pane, 40, 10);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::No,
+            "as source, it has none"
+        );
+
+        // And in a box it is a letter, like every other printable key — the
+        // rule the F1 overlay states once as "in a find box".
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        laid(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('/'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        assert!(matches!(pane.mode, Mode::Doc), "an `o` typed into a query");
+        assert!(pane.title().contains("/o"), "{}", pane.title());
+    }
+
+    #[test]
+    fn enter_in_the_outline_lands_the_reader_on_the_heading_with_it_on_screen() {
+        let dir = TempDir::new("view-outline-jump");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rows = laid(&mut pane, 40, 8);
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::Yes
+        );
+        // Third row of the list, which is `ask`.
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert!(pane.title().contains("· outline · 3/5"), "{}", pane.title());
+        let want = pane.outline[2].row;
+
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(matches!(pane.mode, Mode::Doc), "and the list goes");
+        assert_eq!(pane.scroll.offset, want);
+        // On screen, and at the top of it: everything worth reading in a
+        // section is below its heading, so a centred landing would spend half
+        // the pane on the section just left.
+        assert_eq!(rows[want], "ask");
+        assert!(rows[want + 2].starts_with('A'), "{:?}", rows[want + 2]);
+    }
+
+    #[test]
+    fn a_heading_in_the_last_screenful_is_still_brought_into_view() {
+        // `Scroll::to` clamps to the last full page, so the offset is not the
+        // row here — and the promise is not "the row is the offset", it is "the
+        // heading is on screen". A jump that clamped and left the heading above
+        // the fold would be the one landing this feature must not produce.
+        let dir = TempDir::new("view-outline-end");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 12);
+
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        pane.handle_key(key(KeyCode::End)).unwrap();
+        let want = pane.outline.last().expect("a last heading").row;
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        draw(&mut pane, 40, 12);
+
+        assert!(want >= pane.scroll.offset, "{want} is above the fold");
+        assert!(
+            want < pane.scroll.offset + pane.scroll.viewport(),
+            "{want} is below it"
+        );
+    }
+
+    #[test]
+    fn esc_q_and_a_second_o_all_leave_the_outline_where_the_reader_was() {
+        // "Never mind" never costs you your place. Three keys mean it here, and
+        // none of them may move the document — a list you can back out of for
+        // free is what makes it worth opening to look.
+        let dir = TempDir::new("view-outline-leave");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 8);
+        pane.scroll.to(6);
+
+        for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('o')] {
+            assert_eq!(
+                pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+                Handled::Yes
+            );
+            assert_eq!(pane.exit_hint(), "esc→page", "the border says where");
+            // Move the selection, so leaving has something to *not* act on.
+            pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+            assert_eq!(pane.handle_key(key(code)).unwrap(), Handled::Yes);
+            assert!(matches!(pane.mode, Mode::Doc), "{code:?} left the list");
+            assert_eq!(pane.scroll.offset, 6, "{code:?} moved the reader");
+        }
+    }
+
+    #[test]
+    fn a_source_files_definitions_point_at_the_rows_they_were_drawn_on() {
+        // The other half of the index, and the half with a mapping in it: a
+        // symbol is found at a *source line*, and `source_lines` is what knows
+        // which row that line came out on once the gutter, the wrapping and the
+        // rendered doc blocks have had their say.
+        let dir = TempDir::new("view-outline-src");
+        let path = dir.write(
+            "lib.rs",
+            b"/// Something documented, at enough length that it reflows into \
+              more than one row of a narrow pane and moves what is under it.\n\
+              pub struct Entry {\n    row: usize,\n}\n\n\
+              impl Entry {\n    pub fn row(&self) -> usize {\n        self.row\n    }\n}\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rows = laid(&mut pane, 40, 20);
+
+        let listed: Vec<(&str, u8)> = pane
+            .outline
+            .iter()
+            .map(|e| (e.text.as_str(), e.level))
+            .collect();
+        assert_eq!(
+            listed,
+            [("struct Entry", 1), ("impl Entry", 1), ("fn row", 2)]
+        );
+        for entry in &pane.outline {
+            let first = entry.text.split(' ').nth(1).expect("a name");
+            assert!(
+                rows[entry.row].contains(first),
+                "row {} is {:?}, not {}",
+                entry.row,
+                rows[entry.row],
+                entry.text
+            );
+        }
+        // The doc block above the struct is several rows of reflowed prose with
+        // no source line behind them, which is exactly what makes the mapping
+        // necessary: the struct is not on row 1.
+        assert!(pane.outline[0].row > 1, "{:?}", pane.outline[0]);
+
+        // And `t` keeps it. The rendered doc block is gone, so every row moves
+        // and every entry has to move with it — a source file has an outline in
+        // both of its forms, which is where it differs from markdown.
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        let raw = laid(&mut pane, 40, 20);
+        assert_eq!(pane.outline.len(), 3, "still listed as source");
+        for entry in &pane.outline {
+            let name = entry.text.split(' ').nth(1).expect("a name");
+            assert!(
+                raw[entry.row].contains(name),
+                "row {} is {:?}, not {}",
+                entry.row,
+                raw[entry.row],
+                entry.text
+            );
+        }
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::Yes
+        );
+    }
+
+    #[test]
+    fn the_breadcrumb_names_the_section_the_reader_is_scrolled_into() {
+        let dir = TempDir::new("view-outline-crumb");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        // A short pane, so there is somewhere to scroll to: `Scroll::to` clamps
+        // to the last full page, and a document that fits has no sections below
+        // the fold to be in.
+        laid(&mut pane, 40, 6);
+
+        // At the top there is one heading above the reader and it is the title
+        // of the document, so that is all the crumb can say.
+        assert!(pane.title().ends_with("· Design"), "{}", pane.title());
+
+        // Scrolled into `ask`, which is three levels deep.
+        let at = pane
+            .outline
+            .iter()
+            .find(|e| e.text == "ask")
+            .expect("the heading")
+            .row;
+        pane.scroll.to(at + 1);
+        let title = pane.title();
+        assert!(title.ends_with("Design › The panes › ask"), "{title}");
+    }
+
+    #[test]
+    fn the_breadcrumb_is_the_last_thing_in_the_title_and_so_the_first_thing_clipped() {
+        // The constraint, pinned. A title is clipped from the right, so the
+        // order of this line *is* the priority order: the breadcrumb answers
+        // nothing that cannot be seen by scrolling, and it may never take the
+        // file name, the form word, the search notice or the truncation notice
+        // down with it. Which puts it after the position too — see `title`.
+        let dir = TempDir::new("view-outline-clip");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        laid(&mut pane, 60, 20);
+        pane.handle_key(key(KeyCode::Char('/'))).unwrap();
+        for c in "paragraph".chars() {
+            pane.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+
+        let title = pane.title();
+        let at = |needle: &str| {
+            title
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is missing from {title:?}"))
+        };
+        // Everything that is an *answer* comes first, in the order the comment
+        // on `title` sets out, and the convenience comes last.
+        assert!(at("design.md") < at("· rendered"), "{title}");
+        assert!(at("· rendered") < at("/paragraph"), "{title}");
+        assert!(at("/paragraph") < at("%"), "{title}");
+        assert!(at("%") < at("Design"), "{title}");
+        assert!(title.ends_with("· Design"), "{title}");
+    }
+
+    #[test]
+    fn a_file_arriving_while_the_outline_is_up_waits_rather_than_taking_over() {
+        // The fourth door onto the pane's one rule. Somebody choosing a section
+        // of *this* document is using the pane, and the row under their
+        // selection is a place in a page a new document would replace.
+        let dir = TempDir::new("view-outline-pending");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+
+        let fresh = dir.write("fresh.md", b"# fresh\n");
+        pane.follow(fresh.clone());
+        draw(&mut pane, 40, 10);
+        assert_eq!(
+            pane.path(),
+            Some(path.as_path()),
+            "the document is untouched"
+        );
+        assert!(pane.has_pending(), "and it is still waiting");
+        // No border for the shell to mark while this pane is the one showing,
+        // so the pane says it itself — as the list, the box and the results do.
+        assert!(pane.title().starts_with("◆ "), "{}", pane.title());
+
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        draw(&mut pane, 40, 10);
+        assert_eq!(pane.path(), Some(fresh.as_path()));
+    }
+
+    #[test]
+    fn the_outline_survives_the_pane_being_dragged_while_it_is_open() {
+        // The reason `render` lays the document out from inside a view that is
+        // not showing it. Skip that and the entries stay built for a width the
+        // reader has already left, so this `Enter` lands by the old wrapping.
+        let dir = TempDir::new("view-outline-drag");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        // Short, so that nothing below is clamped by `Scroll::to` and the
+        // offset is the row rather than merely near it.
+        draw(&mut pane, 60, 6);
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        let wide = pane.outline[2].row;
+
+        // The drag itself, and the only frame drawn at the new width is this
+        // one — which is the point: no frame of the *document* has been drawn
+        // at 24 columns, so everything the jump below relies on has to have
+        // been done from inside a view that is not showing it.
+        draw(&mut pane, 24, 6);
+        let narrow = pane.outline[2].row;
+        let rows = text(&pane.lines);
+        assert_ne!(wide, narrow, "the drag re-wrapped the document");
+        assert_eq!(rows[narrow], "ask", "the row is the narrow layout's row");
+        // And `wide` is where a stale outline would have sent them, which in
+        // this layout is not the heading at all.
+        assert_ne!(rows[wide], "ask");
+
+        // The last heading, which is the row that catches the second half of
+        // this: `Scroll::to` clamps against the row count a *frame* last gave
+        // it, so an outline that laid the document out without also measuring
+        // it would aim this `Enter` at a row of the new layout and clamp it by
+        // the old one’s length. A narrower pane makes the document longer, so
+        // that clamp is short and the heading is below the fold.
+        pane.handle_key(key(KeyCode::End)).unwrap();
+        let last = pane.outline.last().expect("a heading").row;
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(last >= pane.scroll.offset, "clamped short of the heading");
+        assert!(last < pane.scroll.offset + pane.scroll.viewport());
+
+        // And the same again for a heading in the middle, where the offset is
+        // the row exactly. `Home` first, because `o` opens on the section the
+        // reader is *in* — which is the last one, after the jump above.
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        pane.handle_key(key(KeyCode::Home)).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(pane.scroll.offset, narrow);
+    }
+
+    #[test]
+    fn the_help_overlay_names_the_key_that_opens_the_outline() {
+        // The one place the key is written down: a title already carrying the
+        // name, the form, the query and the position has no room to advertise
+        // it, so the F1 table is what a reader has.
+        let (key, said) = crate::keys::HELP
+            .iter()
+            .find(|(k, _)| *k == "o")
+            .expect("the key the overlay promises");
+        assert_eq!(*key, "o");
+        assert!(said.contains("heading"), "got: {said}");
+        assert!(said.contains("definition"), "got: {said}");
+        // And it says the key can decline, because nothing else can.
+        assert!(said.contains("if it has any"), "got: {said}");
+    }
+
+    #[test]
+    fn the_outline_draws_at_every_pane_size_without_panicking() {
+        // The same sizes every other view in this pane is pinned at. A list
+        // narrower than its own indent, and one with no rows on screen at all.
+        let dir = TempDir::new("view-outline-sizes");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        for (w, h) in [(0, 0), (1, 1), (2, 20), (5, 6), (29, 4), (60, 20)] {
+            term.draw(|f| pane.render(f, Rect::new(0, 0, w, h)))
+                .unwrap();
+        }
+        assert!(matches!(pane.mode, Mode::Outline), "and it is still up");
     }
 }
