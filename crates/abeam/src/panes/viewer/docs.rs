@@ -36,6 +36,21 @@
 //! document out on *every* frame, and re-scanning there would mean an
 //! allocation per doc block per frame for the whole drag.
 //!
+//! ## Two languages, and no third
+//!
+//! `.rs`, `.py` and `.pyi` are the whole of the list — [`language`] is where
+//! it is written down — so a `.ts` full of JSDoc, a `.go` with a `//` comment
+//! over every exported name, a `.java` with `/** */` blocks: every one of them
+//! opens as plain highlighted source and `t` does nothing, because there is no
+//! second form for it to toggle to. That is scope rather than difficulty, and
+//! the `/** */` reader below would already parse most of them unchanged.
+//!
+//! What keeps the list from growing by guess is that a language costs more
+//! than a comment syntax: it costs a rule for where a doc comment is *allowed*
+//! to be, which is the only thing keeping the false-positive envelope small.
+//! An extension added without one widens that envelope silently, in a file
+//! nobody was watching.
+//!
 //! ## What it gets wrong, and why that is allowed
 //!
 //! The Rust half is exact enough to be boring. `///`, `//!`, `/**` and `/*!`
@@ -48,32 +63,73 @@
 //! of the mistake. That is acceptable for one reason and it is a reason the
 //! reader can act on: `t` swaps the whole document back to its source, and the
 //! title says which form is up. A wrong guess costs a passage rendered as
-//! prose and one keystroke; there is no state to lose and nothing is hidden,
-//! because a doc region is always a whole number of lines and the source is
-//! always one key away. A guess that could *hide* code would not be allowed,
-//! which is why every rule below refuses a block whose closing line has code
-//! after it.
+//! prose and one keystroke; there is no state to lose, because a doc region is
+//! always a whole number of lines and the source is always one key away.
 //!
-//! ## Prose normalisation, which is the wart
+//! What is deliberately *not* claimed — because it was claimed here once and
+//! was not true — is that code can never end up inside a region.
+//! [`tail_is_clear`] guards the **closing** line and nothing else, so a block
+//! opened by a false positive runs to whatever delimiter matches next and
+//! every line it passes on the way is handed to the renderer as prose. Prose
+//! is not a neutral place to put a statement: a line of `---` becomes a
+//! horizontal rule, a `# ...` becomes a heading, and a run of blanks collapses
+//! — so those lines can be not merely misdrawn but absent. Two rules narrow
+//! that hole rather than close it:
 //!
-//! Docstrings are not markdown and the commonest ones are barely prose. A
-//! Google-style block indents four spaces under `Args:`, and CommonMark reads
-//! four spaces as an *indented code block* — so the single most common shape
-//! in Python would render as a grey slab of monospace. [`normalise`] pulls any
-//! indent of four or more down to two, below the threshold, and [`dedent`]
-//! takes the block's own Python indentation off first, because a docstring
-//! inside a method starts four or eight columns in and that indent belongs to
-//! the language rather than to the author.
+//! - a block that never finds its closing delimiter is refused outright, so
+//!   the worst case is bounded by the next matching quote instead of by the
+//!   end of the file, and
+//! - a Python docstring whose body leaves the indentation of the header that
+//!   opened it is refused — see [`docstring`]. A real body cannot do that; a
+//!   template string holding a fake `class` almost always does, because the
+//!   string's own closing quotes are back at the outer column.
 //!
-//! numpydoc needs nothing: `Parameters` over a row of `-` is a setext H2 and
-//! renders as a heading for free.
+//! What is left is Rust's `/**` at the start of a line inside a raw string,
+//! where there is no enclosing indent to measure against and so no equivalent
+//! rule to apply. `t` is the answer to it, and the title says which form is
+//! up — which is the same answer as for every other mistake here, and the
+//! reason the whole heuristic is allowed to exist.
 //!
-//! One rule for both languages rather than one per language. It costs Rust
-//! something real — an *indented* code sample in a doc comment flattens into
-//! the paragraph above it — and that is accepted because the fenced form is
-//! what rustdoc has encouraged for years, fences are detected and exempt the
-//! whole block, and a reader can learn "indentation inside documentation is
-//! reduced" where they could never learn "…except in Rust".
+//! The size of all of that, measured rather than asserted. Against `ast` over
+//! the 4,606 Python files of a 3.12 install: 34,932 regions found, 55 of
+//! `ast`'s 34,953 docstrings missed (0.16%), and **two** regions covering a
+//! line `ast` calls a statement — both of them f-strings, which [`opener`]
+//! takes on purpose. Rerun that before believing any change to the rules
+//! below; it is the only thing here that is evidence rather than argument.
+//!
+//! ## Dedenting, which is the only rewriting done
+//!
+//! [`dedent`] takes the block's own Python indentation off. A docstring inside
+//! a method sits four or eight columns in, CommonMark reads four spaces as an
+//! *indented code block*, and the prose of every method in the file would
+//! therefore arrive at the parser as a grey slab of monospace. That indent
+//! belongs to the language rather than to the author, which is what makes
+//! taking it off a translation rather than an edit — `inspect.cleandoc` and
+//! PEP 257 take the same columns off for the same reason, and this matches
+//! them.
+//!
+//! What is left is the indentation the *author* chose, and it is now left
+//! alone. There was a second pass here that pulled any surviving indent of
+//! four or more columns down to two, justified by a Google-style `Args:` block
+//! being four spaces under a label and therefore "a grey slab". That
+//! justification misread CommonMark. `Args:` is a paragraph, the four-space
+//! lines under it are *lazy continuations*, and an indented code block *cannot
+//! interrupt a paragraph* — so the shape the pass existed for never needed it.
+//! Measured over this repository's own 1679 doc blocks it changed the rendered
+//! output of exactly none of them.
+//!
+//! It was not free, which is why it is not coming back. Four spaces pulled to
+//! two drops a Python doctest's `>>> ` below CommonMark's block-start
+//! threshold, so every prompt is eaten as three nested blockquote markers, the
+//! input merges with its expected output and the sample is drawn as a
+//! quotation. In the same pass a `Returns:` literal block loses its `│ `
+//! gutter to become unmarked prose, and a three-deep list comes out two deep
+//! with a grandchild promoted to a sibling. `docs/design.md` names that as the
+//! fourth thing: the source is always true, and a rendering that has quietly
+//! lost a node is worse than one nobody drew.
+//!
+//! numpydoc needs nothing either way: `Parameters` over a row of `-` is a
+//! setext H2 and renders as a heading for free.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -93,6 +149,22 @@ pub enum Kind {
         /// after tabs are expanded, because that is the unit the pane draws in
         /// and `source::expand_tabs` has already done it to the code rows.
         indent: usize,
+        /// The file line the first word of `text` is actually on, and the line
+        /// the last word is on. Both are indexed exactly as `start` and `end`
+        /// are, and both are inside `start..end`.
+        ///
+        /// Not the same as `start` and `end - 1`, and the difference is the
+        /// whole reason they are carried. `start` is the line the `/**` or the
+        /// `"""` is on and `end - 1` is the line the closing delimiter is on;
+        /// neither of those puts a word on the page. The gutter numbers the
+        /// rows it draws, so it has to be handed the lines those rows came
+        /// from — otherwise the first rendered row wears the number of a line
+        /// the reader can see is a bare marker, which is a gutter that lies
+        /// about a file it is claiming to index.
+        ///
+        /// Equal to each other whenever the block's words are all on one line.
+        first: usize,
+        last: usize,
     },
 }
 
@@ -401,10 +473,19 @@ enum Expect {
 /// `class Example:` reads as a header and the line under it reads as its
 /// docstring. That is the whole envelope of the false positive: a code template
 /// or a doctest fixture, rendered as prose instead of as code, in a file where
-/// `t` shows the truth. It is bounded by one guard that costs nothing — the
-/// docstring has to be indented *further* than its header — which throws out the
-/// far commoner shape where the fake header and the quotes sit at the same
-/// column.
+/// `t` shows the truth. Two guards bound it, and they are the same fact asked
+/// at two moments. The opening quotes must be indented *further* than the
+/// header, which throws out the far commoner shape where the fake header and
+/// the quotes sit at the same column; and every line of the body must stay
+/// there too — see [`docstring`] — which is what stops a block armed this way
+/// from running past real statements to reach a quote that matches.
+///
+/// ## Both spellings of the one-line form
+///
+/// `"""Doc."""` and `"Doc."` are both docstrings and both are taken. The second
+/// is [`short_string`] and it is worth its dozen lines: 1,325 of a Python 3.12
+/// install's docstrings are written that way and nothing else, and missing one
+/// means a `def` whose documentation the pane can see and will not draw.
 fn python(lines: &[&str]) -> Vec<Region> {
     let mut out = Vec::new();
     let mut expect = Some(Expect::Module);
@@ -424,11 +505,18 @@ fn python(lines: &[&str]) -> Vec<Region> {
         }
 
         if let Some(want) = expect.take() {
-            let allowed = match want {
-                Expect::Module => indent == 0,
-                Expect::Body { indent: header } => indent > header,
+            // The same fact asked twice: the opening quotes have to be inside
+            // the suite, and so does every line under them. The first question
+            // is this module's oldest guard and the second is [`docstring`]'s.
+            let outer = match want {
+                Expect::Module => None,
+                Expect::Body { indent: header } => Some(header),
             };
-            if allowed && let Some((end, body)) = docstring(lines, i, rest) {
+            let allowed = match outer {
+                None => indent == 0,
+                Some(header) => indent > header,
+            };
+            if allowed && let Some((end, body)) = docstring(lines, i, rest, outer) {
                 out.push(doc(i, end, indent, body, true));
                 i = end;
                 continue;
@@ -511,6 +599,10 @@ fn code_part(line: &str) -> &str {
 /// prefix Python has. An f-string is not a docstring as far as `__doc__` is
 /// concerned; it is prose as far as a reader is concerned, and this pane is on
 /// the reader's side of that.
+///
+/// Only the triple forms, because only they can open a block that spans lines.
+/// The one-quote spelling is [`short_string`]'s, which can answer for the whole
+/// of itself on the line it is on.
 fn opener(rest: &str) -> Option<(&'static str, usize)> {
     let bytes = rest.as_bytes();
     let mut i = 0;
@@ -531,8 +623,51 @@ fn opener(rest: &str) -> Option<(&'static str, usize)> {
 /// the second one matters more here: an opener this guessed wrong about and
 /// then never found a closer for would turn the entire rest of the file into
 /// prose. Declining leaves it as code, which is what it looked like anyway.
-fn docstring(lines: &[&str], at: usize, rest: &str) -> Option<(usize, Vec<String>)> {
-    let (delim, open) = opener(rest)?;
+///
+/// `outer` is the indent of the `def` or `class` this is supposed to be the
+/// body of, and `None` for a module docstring, which has no header above it.
+/// **It is the rule that keeps a false opener from swallowing real code.**
+/// [`tail_is_clear`] only ever looks at the closing line, so without this a
+/// block armed by a template string runs to the next matching quote and takes
+/// whatever is between with it:
+///
+/// ```text
+/// CODE = '''
+/// class A:
+///     """
+/// '''
+///
+/// class B:
+///     """
+///     Real docstring.
+///     """
+/// ```
+///
+/// The `"""` under the fake `class A:` finds its closer four lines down and
+/// `class B:` is inside the region — drawn as a markdown heading, which is to
+/// say deleted, in a file the reader has no reason to distrust. What gives it
+/// away is that a docstring is *inside a suite*: every line of it is indented
+/// past the header, and the moment a line comes back to the header's own column
+/// or further left, the block has left the body it claimed to be in. Both of
+/// the fixtures above are caught by that at their first line — the closing `'''`
+/// of the outer string, sitting at column zero.
+///
+/// The cost is a real docstring with a line deliberately pushed out to column
+/// zero, which is legal Python — `os.spawnv` and `posixpath.realpath` both do
+/// it — and which now shows as source instead of prose. Measured against `ast`
+/// over the 4,606 files of a Python 3.12 install, that is **14 docstrings in
+/// 34,946**: 0.04% declined to close a hole that could take a `class` off the
+/// page. That is the trade this module makes everywhere, and it is the cheap
+/// side of it.
+fn docstring(
+    lines: &[&str],
+    at: usize,
+    rest: &str,
+    outer: Option<usize>,
+) -> Option<(usize, Vec<String>)> {
+    let Some((delim, open)) = opener(rest) else {
+        return short_string(rest).map(|body| (at + 1, vec![body]));
+    };
     let after = &rest[open..];
 
     if let Some(p) = after.find(delim) {
@@ -544,7 +679,11 @@ fn docstring(lines: &[&str], at: usize, rest: &str) -> Option<(usize, Vec<String
     let mut i = at + 1;
     while i < lines.len() {
         let line = cols(lines[i]);
-        match line.find(delim) {
+        let end = line.find(delim);
+        if !inside(&line[..end.unwrap_or(line.len())], outer) {
+            return None;
+        }
+        match end {
             Some(p) => {
                 if !tail_is_clear(&line[p + 3..], "#") {
                     return None;
@@ -559,13 +698,74 @@ fn docstring(lines: &[&str], at: usize, rest: &str) -> Option<(usize, Vec<String
     None
 }
 
+/// Is this line still inside the suite the docstring's header opened?
+///
+/// Blank is always inside — a docstring is full of blank lines and none of them
+/// says anything about indentation. Anything else has to be indented strictly
+/// past the header, which is what being in its body means. `None` is the module
+/// docstring, which has no header and so nothing to be outside of.
+fn inside(line: &str, outer: Option<usize>) -> bool {
+    let Some(outer) = outer else {
+        return true;
+    };
+    line.trim().is_empty() || indent_of(line) > outer
+}
+
+/// `"One-line doc."` — a docstring written with one pair of quotes instead of
+/// three, which is what the whole first line of a `def` body is when the
+/// summary fits on it.
+///
+/// Worth the extra rule because it is not rare. Measured against `ast` over the
+/// 4,606 files of a Python 3.12 install, this shape is **1,325 real
+/// docstrings** — the scanner misses 3.9% of everything `ast` calls a docstring
+/// without it and 0.16% with it.
+///
+/// Cheap because it cannot hide anything. A single-quoted string cannot span a
+/// line without a backslash, so this only ever claims the one line it is
+/// looking at, and only when [`tail_is_clear`] says there is nothing else on
+/// it: `"a" \` continuing onto the next line fails that check and is left as
+/// code, as does `"a" + x`.
+///
+/// The backslash skip is right for `r'...'` too: a raw string still cannot be
+/// closed by a quote that a backslash precedes, which is the only thing being
+/// asked here.
+fn short_string(rest: &str) -> Option<String> {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < 2 && i < bytes.len() && matches!(bytes[i] | 0x20, b'r' | b'f' | b'b' | b'u') {
+        i += 1;
+    }
+    let quote = *bytes.get(i)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() {
+        if bytes[j] == b'\\' {
+            j += 2;
+            continue;
+        }
+        if bytes[j] == quote {
+            return tail_is_clear(&rest[j + 1..], "#").then(|| rest[i + 1..j].trim().to_string());
+        }
+        j += 1;
+    }
+    None
+}
+
 // --- shared ---------------------------------------------------------------
 
 /// Is there nothing but whitespace or a comment left on the closing line?
 ///
-/// The one rule that keeps this scanner from ever hiding code: a region is a
-/// whole number of lines, so a closing delimiter with a statement after it
-/// means the block is declined outright rather than cut short.
+/// A region is a whole number of lines, so a closing delimiter with a statement
+/// after it means the block is declined outright rather than cut short.
+///
+/// **The closing line, and only the closing line.** This was once described
+/// here as the one rule that keeps the scanner from ever hiding code, and it is
+/// not: a block opened by mistake passes over every line between the false
+/// opener and the delimiter that finally matches, and this is never asked about
+/// any of them. What guards those is [`inside`], on the Python side where there
+/// is a suite to be inside of. See the module doc for what is left over.
 ///
 /// The comment marker is the caller's, and passing it is not fussiness. `#` is
 /// a comment in Python and an *attribute* in Rust, so a shared "or a comment"
@@ -591,35 +791,55 @@ fn doc(
     first_is_special: bool,
 ) -> Region {
     dedent(&mut body, first_is_special);
-    normalise(&mut body);
+    // **`body[n]` is what file line `start + n` contributed**, and that holds
+    // for every shape this module builds one out of: a run of `///` lines is
+    // one entry per line, a `/** … */` block opens with the text after the
+    // marker and closes with the text before it, and a docstring does the same
+    // with its quotes. Nothing above drops a line or adds one, which is what
+    // makes the two indices below a line number rather than a guess. A future
+    // rule that folded two source lines into one entry would break that
+    // quietly, so it would have to carry the offsets itself.
+    let first = body.iter().position(|l| !l.is_empty()).unwrap_or(0);
+    let last = body.iter().rposition(|l| !l.is_empty()).unwrap_or(first);
     // A docstring's closing `"""` sits on its own line and leaves an empty one
     // behind; a `///` block often opens or closes with a bare marker. Neither is
-    // a blank line the author wrote, and markdown would turn a run of them into
-    // nothing anyway — but dropping them here keeps the *first* rendered row
-    // lined up with the line number the gutter puts beside it.
-    while body.first().is_some_and(|l| l.is_empty()) {
-        body.remove(0);
-    }
-    while body.last().is_some_and(|l| l.is_empty()) {
-        body.pop();
-    }
+    // a blank line the author wrote, and `markdown::render` drops a leading or
+    // trailing run of them anyway — so this is not what puts the first row at
+    // the top of the block, and it was documented here as if it were.
+    //
+    // What it does is keep `text` describing exactly the span `first..=last`
+    // names. The two have to agree: the gutter puts `first` beside the first
+    // row it draws, so a `text` that still began with the blank line under the
+    // opening `"""` would be one renderer change away from putting that number
+    // beside a blank row. Trimming here is how the value and the numbers stay
+    // one fact instead of two.
+    body.truncate(last + 1);
+    body.drain(..first.min(body.len()));
     Region {
         start,
         end,
         kind: Kind::Doc {
             text: body.join("\n"),
             indent,
+            first: start + first,
+            last: start + last,
         },
     }
 }
 
 /// Take the block's own indentation off before the markdown parser sees it.
 ///
-/// A docstring in a method starts four or eight columns in and every line of it
-/// carries that; hand it to CommonMark unchanged and the whole block is an
-/// indented code block before the first word is read. What is left afterwards
-/// is the indentation the *author* chose, which is the only kind markdown
-/// should be given a say over.
+/// A docstring in a method starts four or eight columns in and every line
+/// under its first one carries that; hand it to CommonMark unchanged and
+/// everything below the summary is an indented code block. What is left
+/// afterwards is the indentation the *author* chose, which is the only kind
+/// markdown should be given a say over.
+///
+/// The block's *common* indent and not a fixed four, and never more than the
+/// block has: this is `inspect.cleandoc`'s rule, so a docstring reads here the
+/// way `help()` prints it. Any further rewriting of what survives — pulling a
+/// four-space indent down to two, say — is what the module doc argues against
+/// at length, on the evidence of a doctest whose `>>> ` prompts it deleted.
 fn dedent(body: &mut [String], first_is_special: bool) {
     let from = usize::from(first_is_special);
     let common = body
@@ -637,39 +857,6 @@ fn dedent(body: &mut [String], first_is_special: bool) {
             line.clear();
         } else {
             line.drain(..common);
-        }
-    }
-}
-
-/// Pull any indent of four or more columns down to two.
-///
-/// Four spaces is CommonMark's indented-code threshold, and a Google-style
-/// `Args:` block is four spaces under a label — so the commonest docstring in
-/// Python renders as a grey monospace slab unless something moves it. Two is
-/// under the threshold and still reads as a nested thing.
-///
-/// Flat two, not scaled, and that costs something worth naming: a list nested
-/// three deep comes out two deep. Scaling would keep the nesting and put the
-/// deeper levels back over four columns, which is the failure this exists to
-/// prevent — and nesting past one level inside a docstring is rare where a
-/// four-space `Args:` block is close to universal.
-///
-/// Skipped entirely for a block containing a fence, where indentation inside
-/// the fence is the sample's own and rewriting it would be rewriting somebody's
-/// code. numpydoc needs nothing either way: `Parameters` over a row of `-` is a
-/// setext H2, which is a heading already.
-fn normalise(body: &mut [String]) {
-    let fenced = body.iter().any(|l| {
-        let t = l.trim_start_matches(' ');
-        t.starts_with("```") || t.starts_with("~~~")
-    });
-    if fenced {
-        return;
-    }
-    for line in body.iter_mut() {
-        let spaces = indent_of(line);
-        if spaces >= 4 {
-            line.replace_range(..spaces, "  ");
         }
     }
 }
@@ -895,27 +1082,142 @@ mod tests {
     }
 
     #[test]
-    fn a_google_style_block_is_pulled_off_the_indented_code_threshold() {
-        // The wart, and the reason this normalisation exists at all: four spaces
-        // under `Args:` is CommonMark's indented-code marker, so the commonest
-        // docstring shape in Python would render as a grey monospace slab.
+    fn the_only_indentation_taken_off_is_the_blocks_own() {
+        // `dedent` removes the columns the *language* put there and stops. The
+        // four spaces under `Args:` are the author's, and they survive — which
+        // is what a pass that pulled them to two used to prevent, on the
+        // argument that CommonMark would otherwise read them as an indented
+        // code block. It would not: `Args:` is a paragraph and the line under
+        // it is a lazy continuation, and an indented code block cannot
+        // interrupt a paragraph. See this module's doc, and
+        // `viewer::tests::a_doctest_keeps_its_prompts_and_the_shape_they_give_the_sample`
+        // for what the pass cost when it was believed.
         let src = "def f(x):\n    \"\"\"Do it.\n\n    Args:\n        x: the thing.\n    \"\"\"\n";
         assert_eq!(
             docs_of(&scan(src, "a.py")),
-            ["Do it.\n\nArgs:\n  x: the thing."]
+            ["Do it.\n\nArgs:\n    x: the thing."]
         );
+
+        // And the case the same rewriting broke: `>>> ` is four columns of
+        // indentation holding a `>`, and at two columns it is three nested
+        // blockquote markers instead. What arrives at the renderer has to still
+        // be a doctest.
+        let doctest = "def f():\n    \"\"\"Do it.\n\n    >>> f()\n    1\n    \"\"\"\n";
+        assert_eq!(docs_of(&scan(doctest, "a.py")), ["Do it.\n\n>>> f()\n1"]);
     }
 
     #[test]
     fn a_docstring_with_a_fence_in_it_keeps_every_column_of_its_sample() {
-        // The exemption, and it is not symmetry for its own sake: inside a fence
-        // the indentation is the *code's*, and reducing it would be rewriting
-        // somebody's example rather than un-indenting somebody's prose.
+        // Inside a fence the indentation is the *code's*. `dedent` takes the
+        // block's common indent off every line alike, so the nesting inside the
+        // sample survives the way it survives in `inspect.cleandoc` — and
+        // nothing else touches it, which is why there is no fence exemption
+        // here any more for there to be a hole in.
         let src = "def f():\n    \"\"\"Use it.\n\n    ```python\n    if x:\n        f()\n    ```\n    \"\"\"\n";
         assert_eq!(
             docs_of(&scan(src, "a.py")),
             ["Use it.\n\n```python\nif x:\n    f()\n```"]
         );
+    }
+
+    #[test]
+    fn a_block_reports_the_lines_its_words_are_actually_on() {
+        // The gutter numbers rendered rows from these, so they are the lines
+        // that carry text and not the lines that carry delimiters. `start` is
+        // the `/**`; `first` is the sentence under it.
+        let numbers = |text: &str, name: &str| -> Vec<(usize, usize, usize, usize)> {
+            scan(text, name)
+                .into_iter()
+                .filter_map(|r| match r.kind {
+                    Kind::Doc { first, last, .. } => Some((r.start, r.end, first, last)),
+                    Kind::Code => None,
+                })
+                .collect()
+        };
+
+        // Lines 0..3 are `/**`, the sentence, `*/` — and only line 1 has a word.
+        assert_eq!(
+            numbers("/**\nOne.\n*/\nfn f() {}\n", "a.rs"),
+            [(0, 3, 1, 1)]
+        );
+        // A `///` run opening and closing on a bare marker, spanning 1..=2.
+        assert_eq!(
+            numbers("///\n/// One.\n/// Two.\n///\nfn f() {}\n", "a.rs"),
+            [(0, 4, 1, 2)]
+        );
+        // Python: the summary is on the opening line, so `first` is `start`, and
+        // the closing `\"\"\"` on its own line is not the last word.
+        assert_eq!(
+            numbers("def f():\n    \"\"\"One.\n\n    Two.\n    \"\"\"\n", "a.py"),
+            [(1, 5, 1, 3)]
+        );
+        // A block with no words at all still names one line rather than none.
+        assert_eq!(numbers("///\n///\nfn f() {}\n", "a.rs"), [(0, 2, 0, 0)]);
+    }
+
+    #[test]
+    fn a_false_opener_may_not_swallow_the_code_between_it_and_its_closer() {
+        // `tail_is_clear` guards the closing line and nothing else, so both of
+        // these used to be one region running from a fake docstring down to a
+        // quote that matched — with a real statement inside it, drawn as prose
+        // and in the first case drawn as a markdown heading, which is to say not
+        // drawn at all. What refuses them is that a docstring is inside a suite:
+        // the outer string's own closing quotes are back at column zero, and
+        // that is a line the body of a `class A:` cannot contain.
+        let hidden_class = "CODE = '''\nclass A:\n    \"\"\"\n'''\n\nclass B:\n    \"\"\"\n    Real docstring.\n    \"\"\"\n";
+        let got = scan(hidden_class, "a.py");
+        assert!(
+            got.iter().all(|r| !r.is_doc() || r.start >= 5),
+            "a region opened above `class B:`: {got:?}"
+        );
+        assert_eq!(
+            docs_of(&got),
+            ["Real docstring."],
+            "and the real one below it is still found"
+        );
+
+        let hidden_call =
+            "TEMPLATE = \"\"\"\ndef f():\n    '''\n\"\"\"\nprint(\"hello\")\nX = '''\nend'''\n";
+        assert!(
+            docs_of(&scan(hidden_call, "a.py")).is_empty(),
+            "`print(\"hello\")` is code and must stay on the page"
+        );
+    }
+
+    #[test]
+    fn a_line_pushed_out_to_the_margin_is_what_that_guard_costs() {
+        // Named rather than hidden. A docstring may legally contain a line at
+        // column zero, and the rule above cannot tell that from a template
+        // string's closing quotes — so it is declined and shown as source. The
+        // trade is a rendering occasionally refused against a rendering that
+        // occasionally eats a statement, and this module takes the first every
+        // time.
+        let src = "def f():\n    \"\"\"Doc.\n\nFlush left on purpose.\n    \"\"\"\n";
+        assert!(docs_of(&scan(src, "a.py")).is_empty());
+        // Blank lines are not that, and a docstring is full of them.
+        let blanks = "def f():\n    \"\"\"Doc.\n\n    More.\n    \"\"\"\n";
+        assert_eq!(docs_of(&scan(blanks, "a.py")), ["Doc.\n\nMore."]);
+    }
+
+    #[test]
+    fn a_summary_in_one_pair_of_quotes_is_a_docstring_too() {
+        // 1366 of them in the standard library and the packages beside it, and
+        // every one was invisible to this scanner. Safe to take because it can
+        // only ever claim the line it is on: a single-quoted string cannot span
+        // one.
+        assert_eq!(docs_of(&scan("def f():\n    \"Doc.\"\n", "a.py")), ["Doc."]);
+        assert_eq!(
+            docs_of(&scan("'Module doc.'\nimport os\n", "a.py")),
+            ["Module doc."]
+        );
+        assert_eq!(
+            docs_of(&scan("def f():\n    r'Say \\'hi\\'.'\n", "a.py")),
+            ["Say \\'hi\\'."]
+        );
+        // And it declines everything it cannot answer for on that one line: an
+        // implicit continuation, and anything with code after the closing quote.
+        assert!(docs_of(&scan("def f():\n    \"a\" \\\n    \"b\"\n", "a.py")).is_empty());
+        assert!(docs_of(&scan("def f():\n    \"a\" + x\n", "a.py")).is_empty());
     }
 
     #[test]

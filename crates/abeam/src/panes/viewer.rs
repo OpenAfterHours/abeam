@@ -130,12 +130,16 @@
 //! that costs, and why the alternative does not exist, is [`search`]'s argument.
 //!
 //! And it is what [`grep`] has to be reconciled with. A search over files on
-//! disk knows a *line*; this pane scrolls by *row*, and for rendered markdown
-//! the two are not relatable at all. So `Enter` on a result carries an ordinal
-//! rather than a position — the third match in that file is looked for again as
-//! the third match on the page — and when the page turns out to have fewer, the
-//! reader is told rather than parked at the top. See [`ViewerPane::show_at`]
-//! and [`ViewerPane::missed`].
+//! disk knows a *line*; this pane scrolls by *row*, and wherever anything is
+//! rendered the two are not relatable at all. That used to be a sentence about
+//! markdown. It is no longer: a `.py` drawn with its docstrings rendered in
+//! place reflows those lines exactly as a `.md` does, so the gap is now open in
+//! every file this pane knows how to render, which is most of the ones anybody
+//! opens. So `Enter` on a result carries an ordinal rather than a position —
+//! the third match in that file is looked for again as the third match on the
+//! page — and when the page turns out to have fewer, the reader is told rather
+//! than parked at the top. See [`ViewerPane::show_at`] and
+//! [`ViewerPane::missed`].
 
 mod browse;
 mod docs;
@@ -177,6 +181,27 @@ const DEFAULT_VIEWPORT: usize = 20;
 /// Line numbers cost four or five columns. Worth it in a normal right pane,
 /// not worth it in a squeezed one.
 const LINE_NUMBER_MIN_WIDTH: usize = 30;
+
+/// What an interior row of a rendered doc block wears where a line number would
+/// be — right-aligned in the number column, and dim.
+///
+/// **It costs no columns.** The gutter is already paid for by the numbered
+/// rows, and this fills a cell that was a space. That is the whole reason it is
+/// affordable in a pane that is routinely given forty-six columns, and the
+/// reason the alternative — a glyph in the text, pushing the prose one column
+/// further right than the code it belongs to — was not taken.
+///
+/// Dashed rather than solid, and taken from the same family
+/// `markdown::CODE_WRAP_GUTTER` draws a wrapped source line's continuation in,
+/// because it is making the same distinction one level out: this row is a
+/// continuation of something, not the start of something. It is deliberately
+/// not `│`, which inside a rendering already means "fenced code".
+///
+/// Below [`LINE_NUMBER_MIN_WIDTH`] there is no gutter at all and so nowhere to
+/// draw it. In those panes a doc row and a wrapped code row are genuinely
+/// indistinguishable, and that is accepted for the same reason the numbers are:
+/// four columns is too much to spend when there are twenty-nine.
+const DOC_ROW: &str = "┊";
 
 /// Which of the three things the pane is showing. See the module doc.
 #[derive(Clone, Copy)]
@@ -634,12 +659,14 @@ impl ViewerPane {
     /// caller has to be read past.
     ///
     /// An *ordinal* and not a line number, because the grep read the file's
-    /// logical lines and this pane is about to lay out physical rows. Rendered
-    /// markdown makes the gap obvious; a `.rs` hides it until a line is wider
-    /// than the pane, and then the two disagree there too. See
+    /// logical lines and this pane is about to lay out physical rows. That gap
+    /// used to be described as markdown's, with a `.rs` hiding it until a line
+    /// grew wider than the pane; a documented `.rs` now disagrees at every
+    /// width, because a run of `///` lines is reflowed into a paragraph exactly
+    /// as a `.md` is and the sixth line of the block is no longer a row. See
     /// [`grep::Hit::ordinal`], [`ViewerPane::missed`] for what the reader is
-    /// told when they do, and [`search`]'s module doc for the change that would
-    /// retire the disagreement.
+    /// told when the two disagree, and [`search`]'s module doc for the change
+    /// that would retire the disagreement.
     ///
     /// A file that cannot be read is not seeded at all, and that is not a
     /// shortcut. `build` turns an unreadable path into rows of the pane's *own
@@ -1944,8 +1971,19 @@ impl Pane for ViewerPane {
 }
 
 /// Source files get a line-number gutter, because "look at line 42" is how
-/// anyone talks about code. A wrapped continuation gets a blank number, which
-/// is the only thing distinguishing it from the next line.
+/// anyone talks about code. Three things can be in it, and they say three
+/// different things: a **number**, which is a line of the file starting here; a
+/// **blank**, which is the same line still going, wrapped; and a dim
+/// [`DOC_ROW`], which is a row of rendered documentation between the numbers at
+/// the two ends of the block it came from.
+///
+/// The blank and the pip used to be one signal, and that was the mistake worth
+/// naming. A rendered block put its first line's number on its first row and a
+/// blank on the rest, which is exactly what a source line too wide to fit
+/// looks like — so a thirteen-row paragraph read as one very long wrapped
+/// line 1. One glyph cannot mean both "still line 1" and "no line applies", and
+/// the second is what a doc row needs, because there is no mapping from a
+/// rendered row back to the source line it came from.
 ///
 /// Reports how wide that gutter came out, because it is the pane's own margin
 /// and the search steps over it — `/42` is a question about the code and not
@@ -2009,7 +2047,12 @@ fn source_lines(
         page.code(next..start);
         match &region.kind {
             docs::Kind::Code => page.code(start..end),
-            docs::Kind::Doc { text, indent } => page.doc(start..end, text, *indent),
+            docs::Kind::Doc {
+                text,
+                indent,
+                first,
+                last,
+            } => page.doc(start..end, text, *indent, *first, *last),
         }
         next = end.max(next);
     }
@@ -2081,6 +2124,23 @@ impl Page {
         vec![Span::raw(format!("{:>digits$} ", ""))]
     }
 
+    /// The interior of a rendered doc block. See [`DOC_ROW`].
+    ///
+    /// Right-aligned like a number and one cell wide, so it lands under the
+    /// units digit of the numbers above and below it and the gutter stays
+    /// exactly [`Page::gutter`] columns for every row on the page — which is
+    /// the whole of what [`search::Margin`] needs from this.
+    fn pip(&self) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::styled(
+            format!("{DOC_ROW:>digits$} "),
+            self.mode.theme().dim(),
+        )]
+    }
+
     /// Source lines, numbered and hard-wrapped: the whole of what this function
     /// used to do, and byte for byte what it still does for a file with no
     /// documentation in it.
@@ -2095,14 +2155,55 @@ impl Page {
     }
 
     /// A doc block, rendered as markdown where the comment was.
-    fn doc(&mut self, range: std::ops::Range<usize>, text: &str, indent: usize) {
+    ///
+    /// `first` and `last` are the file lines the block's words are actually on,
+    /// zero-based as [`docs::Region`] indexes them — not the lines its
+    /// delimiters are on. See [`docs::Kind::Doc`] for why the difference is
+    /// carried this far.
+    fn doc(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        indent: usize,
+        first: usize,
+        last: usize,
+    ) {
         let avail = self.width.saturating_sub(self.gutter() + indent);
-        if avail == 0 {
-            // Nothing left to lay prose out in — a pane narrower than its own
-            // gutter plus a deeply indented block. Falling back to the source
+        // Rendered before it is decided whether the rendering may be used, and
+        // that order is the point. `markdown::render` does not guarantee a row
+        // fits the width it was given — a two-cell glyph under a prefix it has
+        // already committed to (`▏ ` per quote level, `999. `, `- `) is wider
+        // than the column it has left — and the widths where that bites are not
+        // a constant this could compare `avail` against: `> > > > 日本語`
+        // overflows every width up to nine, and each further level of quoting
+        // adds two. A threshold would be a guess dressed as a rule, so the
+        // invariant is *measured* instead. One pass over rows that were just
+        // built, against a syntect pass on the same file costing several
+        // hundred times more; the arithmetic is not close.
+        let body = if avail == 0 {
+            Vec::new()
+        } else {
+            markdown::render(text, avail, self.mode)
+        };
+        if avail == 0 || body.iter().any(|l| wrap::spans_width(&l.spans) > avail) {
+            // Nothing this could be laid out in — a pane narrower than its own
+            // gutter plus a deeply indented block, or one where the renderer
+            // cannot honour the columns it was given. Falling back to the source
             // lines is not a degradation to apologise for: it is the same rows
-            // `t` would show, at the one width where the rendering has no room
-            // to be different, and it keeps every line of the file on the page.
+            // `t` would show, at the widths where the rendering has no room to
+            // be different, and it keeps every line of the file on the page.
+            //
+            // The title still says `· rendered` here, and that is deliberate
+            // rather than overlooked. The word answers "does this document have
+            // a second form, and is it up" — a document-level question with a
+            // document-level answer — and this is one region of it declining at
+            // one width. A per-region caveat has nowhere honest to go in a
+            // one-line title already carrying the name, the form, the query and
+            // the position, and it would appear and vanish as the pane is
+            // dragged. What settles it is that the fallback shows the *source*,
+            // which this pane holds to be always true: the reader is being given
+            // the more truthful of the two forms, not a broken version of the
+            // other one.
             self.code(range);
             return;
         }
@@ -2111,24 +2212,29 @@ impl Page {
         // reflows to the pane's width, a fence keeps its shape, a list grows a
         // hanging indent — so there is no mapping from a rendered row back to
         // the line it came from, and a number per row would have to be invented.
-        // The block's first line number goes on its first row and the rest get a
-        // blank one, which is not a new rule: it is exactly how `code` above
-        // numbers a source line too wide to fit, and the precedent a reader has
-        // already learned from every wrapped line in the file.
         //
-        // No extra glyph marks the block either. The number column already owns
-        // the left margin, and what says "this is prose" is the prose — the
-        // heading, the bullet, the reflow — plus the indent it keeps, which is
-        // the indent of the code it belongs to.
-        let first = range.start + 1;
+        // What the gutter can say without inventing anything is where the block
+        // *starts* and where it *ends*: `first` on the first row, `last` on the
+        // last, and [`Page::pip`] on everything between. That is a range the
+        // reader can read off the screen — "this prose is lines 15 to 25" — and
+        // it is what makes `f`'s answer of `load.rs:20` findable again, where a
+        // single number at the top left every line of a long block unnumbered
+        // and unreachable.
+        //
+        // The last number is dropped when it would repeat the first, which is
+        // every block whose words are all on one line. `2 ┊ 2` claims a range
+        // that is not one; `2 ┊ ┊` says "line 2, still going", which is the
+        // truth and is what the pip means everywhere else.
+        let top = range.end.saturating_sub(1).max(range.start);
+        let first = first.clamp(range.start, top);
+        let last = last.clamp(first, top);
         let pad = " ".repeat(indent);
-        let body = markdown::render(text, avail, self.mode);
         let rendered = body.len();
         for (n, mut line) in body.into_iter().enumerate() {
-            let mut prefix = if n == 0 {
-                self.numbered(first)
-            } else {
-                self.blank()
+            let mut prefix = match n {
+                0 => self.numbered(first + 1),
+                n if n + 1 == rendered && last > first => self.numbered(last + 1),
+                _ => self.pip(),
             };
             if indent > 0 {
                 prefix.push(Span::raw(pad.clone()));
@@ -2145,7 +2251,7 @@ impl Page {
             // because the alternative is a line number that never appears and a
             // pair of lines the reader can see in the source and not in the
             // rendering.
-            self.out.push(Line::from(self.numbered(first)));
+            self.out.push(Line::from(self.numbered(first + 1)));
         }
     }
 }
@@ -2218,6 +2324,15 @@ mod tests {
         let mut pane = ViewerPane::new(root.to_path_buf());
         pane.scan = None;
         pane
+    }
+
+    /// What is in the number column of each row: a line number, a [`DOC_ROW`]
+    /// pip, or nothing. Sliced by *character* rather than by byte, because the
+    /// pip is three of the latter.
+    fn gutters(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .map(|r| r.chars().take(4).collect::<String>().trim().to_string())
+            .collect()
     }
 
     /// Lay out as if a frame of this size had been drawn.
@@ -2360,8 +2475,8 @@ mod tests {
             laid(&mut pane, 40, 20),
             [
                 "  1 Adds two numbers.",
-                "    ",
-                "    Really does add them.",
+                "  ┊ ",
+                "  3 Really does add them.",
                 "  4 fn add(a: i32, b: i32) -> i32 {",
                 "  5     a + b",
                 "  6 }",
@@ -2382,11 +2497,19 @@ mod tests {
 
     #[test]
     fn a_docstring_is_rendered_at_the_column_the_code_put_it_at() {
-        // Two things at once, and they are the two the design turns on. The
-        // block keeps the indent of the `def` it belongs to, so the prose reads
-        // as part of the function rather than as a chapter heading; and four
-        // spaces under `Args:` — CommonMark's indented-code marker, and the
-        // commonest shape in Python — is prose rather than a grey slab.
+        // **One thing, and only the one in the name.** The block keeps the
+        // indent of the `def` it belongs to, so the prose reads as part of the
+        // function rather than as a chapter heading — and the gutter is
+        // untouched by that, because the indent goes on after it.
+        //
+        // This test used to claim a second thing: that four spaces under
+        // `Args:` renders as prose rather than as a grey slab *because* the
+        // indentation was rewritten. It witnessed no such thing. `Args:` is a
+        // paragraph and the line under it is a lazy continuation of it, and an
+        // indented code block cannot interrupt a paragraph — so the row below
+        // comes out as `Args: a: the first.` whether anything moved the indent
+        // or not. The rewriting is gone and this row is unchanged, which is the
+        // proof rather than the coincidence; see `docs`' module doc.
         let dir = TempDir::new("view-docs-py");
         let (_, py) = documented(&dir);
         let mut pane = quiet(dir.path());
@@ -2397,8 +2520,8 @@ mod tests {
             [
                 "  1 def add(a, b):",
                 "  2     Add two numbers.",
-                "        ",
-                "        Args: a: the first.",
+                "  ┊     ",
+                "  5     Args: a: the first.",
                 "  7     return a + b",
                 "  8 ",
             ]
@@ -2406,23 +2529,157 @@ mod tests {
     }
 
     #[test]
-    fn a_doc_block_carries_the_number_of_its_first_line_and_nothing_else() {
-        // N source lines become M rendered rows and M is not N, so there is no
-        // number to put on rows two and after. The blank is not a new rule: it
-        // is what a wrapped continuation has always worn, and the reader has
-        // already learned it from every line too wide to fit.
+    fn a_doctest_keeps_its_prompts_and_the_shape_they_give_the_sample() {
+        // **The regression that must never come back.** An earlier pass pulled
+        // any indent of four or more columns down to two, which is under
+        // CommonMark's block-start threshold — so `>>> ` stopped being four
+        // columns of indentation holding a `>` and became three nested
+        // blockquote markers. Every prompt was *eaten*: the input merged with
+        // its expected output and the whole sample was drawn as a quotation,
+        // in a viewer whose one promise is that the source is always true.
+        //
+        // Asserted on the drawn rows rather than on the scanner's output,
+        // because the deletion happened in the renderer and a test on the text
+        // handed to it would not have seen it.
+        let dir = TempDir::new("view-docs-doctest");
+        let path = dir.write(
+            "d.py",
+            b"def add(a, b):\n\
+              \x20   \"\"\"Add two numbers.\n\
+              \n\
+              \x20   Example:\n\
+              \n\
+              \x20       >>> add(1, 2)\n\
+              \x20       3\n\
+              \x20   \"\"\"\n\
+              \x20   return a + b\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rows = laid(&mut pane, 46, 20);
+        let page = rows.join("\n");
+
+        assert!(
+            page.contains(">>> add(1, 2)"),
+            "the prompt was consumed as blockquote markers:\n{page}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("│ >>> add(1, 2)")),
+            "the sample is a code block, not a paragraph:\n{page}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("│ 3")),
+            "the expected output kept its own line:\n{page}"
+        );
+        assert!(!page.contains("▏ "), "nothing here is a quotation:\n{page}");
+    }
+
+    #[test]
+    fn a_doc_block_is_numbered_at_both_ends_and_pipped_in_between() {
+        // N source lines become M rendered rows and M is not N, so no row in
+        // the middle has a number that could be put on it. What the two ends
+        // can say is true: the first row is the line the block's first word is
+        // on, the last row is the line its last word is on, and every row
+        // between them wears the pip.
+        //
+        // The pip is the fix for a real ambiguity and not decoration. A blank
+        // there means "the numbered line above is still going", which is what
+        // a wrapped source line wears — so a thirteen-row rendered paragraph
+        // read as one enormous wrapped line 1. One glyph cannot carry both
+        // claims.
         let dir = TempDir::new("view-docs-number");
         let (rs, _) = documented(&dir);
         let mut pane = quiet(dir.path());
         pane.show(&rs);
         let lines = laid(&mut pane, 40, 20);
 
-        let numbers: Vec<&str> = lines.iter().map(|l| l[..4].trim()).collect();
-        assert_eq!(numbers, ["1", "", "", "4", "5", "6", "7"]);
+        assert_eq!(gutters(&lines), ["1", "┊", "3", "4", "5", "6", "7"]);
         // Three source lines of documentation, three rendered rows — and the
         // count agreeing here is a coincidence of this fixture, which is why the
         // assertion above is about the numbers and not about the arithmetic.
         assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn the_number_beside_a_row_of_prose_is_the_line_that_prose_is_on() {
+        // The bug this pins is what the gutter said before: `range.start + 1`,
+        // which is the line the `/**` or the bare `///` is on and not the line
+        // the words are on. A reader who pressed `f`, was told `x.rs:2`, and
+        // opened it, saw the sentence beside a `1`.
+        //
+        // Both openers are here because they fail differently: `/**` puts the
+        // marker on a line of its own, and a `///` block that starts with a
+        // bare marker does the same thing without looking like it.
+        let dir = TempDir::new("view-docs-first");
+        let path = dir.write(
+            "x.rs",
+            b"/**\n\
+              Adds two numbers.\n\
+              */\n\
+              fn add(a: i32, b: i32) -> i32 { a + b }\n\
+              \n\
+              ///\n\
+              /// A block that opens with a bare marker.\n\
+              ///\n\
+              fn g() {}\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        assert_eq!(
+            laid(&mut pane, 46, 20),
+            [
+                "  2 Adds two numbers.",
+                "  4 fn add(a: i32, b: i32) -> i32 { a + b }",
+                "  5 ",
+                "  7 A block that opens with a bare marker.",
+                "  9 fn g() {}",
+                " 10 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_block_reads_as_a_range_a_grep_result_can_be_found_in() {
+        // The second half of the same bug, and the one that reaches `f`. A doc
+        // block renders to more rows than it has lines, and numbering only its
+        // first row meant every other line in it had no number *anywhere on the
+        // page* — so a result reading `long.rs:6`, opened with `Enter`, landed
+        // on a page where line 6 could not be pointed at. Wrapping never does
+        // that: a wrapped line's number is still on the row above.
+        //
+        // Numbering both ends does not put line 6 on a row of its own, and
+        // cannot. It does make the block a visible span the reader can place a
+        // line inside, which is the most the layout can honestly say.
+        let dir = TempDir::new("view-docs-range");
+        let mut body = b"//! A module comment long enough to need several rows \
+                         when it is laid out into a pane this narrow.\n"
+            .to_vec();
+        for _ in 0..3 {
+            body.extend_from_slice(
+                b"//!\n//! Another paragraph, also long enough that it will not \
+                  fit on one row of a forty-six column pane.\n",
+            );
+        }
+        body.extend_from_slice(b"fn f() {}\n");
+        let path = dir.write("long.rs", &body);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let lines = laid(&mut pane, 46, 40);
+        let numbers = gutters(&lines);
+
+        assert!(lines.len() > 8, "the block has to wrap: {lines:#?}");
+        assert_eq!(numbers[0], "1", "the first line with a word on it");
+        let end = numbers.iter().position(|n| *n == "7").unwrap();
+        assert!(
+            numbers[1..end].iter().all(|n| *n == "┊"),
+            "the interior is pips and nothing else: {numbers:?}"
+        );
+        assert_eq!(
+            numbers[end + 1],
+            "8",
+            "and the code underneath resumes at its own number"
+        );
     }
 
     #[test]
@@ -2441,8 +2698,15 @@ mod tests {
         assert_eq!(pane.margin.rows, pane.lines.len());
         for (i, line) in pane.lines.iter().enumerate() {
             let row: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let gutter: String = row.chars().take(4).collect();
+            // A number, or the pip a doc block's interior wears — and either way
+            // exactly four columns, which is the only thing the margin needs.
             assert!(
-                row.len() >= 4 && row[..4].trim().chars().all(|c| c.is_ascii_digit()),
+                wrap::spans_width(&[Span::raw(gutter.clone())]) == 4
+                    && gutter
+                        .trim()
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c.to_string() == DOC_ROW),
                 "row {i} does not open with a gutter: {row:?}"
             );
         }
@@ -2477,12 +2741,37 @@ mod tests {
         // own indent the prose has nowhere to go and falls back to the source.
         // Neither may panic and neither may draw past the edge, because the
         // pane is dragged through every one of these on the way to a new size.
+        //
+        // **The third fixture is the one that can fail.** This test passed for
+        // an ASCII-only pair while rows measured thirty columns in a pane
+        // twenty-nine wide, because nothing in it was two cells: seven nested
+        // `def`s put the docstring at column twenty-eight, which leaves one
+        // column for a glyph that needs two. `markdown::render` does not honour
+        // a width it cannot fit a grapheme into and `Page::doc` now measures
+        // rather than trusting it — a test whose fixture cannot produce the
+        // shape is confidence and not coverage.
         let dir = TempDir::new("view-docs-widths");
         let (rs, py) = documented(&dir);
-        for path in [rs, py] {
+        let mut deep = String::new();
+        for (n, name) in ["a", "b", "c", "d", "e", "f", "g"].iter().enumerate() {
+            deep += &format!("{}def {name}():\n", "    ".repeat(n));
+        }
+        let at = "    ".repeat(7);
+        deep += &format!("{at}\"\"\"日本語のテキストです。\n\n");
+        deep += &format!("{at}> 引用 と 한국어\n{at}\"\"\"\n{at}return 1\n");
+        let wide = dir.write("wide.py", deep.as_bytes());
+        assert_eq!(at.len(), 28, "the docstring has to start at column 28");
+        // The CJK fixture starts at two, and only it. One column is not a width
+        // any layout can honour when a grapheme needs two: it cannot be halved,
+        // and dropping it would be losing a character of somebody's file to save
+        // a column nobody is reading. That is `crate::text::wrap`'s answer for a
+        // plain source row and it is pre-existing — press `t` on this file at
+        // one column and the same thing happens. What this function owes is
+        // below.
+        for (path, floor) in [(rs, 1), (py, 1), (wide, 2)] {
             let mut pane = quiet(dir.path());
             pane.show(&path);
-            for width in 1..=60usize {
+            for width in floor..=60usize {
                 pane.ensure_layout(width);
                 for line in &pane.lines {
                     assert!(
@@ -2491,6 +2780,19 @@ mod tests {
                         path.display()
                     );
                 }
+            }
+            // And below the floor the rendering is not attempted at all: the
+            // rows are byte for byte the ones the source path produces, so the
+            // interleaving is never what *added* an overflow.
+            let text = std::fs::read_to_string(&path).unwrap();
+            let regions = docs::regions(&text, &path);
+            for width in 0..floor {
+                assert_eq!(
+                    source_lines(&text, &path, &regions, width, theme::Mode::Dark),
+                    source_lines(&text, &path, &[], width, theme::Mode::Dark),
+                    "{} at width {width}",
+                    path.display()
+                );
             }
             // And a real frame at the sizes that have no columns to spare.
             let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
@@ -2529,6 +2831,69 @@ mod tests {
             .skip(1)
             .any(|s| s.style.fg.is_some());
         assert!(!coloured, "it was highlighted, so this proves nothing");
+    }
+
+    #[test]
+    fn the_help_overlay_describes_t_as_the_key_it_became() {
+        // A shipped string, not a docs gap: this row is what F1 draws. It read
+        // "rendered markdown / its source", and the file in front of the reader
+        // pressing `t` is as likely to be a `.py`, which is neither markdown nor
+        // covered by that sentence. Pinned from here rather than from
+        // `crate::keys`, because what makes the row true or false is what this
+        // pane does, and this is where that changes.
+        let (_, said) = crate::keys::HELP
+            .iter()
+            .find(|(k, _)| *k == "t")
+            .expect("the key the overlay promises");
+        assert!(
+            !said.contains("markdown"),
+            "`t` is not markdown's alone any more: {said}"
+        );
+
+        // And the pane agrees: a `.py` with a docstring has two forms and `t`
+        // moves between them, which is the whole of what the row now claims.
+        let dir = TempDir::new("view-docs-help");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+        laid(&mut pane, 40, 20);
+        assert!(pane.title().contains(" · rendered"), "{}", pane.title());
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        laid(&mut pane, 40, 20);
+        assert!(pane.title().contains(" · source"), "{}", pane.title());
+    }
+
+    #[test]
+    fn a_rendered_source_file_can_hold_a_phrase_the_file_does_not() {
+        // Recorded, not fixed — see [`search`]'s module doc. Reflow *joins*
+        // lines, so a phrase spanning two `///` comments is on the page and in
+        // no logical line of the file. `f` reads the file's lines and cannot
+        // report it; `/` reads the page and finds it. That is the opposite
+        // direction from the wrap-split miss this pane has always had, and it
+        // is why "the page can only ever hold fewer matches than the file" is
+        // no longer an assumption anything here may make.
+        let dir = TempDir::new("view-docs-gain");
+        let path = dir.write("j.rs", b"/// Must be a\n/// non-empty string.\nfn f() {}\n");
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rows = laid(&mut pane, 46, 10);
+        assert!(
+            rows[0].contains("Must be a non-empty string."),
+            "the two lines have to reflow into one: {rows:?}"
+        );
+
+        query(&mut pane, "a non-empty");
+        assert!(
+            pane.title().contains("/a non-empty · 1/1"),
+            "the page holds it: {}",
+            pane.title()
+        );
+        // And the file does not: no single line of it contains the phrase.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.lines().any(|l| l.contains("a non-empty")),
+            "the fixture has to make the phrase exist only after reflow"
+        );
     }
 
     // --- the four things that must never panic ---------------------------
@@ -3729,9 +4094,11 @@ mod tests {
             "{}",
             missing.title()
         );
-        // ...and the `t for source` answer belongs to rendered markdown only.
-        // Offering it on a screen with no source behind it names a key that
-        // does nothing there.
+        // ...and the `t for source` answer belongs to a document that has a
+        // source, which is any document the pane rendered — a `.md`, and now a
+        // `.rs` or a `.py` with documentation in it. This screen is neither: it
+        // is the pane's own apology for a file it could not read, and offering
+        // `t` on it names a key that does nothing here.
         query(&mut missing, "zzz");
         assert!(
             missing.title().ends_with("/zzz · no match"),
