@@ -2275,7 +2275,14 @@ mod tests {
         let mut pane = quiet(dir.path());
         pane.show(&path);
 
-        assert_eq!(laid(&mut pane, 40, 10), ["# Plan", "", "Do the thing."]);
+        // The rule row under the title is the H1's level, now that the
+        // hashes are gone. It is part of the rendering and so part of what
+        // this fixture pins: one that skipped the rule would pass just as
+        // well against a renderer that had lost the level cue altogether.
+        assert_eq!(
+            laid(&mut pane, 40, 10),
+            ["Plan", &"━".repeat(40), "", "Do the thing."]
+        );
         assert!(pane.title().contains("plan.md"));
     }
 
@@ -2960,7 +2967,10 @@ mod tests {
             "opening a file is something coming of the key"
         );
         assert!(matches!(pane.mode, Mode::Doc), "the list has done its job");
-        assert_eq!(laid(&mut pane, 40, 10), ["# Plan", "", "Do the thing."]);
+        assert_eq!(
+            laid(&mut pane, 40, 10),
+            ["Plan", &"━".repeat(40), "", "Do the thing."]
+        );
     }
 
     #[test]
@@ -3175,7 +3185,10 @@ mod tests {
         assert!(pane.title().contains("· source"), "{}", pane.title());
 
         pane.handle_key(key(KeyCode::Char('t'))).unwrap();
-        assert_eq!(laid(&mut pane, 40, 10), ["# Plan", "", "Do the thing."]);
+        assert_eq!(
+            laid(&mut pane, 40, 10),
+            ["Plan", &"━".repeat(40), "", "Do the thing."]
+        );
         assert!(pane.title().contains("· rendered"), "{}", pane.title());
     }
 
@@ -3350,7 +3363,14 @@ mod tests {
         laid(&mut pane, 40, 10);
 
         query(&mut pane, "thing");
-        assert_eq!(hits(&pane), [(2, 7)], "row 2 of ['# Plan', '', 'Do the…']");
+        // Row 3, not row 2: the rule the H1 now draws under itself is a row of
+        // the page like any other, and the search counts the rows the pane
+        // drew rather than the lines the file holds.
+        assert_eq!(
+            hits(&pane),
+            [(3, 7)],
+            "row 3 of ['Plan', '━━…', '', 'Do the…']"
+        );
         assert!(pane.title().contains("/thing · 1/1"), "{}", pane.title());
 
         // The documented cost of searching the page: what was rendered away is
