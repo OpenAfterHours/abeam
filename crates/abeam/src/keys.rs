@@ -371,6 +371,26 @@ pub const HELP: &[(&str, &str)] = &[
         "files: which files say this — reads every file under the root",
     ),
     ("n / N", "document: next / previous match, outside the box"),
+    // A bare letter for the reason `f` and `w` are, which is the *intercept*
+    // paragraph at the top of this file: `global` claims only `Ctrl+\`, the
+    // F-keys and the Alt combinations, so a key a focused pane handles was
+    // never going to reach the agent whatever this table said. Cited rather
+    // than re-argued, the way those two rows do.
+    //
+    // "document" and not "files", for the reason the `?` row gives lower down:
+    // this is a row about the reader's *modes*. The file list and the `f`
+    // results each own every key while they are up, so `o` reaches nothing
+    // there.
+    //
+    // "if it has any" is doing real work rather than hedging. The key declines
+    // on a `.txt`, on a `.json` and on markdown shown as its source — see
+    // `panes::viewer::outline` — and this table is the only place that can say
+    // so, because a title already carrying the name, the form, the query and
+    // the position has no room to advertise a key per document.
+    (
+        "o",
+        "document: jump to a heading or a definition, if it has any",
+    ),
     ("Backspace or -", "file list: up a directory"),
     ("r", "refresh · queue: clear what has finished (twice)"),
     // Not a fifth global view key: `Alt+W` is Claude's, and a fifth view
