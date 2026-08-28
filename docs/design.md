@@ -602,6 +602,17 @@ outright, so the mistake it can make is to render a string as prose and not to
 hide code behind one. `t` is always one key from what was actually typed. No other
 language has one, which is a scope line rather than a principle.
 
+A Python doctest is recognised and drawn as the code it is, wherever the author
+put it. That pass adds the markup around the sample and moves nothing, which is
+the line between a rendering and an edit — and it is a line this feature has
+already been over once: an earlier version pulled every four-space indent down
+to two, which put `>>> ` under CommonMark's threshold, turned each prompt into
+three nested quote markers and merged a sample's input with its output. What is
+still not rendered well is a Google-style `Args:` block, whose parameters are
+lazy continuations of a paragraph and so arrive as one run-on sentence. Every
+word of it is present and in order; separating them needs the author's text
+moved, which is the thing that was just taken out.
+
 The gutter is what that costs, and it is paid openly. A docstring of twelve
 lines does not become twelve rows of prose, so a number per row would be an
 invention; a rendered block carries the first and the last file line its words

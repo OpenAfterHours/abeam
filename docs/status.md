@@ -194,7 +194,10 @@ work, on either platform.
   falls back to source. That floor is a property of the document rather than of
   the pane: `Choice` is six cells, so no amount of arranging fits it into four,
   and breaking it in half to make it fit would be the one thing this is not
-  allowed to do. It is why the outline exists and where even the outline stops.
+  allowed to do. It is why the *flowchart* outline exists and where even that
+  stops — named that way here because `o` in the files view now opens an
+  outline of a different kind, and this bullet is about neither of the two
+  things a reader would guess from the bare word.
 
 - **`abeam bash` is a prompt now, and nothing says so.** This document used to
   advertise `abeam bash`, `abeam powershell` and "anything else on `PATH`", and
