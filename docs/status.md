@@ -48,7 +48,10 @@ Working, and used. Not finished.
 
 **Done.** The pty host layer, proven by a spike that ran a real Claude session
 against it on 2026-08-01. All six right-hand views, the file list, the
-rendered/source toggle, the watcher driving what it should, and the three
+rendered/source toggle — which now has something to toggle on a documented
+`.rs` or `.py`, whose doc comments and docstrings are rendered where they stand
+— the outline behind `o` and the breadcrumb it puts in the title, the watcher
+driving what it should, and the three
 searches under the reader — a file by its name, a phrase on the page, a phrase
 in every file under the root except directories that are worktrees of another
 repository, which the file list will still walk you into and marks `unindexed`
@@ -396,11 +399,26 @@ work, on either platform.
   able to tell is not being able to stop it. The dropping is deliberate and the
   wire-format bullet below is the argument for it; what is missing is a way out
   beside it.
-- **`?` is inert in the file list and in the `f` results.** It opens the ask from
+- **The outline cannot be filtered, and a big file needs it to be.** `o` lists a
+  document's headings or a source file's definitions, and on this repository's
+  own `crates/abeam/src/panes/viewer.rs` that is 223 entries of which 187 sit at
+  one level, drawn at 46 columns where a name is cut at about 42 cells — six
+  consecutive rows there begin `fn a_doc`. Paging across it is five keystrokes;
+  telling two rows apart is the part that does not work. The three boxes this
+  pane already has are the obvious answer and the reason it does not have a
+  fourth is written down rather than assumed: every one of them adds a stage to
+  `Esc`, and the outline is currently the one layer with a single unconditional
+  way out. That is a real trade and it may well be the wrong side of it; what is
+  not defensible is leaving the gap unwritten, which is why it is here.
+
+- **`?` is inert in the file list, in the `f` results and in the outline.** It
+  opens the ask from
   the document the reader is showing and from the git view, and nowhere else —
-  the list and the results each own every key while they are up, because a pane
-  cannot hand the same key to two vocabularies and hope, and neither of them has
-  an arm for `?`. So `Alt+E` `Alt+E` reaches a view where the key the F1 overlay
+  those three each own every key while they are up, because a pane
+  cannot hand the same key to two vocabularies and hope, and none of them has
+  an arm for `?`. The outline is the newest of the three and the least excusable
+  of them, because unlike the other two it is a layer over the very document
+  `?` would have asked about. So `Alt+E` `Alt+E` reaches a view where the key the F1 overlay
   advertises two rows above does nothing at all, silently. The overlay says
   "document, git" rather than "files, git" for that reason, which is a correction
   and not a fix: the honest answer is that the list should ask about the file the

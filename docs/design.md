@@ -414,9 +414,10 @@ document the reader is showing, or in the git view, it opens **ask** — a
 second-agent pane where the hosted provider supports it, described under "The
 panes" — with the
 file you were looking at attached to the first question, and `Esc` puts back the
-view it displaced the way `F2` does out of the diagnostics. Those two views and
-no others: the file list and the `f` results own every key while they are up, so
-`?` is inert in both, which [status](status.md) records as a gap rather than a
+view it displaced the way `F2` does out of the diagnostics. Those views and
+no others: the file list, the `f` results and now the outline own every key
+while they are up, so `?` is inert in all three, which
+[status](status.md) records as a gap rather than a
 decision. A question about the file you are reading is asked from where you are
 reading it, so the key is only ever delivered to a focused pane; that is
 the whole of the exemption, and it is the same sentence `w` relies on rather than
@@ -709,15 +710,27 @@ hit does**, and for the same reason it is rebuilt in the one place the rows are
 — a width change re-wraps every paragraph and `t` swaps the document for a form
 that shares no rows with it at all, and an entry left over from the previous
 layout would land `Enter` somewhere the reader did not choose, silently. And
-**markdown shown as its source has no outline**, though its headings are plainly
-there as `#` lines a scanner would find in twenty lines of code. That is
-deliberate: `pulldown_cmark` is what decides what a heading is in this pane, and
-a line scanner is not, so where the two disagree — a `#` inside a fence, a setext
-heading, a `#` in an indented code block — one document would list two different
-tables of its own contents depending on which key was last pressed, with nothing
-on screen to say which was right. `t` is one keystroke back to the form that has
-one. Where there is nothing to list, `o` declines rather than opening an empty
-list, which is the same promise `t` makes on a file with no second form.
+**`t` does not cost you the table of contents**: markdown shown as its source
+has an outline too, and it is the same parser's answer rather than a second
+one. A `#`-line scanner would have been twenty lines and was refused — where it
+and `pulldown_cmark` disagree, over a `#` inside a fence, a setext heading, a
+`#` in an indented code block, one document would have listed two different
+tables of its own contents depending on which key was last pressed, with
+nothing on screen to say which was right. Reading the offsets back out of the
+same parser costs about the same and cannot disagree; over four thousand
+markdown files the two forms name the same headings at the same levels in every
+one. What they can differ on is the *label*, because each names what its own
+form has on screen — a heading holding a badge or a link is drawn one way and
+typed another. Where there is nothing to list at all, on a `.txt` or a `.json`,
+`o` declines rather than opening an empty list, which is the same promise `t`
+makes on a file with no second form.
+
+`Esc` or a second `o` puts the outline away; `Enter` jumps and puts it away.
+`q` is not one of the ways out, and that is the same answer the worktree list
+in the git pane already gives: it means what it means everywhere else in this
+program, which is hand focus back to the agent. The four views that keep `q`
+keep it because something is being typed into them, and nothing is being typed
+here.
 
 The title carries a breadcrumb of the section the reader has scrolled into, and
 it sits **after** the position, which is to say last, which is to say it is the
