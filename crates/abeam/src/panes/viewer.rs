@@ -2953,21 +2953,144 @@ mod tests {
         // its expected output and the whole sample was drawn as a quotation,
         // in a viewer whose one promise is that the source is always true.
         //
+        // **And the fixture is three shapes, because it was one.** For a while
+        // this test held only the first of them — a sample indented four
+        // columns *past* the docstring body — which is the one arrangement
+        // CommonMark draws as code all on its own, and so the one arrangement
+        // that cannot witness the bug. The flush shape below is the one PEP
+        // 257, CPython and numpy actually write, and it was broken on this
+        // page, under a green test named for it, until `docs::doctests`. A
+        // regression test that pins only the surviving case is worse than none:
+        // it spends the reader's trust without buying anything with it.
+        //
         // Asserted on the drawn rows rather than on the scanner's output,
         // because the deletion happened in the renderer and a test on the text
         // handed to it would not have seen it.
         let dir = TempDir::new("view-docs-doctest");
+        let shapes: [(&str, &[u8]); 3] = [
+            (
+                "indented under a label, with a blank line",
+                b"def add(a, b):\n\
+                  \x20   \"\"\"Add two numbers.\n\
+                  \n\
+                  \x20   Example:\n\
+                  \n\
+                  \x20       >>> add(1, 2)\n\
+                  \x20       3\n\
+                  \x20   \"\"\"\n\
+                  \x20   return a + b\n",
+            ),
+            (
+                "indented under a label, with none",
+                b"def add(a, b):\n\
+                  \x20   \"\"\"Add two numbers.\n\
+                  \n\
+                  \x20   Example:\n\
+                  \x20       >>> add(1, 2)\n\
+                  \x20       3\n\
+                  \x20   \"\"\"\n\
+                  \x20   return a + b\n",
+            ),
+            (
+                "flush with the prose, as PEP 257 writes it",
+                b"def add(a, b):\n\
+                  \x20   \"\"\"Add two numbers.\n\
+                  \n\
+                  \x20   >>> add(1, 2)\n\
+                  \x20   3\n\
+                  \x20   \"\"\"\n\
+                  \x20   return a + b\n",
+            ),
+        ];
+
+        for (n, (shape, src)) in shapes.iter().enumerate() {
+            let path = dir.write(&format!("d{n}.py"), src);
+            let mut pane = quiet(dir.path());
+            pane.show(&path);
+            let rows = laid(&mut pane, 46, 20);
+            let page = rows.join("\n");
+
+            assert!(
+                page.contains(">>> add(1, 2)"),
+                "{shape}: the prompt was consumed as blockquote markers:\n{page}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("│ >>> add(1, 2)")),
+                "{shape}: the sample is a code block, not a paragraph:\n{page}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("│ 3")),
+                "{shape}: the expected output kept its own line:\n{page}"
+            );
+            assert!(
+                !page.contains("▏ "),
+                "{shape}: nothing here is a quotation:\n{page}"
+            );
+            // The statement and its output are two rows and not one reflowed
+            // line — which is the half of the damage that survives even if the
+            // prompts are somehow still on the page.
+            assert!(
+                !page.contains(">>> add(1, 2) 3"),
+                "{shape}: the sample was reflowed into a paragraph:\n{page}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flush_doctest_is_a_sample_and_not_three_nested_quotations() {
+        // The file that found it, rendered whole rather than asserted at.
+        // Before `docs::doctests` the last row of this docstring read
+        // `▏ ▏ ▏ w = Widget() w.render(buf)`: both prompts eaten as blockquote
+        // markers, two statements merged onto one row, and the sample drawn as
+        // a quotation. Content destroyed, in the pane whose stated promise is
+        // that the source is always true.
+        let dir = TempDir::new("view-docs-flush");
         let path = dir.write(
-            "d.py",
-            b"def add(a, b):\n\
-              \x20   \"\"\"Add two numbers.\n\
+            "widget.py",
+            b"class Widget:\n\
+              \x20   def render(self, buf):\n\
+              \x20       \"\"\"Draw into *buf*.\n\
               \n\
-              \x20   Example:\n\
+              \x20       >>> w = Widget()\n\
+              \x20       >>> w.render(buf)\n\
+              \x20       \"\"\"\n\
+              \x20       return buf\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        assert_eq!(
+            laid(&mut pane, 46, 20),
+            [
+                "  1 class Widget:",
+                "  2     def render(self, buf):",
+                "  3         Draw into buf.",
+                "  ┊         ",
+                "  ┊         │ >>> w = Widget()",
+                "  6         │ >>> w.render(buf)",
+                "  8         return buf",
+                "  9 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quotation_in_a_docstring_is_still_a_quotation() {
+        // The other side of the doctest fix, and the reason it keys on `>>> `
+        // and not on `>`. A block quote in a docstring is a quotation the
+        // author wrote and meant, and it must keep its `▏ ` gutter rather than
+        // be promoted into a `│ ` one — which is a claim that the lines behind
+        // it are code, and would be false here.
+        let dir = TempDir::new("view-docs-quote");
+        let path = dir.write(
+            "q.py",
+            b"def f():\n\
+              \x20   \"\"\"Do it.\n\
               \n\
-              \x20       >>> add(1, 2)\n\
-              \x20       3\n\
+              \x20   > Somebody said this.\n\
+              \x20   > And more of it.\n\
               \x20   \"\"\"\n\
-              \x20   return a + b\n",
+              \x20   return 1\n",
         );
         let mut pane = quiet(dir.path());
         pane.show(&path);
@@ -2975,18 +3098,128 @@ mod tests {
         let page = rows.join("\n");
 
         assert!(
-            page.contains(">>> add(1, 2)"),
-            "the prompt was consumed as blockquote markers:\n{page}"
+            rows.iter().any(|r| r.contains("▏ Somebody said this.")),
+            "the quotation lost its gutter:\n{page}"
         );
         assert!(
-            rows.iter().any(|r| r.contains("│ >>> add(1, 2)")),
-            "the sample is a code block, not a paragraph:\n{page}"
+            !page.contains("│ "),
+            "a quotation was drawn as code:\n{page}"
         );
         assert!(
-            rows.iter().any(|r| r.contains("│ 3")),
-            "the expected output kept its own line:\n{page}"
+            !page.contains("```"),
+            "a fence reached the page as text:\n{page}"
         );
-        assert!(!page.contains("▏ "), "nothing here is a quotation:\n{page}");
+    }
+
+    #[test]
+    fn a_google_style_section_is_left_as_the_run_on_sentence_it_is() {
+        // **Declined, and pinned so that declining it stays a decision.** A
+        // Google-style `Args:` block is a paragraph with lazy continuations
+        // under it, so it reflows into one sentence — poor reading, and a
+        // shape common enough to be worth wanting to fix.
+        //
+        // It is not fixed, for the reason the deleted `normalise` pass is not
+        // coming back. The transform that would be *additive* — a bullet
+        // inserted at each entry's own column — does nothing at all: a list
+        // marker four columns in cannot interrupt a paragraph any more than an
+        // indented code block can, so `Args:\n    - name: x` renders as
+        // `Args: - name: x` and the pass has bought two characters of noise per
+        // entry. The transform that *works* has to pull each entry within three
+        // columns of the label and re-indent its continuation lines to follow —
+        // which is moving the author's text by an amount derived from its
+        // surroundings, and is the thing this module says it does not do. The
+        // one strictly additive shape that separates the entries — a blank line
+        // under the label, making the block indented code — hangs a `│ ` gutter
+        // on them, and `markdown` says in as many words that that gutter is a
+        // claim the lines behind it are code. `name: what to call it.` is not.
+        //
+        // So the reader gets the rows below: every parameter present, in order,
+        // in the author's words, numbered by the lines they are on, with the
+        // source one `t` away. It reads badly and it has lost nothing, which is
+        // the line this pane draws — and the doctest above was on the far side
+        // of it, with two statements merged into one row and both prompts gone.
+        let dir = TempDir::new("view-docs-sections");
+        let path = dir.write(
+            "s.py",
+            b"def f(name, size):\n\
+              \x20   \"\"\"Do it.\n\
+              \n\
+              \x20   Args:\n\
+              \x20       name: what to call it.\n\
+              \x20       size: how many cells wide.\n\
+              \n\
+              \x20   Returns:\n\
+              \x20       A widget.\n\
+              \x20   \"\"\"\n\
+              \x20   return 1\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        assert_eq!(
+            laid(&mut pane, 46, 20),
+            [
+                "  1 def f(name, size):",
+                "  2     Do it.",
+                "  ┊     ",
+                "  ┊     Args: name: what to call it. size: how",
+                "  ┊     many cells wide.",
+                "  ┊     ",
+                "  9     Returns: A widget.",
+                " 11     return 1",
+                " 12 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn fencing_a_doctest_leaves_the_gutter_and_the_source_untouched() {
+        // The pass adds lines to the text handed to the renderer and to nothing
+        // else, so the two things the reader checks a rendering against have to
+        // come back unchanged: the numbers in the margin, which still name the
+        // lines the block's first and last words are on, and `t`, which is the
+        // whole reason a heuristic is allowed in this pane at all.
+        let dir = TempDir::new("view-docs-fence-gutter");
+        let path = dir.write(
+            "g.py",
+            b"def f():\n\
+              \x20   \"\"\"Do it.\n\
+              \n\
+              \x20   >>> f()\n\
+              \x20   1\n\
+              \x20   \"\"\"\n\
+              \x20   return 1\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rendered = laid(&mut pane, 46, 20);
+
+        // Line 2 is the summary and line 5 is the sample's last word; the `"""`
+        // on lines 3 and 6 carry none, and neither does the fence, which is not
+        // in the file.
+        assert_eq!(gutters(&rendered), ["1", "2", "┊", "┊", "5", "7", "8"]);
+        assert!(
+            !rendered.iter().any(|r| r.contains("```")),
+            "the fence reached the page as text:\n{}",
+            rendered.join("\n")
+        );
+
+        // And `t` still puts back exactly the file that was opened — the pass
+        // touches the rendered form and nothing that reaches this one.
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        assert_eq!(
+            laid(&mut pane, 46, 20),
+            [
+                "  1 def f():",
+                "  2     \"\"\"Do it.",
+                "  3 ",
+                "  4     >>> f()",
+                "  5     1",
+                "  6     \"\"\"",
+                "  7     return 1",
+                "  8 ",
+            ]
+        );
     }
 
     #[test]
