@@ -32,6 +32,32 @@ const CODE_GUTTER: &str = "│ ";
 const CODE_WRAP_GUTTER: &str = "┆ ";
 /// Below this many columns of usable text, decoration costs more than it says.
 const CRAMPED: usize = 12;
+/// The rule under an H1, spanning the whole block. Heavy rather than light
+/// because a full-width `─` is already what a thematic break draws, and a title
+/// that renders as a horizontal rule is a worse lie than a title with no rule
+/// under it at all.
+const H1_RULE: &str = "━";
+/// The rule under an H2, which is light but stops at the end of the heading's
+/// own text. Short *and* light, so neither half of it can be read as a break
+/// either — the two rules differ in stroke and in extent, not in colour, both
+/// being the same `dim` as every other piece of chrome on the page.
+const H2_RULE: &str = "─";
+/// Cells an H4 and below is indented per level past three. Two, matching the
+/// quote gutter and the bullet, so a deep heading steps sideways by the same
+/// amount as everything else in this file that steps sideways.
+const HEADING_STEP: usize = 2;
+/// What an image is reduced to, since a terminal cannot show one. Not an emoji:
+/// every glyph this module draws is a BMP symbol that a fixed-width font has an
+/// opinion about, and an emoji is two cells wide in some terminals and one in
+/// others — which is the wrap arithmetic here going wrong on somebody else's
+/// machine. A hatched square rather than `▪`, which is already the bullet three
+/// list levels down.
+const IMAGE_GLYPH: &str = "▨ ";
+/// The share of the pane a link's destination may take before it is cut down to
+/// a host. A third: at the forty-six columns this pane routinely is that is
+/// fifteen cells, which `x.dev` and `./plan.md` clear and a campaign URL with a
+/// query string on it does not. See [`elide_url`].
+const URL_SHARE: usize = 3;
 /// Narrowest a table column may be and still hold a word rather than a
 /// syllable. Below `MIN_COL * columns` the grid is abandoned entirely.
 const MIN_COL: usize = 8;
@@ -64,6 +90,22 @@ pub fn render(source: &str, width: usize, mode: Mode) -> Vec<Line<'static>> {
 struct ListLevel {
     /// `Some(n)` for an ordered list, holding the *next* number.
     next: Option<u64>,
+}
+
+/// What a raw block is being captured *as*, which is what decides how it comes
+/// back out. All three arrive as unparsed text and used to be told apart by a
+/// bare `dim: bool`; front matter now has a rendering of its own, and a third
+/// state spelled as a second boolean is how the third state gets forgotten.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Raw {
+    /// A fence or an indented block: highlighted, behind a gutter.
+    Code,
+    /// An HTML block. Dim rather than highlighted, because it is the document's
+    /// own plumbing rather than something the author was writing to be read.
+    Html,
+    /// YAML front matter, which is tried as a key/value header first and falls
+    /// back to the same dim block as `Html`. See [`front_matter`].
+    Meta,
 }
 
 #[derive(Default)]
@@ -103,9 +145,9 @@ struct Renderer {
     /// Drawn on the first line of an item's first block, then gone.
     marker: Option<(Vec<Span<'static>>, usize)>,
 
-    /// `(language, text, dim)` while inside a fenced block, an indented block,
+    /// `(language, text, kind)` while inside a fenced block, an indented block,
     /// an HTML block or a front-matter block.
-    code: Option<(String, String, bool)>,
+    code: Option<(String, String, Raw)>,
     table: Option<TableAcc>,
 
     need_blank: bool,
@@ -153,8 +195,8 @@ impl Renderer {
                     }
                 }
                 Event::End(TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::MetadataBlock(_)) => {
-                    if let Some((lang, text, dim)) = self.code.take() {
-                        self.emit_code(&lang, &text, dim);
+                    if let Some((lang, text, kind)) = self.code.take() {
+                        self.emit_code(&lang, &text, kind);
                     }
                 }
                 _ => {}
@@ -225,14 +267,20 @@ impl Renderer {
                     CodeBlockKind::Fenced(info) => info.to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                self.code = Some((lang, String::new(), false));
+                self.code = Some((lang, String::new(), Raw::Code));
             }
-            // Rendered dim rather than highlighted: it is metadata about the
-            // document, not part of it, and it is always at the top where it
-            // would otherwise be the loudest thing on screen.
-            Tag::HtmlBlock | Tag::MetadataBlock(_) => {
+            // Neither of these is highlighted. HTML is the document's own
+            // plumbing, and front matter is metadata *about* the document that
+            // sits at the top, where highlighting it would make the loudest
+            // thing on the page the one thing the reader did not open the file
+            // for. They part company in `emit_code`, not here.
+            Tag::HtmlBlock => {
                 self.start_block();
-                self.code = Some((String::new(), String::new(), true));
+                self.code = Some((String::new(), String::new(), Raw::Html));
+            }
+            Tag::MetadataBlock(_) => {
+                self.start_block();
+                self.code = Some((String::new(), String::new(), Raw::Meta));
             }
 
             Tag::List(start) => {
@@ -289,8 +337,15 @@ impl Renderer {
                         .add_modifier(Modifier::UNDERLINED),
                 );
             }
+            // The alt text is the whole of what a terminal can show of an image,
+            // so it is the whole of what is drawn — the brackets around it were
+            // three cells of punctuation announcing something the glyph now says
+            // in one. Dim, because an alt is a stand-in for something that is
+            // not on the page rather than a sentence of the document; the
+            // destination is not shown at all, since unlike a link there is
+            // nothing the reader could do with it here. `t` has the source.
             Tag::Image { .. } => {
-                self.spans.push(Span::styled("[image: ", self.theme.dim()));
+                self.spans.push(Span::styled(IMAGE_GLYPH, self.theme.dim()));
                 self.push_style(self.theme.dim());
             }
 
@@ -304,16 +359,82 @@ impl Renderer {
                 self.flush_inline();
                 self.need_blank = true;
             }
+            // A heading used to be prefixed with its own `#`s, dimmed, on the
+            // argument that a terminal has no font size so the level had to be
+            // readable as text. The reasoning was right and the answer was
+            // wrong: it left the last literal markdown syntax on an otherwise
+            // fully rendered page, and it spent up to seven cells of a
+            // forty-column pane saying something the shape of the block can say
+            // for free. So the level is still carried by something other than
+            // hue — `theme`'s rule, the same one that underlines every link —
+            // but that something is now structural. A rule under the title, a
+            // shorter rule under a section, nothing under a sub-section, and an
+            // indent below that. Read down a page, those four are as distinct
+            // in greyscale as they are in colour.
             TagEnd::Heading(level) => {
+                let level = level as usize;
                 let (mut first, mut rest) = self.prefixes();
-                let hashes = format!("{} ", "#".repeat(level as usize));
-                let pad = " ".repeat(hashes.width());
-                first.push(Span::styled(hashes, self.theme.dim()));
-                rest.push(Span::raw(pad));
+                // Measured off the *continuation* prefix, because that is the
+                // one every line but the first pays and the one the rule below
+                // sits behind. Inside a quote or a list item it is already
+                // several cells wide, which is what keeps the decoration here
+                // honest about the room it actually has.
+                let avail = self.width.saturating_sub(spans_width(&rest));
+                // The threshold the code gutter and the table grid already
+                // answer to: under it, decoration is spending cells the words
+                // needed. A cramped heading is bold and coloured and nothing
+                // else, which is exactly what it was before this pane learned
+                // to draw rules.
+                let roomy = avail >= CRAMPED;
+
+                // H4 and below share a colour — `Theme::heading` gives all of
+                // them `warn` — and get no rule, so the indent is the only
+                // thing left that says which of them you are looking at. It
+                // goes on *both* prefixes: a wrapped H5 whose second line
+                // straightened up under the body text would be reading as a
+                // paragraph from there on. Clamped the way `prefixes` clamps
+                // the list indent, and for the same reason — nesting must never
+                // eat the whole pane.
+                let step =
+                    (HEADING_STEP * level.saturating_sub(3)).min(avail.saturating_sub(CRAMPED));
+                if step > 0 {
+                    first.push(Span::raw(" ".repeat(step)));
+                    rest.push(Span::raw(" ".repeat(step)));
+                }
+
                 let content = std::mem::take(&mut self.spans);
                 let content = restyle(content, self.theme.heading(level as u8));
-                self.out
-                    .extend(wrap::wrap_spans(content, self.width, &first, &rest));
+                let rows = wrap::wrap_spans(content, self.width, &first, &rest);
+                // The widest row this heading actually drew, which is what an
+                // H2's rule is measured against. Taken before the rows are
+                // handed over, since that is the only moment it is knowable —
+                // the wrap decides it, not the text.
+                let drawn = rows
+                    .iter()
+                    .map(|l| spans_width(&l.spans))
+                    .max()
+                    .unwrap_or(0);
+                self.out.extend(rows);
+
+                let rule = match level {
+                    1 if roomy => Some((H1_RULE, avail)),
+                    // Only as wide as the heading, so a short H2 is visibly not
+                    // a break and a long one is visibly not an H1. `clamp`'s
+                    // lower bound cannot invert here: `roomy` has already put
+                    // `avail` at CRAMPED or more.
+                    2 if roomy => Some((
+                        H2_RULE,
+                        drawn.saturating_sub(spans_width(&rest)).clamp(1, avail),
+                    )),
+                    _ => None,
+                };
+                if let Some((glyph, cells)) = rule {
+                    // Dim, like the quote and code gutters: a rule is the pane
+                    // talking about the document, not part of it.
+                    let mut line = rest;
+                    line.push(Span::styled(glyph.repeat(cells), self.theme.dim()));
+                    self.out.push(Line::from(line));
+                }
                 self.need_blank = true;
             }
 
@@ -380,20 +501,19 @@ impl Renderer {
                         .map(|s| s.content.as_ref())
                         .collect();
                     if text.trim() != url.trim() && !url.is_empty() {
-                        self.spans.push(Span::styled(format!(" ({url})"), self.theme.dim()));
+                        let shown = elide_url(&url, self.width);
+                        self.spans
+                            .push(Span::styled(format!(" ({shown})"), self.theme.dim()));
                     }
                 }
             }
-            TagEnd::Image => {
-                self.pop_style();
-                self.spans.push(Span::styled("]", self.theme.dim()));
-            }
+            TagEnd::Image => self.pop_style(),
 
             TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::MetadataBlock(_) => {
                 // Handled by the raw-capture branch in `event`; only reachable
                 // if a block opened and closed with nothing in between.
-                if let Some((lang, text, dim)) = self.code.take() {
-                    self.emit_code(&lang, &text, dim);
+                if let Some((lang, text, kind)) = self.code.take() {
+                    self.emit_code(&lang, &text, kind);
                 }
             }
 
@@ -525,12 +645,12 @@ impl Renderer {
         self.out.push(Line::from(line));
     }
 
-    fn emit_code(&mut self, lang: &str, text: &str, dim_all: bool) {
+    fn emit_code(&mut self, lang: &str, text: &str, kind: Raw) {
         // Fences arrive with a trailing newline that is fence syntax, not a
         // blank line the author wrote.
         let body = text.strip_suffix('\n').unwrap_or(text);
-        // Taken before either branch draws, because it consumes the pending
-        // list marker and the marker may only be spent once.
+        // Taken before any branch draws, because it consumes the pending list
+        // marker and the marker may only be spent once.
         let (pfirst, prest) = self.prefixes();
         let avail = self.width.saturating_sub(spans_width(&prest));
 
@@ -545,10 +665,19 @@ impl Renderer {
             return self.emit_diagram(rows, &pfirst, &prest);
         }
 
-        let rows = if dim_all {
-            source::plain(body, self.theme.dim())
-        } else {
-            source::highlight_code(body, lang, self.mode)
+        // Front matter gets the same bargain the mermaid fence above just made:
+        // rendered when it can be rendered faithfully, and otherwise handed
+        // back to the block it has always had. `front_matter` is the one that
+        // decides, and it declines far more than it accepts.
+        if kind == Raw::Meta
+            && let Some(pairs) = front_matter(body)
+        {
+            return self.emit_front_matter(pairs, &pfirst, &prest);
+        }
+
+        let rows = match kind {
+            Raw::Code => source::highlight_code(body, lang, self.mode),
+            Raw::Html | Raw::Meta => source::plain(body, self.theme.dim()),
         };
 
         // The gutter is the only thing marking the block's extent, so it is the
@@ -583,6 +712,57 @@ impl Renderer {
             // is a bug in there — this is what keeps such a bug inside the pane
             // while the tests are what find it.
             self.out.extend(wrap::hard_wrap(row, self.width, &first, prest));
+        }
+        self.need_blank = true;
+    }
+
+    /// Front matter as a header rather than as a block of source.
+    ///
+    /// A `│ ` gutter is a claim that the lines behind it are code, and the
+    /// moment the pairs are being read as pairs that claim is false — it was
+    /// also, in an agent-written plan, the loudest thing on the page before the
+    /// reader had reached a word of the plan. So the gutter goes and the shape
+    /// carries it instead: one row per key, the key bold and the value not,
+    /// both dim, because all of it is still metadata *about* the document.
+    ///
+    /// The key is clipped rather than allowed to run, because it is a wrap
+    /// *prefix* and a prefix is the one thing `wrap_spans` will let overflow the
+    /// pane — a forty-cell `implementation_strategy: ` at eighteen columns is
+    /// not a hypothetical in this codebase. That is the same trade, and the same
+    /// `clip_label`, the narrow-table records already make one method below.
+    fn emit_front_matter(
+        &mut self,
+        pairs: Vec<(String, String)>,
+        pfirst: &[Span<'static>],
+        prest: &[Span<'static>],
+    ) {
+        // Below two cells there is no room for a key and its colon, so the
+        // values go out bare and in order. Ugly, and it is still the data.
+        let room = self.width.saturating_sub(spans_width(prest) + 2);
+        let key_style = self.theme.dim().add_modifier(Modifier::BOLD);
+
+        for (i, (key, value)) in pairs.into_iter().enumerate() {
+            let mut first = if i == 0 {
+                pfirst.to_vec()
+            } else {
+                prest.to_vec()
+            };
+            if room >= 2 {
+                first.push(Span::styled(
+                    format!("{}: ", clip_label(&key, room)),
+                    key_style,
+                ));
+            }
+            // Hanging by two, as the table records hang: a wrapped value that
+            // came back to column zero would read as the next key.
+            let mut cont = prest.to_vec();
+            cont.push(Span::raw("  "));
+            self.out.extend(wrap::wrap_spans(
+                vec![Span::styled(value, self.theme.dim())],
+                self.width,
+                &first,
+                &cont,
+            ));
         }
         self.need_blank = true;
     }
@@ -736,10 +916,100 @@ fn fit(t: &TableAcc, cols: usize, content: usize) -> Vec<usize> {
     widths
 }
 
-/// Cut a table label down to `width` cells. Deliberately *not* `text::clip`:
-/// this is the one place truncation goes unmarked, because at the widths a
-/// narrow-table label is squeezed into, the ellipsis is a measurable fraction
-/// of the label itself.
+/// Front matter as the flat `key: value` pairs it usually is, or `None` if it
+/// is anything else at all.
+///
+/// The bar here is faithfulness, not effort. Nested maps, lists, block scalars
+/// and comments would all render as *something* if you squinted, and something
+/// is the one outcome this must not produce — `mermaid` states the rule for
+/// diagrams (the source is always true, and a diagram that has quietly lost a
+/// node is worse than one nobody drew) and metadata is the same bargain, made
+/// about a block whose entire content is data. So `None` is not a failure path.
+/// It is the dim block this always used to be, showing the YAML exactly as the
+/// author wrote it, and it is the answer to every case below.
+///
+/// The indent check is what does most of the work: `tags:` introducing a list,
+/// `owner:` introducing a map and `notes: |` introducing a block scalar are all
+/// followed by lines that begin with a space, and YAML has no way to continue a
+/// value that does not.
+fn front_matter(body: &str) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for line in body.lines() {
+        // A blank line is spacing in a block that is no longer being laid out
+        // as a block. It carries no key and no value, so it is the one thing
+        // dropped rather than declined over.
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Indented: a continuation, a nested key or a list element. Leading
+        // `-`: a top-level sequence. `#`: a comment, which is the author
+        // talking and not a datum, and reformatting it is not on offer.
+        if line.starts_with([' ', '\t', '#', '-']) {
+            return None;
+        }
+        let (key, value) = line.split_once(':')?;
+        // Split at the *first* colon and keep the rest verbatim: `url:
+        // https://x.dev` is one pair, not two, and the value is reproduced
+        // rather than re-quoted.
+        let (key, value) = (key.trim_end(), value.trim());
+        // An empty value is `tags:` introducing something on the lines below —
+        // which the indent check has already declined — or an explicit null,
+        // which has no rendering here that is not an invention.
+        if key.is_empty() || value.is_empty() {
+            return None;
+        }
+        pairs.push((key.to_string(), value.to_string()));
+    }
+    // An empty block has no header to be, and falls through to drawing nothing
+    // exactly as it did before.
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// A link's destination, cut down to what the pane can afford to say about it.
+///
+/// The parenthesised URL is a footnote on the sentence it hangs off, and a
+/// footnote longer than the sentence has stopped being one: in a forty-six
+/// column pane a URL carrying a query string routinely outruns the clause it
+/// annotates, and the reader pays two wrapped rows for a string they cannot
+/// click. So an over-budget absolute URL is reduced to its host. `github.com`
+/// still answers the question the annotation exists for — *where does this go* —
+/// which is what a reader deciding whether to follow it is actually reading.
+///
+/// Only a URL with an authority can lose anything, and that is the whole of the
+/// rule. A relative link is not an address, it is a path inside this repository,
+/// and `./plan.md` or `#invariants` *is* the useful half — there is no host to
+/// fall back to and no part of it that is noise. `mailto:` the same: an address
+/// is the information. Those are kept whole at any length, and `wrap` breaks an
+/// over-long one rather than overflowing the pane.
+///
+/// Nothing is lost in either direction. `t` shows the source, where every
+/// destination is written out in full and always has been.
+fn elide_url(url: &str, width: usize) -> String {
+    // The three cells are the ` (` and `)` the caller is about to wrap around
+    // it: the budget is for the annotation, not for the string inside it.
+    if url.width() + 3 <= width / URL_SHARE {
+        return url.to_string();
+    }
+    let Some((_, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // `user@host:port`. Userinfo is the one part of an authority that does not
+    // say *where*, so it goes with the path; the port stays, because
+    // `localhost:3000` and `localhost` are not the same place.
+    let host = authority.rsplit('@').next().unwrap_or("");
+    if host.is_empty() {
+        // `file:///plans/x.md` has an authority and it is empty, so there is
+        // nothing shorter to say than the whole thing.
+        return url.to_string();
+    }
+    host.to_string()
+}
+
+/// Cut a label down to `width` cells. Deliberately *not* `text::clip`: this is
+/// where truncation goes unmarked, because at the widths a narrow-table label
+/// or a front-matter key is squeezed into, the ellipsis is a measurable
+/// fraction of the label itself.
 fn clip_label(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
@@ -823,21 +1093,126 @@ mod tests {
         }
     }
 
+    /// This used to assert the opposite, and the reasoning it asserted is still
+    /// true: a terminal has no font size, so the level cannot be left to hue —
+    /// `theme`'s rule, the one that underlines every link. What changed is the
+    /// answer. The hashes were the last literal markdown syntax on a page that
+    /// renders everything else, and they cost up to seven cells of a forty
+    /// column pane to say something the *shape* of the block says for nothing.
+    /// So the non-chromatic signal is now structural: a full-width rule under a
+    /// title, a rule the width of its own text under a section, nothing under a
+    /// sub-section, an indent below that. Read down a page in greyscale, those
+    /// four are as distinct as they were with the hashes on.
     #[test]
     fn headings_are_marked_by_level_and_coloured() {
         let out = render("# One\n\n## Two\n", 40, Mode::Dark);
-        assert_eq!(text(&out), ["# One", "", "## Two"]);
+        assert_eq!(
+            text(&out),
+            ["One", &"━".repeat(40), "", "Two", "───"].map(String::from)
+        );
         assert_eq!(
             styles_of(&out[0], "One").and_then(|s| s.fg),
             theme::DARK.heading(1).fg
         );
         assert_eq!(
-            styles_of(&out[2], "Two").and_then(|s| s.fg),
+            styles_of(&out[3], "Two").and_then(|s| s.fg),
             theme::DARK.heading(2).fg
         );
-        // The hashes stay, dimmed: a terminal has no font size, so the level
-        // has to be readable as text.
-        assert_eq!(styles_of(&out[0], "#").and_then(|s| s.fg), Some(theme::DARK.dim));
+        // Dim, like every other piece of chrome: a rule is the pane talking
+        // about the document rather than part of it.
+        assert_eq!(
+            styles_of(&out[1], "━").and_then(|s| s.fg),
+            Some(theme::DARK.dim)
+        );
+        // The whole point of the change, stated as the assertion a tidy-up
+        // would have to argue with.
+        assert!(!text(&out).iter().any(|l| l.contains('#')));
+    }
+
+    #[test]
+    fn a_sub_section_gets_no_rule_and_the_levels_under_it_get_an_indent() {
+        // H4 and below share a colour — `Theme::heading` gives all of them
+        // `warn` — so the indent is the only thing left saying which is which,
+        // and it has to be a thing a reader who receives no hue can still see.
+        let out = render(
+            "### Three\n\n#### Four\n\n##### Five\n\n###### Six\n",
+            40,
+            Mode::Dark,
+        );
+        assert_eq!(
+            text(&out),
+            ["Three", "", "  Four", "", "    Five", "", "      Six"]
+        );
+        assert_eq!(
+            styles_of(&out[0], "Three").and_then(|s| s.fg),
+            theme::DARK.heading(3).fg
+        );
+        assert!(
+            styles_of(&out[6], "Six")
+                .unwrap()
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn a_cramped_pane_drops_the_rules_and_the_indent_before_it_drops_the_words() {
+        // CRAMPED is twelve usable columns, the same threshold the code gutter
+        // and the table grid already answer to. Under it the decoration is
+        // spending cells the words needed, so a heading falls back to what it
+        // has always been at that width: bold, coloured, and nothing else.
+        let out = render("# One\n\n###### Six\n", 11, Mode::Dark);
+        assert_eq!(text(&out), ["One", "", "Six"]);
+        assert_fits(&out, 11);
+
+        // One column more and the rule is affordable again. The indent is
+        // clamped the way `prefixes` clamps a list indent, so it is still the
+        // last thing to come back rather than the first.
+        let out = render("# One\n\n###### Six\n", 12, Mode::Dark);
+        assert_eq!(
+            text(&out),
+            ["One", &"━".repeat(12), "", "Six"].map(String::from)
+        );
+        assert_fits(&out, 12);
+    }
+
+    #[test]
+    fn a_heading_rule_stays_behind_a_quote_gutter_and_a_list_marker() {
+        // `prefixes` consumes the pending list marker, so the rule has to come
+        // out of the same call the heading's own text did — and sit behind the
+        // *continuation* prefix, which is where that text starts.
+        let out = render("> # Quoted\n", 20, Mode::Dark);
+        assert_eq!(
+            text(&out),
+            ["▏ Quoted".to_string(), format!("▏ {}", "━".repeat(18))]
+        );
+        assert_fits(&out, 20);
+
+        // An H2's rule is the width of the heading, not of the pane, so inside
+        // a list item it stops where the words did.
+        let out = render("- ## Head\n", 20, Mode::Dark);
+        assert_eq!(text(&out), ["• Head", "  ────"]);
+        assert_fits(&out, 20);
+    }
+
+    #[test]
+    fn a_wrapped_heading_starts_its_continuation_at_its_own_column() {
+        // The hashes used to indent the continuation under the text by their
+        // own width. With nothing to hang under, a wrapped heading simply keeps
+        // its column.
+        let out = render("# alpha beta gamma\n", 12, Mode::Dark);
+        assert_eq!(
+            text(&out),
+            ["alpha beta", "gamma", &"━".repeat(12)].map(String::from)
+        );
+        assert_fits(&out, 12);
+
+        // An H4 and below keeps its indent on every row it drew: a second line
+        // that straightened up under the body text would be reading as a
+        // paragraph from there on.
+        let out = render("##### alpha beta gamma\n", 16, Mode::Dark);
+        assert_eq!(text(&out), ["    alpha beta", "    gamma"]);
+        assert_fits(&out, 16);
     }
 
     #[test]
@@ -934,6 +1309,163 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_too_long_for_the_pane_is_reduced_to_its_host() {
+        // Forty-six columns is a plausible right-hand pane, where the budget is
+        // fifteen cells. The tracker URL is forty-one of them, so the reader
+        // would pay two wrapped rows for a string they cannot click; the host
+        // still answers the question the annotation exists for, which is where
+        // this goes. `t` has the whole of it, as it always did.
+        let out = render(
+            "see [the tracker](https://github.com/o/a/issues/1?utm=x)",
+            46,
+            Mode::Dark,
+        );
+        assert_eq!(text(&out), ["see the tracker (github.com)"]);
+        assert_fits(&out, 46);
+
+        // Under budget at the same width, and kept whole. The threshold is a
+        // share of the pane rather than a fixed length, so a wide pane elides
+        // less — which is the behaviour a reader dragging the split expects.
+        let out = render("see [docs](http://x.dev)", 46, Mode::Dark);
+        assert_eq!(text(&out), ["see docs (http://x.dev)"]);
+        let out = render("see [docs](http://x.dev)", 24, Mode::Dark);
+        assert_eq!(text(&out), ["see docs (x.dev)"]);
+    }
+
+    #[test]
+    fn a_relative_destination_is_kept_whole_however_long_it_is() {
+        // A path in the repository is not an address, it *is* the information —
+        // the thing the reader would open next — and there is no host under it
+        // to fall back to. Both of these are over budget at this width and both
+        // survive intact; only a URL with an authority can lose anything.
+        let out = render(
+            "[the plan](./plan.md), [why](#invariants), [mail](mailto:a@b.dev)",
+            24,
+            Mode::Dark,
+        );
+        let joined = text(&out).join(" ");
+        for kept in ["(./plan.md)", "(#invariants)", "(mailto:a@b.dev)"] {
+            assert!(joined.contains(kept), "{joined:?} lost {kept}");
+        }
+        assert_fits(&out, 24);
+    }
+
+    #[test]
+    fn front_matter_becomes_a_header_of_keys_and_values() {
+        // Still not parsed as a thematic break, which is what this test was
+        // originally written to catch. What changed is what it is parsed *as*:
+        // a dim block behind a `│ ` gutter was the loudest thing on every
+        // agent-written plan before the reader reached a word of the plan, and
+        // a gutter is a claim that the lines behind it are source.
+        let out = render(
+            "---\ntitle: The Plan\nstatus: draft\n---\n\n# Body\n",
+            40,
+            Mode::Dark,
+        );
+        assert_eq!(
+            text(&out),
+            [
+                "title: The Plan",
+                "status: draft",
+                "",
+                "Body",
+                &"━".repeat(40)
+            ]
+            .map(String::from)
+        );
+
+        // Key bold, value not; both dim, because all of it is still metadata
+        // about the document rather than a sentence of it.
+        let key = styles_of(&out[0], "title:").expect("the key is one span");
+        assert_eq!(key.fg, Some(theme::DARK.dim));
+        assert!(key.add_modifier.contains(Modifier::BOLD));
+        let value = styles_of(&out[0], "Plan").expect("the value is drawn");
+        assert_eq!(value.fg, Some(theme::DARK.dim));
+        assert!(!value.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn front_matter_that_is_not_flat_pairs_keeps_the_block_it_had() {
+        // The rule `mermaid` states, applied to metadata: a nested map drawn as
+        // if it were flat has quietly lost the nesting and the reader cannot
+        // tell, which is worse than not drawing it. So one line this cannot
+        // render faithfully declines the whole block back to the dim source.
+        let out = render(
+            "---\ntitle: x\ntags:\n  - a\n  - b\n---\n\n# Body\n",
+            40,
+            Mode::Dark,
+        );
+        assert_eq!(
+            text(&out),
+            [
+                "│ title: x",
+                "│ tags:",
+                "│   - a",
+                "│   - b",
+                "",
+                "Body",
+                &"━".repeat(40),
+            ]
+            .map(String::from)
+        );
+
+        // A key with nothing after it is a map, a list or a null waiting on the
+        // next line, and none of the three has a value this could draw.
+        assert_eq!(
+            text(&render("---\nnotes:\n---\n", 40, Mode::Dark)),
+            ["│ notes:"]
+        );
+        // A comment is the author talking rather than a datum, and reformatting
+        // it is not on offer.
+        assert_eq!(
+            text(&render(
+                "---\n# owned by nobody\nk: v\n---\n",
+                40,
+                Mode::Dark
+            )),
+            ["│ # owned by nobody", "│ k: v"]
+        );
+    }
+
+    #[test]
+    fn a_front_matter_key_is_clipped_rather_than_allowed_to_overflow() {
+        // A wrap *prefix* is the one thing `wrap_spans` will let run past the
+        // pane, and a front-matter key is a prefix. The same trade, and the
+        // same `clip_label`, the narrow-table records make.
+        let out = render(
+            "---\nimplementation_strategy: two passes\n---\n",
+            18,
+            Mode::Dark,
+        );
+        assert_eq!(text(&out), ["implementation_s: ", "  two passes"]);
+        assert_fits(&out, 18);
+    }
+
+    #[test]
+    fn an_image_becomes_a_glyph_and_its_alt_text() {
+        // The brackets were three cells of punctuation announcing what one
+        // glyph now says, and the alt text is the whole of what a terminal has
+        // of the picture, so it is what is left standing. The destination is
+        // not drawn at all: unlike a link there is nothing the reader could do
+        // with it, and `t` has it.
+        let out = render("![the pane at rest](docs/pane.png)", 40, Mode::Dark);
+        assert_eq!(text(&out), ["▨ the pane at rest"]);
+        assert_eq!(
+            styles_of(&out[0], "▨").and_then(|s| s.fg),
+            Some(theme::DARK.dim)
+        );
+        assert_eq!(
+            styles_of(&out[0], "pane").and_then(|s| s.fg),
+            Some(theme::DARK.dim)
+        );
+
+        // No alt text is the common case in an agent-written plan, and the
+        // glyph alone still says a picture was here. The trailing space goes
+        // with the wrap, which drops a space nothing follows.
+        assert_eq!(text(&render("![](x.png)", 40, Mode::Dark)), ["▨"]);
+    }
+
+    #[test]
     fn a_table_is_aligned_when_it_fits_and_honours_the_alignment_row() {
         let out = render("| a | bb |\n| --- | ---: |\n| 1 | 2 |\n", 40, Mode::Dark);
         assert_eq!(text(&out), ["a    │   bb", "─────┼─────", "1    │    2"]);
@@ -960,12 +1492,6 @@ mod tests {
     }
 
     #[test]
-    fn front_matter_is_shown_dimmed_rather_than_parsed_as_a_rule() {
-        let out = render("---\ntitle: x\n---\n\n# Body\n", 40, Mode::Dark);
-        assert_eq!(text(&out), ["│ title: x", "", "# Body"]);
-    }
-
-    #[test]
     fn an_empty_document_renders_to_nothing_rather_than_a_blank_page() {
         assert!(render("", 40, Mode::Dark).is_empty());
         assert!(render("   \n\n  \n", 40, Mode::Dark).is_empty());
@@ -979,12 +1505,30 @@ mod tests {
     }
 
     const KITCHEN_SINK: &str = "\
+---
+title: the sink
+status: draft
+---
+
 # Heading here
 
+## Second level
+
+### Third level
+
+###### Sixth level
+
+![the pane at rest](docs/pane.png)
+
+see [the tracker](https://github.com/o/a/issues/1?utm=x) and [the plan](./plan.md)
+
 > quoted text that runs on
+>
+> > ## a heading two quotes deep
 
 - item one
   - nested item
+  - ## a heading inside a list
 
 | a | b |
 | --- | --- |
@@ -1005,10 +1549,43 @@ tail";
     #[test]
     fn nothing_overflows_a_narrow_pane() {
         // Eight columns is where the last decoration gives up. Everything from
-        // there to a plausible right pane must fit exactly.
-        for width in 8..=48 {
+        // there to a full-window pane must fit exactly.
+        //
+        // The heading rules, the H4 indent, the front-matter header and an
+        // elided host all add cells to a row *after* its words were measured,
+        // which is the single way a renderer that pre-wraps gets a width wrong.
+        // So the sweep runs over every one of them at once, and the fixture
+        // above carries one of each: the widths a split pane actually lands on
+        // — ten, twenty, forty, eighty — are all inside it, and the columns
+        // either side of them are for the arithmetic.
+        for width in 8..=80 {
             assert_fits(&render(KITCHEN_SINK, width, Mode::Dark), width);
         }
+    }
+
+    #[test]
+    fn a_heading_in_a_pathological_position_still_fits_and_still_returns() {
+        // Three quotes inside a list item is four prefixes deep before a word
+        // is drawn, which is where the rule arithmetic runs out of pane first:
+        // `avail` reaches zero long before the width does, and a rule sized off
+        // a subtraction that went negative is the overflow this guards.
+        let md = "- item\n\n  > > > # Buried\n  > > >\n  > > > ## Also buried\n";
+        for width in 1..=48 {
+            let out = render(md, width, Mode::Dark);
+            assert!(!out.is_empty(), "width {width} rendered nothing");
+            // Below eight nothing fits by construction — the quote gutters
+            // alone are wider than the pane — and ratatui clips. See
+            // `absurd_widths_produce_something_rather_than_a_panic`.
+            if width >= 8 {
+                assert_fits(&out, width);
+            }
+        }
+        // A heading with no room for anything at all, which is the width the
+        // `clamp` on an H2's rule would panic at if `roomy` ever stopped
+        // guarding it.
+        assert!(!render("# x", 3, Mode::Dark).is_empty());
+        assert!(!render("###### deep", 1, Mode::Dark).is_empty());
+        assert!(!render("---\nk: v\n---\n", 1, Mode::Dark).is_empty());
     }
 
     #[test]
