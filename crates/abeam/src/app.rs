@@ -4192,20 +4192,41 @@ mod tests {
         {
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Both halves of that wait get their own assertion, so a deadline that
+        // expired says which child it was still waiting on rather than failing
+        // further down for a reason that has nothing to do with wakers.
         assert!(fx.app.agents[0].pane.has_exited(), "the first child stayed");
+        assert!(
+            fx.app.agents[1].pane.bracketed_paste(),
+            "the second child never spoke, so it was never really up"
+        );
 
         let (tx, rx) = mpsc::sync_channel::<Wake>(64);
         fx.app.arm_wakers(&tx);
-        // Everything the startup produced, off the channel, and then a pause
-        // long enough to prove nothing else is ringing on its own. Without that
-        // second half a channel still trickling would answer this test's
-        // question for it, and the answer would be yes whatever was armed.
-        std::thread::sleep(Duration::from_millis(200));
-        while rx.try_recv().is_ok() {}
-        std::thread::sleep(Duration::from_millis(200));
+
+        // **Drained until the channel has *stayed* empty, not until a fixed
+        // pause has elapsed.** What this establishes is that the ring further
+        // down is the one this test asked for, and a child still writing the
+        // prompt it draws after its file would answer that question for it —
+        // on a loaded machine, at whatever moment the machine chose. So the
+        // quiet is waited for rather than assumed, and only then asserted.
+        let settled = Instant::now() + Duration::from_secs(20);
+        let mut last_heard = Instant::now();
+        while Instant::now() < settled {
+            let mut heard = false;
+            while rx.try_recv().is_ok() {
+                heard = true;
+            }
+            if heard {
+                last_heard = Instant::now();
+            } else if last_heard.elapsed() >= Duration::from_millis(300) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             rx.try_recv().is_err(),
-            "both children were meant to be quiet by now"
+            "the children never went quiet, so nothing below could say what rang"
         );
 
         fx.app.agents[1]
@@ -4246,22 +4267,30 @@ mod tests {
             "nothing has asked yet, so nothing can know yet"
         );
 
-        // Both children leave on their own; the wait is for the operating
-        // system rather than for abeam, which is why it is a deadline and not a
-        // fixed pause.
+        // **Both children, and the `&&` is the whole of why this test is not
+        // flaky.** They are two processes leaving on their own schedule, so
+        // stopping the moment *one* of them has gone and then asserting about
+        // the other is a coin toss under a loaded machine — and the coin lands
+        // on an assertion accusing `reap` of skipping a pane it had polled
+        // perfectly well and simply had nothing to report about yet. A test
+        // that names the wrong culprit costs more than no test.
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !fx.app.agents[1].pane.has_exited() && Instant::now() < deadline {
+        while !(fx.app.agents[0].pane.has_exited() && fx.app.agents[1].pane.has_exited())
+            && Instant::now() < deadline
+        {
             fx.app.reap().expect("try_wait on a child that exists");
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        // The assertion that carries the meaning: index 1 is the one nothing
+        // but the word *every* reaches.
         assert!(
             fx.app.agents[1].pane.has_exited(),
             "an agent that is neither current nor the session's was never reaped"
         );
         assert!(
             fx.app.agents[0].pane.has_exited(),
-            "and the session's agent was skipped on the way past it"
+            "and the session's own was not skipped"
         );
     }
 
