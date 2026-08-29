@@ -151,8 +151,34 @@ pub enum Readiness {
 }
 
 impl Readiness {
+    /// Whether this is a permission to type at the agent.
+    ///
+    /// **The one gate, and an exhaustive `match` rather than `self == Idle`,
+    /// which is the whole of what makes it a mechanism.** Adding a variant to
+    /// this enum is a change to what abeam might type into; written as an
+    /// equality the new state would be silently refused — correct today, and
+    /// correct only by luck, because nothing would have made anybody *decide*.
+    /// Written as a `match` with no wildcard, `rustc` refuses the file until
+    /// somebody has said, in the one place the answer matters, whether the new
+    /// state lets a queued prompt through.
+    ///
+    /// [`Readiness::Waiting`] is the variant that proved the point. It split
+    /// out of `Unknown` so that a border could name a stopped agent, and a
+    /// reviewer had to enumerate every read of this enum by hand to establish
+    /// that it was still refused everywhere. The next split should not need
+    /// that: this is where it is answered.
+    ///
+    /// `crate::panes::queue` asks through here and nowhere else — both of its
+    /// gates, which were two spellings of the same comparison until this
+    /// existed to be the one.
     pub fn is_idle(self) -> bool {
-        self == Readiness::Idle
+        match self {
+            Readiness::Idle => true,
+            // Spelled out rather than left to a `_`, for the reason the arms in
+            // [`Session::readiness`] are: a wildcard here would let a fifth
+            // variant compile, which is exactly what this function is for.
+            Readiness::Busy | Readiness::Waiting | Readiness::Unknown => false,
+        }
     }
 }
 

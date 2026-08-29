@@ -584,7 +584,11 @@ impl QueuePane {
         // Conditions 2 and 3. They govern both kinds of due: a by-hand ask is
         // attended, not exempt, and the agent can go busy between the keystroke
         // that asked for it and the pass that would deliver it.
-        let safe = self.readiness == Readiness::Idle && !self.draft_open;
+        // `is_idle` and not `== Readiness::Idle`, which is what this line used
+        // to be. The two spellings were the same question asked twice, and only
+        // one of them refuses to compile when the vocabulary grows — see
+        // [`Readiness::is_idle`], which is now the only gate in the program.
+        let safe = self.readiness.is_idle() && !self.draft_open;
         let armed = self.armed;
         let next = self.next_send();
         let mut changed = false;
@@ -1695,12 +1699,16 @@ mod tests {
 
     #[test]
     fn nothing_is_sent_while_the_agent_is_busy_or_the_queue_is_disarmed() {
+        // **This list is coverage, not the mechanism, and saying otherwise was
+        // an overclaim worth correcting.** A `for` over closures cannot be made
+        // to fail to compile when `Readiness` grows a variant; somebody has to
+        // remember. What *is* mechanical lives in production, where it belongs:
+        // [`Readiness::is_idle`] is an exhaustive `match` and both of this
+        // pane's gates ask through it, so a fifth variant does not compile
+        // until its answer has been stated at the gate itself. These lines
+        // exercise that answer; they do not enforce it.
         for break_it in [
             |p: &mut QueuePane| p.readiness = Readiness::Busy,
-            // Every state that is not `Idle`, so that a variant added to
-            // `Readiness` for a border's sake has to be added here too before
-            // this test will pass — which is the mechanical half of "splitting
-            // a refusal is not widening an acceptance".
             |p: &mut QueuePane| p.readiness = Readiness::Waiting,
             |p: &mut QueuePane| p.readiness = Readiness::Unknown,
             |p: &mut QueuePane| p.armed = false,
@@ -1970,7 +1978,19 @@ mod tests {
 
         // Whole, beside every answer the readiness line can give — the warning
         // that clips in half is the one nobody reads.
-        for readiness in [Readiness::Idle, Readiness::Busy, Readiness::Unknown] {
+        //
+        // `Waiting` is the longest of the four and was the one missing: it
+        // draws `waiting on you`, thirteen cells against `busy`'s four, and it
+        // sits between `· agent ` and whatever follows, so it is the widest
+        // line this row can produce. A sweep that omitted it proved the
+        // warning fits beside three answers and not beside the one most likely
+        // to push it off the end.
+        for readiness in [
+            Readiness::Idle,
+            Readiness::Busy,
+            Readiness::Waiting,
+            Readiness::Unknown,
+        ] {
             p.readiness = readiness;
             for armed in [false, true] {
                 p.armed = armed;

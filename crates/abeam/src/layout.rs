@@ -404,14 +404,24 @@ mod tests {
                         "{height}/{n}/{at}: the focused pane has no inside at \
                          or above the floor: {rects:?}"
                     );
-                    // ...and nobody is drawn whole while the focused pane is
-                    // not, which is the half that would let a reader type into
-                    // a title row with a readable pane beside it.
+                    // ...and nobody is drawn *whole* while the focused pane is
+                    // a title row, which is the half that would let a reader
+                    // type into nothing with a readable pane beside it.
+                    //
+                    // **Within one row, and the `+ 1` is the guarantee rather
+                    // than slack in the test.** The remainder left over when
+                    // the rows do not divide is handed to the earliest whole
+                    // panes, so a focused pane late in the list is legitimately
+                    // one row shorter than an earlier one — `n = 2, at = 1` at
+                    // 29 rows gives `[15, 14]`, and neither of those is a bug.
+                    // Asserting equality here would go red on that the moment
+                    // somebody widened the sweep, which is a test failing on
+                    // correct code and the most expensive kind.
                     for (ix, rect) in rects.iter().enumerate() {
                         assert!(
-                            ix == at || inner(*rect).height <= focused,
-                            "{height}/{n}/{at}: pane {ix} is taller than the \
-                             one with the keys: {rects:?}"
+                            ix == at || inner(*rect).height <= focused + 1,
+                            "{height}/{n}/{at}: pane {ix} is more than one row \
+                             taller than the one with the keys: {rects:?}"
                         );
                     }
                 }
