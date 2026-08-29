@@ -19,13 +19,24 @@
 //! always exactly what will be copied — which is the property worth keeping,
 //! and the only one a rule this simple can promise.
 //!
-//! Rows rather than cells because the six panes on the right are six different
-//! kinds of thing. The shell is a terminal grid; the reader is wrapped markdown
-//! with quote gutters and bullet indents; git is a column-aligned status list.
-//! A cell-precise selection means something different in each of them, and
-//! three of the six would need it drawn in a coordinate space they do not have.
-//! A row means the same thing in all six, and a row is what somebody copying a
-//! path, a hash, a stack trace or a test failure is after.
+//! Rows rather than cells because the seven panes on the right are seven
+//! different kinds of thing. The shell is a terminal grid; the reader is
+//! wrapped markdown with quote gutters and bullet indents; git is a
+//! column-aligned status list. A cell-precise selection means something
+//! different in each of them, and three of the seven — git, the queue and the
+//! diagnostics view — would need it drawn in a coordinate space they do not
+//! have. Those three are lists of *records* rather than text: a repository's
+//! changed files, the work lined up for the agent, the counters behind the
+//! pty. "Column 12 of row 3" names a position in a document and names nothing
+//! at all in a record, which is why git is last in the list above — it is the
+//! example that introduces the kind. A row means the same thing in all seven,
+//! and a row is what somebody copying a path, a hash, a stack trace or a test
+//! failure is after.
+//!
+//! The scratch pad is not a fourth, which is worth saying because it is the
+//! newest pane and looks like a candidate. Its edit form has a real coordinate
+//! space and has to — the caret is placed out of it — and its rendering is text
+//! like the reader's. It is on the text side of the line this paragraph draws.
 //!
 //! ## Why the vocabulary is the scroll vocabulary
 //!
@@ -37,7 +48,7 @@
 //!
 //! The caret opens on the **first** row rather than the last, which costs the
 //! shell case one keystroke — output collects at the bottom of a terminal, so
-//! `G` is usually the first thing pressed there. It is one rule for six panes
+//! `G` is usually the first thing pressed there. It is one rule for seven panes
 //! instead of a rule per pane: the reader, git, the queue and the diagnostics
 //! view all put their first line of content at the top, and a caret that landed
 //! somewhere different depending on which view was up is a caret nobody can

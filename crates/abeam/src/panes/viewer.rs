@@ -169,7 +169,7 @@ pub(crate) mod markdown;
 mod mermaid;
 mod outline;
 mod search;
-mod source;
+pub(crate) mod source;
 pub(crate) mod theme;
 
 use std::path::{Path, PathBuf};
@@ -6161,14 +6161,16 @@ mod tests {
         // through" needs a carve-out naming this view and not the other three.
         assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::Yes);
         assert!(matches!(pane.mode, Mode::Doc));
-        // The exhaustive list itself, so that adding a fifth deviation to the
-        // code without adding it to the table fails here.
+        // The exhaustive list itself, so that adding a sixth deviation to the
+        // code without adding it to the table fails here. It has caught one
+        // since it was written: the scratch pad keeps `q` while it is being
+        // typed into, exactly as the ask does, and the row did not say so.
         let (_, said) = crate::keys::HELP
             .iter()
             .find(|(k, _)| *k == "Esc or q")
             .expect("the row that promises the way out");
         assert!(said.contains("a shell and a find box keep both"), "{said}");
-        assert!(said.contains("the ask keeps q"), "{said}");
+        assert!(said.contains("ask and pad keep q"), "{said}");
         assert!(said.contains("worktrees keep Esc"), "{said}");
         assert!(!said.contains("outline"), "the outline is not a deviation");
     }

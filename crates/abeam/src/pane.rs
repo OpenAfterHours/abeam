@@ -188,7 +188,7 @@ pub trait Pane {
     /// The text on rows `first..=last`, if this pane can say it better than the
     /// screen can.
     ///
-    /// `None` — the default, and the right answer for five of the six views —
+    /// `None` — the default, and the right answer for six of the seven views —
     /// means "what was drawn is what there is", and the shell reads the rows
     /// back out of the frame it drew. See `crate::select` for why a selection
     /// here is whole rows of the *pane* rather than a range in the content.

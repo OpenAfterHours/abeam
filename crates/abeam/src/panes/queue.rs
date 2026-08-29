@@ -614,8 +614,8 @@ impl QueuePane {
     /// The scroll vocabulary comes first and keeps everything it claims,
     /// `space` included. Arming wanted that key — it is the switch that decides
     /// whether abeam types at the agent unasked, and it is the biggest key on
-    /// the board — and it does not get it: `space` pages in three other panes
-    /// and is promised by name in the F1 overlay, so a fourth pane where it
+    /// the board — and it does not get it: `space` pages in four other panes
+    /// and is promised by name in the F1 overlay, so a fifth pane where it
     /// toggles a mode is exactly the collision this program rebinds keys to
     /// avoid. Arming is `a` instead, which is free because `i` carries opening
     /// the composer on its own.
@@ -2462,8 +2462,8 @@ mod tests {
 
         // The scroll vocabulary of `crate::scroll`, which is one table for the
         // whole program — space and b included. Arming wanted space and did not
-        // get it, because a key that pages in three panes and toggles a mode in
-        // the fourth is a key nobody can learn.
+        // get it, because a key that pages in four panes and toggles a mode in
+        // the fifth is a key nobody can learn.
         assert_eq!(p.handle_key(key(KeyCode::Char('j'))).unwrap(), Handled::Yes);
         assert_eq!(p.scroll.offset, 1);
         assert_eq!(p.handle_key(key(KeyCode::Char(' '))).unwrap(), Handled::Yes);

@@ -72,10 +72,10 @@ const RECENT_COMMITS: &str = "6";
 
 /// Which of the two lists this pane is showing.
 ///
-/// A mode rather than a fifth right-hand view, and `crate::keys` is where the
-/// argument for that lives: `Alt+G`, `Alt+E`, `Alt+S` and `F8` are a set of
-/// four workspace views, and a fifth spelled `F6` would be a key nobody groups
-/// with the other three. The list of worktrees is not a peer of those — it is
+/// A mode rather than another right-hand view, and `crate::keys` is where the
+/// argument for that lives: `Alt+G`, `Alt+E`, `Alt+S`, `F8` and `F9` are the
+/// workspace views, and a further one spelled `F6` would be a key nobody
+/// groups with them. The list of worktrees is not a peer of those — it is
 /// how you point *this* pane somewhere else — so it is reached by a pane-local
 /// key, which is exempt from the global invariant because it is only ever
 /// delivered while the right pane has focus and this view is up.
