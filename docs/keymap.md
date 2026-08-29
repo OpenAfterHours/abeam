@@ -155,6 +155,16 @@ that is only up while the right pane has focus, and the exemption is
 direction, deliberately: a modified F-key is a key abeam knows nothing about and
 therefore the agent's, which `keys.rs` says in a comment about `Ctrl+F12`.
 
+One consequence is worth disclosing rather than leaving to be discovered.
+**While the right pane is hidden — `Alt+Z`, or a window narrower than
+`MIN_SPLIT_COLS` — every `F4` cycles, including the first.** Focus cannot be on
+the right when there is no right pane, so abeam holds it on the left, and a
+press meaning "back to the agent" is a press that already has the keys. What
+stops that silently handing your next sentence to another session is the agent
+pane's own border, which reads `claude · 2/3` whenever there is more than one
+agent. The position is the disclosure, and it is drawn for this reason rather
+than as decoration.
+
 **"Focus unchanged" holds in both directions.** The four rows marked so —
 `Alt+G`, `Alt+E`, `F8` and `F2` — neither take focus nor hand it back:
 `Alt+E` pressed while a shell has your keys leaves them on the right pane, now

@@ -137,6 +137,17 @@ move to a worktree, and the new agent starts there. `Row.agent_here: bool`
 becomes a count or a list of pane ids, and the list stops being able to say
 "the" agent, which it should never have been able to say.
 
+**That count is not a phase-4 nicety, and phase 2 pulled it forward on being
+told so.** It is the load-bearing half of the argument for putting the key in
+this list rather than anywhere else: the list is where you can already see who
+is working in which checkout, so the gesture that fixes an empty worktree is
+next to the evidence that it is empty. A row that went on reading empty after
+`a` had started something takes that away — and takes with it the reason the key
+needs no confirmation, since what a confirmation buys is that the second press
+is an informed one. It is `agents_here: usize` now. The list of pane ids is
+still phase 4's, and it arrives with the queue's per-pane targeting, which is
+what first needs to *name* a pane rather than count them.
+
 ## What `main` has to hand over
 
 `main` owns the spawn today. It resolves the command line, builds the one
@@ -262,6 +273,31 @@ If the target has gone, the item disarms with a note. It is not retargeted.
 obvious neighbour it should probably not gain yet: "dispatch, then open it in a
 pane" is a real feature and a different one.
 
+**Phase 2 could not defer all of this, and what it did instead is worth writing
+down because it is not the interim anyone would have guessed.** The failure
+above arrives the moment a second pane exists, by two routes with no new feature
+between them: `F4` during the three-second countdown, and `a` on another
+worktree while an item is armed. The obvious interim — stand the queue down
+whenever the cursor is elsewhere — makes a feature stop working for a reason
+nobody can see. So the queue is aimed at **`agents[0]`, the session's agent,
+outright**: not the pane with the keys, and not a target the item carries.
+
+That is byte-identical while there is one agent, and it is defensible on its own
+terms rather than as a placeholder — a `Send` continues *this session's*
+conversation, and the session is the agent whose exit is abeam's exit. The rule
+it makes explicit is the one the bug broke: **the queue's three inputs must name
+one agent** — the readiness it reads, the `draft_open` it gates on, and the pty
+it types into. It also deleted work rather than adding it, because the
+per-agent draft flag no longer has to be kept in step with the queue's copy as
+the cursor moves; that syncing was itself the mechanism of a second bug.
+
+The cost is one sentence long and is a labelling problem: with one agent drawn
+at a time, the countdown can appear in a border describing a pane the send is
+not going to. The stack fixes it by drawing `agents[0]`'s border at the same
+time as everybody else's. Everything above this paragraph still stands as the
+end state; what changed is that phase 2 is no longer sitting on a live
+misdelivery while it waits.
+
 ## The exit contract
 
 Today the agent leaving ends abeam, `main` prints its last screen to the primary
@@ -327,8 +363,11 @@ pass.
 3. **The stack.** `layout::stack`, the rows floor, collapsed title rows. This is
    the part the request actually asked for, and it lands on a foundation that
    two phases of tests have already been run against.
-4. **The rest of the contract.** Queue targeting, the exit rule, `agent_here`
-   becoming per-pane, `docs/keymap.md` and `docs/status.md` updated.
+4. **The rest of the contract.** Queue targeting, the exit rule,
+   `docs/keymap.md` and `docs/status.md` updated. The occupancy count left this
+   list during phase 2 — see above; a key whose only effect is invisible is a
+   key nobody presses twice, and that was not a cost phase 2 could book and
+   defer.
 
 Each phase ships something on its own, and phase 1 ships nothing, which is the
 point of it.

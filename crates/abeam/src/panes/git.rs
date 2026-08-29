@@ -570,11 +570,28 @@ impl GitPane {
             // difference is the whole distinction between the two keys. A
             // switch is *for* looking at the other worktree's git, so the list
             // has done its job and gets out of the way. Starting an agent
-            // changes nothing about what this pane is showing — the occupancy
-            // column is the only row that moves — and the ordinary next thing
-            // to do is start another one somewhere else. Closing the list to
-            // announce a child that does not appear in it would cost the
-            // reader their place for nothing.
+            // leaves this pane on the same worktree — only the row's own count
+            // changes — and the ordinary next thing to do is start another one
+            // somewhere else.
+            //
+            // **It asks nothing first, where `Alt+Q` asks twice and the
+            // queue's `d` and `r` ask once, and the difference is what the
+            // key does rather than what it costs.** Those three destroy: a
+            // session, a queued item, a whole queue, and none of them can be
+            // got back by pressing anything. This one creates. A mistaken `a`
+            // leaves a process you can see and stop; a mistaken `Alt+Q` leaves
+            // nothing, and a confirmation that fires where nothing is at stake
+            // is a confirmation nobody reads where something is.
+            //
+            // What replaces the confirmation is that the gesture reports
+            // itself, immediately and where the reader is already looking: the
+            // row under the cursor gains an agent in its own occupancy column
+            // on the frame the key was pressed, and the pane in the left column
+            // says `2/3`. So a second press is an informed one rather than a
+            // blind one, which is the whole of what asking twice buys. The
+            // gesture that will need a confirmation is the one that *closes* a
+            // pane, and `crate::app::App::close_agent` is where that is
+            // written down.
             KeyCode::Char('a') => match self.worktrees.get(self.wt_sel) {
                 Some(row) => {
                     self.agent = Some(row.root.clone());
@@ -977,9 +994,20 @@ fn worktree_lines(rows: &[workspace::Row], width: u16, sel: usize) -> Vec<Line<'
 /// pane's own two-second timer instead — and a pane that is merely slow looks
 /// exactly like a pane that is broken unless something admits which it is.
 fn worktree_note(row: &workspace::Row) -> String {
+    // One agent keeps the word it has always had and says nothing about a
+    // count, because in a session with one agent there is no count to read and
+    // the row should look exactly as it always did. Two is where the number
+    // starts earning its columns — it is the answer to "did that `a` do
+    // anything", asked by pressing `a` again.
+    let agents = match row.agents_here {
+        0 => String::new(),
+        1 => "agent".to_string(),
+        n => format!("{n} agents"),
+    };
+
     let mut parts: Vec<&str> = Vec::new();
-    if row.agent_here {
-        parts.push("agent");
+    if !agents.is_empty() {
+        parts.push(&agents);
     }
     if let Some(who) = &row.occupant {
         parts.push(who);
@@ -2437,7 +2465,7 @@ mod tests {
             label: label.to_string(),
             root: PathBuf::from(root),
             here,
-            agent_here: false,
+            agents_here: 0,
             occupant: None,
             watched: true,
         }
@@ -2847,7 +2875,7 @@ mod tests {
     fn every_row_of_the_worktree_list_fits_the_pane_it_is_drawn_in() {
         let rows = vec![
             workspace::Row {
-                agent_here: true,
+                agents_here: 1,
                 ..a_row("hand-the-command-line-to-the-agent", ONE, true)
             },
             workspace::Row {

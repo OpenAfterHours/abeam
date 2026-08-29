@@ -318,6 +318,30 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // declares that pair as word-motion in Copilot CLI's command reference,
         // so it is the agent's key and not abeam's; the module doc has the
         // argument, and `the_agents_alt_bindings_are_left_alone` pins it.
+        //
+        // **`F4` has since acquired a second meaning, and it is the exception
+        // the paragraph above has to admit rather than a counter-example
+        // somebody will find later.** Pressed while the keys are already on the
+        // left it moves along the hosted agents — see `crate::app`'s
+        // `Action::FocusLeft` arm — which is a *cycle*, on a key whose whole
+        // defence was that it is not one.
+        //
+        // What keeps the defence standing is that the two meanings are not the
+        // same question. The first press answers "give me the keys", is a
+        // direct key still, and is the only meaning in a session with one
+        // agent — which is most of them. The second answers "the next one", and
+        // by then the reader is not glancing: they have the keyboard, they are
+        // looking at the pane it belongs to, and its border says `2/3`.
+        //
+        // The state to know before pressing is therefore on screen, which is
+        // the condition the paragraph above actually imposes — and it is on
+        // screen *because* of this key rather than as a coincidence, which is
+        // why `crate::app::App::agent_tag` is not optional chrome. The case
+        // that pays for it is zoom: with the right pane hidden `App::ui` holds
+        // focus on the left, so every press cycles, including the one somebody
+        // pressed meaning "back to the agent". Without the position in the
+        // border that press would silently hand their next sentence to another
+        // session.
         KeyCode::F(4) if bare => Some(Action::FocusLeft),
         KeyCode::F(5) if bare => Some(Action::FocusRight),
         // F6 for the ask, and an F-key rather than an `Alt` letter for a

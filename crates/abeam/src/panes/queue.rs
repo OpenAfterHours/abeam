@@ -7,9 +7,26 @@
 //!
 //! ## The two modes, and why they are one pane
 //!
-//! - [`Mode::Send`] — typed into the session in the left pane the moment it
-//!   goes idle. It *continues the conversation*: everything above it is still
-//!   context. There is one left pane, so these are strictly sequential.
+//! - [`Mode::Send`] — typed into the session abeam was started with, the moment
+//!   it goes idle. It *continues the conversation*: everything above it is
+//!   still context, which is what makes these strictly sequential — one
+//!   conversation, one turn at a time.
+//!
+//!   **"The session abeam was started with" is `agents[0]`, and it used to be
+//!   possible to write "the left pane" and mean the same thing.** It is not any
+//!   more: `crate::app` can hold several hosted agents and `F4` moves between
+//!   them, so an item enqueued while looking at one pane and released while
+//!   looking at another had two candidate destinations. This pane is aimed at
+//!   the first — `crate::app::App::pump_queue` carries the argument, and the
+//!   short version is that a `Send` continues *this session's* conversation and
+//!   the session is the agent whose exit is abeam's exit. Sequential is
+//!   therefore still true, and is a fact about one conversation rather than
+//!   about how many panes there are.
+//!
+//!   What is not yet expressible is a `Send` aimed at some other pane. That
+//!   wants an item that carries its target — a pane id, decided when the item
+//!   is enqueued rather than when it fires — and it is a change to all four
+//!   conditions below, because two of them name an agent.
 //! - [`Mode::Dispatch`] — started as its own background agent
 //!   (`crate::dispatch`), with none of that context, running beside you. These
 //!   are parallel, and there can be many.

@@ -50,6 +50,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
+// A border is measured in cells, not bytes: `str::len` would size a title
+// holding a `·` for three columns it does not occupy, and the one place that
+// arithmetic decides anything is the room left for a refusal.
+use unicode_width::UnicodeWidthStr;
 
 use crate::agentstate::Probe;
 use crate::ask::{self, AskSession};
@@ -123,6 +127,22 @@ const ROSTER_EVERY: Duration = Duration::from_secs(3);
 /// `crate::workspace::is_evidence` is where both directions are written out,
 /// because that is the function a reader is standing in when it matters.
 const WORKTREES_EVERY: Duration = Duration::from_secs(10);
+
+/// What joins two parts of a border title: `" · "`, three cells.
+///
+/// A number rather than the string, because what it is used for is arithmetic —
+/// [`App::ui`] has to know what a part *will* cost before it decides how much
+/// room is left for the one that can be shortened.
+const SEPARATOR: usize = 3;
+
+/// The shortest a refusal in the left title may be elided to before it is
+/// replaced outright.
+///
+/// `crate::launch`'s answer ends `` ` was not found on PATH.``, which is
+/// twenty-four cells, and an elision is only worth drawing if a few characters
+/// of the file name survive in front of it. Below this the sentence has stopped
+/// being a sentence and a fixed short one says more. See [`App::ui`].
+const REFUSAL_FLOOR: usize = 30;
 
 /// How long a command handed from the ask pane to the shell waits for a shell
 /// that can take it.
@@ -441,7 +461,7 @@ struct Agent {
     /// them in terms of the other would make that coincidence into a rule, and
     /// the first agent started in a worktree would then re-root the watcher.
     ///
-    /// The probe reads it, and so does the border — [`App::agent_where`] names
+    /// The probe reads it, and so does the border — [`App::agent_tag`] names
     /// it on the pane, which is what turns the asymmetry into a label rather
     /// than an apology. The reader still missing is the worktree list, which
     /// wants *every* agent's root and cannot have them until
@@ -463,27 +483,34 @@ struct Agent {
     /// would be spliced into the middle of a half-written message, which is the
     /// failure nobody would think to look for.
     ///
-    /// **`QueuePane` keeps a second copy of this and there is now one of these
-    /// per agent, which is the mismatch a cycling key turns into the bug
-    /// above.** The queue's copy is what its own send gate reads; this one is
-    /// what maintains it. They cannot disagree today, because every write moves
-    /// both halves in the same statement and there is one agent to write about.
-    /// The first key that moves [`App::at_agent`] ends that: with the keys at
-    /// agent 1, [`App::poll_readiness`] reads *its* record, sees it go busy,
-    /// and clears the queue's single flag — while agent 0 is still sitting on
-    /// an unsubmitted sentence nobody has withdrawn. One idle pass at agent 0
-    /// after that and the queue types a prompt into the middle of it, which is
-    /// precisely the splice this pair of flags exists to prevent, arrived at by
-    /// two mechanisms that were each individually correct.
+    /// **`QueuePane` keeps a second copy of this, and only `agents[0]`'s is in
+    /// step with it.** The queue's copy is what its own send gate reads, and
+    /// the queue is aimed at the session's agent outright — see
+    /// [`App::pump_queue`], where the argument is — so
+    /// [`App::note_left_key`] writes the queue's copy on a keystroke at
+    /// `agents[0]` and not on one anywhere else, and [`App::poll_readiness`]
+    /// clears `agents[0]`'s and the queue's together.
     ///
-    /// So the gate has to learn which agent it is gating before the cursor can
-    /// move — a `set_draft_open` that names a pane, or a queue that asks rather
-    /// than being told. Not a phase-1 problem and not a phase-1 fix: with one
-    /// agent the two flags are one flag, and widening the queue's interface for
-    /// a caller that does not exist would be a second thing to keep true.
+    /// **So this field is maintained for every agent and consulted for one, and
+    /// the difference is worth being exact about.** For `agents[0]` it is
+    /// complete: set by typing, cleared by that agent being seen busy. For a
+    /// pane opened later it is set-only — nothing clears it, because nothing
+    /// polls that pane's record — so it says "something was typed here at some
+    /// point" rather than "there is a draft here now". Nothing reads it in that
+    /// state, which is why an incomplete flag is not a bug today; it becomes
+    /// one the moment a `Send` item can be aimed at a pane other than the
+    /// session's, and that is the same change that makes readiness per-pane.
+    /// The two land together or neither does.
     draft_open: bool,
     /// A sent prompt is sitting in this agent's composer, waiting for the
     /// `Enter` that submits it on the next pass. See [`App::pump_queue`].
+    ///
+    /// Per agent for [`draft_open`](Self::draft_open)'s reason and, like it,
+    /// only ever *set* on `agents[0]` — the queue is the only thing that arms
+    /// one and the queue types there. A keystroke at another agent clears that
+    /// agent's, which is a no-op on a flag nothing set; a keystroke at
+    /// `agents[0]` clears the one that matters, which is the whole point of
+    /// abandoning a submit the user has typed over.
     submit_pending: bool,
     /// This child's exit, and the screen it left behind, held until abeam is
     /// actually willing to go. Normally that is immediately; with a command
@@ -634,8 +661,15 @@ struct Recipe {
 impl Recipe {
     /// The launch a new pane is spawned from: this program, interactively, with
     /// nothing on its command line.
+    ///
+    /// `resolve_at` and not `resolve`, so the path never becomes a `String` and
+    /// back. That module's own doc has the argument; the short version is that
+    /// a lossy round trip through `to_string_lossy` is a *different path*
+    /// wherever it is lossy, and this one is about to be looked up on the
+    /// filesystem — so a pane opened on a keystroke would refuse where the
+    /// session's own agent started fine.
     fn launch(&self) -> Result<crate::launch::Launch, String> {
-        crate::launch::resolve(&self.target.to_string_lossy(), &[])
+        crate::launch::resolve_at(&self.target, &[])
     }
 }
 
@@ -1263,26 +1297,21 @@ impl App {
     /// somewhere; until this existed the field held only because nothing
     /// assigned to it.
     ///
-    /// **It also carries the newly-current agent's state into the queue, and
-    /// that half is a bug fix rather than bookkeeping.** `QueuePane` keeps one
-    /// `draft_open` per session against one [`Agent::draft_open`] per agent —
-    /// see that field, which records the hazard — and this key is what makes
-    /// them disagree. The sequence needs only `a` and `F4`: type at agent 0, so
-    /// both flags are set; move to agent 1 and type there; agent 1 goes busy,
-    /// and [`poll_readiness`](Self::poll_readiness) clears *the current agent's*
-    /// flag and the queue's single copy with it; move back to agent 0, which is
-    /// idle and still holding an unsubmitted sentence that nobody withdrew. The
-    /// queue's gate now believes there is no draft anywhere, so
-    /// `take_send_request` releases and [`pump_queue`](Self::pump_queue) pastes
-    /// a prompt into the middle of what was being written. That is precisely
-    /// the splice the pair of flags exists to prevent, arrived at by two
-    /// mechanisms that were each individually correct.
+    /// **It does not touch the queue, and the version of this that did was
+    /// wrong in a way worth recording.** It pushed the newly-current agent's
+    /// draft flag and readiness across, to keep the queue's single `draft_open`
+    /// in step with the per-agent one — and in doing so aimed the *gate* at
+    /// whichever pane the cursor was on while [`pump_queue`](Self::pump_queue)
+    /// went on typing into whichever pane the cursor was on *later*. `F4`
+    /// during the countdown, or `a` on another worktree while an item was
+    /// armed, and somebody's queued prompt arrived at a session it was never
+    /// written for.
     ///
-    /// The readiness goes over in the same breath and for the same reason: it
-    /// is the other half of the gate, it is read from *this* agent's own
-    /// record, and leaving the queue holding the last agent's answer for up to
-    /// [`READINESS_EVERY`] is a quarter of a second in which a send can be
-    /// released against a pane that is busy.
+    /// The fix is not here. The queue is aimed at
+    /// [`session_agent`](Self::session_agent) outright, so its three inputs —
+    /// the readiness, the draft flag and the pty — all name `agents[0]`, this
+    /// cursor is not one of them, and there is nothing left to keep in step.
+    /// `pump_queue`'s own doc has the argument and the cost.
     ///
     /// **It does not touch the right pane. Not `at`, not `right_view`, not the
     /// reader, not a scroll position.** Somebody reaching for another agent is
@@ -1301,20 +1330,20 @@ impl App {
     /// within the left column, exactly as [`at`](Self::at) is one within the
     /// right.
     ///
+    /// **Its second caller is [`close_agent`](Self::close_agent)**, which is
+    /// what keeps the claim at the top of this doc true: removing an element is
+    /// the other way `at_agent` can stop being valid, and it repairs the cursor
+    /// by calling this rather than by assigning to the field itself.
+    ///
     /// Returns whether a frame is owed, which is `true` for any real move: the
-    /// left column is drawing a different child. The queue's two answers are
-    /// deliberately discarded — they say whether *its* pane changed, and this
-    /// pass is redrawing regardless.
+    /// left column is drawing a different child. `false` for an index it
+    /// refused *and* for the index it is already on — the two are not worth
+    /// telling apart, because neither is a frame.
     fn set_agent(&mut self, ix: usize) -> bool {
         if ix >= self.agents.len() || ix == self.at_agent {
             return false;
         }
         self.at_agent = ix;
-
-        let draft = self.current().draft_open;
-        self.queue.set_draft_open(draft);
-        let readiness = self.readiness();
-        self.queue.set_readiness(readiness);
         true
     }
 
@@ -1412,6 +1441,12 @@ impl App {
         }
         self.agents.push(agent);
 
+        // Here rather than at the caller, because the count in the occupancy
+        // column is the only thing on screen that reports this key at all and a
+        // refresh the spawn site can forget is a row that goes on saying the
+        // worktree is empty. It is also the argument for `a` needing no
+        // confirmation — see the key's own arm in `crate::panes::git`.
+        self.refresh_worktree_rows();
         self.set_agent(self.agents.len() - 1);
         true
     }
@@ -1490,7 +1525,7 @@ impl App {
         // it points into changing length.
         let keeping = self.current().id;
         self.agents.remove(ix);
-        self.at_agent = self
+        let to = self
             .agents
             .iter()
             .position(|agent| agent.id == keeping)
@@ -1499,6 +1534,14 @@ impl App {
             // so `agents[0]` is a destination here and not a panic avoided. It
             // is the one element that is always there, and it is the session's.
             .unwrap_or(0);
+        // **Through `set_agent` and not by assignment**, so that function's
+        // claim to be the only writer of `at_agent` stays a fact. It answers
+        // `false` when the cursor is already on `to`, which is the case where
+        // the agent that had the keys did not move index — and `false` there is
+        // right rather than a missed write: nothing to do, and no frame owed
+        // for the cursor, though the caller owes one for the pane that has
+        // gone.
+        self.set_agent(to);
         Ok(())
     }
 
@@ -1744,24 +1787,27 @@ impl App {
     /// a keystroke. Returns whether a frame is owed — the pane answers `false`
     /// unless the list is the mode actually on screen.
     fn refresh_worktree_rows(&mut self) -> bool {
+        // Where every hosted pane is standing, which is what puts a count in
+        // the occupancy column. Built here rather than kept as a field for the
+        // reason the vector exists at all: a pane can be opened or closed
+        // between two of these calls, and a list held anywhere else would be
+        // the previous answer.
+        let agents: Vec<&Path> = self.agents.iter().map(|agent| agent.root.as_path()).collect();
         let rows = workspace::rows(
             &self.worktrees,
             &self.roster,
-            // The root abeam was started on, and **deliberately not
-            // [`Agent::root`]**, however much the parameter's name invites it.
-            // `workspace::rows` guarantees this argument a row whatever git
-            // said, and `spaces[0]` is built from the same path — which is what
-            // makes the one workspace that is never removed always reachable
-            // from the `w` list. Handing it the *current* agent's root instead
-            // would drop that guarantee the first time the two differ, and
-            // silently: a session started in a subdirectory of the repository
-            // is one git does not name, so `spaces[0]` would simply have no row
-            // to switch back to.
-            //
-            // The honest end state is plural — every agent's root gets a row —
-            // and that is a change to `rows`' signature, which belongs with the
-            // rest of the per-pane work rather than here.
+            // The root abeam was started on, and **deliberately not any
+            // agent's**, which is why it is a separate argument from the list
+            // above rather than the first element of it. `workspace::rows`
+            // guarantees this argument a row whatever git said, and `spaces[0]`
+            // is built from the same path — which is what makes the one
+            // workspace that is never removed always reachable from the `w`
+            // list. Reading the guarantee off an agent instead would drop it
+            // the first time the two differ, and silently: a session started in
+            // a subdirectory of the repository is one git does not name, so
+            // `spaces[0]` would have no row to switch back to.
             &self.root,
+            &agents,
             &self.workspace().root,
             self.watch.as_ref().map(|_| self.root.as_path()),
         );
@@ -2089,37 +2135,19 @@ impl App {
             return false;
         }
         self.readiness_at = Instant::now();
-        let readiness = self.readiness();
 
-        // The one event that ends a draft, and the only place this flag is ever
-        // cleared. See [`note_left_key`](Self::note_left_key) for why it is this
-        // and not a keystroke: a message that was really submitted makes the
-        // agent work, and nothing else the user can press does.
-        let mut redraw = false;
-        if readiness == crate::agentstate::Readiness::Busy && self.current().draft_open {
-            self.current_mut().draft_open = false;
-            redraw |= self.queue.set_draft_open(false);
-        }
-        redraw | self.queue.set_readiness(readiness)
-    }
-
-    /// What the queue's gate should be told about the agent that has the keys.
-    ///
-    /// **Split out of [`poll_readiness`](Self::poll_readiness) because there are
-    /// now two moments at which the question is asked and only one of them is a
-    /// tick.** The other is [`set_agent`](Self::set_agent): the answer is read
-    /// from one agent's own record, so moving the cursor invalidates it
-    /// outright, and leaving the queue holding the last agent's answer until
-    /// the next poll is a quarter of a second in which a send can be released
-    /// against a pane that is busy. Two copies of these three lines is two
-    /// places for a fourth downgrade to be added to one of them.
-    fn readiness(&mut self) -> crate::agentstate::Readiness {
+        // **The session's agent, not the current one, and every read in this
+        // function names the same one.** See [`App::pump_queue`] — the queue is
+        // aimed at `agents[0]` outright, and the whole class of bug this
+        // replaced was these three inputs disagreeing about which pane they
+        // were describing.
+        //
         // The probe reads Claude's session records. A record in the same
         // repository is not evidence about a Codex, Copilot or generic program
         // hosted beside it, and mistaking its `idle` for theirs would let the
         // queue type without knowing whether the actual agent is ready.
         let mut readiness = if self.has_claude_state() {
-            self.current_mut().probe.readiness()
+            self.session_agent_mut().probe.readiness()
         } else {
             crate::agentstate::Readiness::Unknown
         };
@@ -2129,16 +2157,26 @@ impl App {
         // three-line prompt arrives as three — the second and third typed at an
         // agent already busy with the first. Every agent abeam hosts enables it,
         // so this is a floor rather than a case anyone will meet.
-        if !self.current().pane.bracketed_paste() {
+        if !self.session_agent().pane.bracketed_paste() {
             readiness = crate::agentstate::Readiness::Unknown;
         }
         // A session that has gone cannot be typed at, and its last record can
         // sit at `idle` forever — a dead agent is the most convincingly idle
         // thing there is.
-        if self.current().pane.has_exited() {
+        if self.session_agent().pane.has_exited() {
             readiness = crate::agentstate::Readiness::Unknown;
         }
-        readiness
+
+        // The one event that ends a draft, and the only place this flag is ever
+        // cleared. See [`note_left_key`](Self::note_left_key) for why it is this
+        // and not a keystroke: a message that was really submitted makes the
+        // agent work, and nothing else the user can press does.
+        let mut redraw = false;
+        if readiness == crate::agentstate::Readiness::Busy && self.session_agent().draft_open {
+            self.session_agent_mut().draft_open = false;
+            redraw |= self.queue.set_draft_open(false);
+        }
+        redraw | self.queue.set_readiness(readiness)
     }
 
     /// Remember that the user may have an unsubmitted message at the agent.
@@ -2188,9 +2226,22 @@ impl App {
         );
         if typing {
             self.current_mut().draft_open = true;
+            // **Told only when the key went to the agent the queue is aimed
+            // at.** The queue types into `agents[0]` — see
+            // [`pump_queue`](Self::pump_queue) — so its gate is about that
+            // pane's composer and nobody else's. A keystroke at another agent
+            // opens a draft *there*, which is recorded on the line above and
+            // is not a reason to hold a send bound for the session's pane.
+            //
+            // `at_agent == 0` rather than an identity comparison, because
+            // `agents[0]` being the session's is an invariant of the vector
+            // rather than something to re-derive: it is never removed.
+            //
             // Told rather than asked for, so the countdown is withdrawn on the
             // keystroke itself rather than up to a quarter second later.
-            self.queue.set_draft_open(true);
+            if self.at_agent == 0 {
+                self.queue.set_draft_open(true);
+            }
             // And the submit abeam still owes is abandoned. Between the paste
             // and the `Enter` that submits it there is one pass in which the
             // composer holds a queued prompt and the user can type into it;
@@ -2789,6 +2840,36 @@ impl App {
     /// title for seconds. By the time a request arrives here it has already
     /// been announced and not cancelled. What is left for this function is to
     /// deliver it without inventing a second way to get it wrong.
+    ///
+    /// **The queue is aimed at [`session_agent`](Self::session_agent), and that
+    /// is the whole answer to a bug two reviewers found independently.** The
+    /// pane's four conditions are asked of one agent and typed into another the
+    /// moment the two can differ: the readiness comes from a probe, the draft
+    /// flag from the keyboard, and the pty from whichever pane the cursor
+    /// happens to be on — so `F4` during the countdown, or `a` on another
+    /// worktree while an item is armed, delivered somebody's queued prompt to a
+    /// session it was never written for. **The invariant is that the queue's
+    /// three inputs name one agent**: the readiness
+    /// [`poll_readiness`](Self::poll_readiness) reads, the `draft_open`
+    /// [`note_left_key`](Self::note_left_key) writes, and the pty below. All
+    /// three are `agents[0]`.
+    ///
+    /// `agents[0]` rather than the cursor, because the cursor moves and the
+    /// item does not: a `Send` is enqueued to continue *this session's*
+    /// conversation, and the session is the agent abeam was started with — the
+    /// same one whose exit is abeam's exit. Standing the queue down whenever
+    /// the cursor was elsewhere was the other candidate and is worse: it makes
+    /// a feature stop working for a reason nobody can see, where this keeps it
+    /// working and pointed at the pane it was always about.
+    ///
+    /// **The cost, said plainly: the countdown can appear in a border
+    /// describing a pane the send is not going to.** One agent is drawn at a
+    /// time in this phase and the left title is the current one's, so with the
+    /// cursor on another pane the announcement is attached to the wrong name.
+    /// It is a labelling problem rather than a delivery one — the prompt goes
+    /// where it was always going — and it is the direction to be wrong in. The
+    /// stack is what fixes it, by drawing `agents[0]`'s border at the same time
+    /// as everybody else's.
     fn pump_queue(&mut self) -> bool {
         let mut redraw = false;
 
@@ -2805,20 +2886,20 @@ impl App {
         // `poll_readiness` downgrades to `Unknown` on the same condition, so
         // this is unreachable in practice — it is the check that makes the
         // unreachability structural rather than a coincidence of ordering.
-        if !self.current().submit_pending
-            && self.current().pane.bracketed_paste()
+        if !self.session_agent().submit_pending
+            && self.session_agent().pane.bracketed_paste()
             && let Some(text) = self.queue.take_send_request()
         {
             // The `Enter` is armed only by a write that actually succeeded. A
             // pty that refused the paste and then got a bare `\r` would submit
             // whatever the user had in the composer, which is a stray keystroke
             // abeam invented out of its own failure.
-            let sent = self.current_mut().pane.send_text(&text).is_ok();
-            self.current_mut().submit_pending = sent;
+            let sent = self.session_agent_mut().pane.send_text(&text).is_ok();
+            self.session_agent_mut().submit_pending = sent;
             redraw = true;
-        } else if std::mem::take(&mut self.current_mut().submit_pending) {
+        } else if std::mem::take(&mut self.session_agent_mut().submit_pending) {
             let _ = self
-                .current_mut()
+                .session_agent_mut()
                 .pane
                 .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             redraw = true;
@@ -3012,9 +3093,14 @@ impl App {
                 // terminal.
                 let handled = match self.focus {
                     Focus::Left => {
-                        // A paste into the composer is a draft like any other.
+                        // A paste into the composer is a draft like any other,
+                        // and reaches the queue's gate on the same condition —
+                        // see [`note_left_key`](Self::note_left_key), where the
+                        // argument for that condition is written.
                         self.current_mut().draft_open = true;
-                        self.queue.set_draft_open(true);
+                        if self.at_agent == 0 {
+                            self.queue.set_draft_open(true);
+                        }
                         self.current_mut().pane.handle_paste(&text)?
                     }
                     Focus::Right => self.right_pane().handle_paste(&text)?,
@@ -3806,44 +3892,45 @@ impl App {
         // contract is that it is never silent while a send is due; the pane
         // kept that promise and the shell broke it. Two facts about the left
         // pane are two pieces of one title.
+        //
+        // **Which facts belong on which border, decided here because the stack
+        // is about to draw several of them.** Four things on this line are the
+        // *session's* and not the pane's: the pending quit, a spawn that
+        // refused, why abeam is still up after the session's agent left, and
+        // the queue's countdown — which is now literally about `agents[0]`,
+        // since that is the pane the queue types into. Three things are the
+        // pane's: its name, its position in the list, and the root it is
+        // standing in. When there are N borders the session's four go on
+        // `agents[0]`'s and the pane's three go on each; with one border drawn
+        // they share it, and the countdown is the one that reads oddly in the
+        // meantime — attached to whichever pane the cursor is on rather than to
+        // the pane it is about. See [`App::pump_queue`], which books that cost.
         let state = if self.pending_quit {
             Some("Alt+Q again to quit".to_string())
-        } else if let Some(why) = &self.agent_refused {
-            // **Elided from the left, which is the opposite of everything else
-            // in this border and is the right way round for this one string.**
-            // `crate::launch`'s answer is `` `<absolute path>` was not found on
-            // PATH. `` — the path is the long half and the *verdict* is the
-            // half worth 44 columns, so clipping from the right would leave a
-            // truncated path and no sentence. `elide_left` keeps the file name
-            // and what happened to it, which is the whole diagnosis.
-            //
-            // That shape is not one failure among several, it is the only one
-            // that can arrive here. Everything else `crate::launch` refuses —
-            // a `.ps1`, an extension it will not route, a command line past
-            // `cmd`'s limit — was decided about *this same file* at startup and
-            // succeeded, and none of those answers can change while abeam runs.
-            // What changes mid-session is that the file has gone.
-            //
-            // Ahead of the door-holding sentence below because it is news and
-            // that is standing state: this one answers a key just pressed, and
-            // it is gone again on the next.
-            Some(crate::text::elide_left(why, 44))
-        } else if self.session_agent().exit.is_some() {
-            // This is abeam outliving the session it exists for, which happens
-            // only because something of the user's is still alive. Naming it
-            // matters: without that word the window looks stuck, and the one
-            // thing they need to know is that something of theirs is still
-            // running.
-            //
-            // **One of the two is named, never both**, and the ranking is the
-            // border's rule rather than a preference. `Alt+Q` ends whichever it
-            // was, so the second name buys no action at the price of the pane's
-            // own; and the agent leads because it is the more expensive thing
-            // to end — a turn somebody is paying for, against a shell sitting
-            // at a prompt. The empty arm is not decoration either: this branch
-            // is drawn from a test as readily as from the loop, and a title
-            // that asserted a live shell where there is none would be the
-            // border making something up.
+        } else {
+            None
+        };
+        // This is abeam outliving the session it exists for, which happens only
+        // because something of the user's is still alive. Naming it matters:
+        // without that word the window looks stuck, and the one thing they need
+        // to know is that something of theirs is still running.
+        //
+        // **One of the two is named, never both**, and the ranking is the
+        // border's rule rather than a preference. `Alt+Q` ends whichever it
+        // was, so the second name buys no action at the price of the pane's
+        // own; and the agent leads because it is the more expensive thing to
+        // end — a turn somebody is paying for, against a shell sitting at a
+        // prompt. The empty arm is not decoration either: this branch is drawn
+        // from a test as readily as from the loop, and a title that asserted a
+        // live shell where there is none would be the border making something
+        // up.
+        //
+        // `any_agent_live` counts `agents[0]` too, and here it cannot be one of
+        // them: the branch is only reached once that child's exit has been
+        // *recorded*, which `drive` does from `exit_status()` and therefore
+        // only after `poll_exit` has reaped it. So "another agent" is exactly
+        // what a `true` means — a pane opened later.
+        let door = (state.is_none() && self.session_agent().exit.is_some()).then(|| {
             let holding = if self.any_agent_live() {
                 "another agent · "
             } else if self.any_shell_live() {
@@ -3851,17 +3938,64 @@ impl App {
             } else {
                 ""
             };
-            Some(format!("{holding}Alt+Q to quit"))
-        } else {
-            None
-        };
+            format!("{holding}Alt+Q to quit")
+        });
         // The queue reports in the *left* title because everything it says is
         // about the left pane: how much is waiting to be typed there, and — the
         // part that has to be impossible to miss — that abeam is about to type
         // it. Last, so that a title clipped at 46 columns loses the count
         // before it loses the announcement.
-        let name = format!(" {}{}", self.current().pane.title(), self.agent_where());
-        let left_title = [state, self.queue.title_note()]
+        let note = self.queue.title_note();
+        let name = format!(" {}{}", self.current().pane.title(), self.agent_tag());
+
+        // **The refusal is fitted to what the line actually has spare, and it
+        // is a separate part rather than an arm of the `if` above** — which is
+        // the whole of what it used to get wrong. Sitting in that chain it
+        // replaced `Alt+Q to quit` in the one state where that is the only exit
+        // instruction on screen, so a spawn that failed while the session's
+        // agent had already gone took away the way out to explain itself.
+        let refusal = self.agent_refused.as_ref().map(|why| {
+            // Everything else on the line has a claim on it first, and each of
+            // those claims is stronger: the pane's name is its identity, and
+            // the other three are instructions. `state` is in the sum even
+            // though it and this are mutually exclusive by way of
+            // `handle_key` clearing one before the other can be set — the
+            // arithmetic should not depend on an argument made two functions
+            // away.
+            let width = abeam_layout::inner(split.left).width as usize;
+            let spent = name.width()
+                + [state.as_ref(), door.as_ref(), note.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|part| SEPARATOR + part.width())
+                    .sum::<usize>();
+            // This part's own separator, and the space the title closes with.
+            let budget = width.saturating_sub(spent + SEPARATOR + 1);
+            // **Elided from the left, which is the opposite of everything else
+            // in this border and is the right way round for this one string.**
+            // `crate::launch`'s answer is `` `<absolute path>` was not found on
+            // PATH. `` — the path is the long half and the verdict is the half
+            // worth the columns, so clipping from the right would leave a
+            // truncated path and no sentence. That shape is the only one that
+            // can arrive here: everything else `crate::launch` refuses — a
+            // `.ps1`, an extension it will not route, a command line past
+            // `cmd`'s limit — was decided about this same file at startup and
+            // succeeded, and none of those answers changes while abeam runs.
+            // What changes mid-session is that the file has gone.
+            //
+            // Below the floor the sentence is *replaced* rather than shortened
+            // further, because an elision that has run out of room says less
+            // than nothing — a `…` and four characters of a path is a border
+            // that has failed twice. What is left then is the only thing that
+            // still fits and is still true.
+            if budget >= REFUSAL_FLOOR {
+                crate::text::elide_left(why, budget)
+            } else {
+                "no agent started".to_string()
+            }
+        });
+
+        let left_title = [state, refusal, door, note]
             .into_iter()
             .flatten()
             .fold(name, |title, part| format!("{title} · {part}"))
@@ -3980,8 +4114,28 @@ impl App {
         self.select_rows = rows;
     }
 
-    /// Where the current agent is standing, for its own border — or nothing,
-    /// when that is the repository abeam was started on.
+    /// Which agent this is and where it is standing, for its own border.
+    ///
+    /// **Two facts, suppressed on two different conditions, and getting that
+    /// wrong is what made this worth a second pass.** The position is
+    /// suppressed when there is one agent; the root is suppressed when it is
+    /// the repository abeam was started on. Suppressing both on the *root*
+    /// condition alone leaves the shortest use of the whole feature invisible:
+    /// `Alt+G`, `w`, `a` on the row you are already on starts a second agent in
+    /// the session's own root, so both panes draw byte-identical borders and
+    /// `F4` looks like a key that does nothing.
+    ///
+    /// `2/3` and not a name, because a name is what the pane already has and
+    /// it is the same name — every agent abeam starts is the one it was started
+    /// with, in another directory. What a reader needs from a cursor is where
+    /// in the list they are and how many there are to come back through, which
+    /// is two numbers and four columns.
+    ///
+    /// It is also the disclosure that makes `F4`'s second meaning acceptable
+    /// while the right pane is hidden. Zoomed, `crate::app::App::ui` holds
+    /// focus on the left, so *every* press cycles including the one that would
+    /// otherwise have been "give me the keys back" — and the only thing that
+    /// tells the reader a press moved them is this.
     ///
     /// **An agent pane can say this and never be wrong, which is the one piece
     /// of chrome this feature gets for free.** A live child's working directory
@@ -4014,17 +4168,21 @@ impl App {
     /// workspace of its own is not a case anyone can reach today, since the
     /// list `a` is pressed in is built from the same discovery `spaces` is, but
     /// it is one `git worktree remove` away from being one.
-    fn agent_where(&self) -> String {
-        let root = &self.current().root;
-        if paths::same_dir(root, &self.root) {
-            return String::new();
+    fn agent_tag(&self) -> String {
+        let mut tag = String::new();
+        if self.agents.len() > 1 {
+            tag.push_str(&format!(" · {}/{}", self.at_agent + 1, self.agents.len()));
         }
-        let label = self
-            .spaces
-            .iter()
-            .find(|space| paths::same_dir(&space.root, root))
-            .map_or_else(|| workspace::dir_label(root), |space| space.label.clone());
-        format!(" · {label}")
+        let root = &self.current().root;
+        if !paths::same_dir(root, &self.root) {
+            let label = self
+                .spaces
+                .iter()
+                .find(|space| paths::same_dir(&space.root, root))
+                .map_or_else(|| workspace::dir_label(root), |space| space.label.clone());
+            tag.push_str(&format!(" · {label}"));
+        }
+        tag
     }
 
     /// The right pane's border text.
@@ -4875,29 +5033,51 @@ mod tests {
         stays_at(fx, 1);
     }
 
-    /// A program a pane opened on a keystroke can really be started from: it
-    /// says one word and then waits on its standard input for ever.
+    /// A program a pane opened on a keystroke can really be started from, and
+    /// **which behaves like an agent about arguments**: given none it asks for
+    /// bracketed paste and then waits on its standard input for ever; given
+    /// any, it leaves at once without asking for anything.
+    ///
+    /// **That second half is the whole of what makes the `-p` assertions able
+    /// to fail.** `abeam -p "fix the tests"` runs a prompt and exits, so a pane
+    /// that inherited the command line is one that is gone — and the way to
+    /// observe "gone" without reaping is that it never enabled the mode. A shim
+    /// that ignored its arguments would sit there being alive whether or not
+    /// the recipe was carrying them, and the test would pass over a bug.
+    ///
+    /// The mode is typed out of a file beside the shim rather than printed,
+    /// which is `asks_and_stays`' route and for its reason — a `.cmd` cannot
+    /// say `ESC` and a POSIX `printf` cannot portably either. `%~dp0` and
+    /// `dirname "$0"` because the child's working directory is the *agent's*
+    /// root, which is not where this was written.
     ///
     /// **The path returned is the file that does the work**, which is what
     /// [`Recipe`] keeps and not what a pty is handed — on Windows this is a
     /// `.cmd`, so the launch the recipe derives from it routes through
     /// `cmd.exe`, and that is the install shape most people have rather than an
-    /// exotic one. Saying the word matters on Unix, where nothing at all
-    /// reaches a pty unless the child puts it there: a child that only listened
-    /// would leave the doorbell test below waiting for a ring that was never
-    /// coming, and unable to tell that from a waker nobody armed.
+    /// exotic one.
     #[cfg(windows)]
     fn a_pane_that_stays(dir: &TempDir) -> PathBuf {
+        dir.write("abeam-pane-bracketed.txt", b"\x1b[?2004h");
         dir.write(
             "abeam-pane.cmd",
-            b"@echo off\r\necho started\r\n:loop\r\nset /p LINE=\r\ngoto loop\r\n",
+            b"@echo off\r\n\
+              if not \"%~1\"==\"\" exit /b 0\r\n\
+              type \"%~dp0abeam-pane-bracketed.txt\"\r\n\
+              :loop\r\n\
+              set /p LINE=\r\n\
+              goto loop\r\n",
         )
     }
     #[cfg(unix)]
     fn a_pane_that_stays(dir: &TempDir) -> PathBuf {
+        dir.write("abeam-pane-bracketed.txt", b"\x1b[?2004h");
         dir.write_exec(
             "abeam-pane",
-            b"#!/bin/sh\necho started\nwhile read -r LINE; do :; done\n",
+            b"#!/bin/sh\n\
+              [ $# -gt 0 ] && exit 0\n\
+              cat \"$(dirname \"$0\")/abeam-pane-bracketed.txt\"\n\
+              while read -r LINE; do :; done\n",
         )
     }
 
@@ -5048,15 +5228,48 @@ mod tests {
             paths::same_dir(&fx.app.agents[1].root, &other),
             "the agent is standing somewhere other than the row that was chosen"
         );
+        // **`bracketed_paste` and not `!has_exited`, and the difference is the
+        // difference between a test and a decoration.** `has_exited` is written
+        // only by `poll_exit` and nothing here reaps, so it answers `false` for
+        // a child that left microseconds ago exactly as it does for one that is
+        // working — an assertion that cannot fail. The mode is a fact the child
+        // has to have *produced*, and [`a_pane_that_stays`] leaves without
+        // producing it when it is given arguments, which is what `claude -p`
+        // does. So this is the assertion that goes red if a pane opened later
+        // ever inherits the command line.
+        //
+        // **The wait ends on either outcome, which is what makes the red
+        // useful rather than merely present.** A child that inherited the
+        // command line exits, so waiting only for the mode would spend the
+        // whole deadline and then fail inside the waiter — accusing the wait of
+        // being too short instead of naming what happened. Reaping inside the
+        // loop is what lets the exit be *observed*: `has_exited` is written by
+        // `poll_exit` and by nothing else.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.app.agents[1].pane.bracketed_paste() && Instant::now() < deadline {
+            fx.app.reap().expect("try_wait on a child that exists");
+            if fx.app.agents[1].pane.has_exited() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
-            !fx.app.agents[1].pane.has_exited(),
-            "the child was started with the session's own arguments and left"
+            fx.app.agents[1].pane.bracketed_paste(),
+            "the child never asked for bracketed paste: a pane started with \
+             the session's own arguments runs the prompt and leaves"
         );
         assert_eq!(fx.app.at_agent, 1, "nothing on screen would say it started");
         assert_eq!(
-            fx.app.agent_where(),
-            " · other",
-            "the border does not say which root the pane is standing in"
+            fx.app.agent_tag(),
+            " · 2/2 · other",
+            "the border does not say which agent this is or where it stands"
+        );
+        // And the row the key was pressed on says so too, which is the whole
+        // argument for the key living in this list and for it asking nothing
+        // first.
+        assert!(
+            screen(&mut fx.app, 120, 24).contains("agent"),
+            "the worktree row does not report the agent that was just started"
         );
 
         assert_eq!(fx.app.at, was_at, "the right pane followed");
@@ -5102,6 +5315,25 @@ mod tests {
         assert!(
             shown.contains("was not found on PATH"),
             "the border kept the path and threw away what happened to it: {shown}"
+        );
+
+        // **And it does not take the way out with it.** This is a part of the
+        // title rather than an arm of a chain, and the state that proves the
+        // difference is the one where the session's agent has already gone: a
+        // refusal that displaced `Alt+Q to quit` there would have removed the
+        // only exit instruction on screen in order to explain itself. Reaped
+        // first, because `exit` being set while `has_exited` is still `false`
+        // is a state only a test can build and it is not the one under test.
+        until("the session's agent to go", || {
+            fx.app.reap().expect("try_wait on a child that exists");
+            fx.app.agents[0].pane.has_exited()
+        });
+        fx.app.agents[0].exit = Some((abeam_pty::ExitStatus::with_exit_code(0), Vec::new()));
+        let both = screen(&mut fx.app, 300, 24);
+        assert!(both.contains("was not found on PATH"), "got: {both}");
+        assert!(
+            both.contains("Alt+Q to quit"),
+            "the refusal took the way out with it: {both}"
         );
 
         // ...and it is gone on the next key, which is `pending_quit`'s
@@ -5152,26 +5384,31 @@ mod tests {
         assert_eq!(fx.app.at_agent, 0);
     }
 
-    /// Moving the agent cursor hands the queue the draft it is gating on.
+    /// The agent cursor cannot reach the queue's gate, however it is moved.
     ///
-    /// **The five steps below are a live bug in anything that writes
-    /// `at_agent` without them, and they need only `a` and `F4` to reach.**
-    /// `QueuePane` keeps one `draft_open` per session and there is one
-    /// [`Agent::draft_open`] per agent, so: type at agent 0 and both are set;
-    /// move to agent 1 and type there; agent 1 goes busy, and `poll_readiness`
-    /// clears *the current agent's* flag and the queue's single copy with it;
+    /// **These five steps were a live bug and the shape of it is worth keeping,
+    /// because the fix is not the one it invites.** `QueuePane` keeps one
+    /// `draft_open` and there is one [`Agent::draft_open`] per agent, so a
+    /// version that kept them in step as the cursor moved went: type at agent
+    /// 0, both set; move to agent 1 and type there; agent 1 goes busy and the
+    /// poll clears *the current agent's* flag and the queue's copy with it;
     /// move back to agent 0, which is idle and still holding an unsubmitted
-    /// sentence nobody withdrew. The gate now believes there is no draft
-    /// anywhere, and the next armed item is pasted into the middle of what was
-    /// being written — the exact splice the pair of flags exists to prevent,
-    /// arrived at by two mechanisms that were each individually correct.
+    /// sentence. The gate then believed there was no draft anywhere, and the
+    /// next armed item was pasted into the middle of what was being written.
+    ///
+    /// Keeping the two in step is what made that possible, and it also aimed
+    /// the gate at a pane the send was not going to. So the queue is aimed at
+    /// `agents[0]` outright — see [`App::pump_queue`] — the cursor is not one
+    /// of its inputs, and these steps have nothing left to disturb. Every
+    /// assertion below is the same assertion in a different disguise: the gate
+    /// still describes the session's agent.
     ///
     /// The control at the end is what stops this passing for the wrong reason.
     /// "Nothing was typed" is also what a queue with nothing armed says, so the
     /// draft is withdrawn by hand and the same pass is asked again: it sends,
     /// which means the only thing holding it before was the gate.
     #[test]
-    fn moving_between_agents_hands_the_queue_the_draft_it_is_gating_on() {
+    fn the_agent_cursor_cannot_reach_the_queues_gate() {
         let mut fx = app();
         let _at_zero = records_at(&mut fx, 0, "idle");
         stays_at(&mut fx, 0);
@@ -5185,33 +5422,36 @@ mod tests {
         assert!(fx.app.agents[0].draft_open);
         assert!(fx.app.queue.is_draft_open());
 
-        // 2. `F4` to agent 1, and typed there too.
+        // 2. `F4` to agent 1, and typed there too. The draft is agent 1's; the
+        // queue is told nothing, because the queue does not type there.
         fx.app.handle_key(key(KeyCode::F(4))).unwrap();
         assert_eq!(fx.app.at_agent, 1);
         fx.app.note_left_key(&key(KeyCode::Char('y')));
-
-        // 3. Agent 1 goes busy, which is the one event that ends a draft.
-        say(&at_one, fx.dir.path(), "busy");
-        polled(&mut fx);
-        assert!(!fx.app.agents[1].draft_open, "agent 1 kept its own draft");
+        assert!(fx.app.agents[1].draft_open);
         assert!(
-            !fx.app.queue.is_draft_open(),
-            "the queue kept a draft the agent that owns it has submitted"
+            fx.app.queue.is_draft_open(),
+            "typing at another agent moved the gate that guards this one"
         );
 
-        // 4. Back to agent 0, which is idle and still holding its sentence.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
-        assert_eq!(fx.app.at_agent, 0);
+        // 3. Agent 1 goes busy — which is the one event that ends a draft, and
+        // it ends agent 1's. The poll reads agent 0's record and nobody else's.
+        say(&at_one, fx.dir.path(), "busy");
+        polled(&mut fx);
         assert!(
             fx.app.agents[0].draft_open,
-            "one agent going busy ended another agent's draft"
+            "another agent going busy ended the session agent's draft"
         );
         assert!(
             fx.app.queue.is_draft_open(),
-            "the gate was left believing there is no draft anywhere"
+            "the gate was opened by a turn starting in a pane it does not type into"
         );
 
-        // 5. And the queue does not type into the middle of it.
+        // 4. Back to agent 0, and nothing about the gate has moved at any point.
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.at_agent, 0);
+        assert!(fx.app.queue.is_draft_open());
+
+        // 5. And the queue does not type into the middle of the sentence.
         fx.app.queue.stub_item("splice-check-alpha", Mode::Send);
         fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
         fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
@@ -5235,6 +5475,74 @@ mod tests {
             fx.app.agents[0].submit_pending,
             "nothing was armed, so the four assertions above proved nothing"
         );
+    }
+
+    /// An armed send reaches the session's agent whichever pane the cursor is
+    /// on.
+    ///
+    /// **The delivery half of the same rule, and the one both reviews found
+    /// independently.** A `Send` continues the conversation in `agents[0]`; the
+    /// cursor is a separate thing that `F4` and `a` move, including during the
+    /// three seconds between the announcement and the write. Typed at
+    /// `current()`, a prompt somebody queued while watching one session arrived
+    /// at another — with the queue reporting it sent, and the pane it was
+    /// written for never having heard it.
+    #[test]
+    fn an_armed_send_reaches_the_session_agent_wherever_the_cursor_is() {
+        let mut fx = app();
+        let _records = records_at(&mut fx, 0, "idle");
+        stays_at(&mut fx, 0);
+        second_agent(&mut fx);
+        stays_at(&mut fx, 1);
+        polled(&mut fx);
+
+        // The cursor is on the pane the send is *not* for, which is the whole
+        // test: everything below has to name `agents[0]` on its own account.
+        fx.app.set_focus(Focus::Left);
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.at_agent, 1);
+
+        fx.app.queue.stub_item("aimed-at-the-session", Mode::Send);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(fx.app.pump_queue(), "a send is worth a frame");
+
+        assert!(
+            fx.app.agents[0].submit_pending,
+            "the session's agent was owed no Enter, so it was typed at somebody else"
+        );
+        assert!(
+            !fx.app.agents[1].submit_pending,
+            "the prompt went to the pane the cursor happened to be on"
+        );
+        // `reaches_the_agent` reads `agents[0]`, and waits — the echo comes
+        // back through a pty on another thread.
+        reaches_the_agent(&mut fx, "aimed-at-the-session");
+        // By the time it is on agent 0's screen, agent 1's pty has either had
+        // it or never will: one write went out, to one child.
+        assert!(
+            !fx.app.agents[1]
+                .pane
+                .last_screen()
+                .join("\n")
+                .contains("aimed-at-the-session"),
+            "the prompt reached both agents"
+        );
+
+        // **And the pass after it, with the cursor still where it was.** The
+        // paste and the `Enter` are two passes apart, and the flag that owes
+        // the second one is per agent — so a version that armed it on one pane
+        // and read it on another left a prompt sitting unsubmitted in a
+        // composer while the queue reported it sent, with the flag set for ever
+        // on a pane nothing would look at again. Both halves name `agents[0]`.
+        assert_eq!(fx.app.at_agent, 1, "the cursor moved on its own");
+        assert!(fx.app.pump_queue(), "the submit is worth a frame too");
+        assert_eq!(
+            keys_sent(&fx),
+            1,
+            "the Enter that submits it went somewhere else, or nowhere"
+        );
+        assert!(!fx.app.agents[0].submit_pending);
     }
 
     /// A pane opened on a keystroke is armed, seeded and told what the session
@@ -5361,6 +5669,45 @@ mod tests {
             fx.app.handle_key(alt(KeyCode::Char('q'))).unwrap(),
             Flow::Quit
         ));
+    }
+
+    /// The other half of that sentence: a live *shell* is named too.
+    ///
+    /// **Written because the wording moved and took its only assertion with
+    /// it.** The title used to say `shell open` unconditionally once the
+    /// session's agent had gone, so the one test that rendered that state
+    /// asserted the words by accident; now the border names what is actually
+    /// holding the door and that test asserts the exit instruction instead. A
+    /// phrase nothing checks is a phrase the next rewording deletes.
+    ///
+    /// No agent is live, and that is asserted rather than assumed — otherwise
+    /// this passes through the `another agent` arm and proves the opposite of
+    /// what it says.
+    #[test]
+    fn a_live_shell_still_holds_the_door_and_the_title_still_names_it() {
+        let mut fx = app();
+        a_live_shell(&mut fx);
+        until("the session's agent to go", || {
+            fx.app.reap().expect("try_wait on a child that exists");
+            fx.app.agents[0].pane.has_exited()
+        });
+        assert!(fx.app.agents[0].pane.has_exited());
+        assert!(
+            !fx.app.any_agent_live(),
+            "an agent is live, so this would prove the wrong arm"
+        );
+        assert!(fx.app.any_shell_live(), "the shell's child has gone");
+        assert!(fx.app.anything_live(), "nothing is holding the door open");
+
+        fx.app.agents[0].exit = Some((abeam_pty::ExitStatus::with_exit_code(0), Vec::new()));
+        // Wide, for `a_live_agent_holds_the_door_at_quit_and_the_title_says_which`'s
+        // reason: a departed child's own title is most of a 72-column pane
+        // before the shell has appended a word.
+        let shown = screen(&mut fx.app, 300, 24);
+        assert!(
+            shown.contains("shell open"),
+            "the title does not name the shell that is holding the door: {shown}"
+        );
     }
 
     /// Only an agent that has finished can be closed, never the session's, and
@@ -7440,15 +7787,17 @@ mod tests {
             "git's nested worktree is not inside the root abeam is holding"
         );
 
+        let agents: Vec<&Path> = fx.app.agents.iter().map(|a| a.root.as_path()).collect();
         let rows = workspace::rows(
             &fx.app.worktrees,
             &fx.app.roster,
             &fx.app.root,
+            &agents,
             &fx.app.workspace().root,
             Some(fx.app.root.as_path()),
         );
         assert!(
-            rows.iter().any(|row| row.here && row.agent_here),
+            rows.iter().any(|row| row.here && row.agents_here > 0),
             "no row is where the agent is: {:#?}",
             rows.iter().map(|row| &row.label).collect::<Vec<_>>()
         );
@@ -7524,10 +7873,12 @@ mod tests {
             "git named the subdirectory, so this test is about nothing"
         );
 
+        let agents: Vec<&Path> = fx.app.agents.iter().map(|a| a.root.as_path()).collect();
         let rows = workspace::rows(
             &fx.app.worktrees,
             &fx.app.roster,
             &fx.app.root,
+            &agents,
             &fx.app.workspace().root,
             Some(fx.app.root.as_path()),
         );
@@ -7547,7 +7898,7 @@ mod tests {
             );
         }
         assert!(
-            rows.iter().any(|row| row.here && row.agent_here),
+            rows.iter().any(|row| row.here && row.agents_here > 0),
             "no row is where the agent is, so the list says you are nowhere"
         );
 
@@ -7623,7 +7974,7 @@ mod tests {
             label: label.to_string(),
             root: root.to_path_buf(),
             here,
-            agent_here: here,
+            agents_here: usize::from(here),
             occupant: None,
             watched: true,
         }
