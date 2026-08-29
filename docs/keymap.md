@@ -358,6 +358,12 @@ a bare letter, and the key underneath it is not free. Claude binds `meta+t` to
 the pad has focus, and while the pad has focus the agent is not being typed at,
 so the keystroke was never going to reach Claude whatever this file said.
 
+`Alt+T` is also where this document learned that "the `Alt` namespace" was two
+different sets, and the section below — "AltGr is Ctrl+Alt" — is what came of
+it. The short version: the pad asked `alt && !ctrl` while `global` asked only
+for `ALT`, so every global binding answered to both `Alt` keys and the pad's
+answered to the left one alone.
+
 The cost runs the other way instead, and it is the one direction that paragraph
 would otherwise hide. After the round trip this document recommends — `F9` to
 open the pad and take it, `F9` again to hand your keys back — the pad is still
@@ -620,6 +626,53 @@ what desktop environments take for switching workspaces), bare PageUp/PageDown
 Only the reasons differ, which is worth noticing rather than smoothing over: an
 exclusion that survives a change of platform for a *different* reason is one
 nobody should reopen on the grounds that the original reason has gone.
+
+## AltGr is Ctrl+Alt
+
+Not a keymap decision so much as a fact about Windows that the keymap has to
+survive: pressing AltGr sets `LEFT_CTRL_PRESSED` beside `RIGHT_ALT_PRESSED`, and
+crossterm hands abeam the pair as `ALT | CONTROL`. On a UK, Irish or continental
+layout the right-hand `Alt` key *is* AltGr, so **half the keyboard reports every
+`Alt` binding with CONTROL set**. `keys::alt_chord` is abeam's one answer to
+that, and `keys::global` and every pane-local `Alt` binding read it rather than
+testing the modifiers themselves. `altgr_is_alt` walks the whole table and
+asserts `Ctrl+Alt`+key resolves exactly as `Alt`+key does, declines included.
+
+Three bugs came out of not having a single answer, and they are worth listing
+because they are three different shapes of the same mistake:
+
+- **`Alt+T` in the scratch pad** asked `alt && !ctrl`, so the pad turned over
+  from the left `Alt` key only. Every global binding had always worked from
+  both. A pane's private definition of a word the rest of the program had
+  already defined.
+- **The three composers** — the pad, the ask and the queue — guarded text with
+  `!ctrl && !alt`, which is a guard against AltGr and therefore against every
+  character behind it. `€` on a UK layout; `@`, `€`, `~`, `|`, `[`, `]`, `{`
+  and `}` on a German one. Typed, and silently dropped. `keys::is_text` is the
+  shared answer, and it reads `Ctrl` and `Alt` *together* as no modifier at all.
+- **`Ctrl+\` literal-next** matched on `ctrl` alone. On the layouts that put `\`
+  behind AltGr — German, Spanish, Italian — typing a backslash therefore armed
+  literal-next and sent the *next* keystroke to the agent raw. The note beside
+  that binding said the key was "awkward" on those layouts and offered `F12` as
+  an alias; what was actually true is that the character was unreachable and the
+  keystroke after it was misrouted. It now matches `ctrl && !alt`.
+
+Nothing is given up by counting `Ctrl+Alt` as `Alt`, and the reason belongs to
+crossterm rather than to this document: when an AltGr combination *produces* a
+character, the reported `KeyCode` is that character — `€`, not the `e` under the
+key — because `u_char` is non-zero and the keyboard-layout fallback never runs.
+A binding letter only ever arrives from a combination that typed nothing, so a
+binding and a layout's AltGr text cannot be the same event. What `is_text` does
+give up is `Ctrl+Alt`+letter as a chord, which nothing binds and nothing hosted
+can hear: all three composers are abeam's own, with no child in them.
+
+Two things this does **not** fix, both of them outside abeam. A terminal that
+takes `Alt`+letter for its own menu accelerators before the application sees it
+— several IDE terminals do — cannot be reached from here; and a console that
+reports `Alt` as an `Esc` prefix rather than as a modifier sends two events, the
+first of which reads as a bare `Esc`. `crates/abeam/examples/keyprobe.rs` tells
+the three cases apart: it prints the modifier set, names which `Alt` key
+arrived, and names the binding each event would resolve to.
 
 ## Known gaps, against Claude
 

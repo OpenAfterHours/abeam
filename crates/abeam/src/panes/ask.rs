@@ -1851,8 +1851,10 @@ impl Pane for AskPane {
             // Ctrl plus a letter is the agent's everywhere else in this
             // program, and only the two half-page keys above are claimed inside
             // a pane. Without this arm `Ctrl+A` would be typed into the
-            // question.
-            KeyCode::Char(c) if !ctrl && !alt => {
+            // question. `crate::keys::is_text` rather than `!ctrl && !alt`
+            // because Ctrl *and* Alt together is how Windows reports AltGr, and
+            // the pair spelt out here dropped every character behind it.
+            KeyCode::Char(c) if crate::keys::is_text(&key) => {
                 self.composing.push(c);
                 Handled::Yes
             }
@@ -3279,6 +3281,38 @@ mod tests {
         assert_eq!(p.scroll_key(key(KeyCode::Down)).unwrap(), Handled::Yes);
         assert_eq!(p.scroll.offset, 1);
         assert!(p.composing.is_empty(), "a glance typed into the question");
+    }
+
+    #[test]
+    fn a_character_behind_altgr_reaches_the_question() {
+        // Windows reports AltGr as Ctrl+Alt, so `!ctrl && !alt` — which is what
+        // the text arm used to say — is a guard that drops every character
+        // living behind that key. `crate::keys::is_text` is the shared answer;
+        // `crate::keys`'s module doc has the argument.
+        let mut p = live();
+        let altgr = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT | KeyModifiers::CONTROL);
+        for c in ['€', '@'] {
+            assert_eq!(p.handle_key(altgr(c)).unwrap(), Handled::Yes, "AltGr {c}");
+        }
+        assert_eq!(p.composing, "€@");
+
+        // AltGr+L is a letter and `Ctrl+L` is the clear, which is the pair this
+        // pane already told apart correctly: that arm reads `ctrl && !alt`, so
+        // it was the text arm beside it and not the binding that was wrong.
+        // `clear` keeps the draft on purpose — see
+        // `clearing_keeps_the_draft_and_the_file_the_reader_attached` — so what
+        // separates them here is whether a letter arrived, which is the whole
+        // question anyway.
+        assert_eq!(p.handle_key(altgr('l')).unwrap(), Handled::Yes);
+        assert_eq!(p.composing, "€@l", "AltGr+L is a letter");
+        assert_eq!(
+            p.handle_key(ctrl(KeyCode::Char('l'))).unwrap(),
+            Handled::Yes
+        );
+        assert_eq!(
+            p.composing, "€@l",
+            "Ctrl+L must not be typed into the question"
+        );
     }
 
     #[test]
