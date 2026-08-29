@@ -1,6 +1,7 @@
 pub mod ask;
 pub mod diag;
 pub mod git;
+pub mod pad;
 pub mod queue;
 pub mod shell;
 pub mod terminal;
@@ -9,6 +10,7 @@ pub mod viewer;
 pub use ask::{AskContext, AskPane};
 pub use diag::{DiagPane, FrameStats};
 pub use git::GitPane;
+pub use pad::PadPane;
 pub use queue::QueuePane;
 pub use shell::ShellPane;
 pub use terminal::TerminalPane;
@@ -30,6 +32,26 @@ pub enum RightView {
     /// idle, or dispatched as background agents. A workspace view like the
     /// three above — `F2` remembers it, and it is reached by `F8`.
     Queue,
+    /// A markdown scratch pad, one per workspace: the sentence somebody had
+    /// while the agent was mid-task, kept between sessions.
+    ///
+    /// A workspace view like the four above, so `F2` and `Esc` put it back and
+    /// `App::last_workspace_view` remembers it. That is a claim about the key
+    /// rather than about the pane, and it is the claim `Diag` and `Ask` below
+    /// fail: both of those are reached *from* somewhere and both put that
+    /// somewhere back, so a view that remembered them would be a key that could
+    /// never leave. `F9` is not pressed about anything — it is pressed because
+    /// you have had a thought — so there is no somewhere for it to restore.
+    ///
+    /// It takes focus, which is `Shell`'s property and not a second exception:
+    /// a pad you have to press a second key to type into is a picture of one.
+    /// Pressed again from inside, it hands focus back.
+    ///
+    /// Per workspace, and for a reason weaker than the shell's and the ask's
+    /// rather than for theirs — `crate::app::Space` is where that argument
+    /// belongs and where it is made. Everything else about it is
+    /// `crate::panes::pad`.
+    Pad,
     /// The pty instrument. Not one of the workspace views — it is reached by a
     /// toggle that remembers what it displaced, because you go there to answer
     /// a question and then come back.

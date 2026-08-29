@@ -57,7 +57,7 @@ use crate::keys::{self, Action};
 use crate::layout as abeam_layout;
 use crate::pane::{Focus, Pane};
 use crate::panes::{
-    AskContext, AskPane, AskRequest, DiagPane, FrameStats, GitPane, QueuePane, RightView,
+    AskContext, AskPane, AskRequest, DiagPane, FrameStats, GitPane, PadPane, QueuePane, RightView,
     ShellPane, TerminalPane, ViewerPane,
 };
 use crate::paths;
@@ -311,6 +311,25 @@ struct Space {
     /// be asked anything, and the old one is dropped — which kills it — as the
     /// new one takes its place.
     ask_session: Option<AskSession>,
+    /// The scratch pad for this workspace, and it is per workspace for a reason
+    /// **weaker** than the two panes above it.
+    ///
+    /// Theirs is a constraint: a live child's working directory belongs to the
+    /// child, there is no call that moves a running process to another one, so
+    /// a shell or an ask that followed the view would be answering about a
+    /// checkout it is not standing in. There is no child here and nothing that
+    /// cannot be moved. In their place are two decisions. The notes are about a
+    /// checkout — the sentence somebody had is about the code in front of them,
+    /// and carrying it into another worktree would be carrying it away from
+    /// what it is about. And `crate::panes::pad::store` keys the file it writes
+    /// by the workspace root, so one pad spanning every worktree would have to
+    /// be a different file from the one on disk today.
+    ///
+    /// Both of those abeam chose and could unchoose, which is why this does not
+    /// simply say "for the shell's reason": borrowing that sentence would
+    /// present a decision as a thing the platform forced, and the next person
+    /// weighing a shared pad would think it had already been ruled out.
+    pad: PadPane,
     /// Whether the one watcher can see it. False for a worktree outside the
     /// agent's root, which falls back to the git pane's own two-second poll.
     watched: bool,
@@ -335,6 +354,13 @@ impl Space {
                 ask
             },
             ask_session: None,
+            // Handed the palette outright rather than set afterwards, because
+            // this pane's constructor takes one — and for the reason the ask's
+            // two lines up gives: the pad draws markdown through the reader's
+            // renderer, whose colours are absolute RGB chosen against a page it
+            // paints itself. A workspace opened mid-session starts where the
+            // session already is instead of dark in a light window.
+            pad: PadPane::new(root.clone(), theme),
             root,
             label,
             watched,
@@ -399,7 +425,7 @@ pub struct App {
     /// selecting. See `crate::select`; `F7` and a drag are the two ways in.
     ///
     /// Held here rather than by a pane for the reason that module gives: the
-    /// same three keys have to work over all six views, and a selection is
+    /// same three keys have to work over all seven views, and a selection is
     /// something a pane is copied *from* rather than something it implements.
     select: Option<Select>,
     /// Whether `F7` moved focus to the right pane *and nothing has moved it
@@ -771,6 +797,17 @@ impl App {
         &mut self.spaces[at].ask
     }
 
+    fn pad(&self) -> &PadPane {
+        &self.workspace().pad
+    }
+
+    /// The same, mutably, by [`shell_mut`](Self::shell_mut)'s route and for its
+    /// borrow reason.
+    fn pad_mut(&mut self) -> &mut PadPane {
+        let at = self.at;
+        &mut self.spaces[at].pad
+    }
+
     /// Is there a live child in *any* workspace's command view?
     ///
     /// Every one of them, not just the one on screen, because that is what
@@ -918,6 +955,23 @@ impl App {
                         .any(|worktree| paths::same_dir(&worktree.root, &space.root))
             })
             .collect();
+        // A workspace about to be dropped takes its pad's text with it, and
+        // this is the last moment anything can ask for it. `crate::panes::pad`
+        // says in as many words that dropping a `PadPane` is how a note is
+        // lost rather than how it is kept — there is no `Drop` on it, and the
+        // debounce that would have written the text needs a tick this space
+        // will not live to receive.
+        //
+        // The window is narrow and the fix is a write nobody will notice: type
+        // in a worktree, switch to another, and have `git worktree remove` land
+        // on the first before the two seconds are up. Narrow is not the same as
+        // closed, and this is the only place in this program where something a
+        // person wrote is destroyed rather than merely stopped being shown.
+        for (space, keeping) in self.spaces.iter_mut().zip(&keep) {
+            if !keeping {
+                space.pad.flush();
+            }
+        }
         // Remembered before the retain and looked up again after it, because
         // the whole point is that an index does not survive a list changing
         // length underneath it.
@@ -957,16 +1011,20 @@ impl App {
         self.git.set_worktree_rows(rows)
     }
 
-    /// The loop.
+    /// The session: start the two sources of news, run the loop, and leave.
     ///
-    /// It waits to be told rather than asking on a timer, and then declines to
-    /// draw more often than a screen can show. Those are two halves of one
-    /// idea: the old loop blocked 10 ms on the console before it would so much
-    /// as look at the pty, which put a 10 ms floor under a renderer measured at
-    /// 0.75 ms and quantised the agent's output onto a grid unrelated to it.
-    /// Now both sources of news arrive on one channel — the console from a
-    /// thread that may block on it, the agent from the pty reader — and
-    /// [`MIN_FRAME`] is the only thing deciding when a frame goes out.
+    /// **Every way out of the loop comes back through here**, which is the
+    /// whole reason [`drive`](Self::drive) is a function rather than the body
+    /// of this one. It ends six ways: a quit, the agent leaving with nothing
+    /// holding the door, the console going away, and three kinds of error — a
+    /// draw that failed, a `try_wait` on the pty that errored, and a keystroke
+    /// that could not be written to the agent. That last one is the one nearest
+    /// somebody's fingers, and it was the one the pads used to be lost on.
+    ///
+    /// So the pads are written here, after the loop and before anything is
+    /// decided about what to report, on all six. The alternative was a sentence
+    /// disclosing which endings lost a note, and that is a worse thing to have
+    /// written down than a `let` and a `?` two lines apart.
     pub fn run(mut self, terminal: &mut Tui) -> Result<Outcome> {
         // Bounded, because it is a doorbell and not a queue. Input uses the
         // blocking `send` — a keystroke may never be dropped — while output
@@ -988,6 +1046,50 @@ impl App {
         });
         spawn_input(tx);
 
+        let leaving = self.drive(terminal, &rx);
+        // Before the `?` below, so that the ending nobody planned for saves as
+        // much as the ordinary one.
+        self.flush_pads();
+        leaving?;
+        Ok(self.finish())
+    }
+
+    /// Write every workspace's pad, now.
+    ///
+    /// **Every** one, for the reason [`any_shell_live`](Self::any_shell_live)
+    /// walks them all: a note typed in a worktree somebody switched away from
+    /// an hour ago is exactly as unwritten as the one on screen, and the tick
+    /// that would have written it is not going to happen now.
+    ///
+    /// A method rather than four lines inside [`run`](Self::run) because those
+    /// four lines are the last thing standing between somebody's last sentence
+    /// and nothing, and a test cannot reach into `run` — it wants a real
+    /// terminal and a loop that only stops when a person or an error stops it.
+    /// What a test can reach is this, and what it pins is the word *every*.
+    /// That `run` calls it is one line above a `?` and is held by reading.
+    fn flush_pads(&mut self) {
+        for space in &mut self.spaces {
+            space.pad.flush();
+        }
+    }
+
+    /// The loop.
+    ///
+    /// It waits to be told rather than asking on a timer, and then declines to
+    /// draw more often than a screen can show. Those are two halves of one
+    /// idea: the old loop blocked 10 ms on the console before it would so much
+    /// as look at the pty, which put a 10 ms floor under a renderer measured at
+    /// 0.75 ms and quantised the agent's output onto a grid unrelated to it.
+    /// Now both sources of news arrive on one channel — the console from a
+    /// thread that may block on it, the agent from the pty reader — and
+    /// [`MIN_FRAME`] is the only thing deciding when a frame goes out.
+    ///
+    /// It answers `Ok(())` for "the loop is over" and nothing else. What to
+    /// report is [`App::finish`]'s question and is asked in [`run`](Self::run)
+    /// afterwards, which is what leaves this function free to end wherever it
+    /// has to without any of those endings having to remember what the last
+    /// one owed.
+    fn drive(&mut self, terminal: &mut Tui, rx: &mpsc::Receiver<Wake>) -> Result<()> {
         self.draw(terminal)?;
         // Something has changed that the screen does not show yet. Sticky
         // across iterations: news that arrives inside the frame floor is not
@@ -1011,7 +1113,7 @@ impl App {
                         match wake {
                             Wake::Output => redraw = true,
                             Wake::Input(ev) => match self.handle_event(ev)? {
-                                Flow::Quit => return Ok(self.finish()),
+                                Flow::Quit => return Ok(()),
                                 Flow::Continue { redraw: wanted } => redraw |= wanted,
                             },
                         }
@@ -1024,7 +1126,7 @@ impl App {
                 // outlives this function. Treated as the console having gone
                 // rather than ignored, because the alternative to leaving is
                 // spinning on a channel that will never speak again.
-                Err(RecvTimeoutError::Disconnected) => return Ok(self.finish()),
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
 
             // Everything below happens only when a frame could actually go out.
@@ -1065,7 +1167,7 @@ impl App {
             // which is why the title names the shell rather than just saying
             // abeam is still here.
             if self.agent_exit.is_some() && !self.any_shell_live() {
-                return Ok(self.finish());
+                return Ok(());
             }
 
             redraw |= self.poll_readiness();
@@ -1114,6 +1216,7 @@ impl App {
         let at = self.at;
         let mut shell_dirty = false;
         let mut ask_dirty = false;
+        let mut pad_dirty = false;
         for (ix, space) in self.spaces.iter_mut().enumerate() {
             let dirty = space.shell.tick();
             // Every workspace's ask pane too, and on the same terms. It owes a
@@ -1122,9 +1225,18 @@ impl App {
             // still be set the next time one of them is looked at — a redraw
             // for news that has already been on screen for an hour.
             let asked = space.ask.tick();
+            // And every workspace's pad, because the tick is the whole of what
+            // the debounced save hangs off: two seconds after the last
+            // keystroke this is what writes the file, and a pad typed into and
+            // then switched away from would otherwise wait for a tick that
+            // never comes. It is not the same argument as the shell's `try_wait`
+            // — nothing here is a child and nothing needs reaping — it is that
+            // the pane cannot save itself without being asked.
+            let noted = space.pad.tick();
             if ix == at {
                 shell_dirty = dirty;
                 ask_dirty = asked;
+                pad_dirty = noted;
             }
         }
         redraw |= shell_dirty && self.right_view == RightView::Shell;
@@ -1133,6 +1245,12 @@ impl App {
         // the frame ceiling, and switching to the view redraws on the keystroke
         // that switches.
         redraw |= ask_dirty && self.right_view == RightView::Ask;
+        // And the same rule again, where it is at its plainest: the only thing
+        // a pad's tick can have to show is a save that started or stopped
+        // failing, and a save is invisible by design. A file written in a
+        // workspace nobody is looking at must not re-render the agent's screen
+        // to announce that nothing happened.
+        redraw |= pad_dirty && self.right_view == RightView::Pad;
 
         // Unlike the shell's, this pane's news counts while it is hidden, and
         // it has to: the countdown before an automatic send is drawn in the
@@ -1275,8 +1393,14 @@ impl App {
     /// `Drop` closes the child's standard input first and then kills it, which
     /// is the whole of why nothing is done here: a second, explicit teardown
     /// would be a second thing to keep correct, and the one that already exists
-    /// also runs on the paths this function is never reached from — a `?` out
-    /// of `draw`, and a console that has gone.
+    /// also runs on the paths this function is never reached from — the three
+    /// `?`s inside [`drive`](Self::drive).
+    ///
+    /// The pads are not among the things done here, and the near miss is worth
+    /// a sentence: a `PadPane` writes only when it is asked to, so `Drop` is
+    /// what loses a note rather than what keeps it, and asking here would have
+    /// covered only the endings that get this far. [`run`](Self::run) asks
+    /// instead, outside and after, where the errors pass too.
     fn finish(&mut self) -> Outcome {
         match self.agent_exit.take() {
             Some((status, screen)) => Outcome::Exited { status, screen },
@@ -1975,8 +2099,31 @@ impl App {
     /// the highlight away — and focus stays on the shell, where `Esc` belongs
     /// to the child and only `Alt+S` gets out. The user pressed one key twice
     /// and ended somewhere they had no obvious way to leave.
+    ///
+    /// The pad is written on the way out, and it is written *here* rather than
+    /// at the four keys that leave it. `set_right_view` makes the argument for
+    /// a flush when the pad stops being on screen; leaving it by focus is the
+    /// commoner way and the one the feature is named after — `F9`, type, `F9`
+    /// — with `Esc`, `F4` and a click on the agent behind it. Four call sites
+    /// is a flush the fifth one forgets, and this function is already the
+    /// answer to "what can take my keys": the module doc keeps that as a list
+    /// of callers rather than an argument, so a consequence of focus moving
+    /// belongs beside `select_took_focus` rather than sprinkled among the
+    /// things that move it.
+    ///
+    /// One caller is not a key, and it is the reason to name the cost rather
+    /// than deny it: [`App::ui`] pulls focus back when a narrowed window has
+    /// no right pane left, so a pad with unsaved text in it can be written
+    /// from inside a frame. That is a `write` and a `rename` of at most 64 KiB
+    /// — `crate::panes::pad` weighs the same trade for the tick thread — on
+    /// the one frame a window crosses `crate::layout::MIN_SPLIT_COLS` with a
+    /// dirty pad focused, and it is the frame on which the pad has most
+    /// completely stopped being on screen.
     fn set_focus(&mut self, to: Focus) {
         if to != self.focus {
+            if self.focus == Focus::Right && self.right_view == RightView::Pad {
+                self.pad_mut().flush();
+            }
             self.select_took_focus = false;
             self.focus = to;
         }
@@ -2167,12 +2314,13 @@ impl App {
                 self.set_right_view(RightView::Viewer);
             }
             Action::ShowShell => {
-                // The one of the four workspace views that moves focus, because
-                // a command line you have to press a second key to type into is
+                // One of the two workspace views that move focus, because a
+                // command line you have to press a second key to type into is
                 // not a command line — `F6` and `F7` move it too, and neither is
-                // a workspace view. Pressed again from inside, it is the way
-                // home — so the whole round trip for `git branch` is Alt+S,
-                // type, Alt+S.
+                // a workspace view; `F9` is the other one that is, and it takes
+                // focus for this key's reason. Pressed again from inside, it is
+                // the way home — so the whole round trip for `git branch` is
+                // Alt+S, type, Alt+S.
                 if self.right_view == RightView::Shell && self.focus == Focus::Right {
                     self.set_focus(Focus::Left);
                 } else {
@@ -2196,6 +2344,33 @@ impl App {
             // at what is still queued while the agent works and you keep
             // typing at it, which is the rule the whole shell is built on.
             Action::ShowQueue => self.set_right_view(RightView::Queue),
+            // The second workspace view that moves focus, and it takes focus
+            // for the command view's reason rather than by analogy with it: a
+            // pad you have to press a second key before it will accept a word
+            // is not a pad, and the thought it exists to catch lasts about as
+            // long as it takes to decide the key did nothing. Pressed again
+            // from inside it is the way home, so the whole round trip is F9,
+            // type, F9.
+            Action::ShowPad => {
+                if self.right_view == RightView::Pad && self.focus == Focus::Right {
+                    self.set_focus(Focus::Left);
+                } else {
+                    self.set_right_view(RightView::Pad);
+                    // Asked of the layout rather than of the last frame, for
+                    // `Action::ShowShell`'s reason and with the same hazard
+                    // behind it: `right_inner` is a frame behind, and
+                    // `set_right_view` has just un-zoomed, so the pane that is
+                    // about to exist does not exist yet. The batching half
+                    // matters more here than it does there, because what
+                    // follows this key is a sentence — the loop drains every
+                    // pending event before it draws, so `F9` and the note typed
+                    // straight after it arrive together, and an optimistic
+                    // focus would route the note at a pane that never appears.
+                    if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                        self.set_focus(Focus::Right);
+                    }
+                }
+            }
             Action::ToggleDiag => {
                 let target = if self.right_view == RightView::Diag {
                     self.last_workspace_view
@@ -2247,16 +2422,16 @@ impl App {
             // and the common case is pressing it while already looking at a
             // document from the left pane.
             //
-            // Two panes now, and the second one is not a widening of what this
-            // key means: the ask draws its answers through the reader's own
-            // markdown renderer, whose colours are absolute RGB chosen against
-            // a known page, and it paints that page itself. Left out, a reader
-            // in a light session would press `F3` and get one dark pane in the
-            // corner of an otherwise light window — which reads as a pane that
-            // has not been finished rather than as a setting with a scope.
-            // Every workspace's, because a palette that applied to the
-            // workspace on screen and not to the one next door is the same
-            // failure one switch later.
+            // Three panes now, and neither of the two beside the reader is a
+            // widening of what this key means: the ask and the scratch pad both
+            // draw through the reader's own markdown renderer, whose colours
+            // are absolute RGB chosen against a known page, and both paint that
+            // page themselves. Left out, a reader in a light session would
+            // press `F3` and get one dark pane in the corner of an otherwise
+            // light window — which reads as a pane that has not been finished
+            // rather than as a setting with a scope. Every workspace's, because
+            // a palette that applied to the workspace on screen and not to the
+            // one next door is the same failure one switch later.
             Action::ToggleReaderTheme => {
                 self.theme = match self.theme {
                     Theme::Dark => Theme::Light,
@@ -2266,6 +2441,7 @@ impl App {
                 let theme = self.theme;
                 for space in &mut self.spaces {
                     space.ask.set_theme(theme);
+                    space.pad.set_theme(theme);
                 }
             }
 
@@ -2640,7 +2816,7 @@ impl App {
                     // is a file row being picked, and that says nothing about
                     // whether the gesture is about to become a drag — where
                     // clearing it afterwards meant no selection could ever
-                    // start on a row those panes care about. None of the six
+                    // start on a row those panes care about. None of the seven
                     // claims a `Drag`, so the two questions do not collide.
                     if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                         self.drag = Some(Drag {
@@ -2817,7 +2993,7 @@ impl App {
     /// Take the right pane's rows out of the frame that just drew them, and
     /// paint the selected ones back inverted.
     ///
-    /// **One implementation for six panes**, which is the whole reason it is
+    /// **One implementation for seven panes**, which is the whole reason it is
     /// here and not in the `Pane` trait. Highlighting the shell would mean
     /// inverting a terminal grid, the reader styled markdown, git a row that is
     /// already inverted because it is the selected one — and done to the cells
@@ -2896,7 +3072,7 @@ impl App {
         // repositories somebody would be reading it in — this project's own
         // branch names are long enough to do it. Clipped, the only thing left
         // saying the right pane had the keys was the border colour, and there
-        // is no cursor to fall back on: four of the six views draw none, so a
+        // is no cursor to fall back on: four of the seven views draw none, so a
         // focused read-only pane leaves the window with no cursor anywhere at
         // all.
         //
@@ -3028,6 +3204,15 @@ impl App {
         // showing — so the one place that knows is here, beside the selection
         // this line already drops for the same reason.
         self.queue.cancel_confirm();
+        // And the pad is written, for the reason the two lines above share: a
+        // pane is never told it has left the screen, so this is the one place
+        // that knows. What it buys is two seconds — the debounce would have
+        // reached it anyway — but they are the two seconds in which the user
+        // has already gone somewhere else, and a machine that dies in them
+        // takes the last sentence somebody typed with it. It costs nothing when
+        // there is nothing to write: a pad with no change in it does not open
+        // the file.
+        self.pad_mut().flush();
         self.right_view = view;
         // Neither of the two displaceable views is remembered, and `Ask` is in
         // this line for `Diag`'s reason rather than by analogy with it: both are
@@ -3044,6 +3229,7 @@ impl App {
             RightView::Viewer => &mut self.viewer,
             RightView::Shell => self.shell_mut(),
             RightView::Queue => &mut self.queue,
+            RightView::Pad => self.pad_mut(),
             RightView::Diag => &mut self.diag,
             RightView::Ask => self.ask_mut(),
         }
@@ -3055,6 +3241,7 @@ impl App {
             RightView::Viewer => &self.viewer,
             RightView::Shell => self.shell(),
             RightView::Queue => &self.queue,
+            RightView::Pad => self.pad(),
             RightView::Diag => &self.diag,
             RightView::Ask => self.ask(),
         }
@@ -4741,6 +4928,331 @@ mod tests {
         assert_eq!(app.right_view, RightView::Git);
     }
 
+    // --- the scratch pad ---------------------------------------------------
+    //
+    // The pane is `crate::panes::pad` and is tested there. What is here is the
+    // wiring: the key, where focus lands, and whether the view is remembered.
+    //
+    // **Four of those wires decide whether somebody's notes survive**, and they
+    // are the four this file is the only place to test: the pad is written when
+    // the view leaves the screen (`set_right_view`), when focus leaves it
+    // (`set_focus`), when a workspace is dropped (`sync_workspaces`), and on
+    // every way out of the loop (`flush_pads`). Each is a call that can be
+    // deleted without anything else in the program noticing, which is exactly
+    // the shape a test is for — and each of the four below was checked by
+    // deleting it and watching that test, and only that test, fail.
+    //
+    // **The rule: a test that types into a pad sets that pad's path first.**
+    // `PadPane::new` derives its file from `panes::pad::store` and lands in the
+    // profile of whoever is running the suite, so a pane that has been typed
+    // into is one flush away from a file in a real person's scratch directory —
+    // and the flushes above are deliberately hard to avoid, so the next test
+    // added here has no way of knowing it was relying on not triggering one.
+    // `PadPane::set_path` is the pane's answer to this and its own fixture goes
+    // through it; `pad_at` is how this module does, and every test below that
+    // types goes through that function. The rule is a thing to comply with
+    // rather than a hazard to remember, which is what makes it keepable.
+    //
+    // Restating the store's path rule here instead, and cleaning up the profile
+    // afterwards, was tried and taken out again: it is a second derivation of a
+    // path this branch spent a round establishing must be derived once, and
+    // cleaning up after a write into somebody's real scratch directory is not
+    // the same as not writing there.
+
+    /// Point one workspace's pad at a file inside the fixture, and hand back
+    /// the path it will be written to.
+    ///
+    /// The rule above, as a function. `PadPane::set_path` exists for exactly
+    /// this and the pane's own fixture goes through it too; what this adds is
+    /// that the file is in the `TempDir` the fixture already owns, so it goes
+    /// when the test ends however the test ends — no guard to remember, and
+    /// nothing left behind by a test that panicked half way through.
+    fn pad_at(fx: &mut Fixture, ix: usize, name: &str) -> PathBuf {
+        let path = fx.dir.path().join(name);
+        fx.app.spaces[ix].pad.set_path(path.clone());
+        path
+    }
+
+    /// Type at whatever has the keys, a key at a time, the way somebody would.
+    fn typed(fx: &mut Fixture, text: &str) {
+        for c in text.chars() {
+            fx.app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+    }
+
+    #[test]
+    fn f9_opens_the_pad_with_the_keys_already_in_it() {
+        // The whole promise of the key. A view that opened without focus would
+        // make the round trip F9, F5, type, F4 — which nobody performs
+        // mid-sentence, so the note would not get written down at all.
+        let mut fx = app();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert_eq!(fx.app.right_view, RightView::Pad);
+        assert_eq!(fx.app.focus, Focus::Right);
+        assert!(
+            fx.app.right_pane().takes_input(),
+            "the pad opens on the form that can be typed into"
+        );
+
+        // ...and the same key is the way home, which is the command view's
+        // round trip and is meant to be read as the same one.
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Left);
+        assert_eq!(
+            fx.app.right_view,
+            RightView::Pad,
+            "handing the keys back is not putting the view away"
+        );
+    }
+
+    #[test]
+    fn f9_while_zoomed_brings_the_pane_back_and_still_lands_in_it() {
+        // The hazard `Action::ShowShell` names, met by the second key that has
+        // it: `set_right_view` un-zooms, so `right_inner` is still describing a
+        // window with no right pane in it at the moment focus is decided. Ask
+        // that frame and the keys stay with the agent while the pad is drawn
+        // beside them, waiting for typing that is going somewhere else.
+        let mut fx = app();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(alt(KeyCode::Char('z'))).unwrap();
+        screen(&mut fx.app, 120, 24);
+        assert!(fx.app.right_inner.is_none(), "zoom hides the right pane");
+
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert!(!fx.app.zoom);
+        assert_eq!(fx.app.right_view, RightView::Pad);
+        assert_eq!(fx.app.focus, Focus::Right);
+    }
+
+    #[test]
+    fn the_instrument_comes_back_to_the_pad_too() {
+        // A workspace view, so `last_workspace_view` records it. The pad is
+        // somewhere you go rather than somewhere you are sent — nothing is
+        // displaced to reach it — which is the whole of what separates it from
+        // the instrument and the ask.
+        let mut fx = app();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        assert_eq!(fx.app.right_view, RightView::Diag);
+        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        assert_eq!(fx.app.right_view, RightView::Pad);
+        assert_eq!(fx.app.last_workspace_view, RightView::Pad);
+    }
+
+    #[test]
+    fn esc_out_of_the_pad_hands_the_keys_back_to_the_agent() {
+        // The pad declines `Esc` in both its forms, so the rule the read-only
+        // views taught is what answers it. `q` is deliberately not asserted
+        // beside it: in the edit form `q` is a letter somebody is typing and
+        // the pane claims it, which is the `Esc or q` row's parenthetical
+        // arriving in one more pane.
+        let mut fx = app();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right);
+
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(fx.app.focus, Focus::Left);
+        assert_eq!(
+            fx.app.right_view,
+            RightView::Pad,
+            "nothing was displaced to get here, so there is nothing to put back"
+        );
+    }
+
+    #[test]
+    fn alt_t_turns_the_pad_over_only_while_the_pad_has_the_keys() {
+        // The hazard the `Alt+T` overlay row discloses, pinned from the side
+        // that makes it true. After the round trip — `F9`, type, `F9` — the pad
+        // is still on screen with the keys back at the agent, which is exactly
+        // when somebody thinks of looking at the rendering. `Alt+T` from there
+        // is not a key that does nothing: `keys::global` declines it, so it
+        // goes to the agent, where it is Claude's own binding. Nothing on
+        // screen would say so, which is why the row carries the condition.
+        let mut fx = app();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert_eq!(fx.app.right_pane().title(), "pad");
+
+        fx.app.handle_key(alt(KeyCode::Char('t'))).unwrap();
+        assert_eq!(fx.app.right_pane().title(), "pad · rendered");
+        fx.app.handle_key(alt(KeyCode::Char('t'))).unwrap();
+        assert_eq!(fx.app.right_pane().title(), "pad");
+
+        // ...and the same chord over the same pane, one focus key later.
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Left);
+        fx.app.handle_key(alt(KeyCode::Char('t'))).unwrap();
+        assert_eq!(
+            fx.app.right_pane().title(),
+            "pad",
+            "the chord reached the agent, and the pad is where it was"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_does_nothing_in_the_pad_and_the_overlay_says_so() {
+        // The one place the pad is *worse* than the ask rather than merely
+        // different: there `Ctrl+D`/`Ctrl+U` still scroll, and here they are
+        // declined outright. A dead key is indistinguishable from a pane that
+        // has stopped listening, so the `(in the pad, editing)` row names them
+        // — and this is the assertion that row rests on.
+        //
+        // `redraw: false` is the whole signal, and it is enough: a key the
+        // *agent* had taken would have come back a redraw, because everything
+        // typed at the left pane does.
+        let mut fx = app();
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right);
+
+        let half = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(
+                fx.app.handle_key(half).unwrap(),
+                Flow::Continue { redraw: false }
+            ),
+            "Ctrl+D reached something, and the overlay row promises it does not"
+        );
+
+        // And the row that says so is in the table, because nothing else
+        // catches a mode whose keys were decided and never written down.
+        let (_, said) = keys::HELP
+            .iter()
+            .find(|(k, _)| *k == "(in the pad, editing)")
+            .expect("the pad's own row in the overlay");
+        assert!(said.contains("every letter is typed"), "{said}");
+        assert!(said.contains("Ctrl+D/U do nothing"), "{said}");
+    }
+
+    #[test]
+    fn looking_away_from_the_pad_writes_it() {
+        // A pane is never told it has left the screen, so the key that takes it
+        // away is the last thing that can ask. Without this the note sits in
+        // memory for up to the debounce with the user already somewhere else,
+        // and a machine that goes in those two seconds takes it with it.
+        //
+        // `Alt+G` and not `Esc`, because this test is about `set_right_view`
+        // alone: a view key moves no focus, so the flush beside `set_focus`
+        // cannot stand in for the one being tested here.
+        let mut fx = app();
+        let path = pad_at(&mut fx, 0, "away.md");
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        typed(&mut fx, "ask about the retry budget");
+        assert!(!path.exists(), "the debounce has not run and must not have");
+
+        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "a view key moves no focus");
+        let written = std::fs::read_to_string(&path).expect("the pad the view key left behind");
+        assert!(written.contains("retry budget"), "got: {written}");
+    }
+
+    #[test]
+    fn leaving_the_pad_by_focus_writes_it_too() {
+        // The round trip the feature is named after — `F9`, type, `F9` — and
+        // the one that used not to save. `set_right_view`'s argument is that
+        // the two seconds the debounce would take are the two in which the user
+        // has already gone somewhere else; here they have gone back to the
+        // agent, which is further away than another view.
+        //
+        // The second `F9` changes no view at all, so nothing but the flush in
+        // `set_focus` can write this file.
+        let mut fx = app();
+        let path = pad_at(&mut fx, 0, "focus.md");
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        typed(&mut fx, "the retry budget again");
+        assert!(!path.exists(), "the debounce has not run and must not have");
+
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Left);
+        assert_eq!(fx.app.right_view, RightView::Pad, "the view did not move");
+        let written = std::fs::read_to_string(&path).expect("the pad the round trip left behind");
+        assert!(written.contains("retry budget"), "got: {written}");
+    }
+
+    #[test]
+    fn a_workspace_git_has_forgotten_writes_its_pad_before_it_goes() {
+        // The one place in this program where text somebody wrote is destroyed
+        // rather than merely stopped being shown: a `Space` dropped by
+        // `sync_workspaces` takes its pad with it, and `panes::pad` has no
+        // `Drop` to catch that. Type in a worktree, switch away, and have
+        // `git worktree remove` land inside the debounce.
+        let mut fx = app();
+        let other = a_second_workspace(&fx, ".claude/worktrees/other");
+        fx.app
+            .sync_workspaces(&[the_main_worktree(&fx), worktree(other.clone(), "other")]);
+        assert_eq!(fx.app.spaces.len(), 2);
+        let path = pad_at(&mut fx, 1, "forgotten.md");
+
+        assert!(fx.app.set_workspace(1));
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        typed(&mut fx, "this branch has the same bug");
+        // Back to the agent's own workspace, so the one about to be dropped is
+        // not the one on screen — which is the only interesting version of
+        // this, because a workspace being looked at is never dropped.
+        assert!(fx.app.set_workspace(0));
+        assert!(!path.exists(), "switching workspaces is not a flush");
+
+        fx.app.sync_workspaces(&[the_main_worktree(&fx)]);
+        assert_eq!(fx.app.spaces.len(), 1, "git no longer lists the worktree");
+        let written = std::fs::read_to_string(&path).expect("the pad of the workspace that went");
+        assert!(written.contains("the same bug"), "got: {written}");
+    }
+
+    #[test]
+    fn leaving_writes_the_pad_in_every_workspace() {
+        // What `flush_pads` is for, and the word under test is *every*. A note
+        // typed in a worktree somebody switched away from an hour ago is
+        // exactly as unwritten as the one in front of them, and the tick that
+        // would have written it is not going to happen.
+        let mut fx = app();
+        let other = a_second_workspace(&fx, ".claude/worktrees/other");
+        fx.app
+            .sync_workspaces(&[the_main_worktree(&fx), worktree(other.clone(), "other")]);
+        let here = pad_at(&mut fx, 0, "here.md");
+        let there = pad_at(&mut fx, 1, "there.md");
+
+        screen(&mut fx.app, 120, 24);
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        typed(&mut fx, "the agent is wrong about the cache");
+        assert!(fx.app.set_workspace(1));
+        typed(&mut fx, "and this branch has the same bug");
+
+        // What `run` does after the loop, on all six of its endings.
+        fx.app.flush_pads();
+        // The hidden one first: a `flush_pads` that had reached for the
+        // workspace on screen would pass every assertion below this one.
+        let behind = std::fs::read_to_string(&here).expect("the pad nobody is looking at");
+        assert!(behind.contains("about the cache"), "got: {behind}");
+        let front = std::fs::read_to_string(&there).expect("the pad on screen");
+        assert!(front.contains("the same bug"), "got: {front}");
+    }
+
+    #[test]
+    fn f3_moves_the_pad_with_the_reader() {
+        // The pad draws through the reader's own markdown renderer, whose
+        // colours are absolute RGB chosen against a page it paints itself, so
+        // it is in this key's loop for the ask pane's reason: left out, a
+        // session that has gone light keeps one dark pane in the corner of it.
+        let mut fx = app();
+        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        assert_eq!(fx.app.theme, Theme::Dark);
+
+        let dark = right_page(&mut fx.app);
+        fx.app.handle_key(key(KeyCode::F(3))).unwrap();
+        assert_eq!(fx.app.theme, Theme::Light);
+        assert_ne!(
+            dark,
+            right_page(&mut fx.app),
+            "F3 repainted the reader and left the pad on the page it had"
+        );
+    }
+
     // --- whose change was that ---------------------------------------------
 
     /// A worktree of the fixture's repository, made as a real directory.
@@ -5341,7 +5853,7 @@ mod tests {
     #[test]
     fn the_focus_hint_leads_the_border_where_a_long_title_cannot_clip_it() {
         // The border is the only thing on screen that says the right pane has
-        // the keys. Four of the six views draw no cursor, so a focused
+        // the keys. Four of the seven views draw no cursor, so a focused
         // read-only pane leaves the window without one anywhere at all — and
         // this hint used to be appended, behind a title that fills the 46
         // columns on its own. On a busy repository, or a document with a long

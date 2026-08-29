@@ -107,18 +107,33 @@ pub enum Action {
     Quit,
     ShowGit,
     ShowViewer,
-    /// Show the command view *and* focus it — the one of the four workspace
-    /// views that moves focus, because a command line you cannot type into is a
-    /// picture of one. ([`Action::ShowAsk`] and [`Action::ToggleSelect`] take
-    /// focus too, and say so below; neither is one of the four.) Pressed
-    /// again while it already has focus, it hands focus back, so the round trip
-    /// to run `git branch` is one key out and the same key home.
+    /// Show the command view *and* focus it, because a command line you cannot
+    /// type into is a picture of one. One of the two workspace views that move
+    /// focus — [`Action::ShowPad`] is the other, and it is the other for this
+    /// key's reason rather than for one of its own. ([`Action::ShowAsk`] and
+    /// [`Action::ToggleSelect`] take focus too, and say so below; neither is a
+    /// workspace view at all.) Pressed again while it already has focus, it
+    /// hands focus back, so the round trip to run `git branch` is one key out
+    /// and the same key home.
     ShowShell,
     /// Show the queue: work lined up for the agent. A workspace view like git
     /// and the reader, reached with `F8` — it does *not* take focus,
     /// because the common case is glancing at what is still to come while the
     /// agent works and you keep typing at it.
     ShowQueue,
+    /// Show the scratch pad *and* focus it, on `F9`.
+    ///
+    /// It takes focus for [`Action::ShowShell`]'s reason rather than by
+    /// analogy with it: the pad exists to be typed into, and a pad that needed
+    /// a second key before it would accept a word is one nobody reaches for in
+    /// the ten seconds the thought lasts. Pressed again from inside it hands
+    /// focus back, so the round trip is `F9`, type, `F9` — the same shape as
+    /// the shell's, because it is the same promise.
+    ///
+    /// A workspace view, unlike [`Action::ShowAsk`] and [`Action::ToggleDiag`]:
+    /// it displaces nothing and puts nothing back, so `F2` and `Esc` return to
+    /// it. See `crate::panes::RightView::Pad`.
+    ShowPad,
     FocusLeft,
     FocusRight,
     /// Scroll the right pane *without focusing it* — glancing at git or at the
@@ -237,12 +252,12 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // alone. Codex can remap it, which is the custom-keymap limitation the
         // module documentation and docs/keymap.md disclose.
         //
-        // It joins F2 rather than the four view keys, and the grouping is real
+        // It joins F2 rather than the view keys, and the grouping is real
         // rather than a leftover: `Diag` and `Ask` are the two views that
         // *displace* something and put it back, and neither is remembered as a
-        // workspace view. The row further down this file arguing that a fifth
-        // view spelled `F6` would be a key nobody groups with the other three
-        // still stands — this is not a fifth view.
+        // workspace view. The row further down this file arguing that a view
+        // spelled `F6` would be a key nobody groups with the workspace ones
+        // still stands — this is not one of them.
         KeyCode::F(6) if bare => Some(Action::ShowAsk),
         // F7 for the selection, and the argument is not "one more F-key was
         // free". It is the only namespace that *can* carry this: the key has to
@@ -261,6 +276,20 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // evidence rather than a structural guarantee; docs/keymap.md records
         // the audited build and the custom-keymap limitation.
         KeyCode::F(8) if bare => Some(Action::ShowQueue),
+        // Whether `F9` is clear of the three hosted agents is the audit
+        // docs/keymap.md carries, recorded there beside the builds it was run
+        // against rather than restated here.
+        //
+        // The other half of the argument is not about agents at all, and it is
+        // why the pad is `F9` rather than the next number along: `F11` is
+        // fullscreen in Windows Terminal and in most other emulators, and `F10`
+        // activates the menu bar in several, so neither reliably reaches an
+        // application at all. A key the terminal eats is worse than a key an
+        // agent binds — literal-next can hand a key to a child, and nothing
+        // abeam can do reaches past the emulator. That leaves `F9` as the only
+        // clean slot, and it is a fact about terminals rather than one about
+        // whatever is running in them.
+        KeyCode::F(9) if bare => Some(Action::ShowPad),
 
         _ if !alt => None,
 
@@ -295,6 +324,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("Alt+E", "right pane: files (again for the file list)"),
     ("Alt+S", "right pane: a shell, focused (again to leave)"),
     ("F8", "right pane: the queue of work for the agent"),
+    (
+        "F9",
+        "right pane: the scratch pad, focused (again to leave)",
+    ),
     ("F4 / F5", "move focus left / right"),
     ("Alt+J / Alt+K", "scroll right pane, without focusing it"),
     (
@@ -356,6 +389,33 @@ pub const HELP: &[(&str, &str)] = &[
     // language — which is what keeps this row true the next time the list of
     // languages grows.
     ("t", "files: the rendering / what was typed"),
+    // The pad's own version of the row above, and it is in this table because
+    // otherwise it is written down in exactly one place: the pad's opening
+    // screen, which is drawn only while the pad is empty. Somebody who types a
+    // single character into a fresh pad has just lost the only pointer there
+    // was to the rendering, which is the shape of bug this overlay exists to
+    // prevent.
+    //
+    // A chord where the reader's is a bare letter, because in the pad's edit
+    // form `t` is a letter somebody is typing — the box rule further down,
+    // arriving in a pane that is a box the whole way through. Both keys are on
+    // one row because they are one question asked in the two forms, which is
+    // also why the words are the reader's words: the two forms of a document
+    // are the same two forms wherever they are met.
+    //
+    // **"when focused" is the only condition in this table that is about where
+    // the key goes rather than what it does**, and it is here because the
+    // failure is silent. `F9`, type, `F9` leaves the pad on screen with the
+    // keys back at the agent, which is the state somebody is most likely to be
+    // in when they think of turning it over — and `Alt+T` from there is not a
+    // key that does nothing. It is Claude's `chat:thinkingToggle`, so the pad
+    // sits there unchanged while a setting moves in the pane next door. The
+    // reader's bare `t` cannot do this: `global` claims no bare letter, so an
+    // unfocused `t` was always the agent's and never looked like the reader's.
+    (
+        "Alt+T",
+        "pad, when focused: the rendering / what was typed (t, in the rendering)",
+    ),
     // The three searches are three questions, and the rows name them as
     // questions: two keys that both ended "under the root" differed by five
     // characters read at a glance, which is not a difference anyone reads.
@@ -400,11 +460,11 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     ("Backspace or -", "file list: up a directory"),
     ("r", "refresh · queue: clear what has finished (twice)"),
-    // Not a fifth global view key: `Alt+W` is Claude's, and a fifth view
-    // spelled `F6` would be a key nobody groups with the other three. Why a
-    // bare letter is allowed at all is the *intercept* paragraph at the top of
-    // this file, stated there once rather than re-argued beside every key that
-    // relies on it.
+    // Not another global view key: `Alt+W` is Claude's, and one spelled `F6`
+    // would be a key nobody groups with the workspace views. Why a bare letter
+    // is allowed at all is the *intercept* paragraph at the top of this file,
+    // stated there once rather than re-argued beside every key that relies on
+    // it.
     ("w", "git: the worktrees of this repository"),
     // The second key that opens a view without being in the `Alt` table, and
     // it is pane-local for `w`'s reason rather than for a reason of its own:
@@ -431,7 +491,7 @@ pub const HELP: &[(&str, &str)] = &[
     // The queue's own four. `space` is conspicuously not among them: it pages,
     // here as in every other pane, and arming moved to `a` rather than take a
     // key out of the shared vocabulary this table promises three rows above.
-    // A key that pages in three panes and toggles a mode in the fourth is a
+    // A key that pages in four panes and toggles a mode in the fifth is a
     // key nobody can learn.
     ("i", "queue: write a new item"),
     ("a", "queue: arm / disarm sending to the agent"),
@@ -467,6 +527,28 @@ pub const HELP: &[(&str, &str)] = &[
     (
         "(in the ask)",
         "every letter is typed; arrows, PgUp/PgDn, Home/End, Ctrl+D/U scroll; Esc clears the draft",
+    ),
+    // The fourth statement of the box rule, and it is the one this table owed
+    // the longest: the pad is a document somebody is *writing*, so the three
+    // scroll rows near the top — `j`/`k`, `space`/`b`, `g`/`G` — are not merely
+    // untrue here, they are the letters being typed. The `(in the ask)` row
+    // above states the standard this row is held to: this table must not
+    // promise a key that types a letter.
+    //
+    // It names `Ctrl+D`/`Ctrl+U` because they are the one place the pad is
+    // *worse* than the ask rather than merely different. There they still
+    // scroll, and a reader who learned that pair as the half page they are in
+    // every other pane would find them doing nothing at all here — a dead key
+    // is indistinguishable from a pane that has stopped listening, which is
+    // the whole reason this row exists.
+    //
+    // "editing" and not "the pad", because the rendering takes every one of
+    // them back: it is a read-only view like the others and the rows near the
+    // top of this table are simply true there. `Alt+T` is the key between the
+    // two, and it has its own row further up.
+    (
+        "(in the pad, editing)",
+        "every letter is typed; arrows, Home/End move the caret; PgUp/PgDn page; Ctrl+D/U do nothing",
     ),
     // The third statement of the box rule, and the one that has to be loudest:
     // this mode swallows *every* key, over a pane that may have a live shell in
@@ -519,9 +601,18 @@ pub const HELP: &[(&str, &str)] = &[
     // `Esc` is the ask's only while there is a draft to clear, which the
     // `(in the ask)` row says rather than this one: this row would have had to
     // carry the condition as well as the key, and it is already a list.
+    //
+    // The pad is the fifth, added on the day it landed as this comment asks.
+    // It keeps `q` for the ask's reason exactly — a letter is a letter in a
+    // pane being typed into — and only in the form that is being typed into:
+    // the rendering hands both keys back like any other read-only view. That
+    // condition lives on the `(in the pad, editing)` row rather than here, for
+    // the reason the ask's does. `Esc` is not in the pad's half of this list
+    // because the pad declines it in both forms, which is this row working
+    // rather than an exception to it.
     (
         "Esc or q",
-        "back to the agent (a shell and a find box keep both; the ask keeps q; worktrees keep Esc)",
+        "back to the agent (a shell and a find box keep both; ask and pad keep q; worktrees keep Esc)",
     ),
 ];
 
@@ -667,6 +758,10 @@ mod tests {
             global(&k(KeyCode::F(8), KeyModifiers::NONE)),
             Some(Action::ShowQueue)
         );
+        assert_eq!(
+            global(&k(KeyCode::F(9), KeyModifiers::NONE)),
+            Some(Action::ShowPad)
+        );
     }
 
     #[test]
@@ -739,7 +834,7 @@ mod tests {
             KeyModifiers::ALT,
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ] {
-            for n in [1u8, 2, 3, 4, 5, 6, 7, 8, 12] {
+            for n in [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 12] {
                 assert_eq!(
                     global(&k(KeyCode::F(n), mods)),
                     None,
@@ -760,7 +855,7 @@ mod tests {
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
         for expected in [
             "Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4", "F5", "F6", "F7",
-            "F8",
+            "F8", "F9",
         ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),

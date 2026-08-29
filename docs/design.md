@@ -6,7 +6,7 @@
 > This is the *why*: the arguments behind decisions that look arbitrary until
 > you know what went wrong first. Why one leading `+` token and nothing else on
 > the command line is abeam's; why the config file is read from your profile and
-> never from the repository; why two of the six views do not answer to the
+> never from the repository; why three of the seven views do not answer to the
 > shared scroll vocabulary; why the obvious version of the worktree routing rule
 > is a no-op dressed as a rule.
 >
@@ -260,8 +260,8 @@ so half-reading it is the one outcome worse than refusing it.
 
 ```toml
 [defaults]
-view  = "git"    # git | files | shell | queue | ask — which right-hand view opens
-focus = "left"   # left | right                     — which pane has the keyboard
+view  = "git"    # git | files | shell | queue | pad | ask
+focus = "left"   # left | right               — which pane has the keyboard
 zoom  = false
 theme = "dark"   # light | dark               — the reader's page
 
@@ -347,6 +347,7 @@ abeam key such as `F8`; literal-next is the recovery path when it does.
 | `F4` / `F5` | move focus left / right |
 | `F6` | right pane → **ask**, with nothing attached, **and focus it** (again for what it displaced) |
 | `F7` | select rows of the right pane by keyboard, **and focus it** |
+| `F9` | right pane → the scratch pad, **and focus it** (again to hand focus back) |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
 | `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
 | `Alt+Z` | zoom: hide / show the right pane |
@@ -363,8 +364,9 @@ the argument about which side should yield.
 
 Reading the right pane costs nothing: switching views and scrolling both work
 while the agent still has focus. You need focus to type into the pane — which is
-what `Alt+S` and `F6` are for, and the only reason a view key ever moves focus —
-or to drive a selection, which is `F7`'s, and `F7` switches no view: it acts on
+what `Alt+S`, `F6` and `F9` are for, and the only reason a view key ever moves
+focus — or to drive a selection, which is `F7`'s, and `F7` switches no view: it
+acts on
 whatever is already showing. Every other view key leaves focus exactly where it
 found it, in both directions.
 
@@ -388,8 +390,12 @@ the document is *where is it on this page* — `n` and `N` walk the matches — 
 disk, and it is the only one of the three whose box waits for `Enter` rather
 than narrowing as you type. `Esc` or `q` hands focus back to the agent.
 
-**Two of the views do not answer to that paragraph, and both are named below.**
-It used to be one.
+**Three of the views do not answer to that paragraph.** It used to be one, then
+two. The shell and the ask are named below. The third is the scratch pad, and it
+is the only one that answers to the vocabulary in one of its forms and not in
+the other: its edit form is a text field, so `j`, `k`, `g`, `q` and `t` are
+letters somebody is typing and `Alt+T` is what turns the page over, while its
+rendering takes nothing and the whole vocabulary comes back, bare `t` included.
 
 `w` is the one key in that vocabulary that is not about reading: in the git view
 it opens the repository's worktrees, `Enter` there points the right pane at the
@@ -502,13 +508,19 @@ prompt nobody was looking at.
 
 **What it selects is whole rows of the pane, as they are on screen** — not a
 range in the content behind them. That is the one thing about it worth learning,
-and everything else follows from it. Six views live in that pane and they are six
-different kinds of thing: a terminal grid, wrapped markdown with quote gutters,
-a column-aligned status list. A cell-precise selection means something different
-in each, and three of them have no coordinate space to draw it in. A row means
-the same thing in all six, and a row is what somebody copying a path, a hash, a
-stack trace or a test failure is after. It also means the highlight stays put
-when the pane scrolls under it, naming whatever is there now — which is the
+and everything else follows from it. Seven views live in that pane and they are
+seven different kinds of thing: a terminal grid, wrapped markdown with quote
+gutters, a column-aligned status list. A cell-precise selection means something
+different in each, and three of the seven have no coordinate space to draw it in
+at all: git, the queue and the diagnostics view are lists of *records* rather
+than text, and "column 12 of row 3" is not a position in anything those panes
+hold. The pad is not one of the three — it is text — but it is the sharpest
+illustration of why the row is the unit even where a coordinate space does
+exist, because it disagrees with itself about whether one does: its edit form
+turns a click into a caret, and its rendering has no cell that caret could
+honestly point at. A row means the same thing in all seven, and a row is what
+somebody copying a path, a hash, a stack trace or a test failure is after. It
+also means the highlight stays put when the pane scrolls under it, naming whatever is there now — which is the
 honest consequence, and it keeps the property that matters: what is highlighted
 is always exactly what will be copied, because the text is read at the moment you
 press the key.
@@ -520,7 +532,7 @@ above, so a `cargo` diagnostic drawn over three rows of a 46-column pane comes
 back as the one line it was written as. A frame cannot know that — a wrapped row
 and a row that happens to be full look identical once drawn — and a path
 rejoined with a newline through the middle of it is worse than not copying it.
-The other five answer `None` and get what was drawn, which is genuinely all there
+The other six answer `None` and get what was drawn, which is genuinely all there
 is to know about them.
 
 The two destinations are not the same feature wearing two hats. The clipboard is
@@ -728,9 +740,10 @@ makes on a file with no second form.
 `Esc` or a second `o` puts the outline away; `Enter` jumps and puts it away.
 `q` is not one of the ways out, and that is the same answer the worktree list
 in the git pane already gives: it means what it means everywhere else in this
-program, which is hand focus back to the agent. The four views that keep `q`
-keep it because something is being typed into them, and nothing is being typed
-here.
+program, which is hand focus back to the agent. The five views that keep `q`
+keep it because something is being typed into them — the scratch pad's edit form
+is the newest of them and the plainest case, since `q` there is a letter and
+nothing else — and nothing is being typed here.
 
 The title carries a breadcrumb of the section the reader has scrolled into, and
 it sits **after** the position, which is to say last, which is to say it is the
@@ -1111,6 +1124,13 @@ re-rooted any more than the agent can, so switching with the shell up starts a
 one of them is ticked whether or not it is on screen, so a hidden workspace's
 child can still exit, and `Alt+Q` consults all of them — otherwise quitting
 would kill somebody's build in a workspace they were not looking at.
+
+The scratch pad is per workspace as well, and it is the gentle version of the
+shell's problem rather than a fourth case of the reader's: it is not re-rooted,
+because nothing in it belongs to a directory, and nothing is running in it to be
+left behind. A switch puts the pad belonging to the worktree you moved to on
+screen, and the one you were writing in stays on disk under its own key, which
+is the workspace root written down as a file name by `crate::paths`.
 
 What deliberately does *not* follow is everything belonging to the agent: the
 idle/busy probe, the queue and the background dispatcher stay where the agent

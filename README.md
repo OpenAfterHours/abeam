@@ -5,7 +5,8 @@ One window for an AI coding session.
 Your agent runs in the left pane — hosted in a pty, parsed and drawn by abeam,
 not passed through to your terminal. The right pane shows the state of the git
 worktree, the document the agent just wrote, a shell to run things in, work
-lined up for the agent, or, where that provider is supported, a second copy you
+lined up for the agent, a pad to write your own notes in, or, where that
+provider is supported, a second copy you
 can ask about the file in front of you. A file watcher drives the first two, so
 neither has to be asked.
 
@@ -127,7 +128,7 @@ running process cannot be moved.
 
 ## The panes
 
-The left pane is your agent. The right pane is one of six views, and switching
+The left pane is your agent. The right pane is one of seven views, and switching
 between them or scrolling them costs you nothing — you only need to move focus
 to pick something out of a list, to type, or to copy with the keyboard rather
 than the mouse.
@@ -225,6 +226,23 @@ command there is. A send waits for the agent's own record to say it is idle and 
 nothing to be sitting unsubmitted in its composer, and announces itself in the
 left title first — typing at the agent during that pause defers it.
 
+**pad** (`F9`) — a scratch pad, one per workspace, and the only thing on screen
+that nobody but you wrote. It is where the thought goes when the agent is
+mid-task and interrupting it would cost you the turn. `F9` opens it **and gives
+it your keys**, because a pad you have to press a second key to type into is a
+picture of a pad; `F9` again hands them back. It holds markdown and opens on the
+source with a caret in it, so every plain key is a letter rather than a command —
+the arrows, `Home` and `End` move the caret, and `Alt+T` shows you the rendering
+instead, which is read-only and where a bare `t` brings the source back. What
+you type is saved a couple of seconds after you stop, in your own profile
+directory rather than in the repository, so it is still there next week and it
+never appears in `git status`. One thing to know about `Alt+T`: it needs the pad
+to have your keys. Hand them back with a second `F9` and the pad is still on
+screen but no longer listening, so `Alt+T` goes to the agent instead and the
+page does not turn over. `F9` again, or a click, and it does. `F7`, a drag and
+`Enter` work here as they do in every other
+right-hand view, which is how a line of it reaches the agent.
+
 **ask** (`?` from the document or the git view, `F6` from anywhere) — for Claude
 and Copilot, a second copy of your agent in the right pane which **may read and
 may not write**. For
@@ -279,6 +297,7 @@ to send it to Codex untouched.
 | `F2` | right pane → pty diagnostics, and back to what it displaced |
 | `F3` | file reader → light / dark page |
 | `F7` | select rows of the right pane by keyboard, **and focus it** (a drag copies on its own) |
+| `F9` | right pane → the scratch pad, **and focus it** (again to hand focus back) |
 | `F4` / `F5` | move focus left / right |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
 | `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
@@ -299,8 +318,10 @@ screen any more, so what you type next goes to whatever is.
 You can always tell which it is. While the right pane holds your keys its
 border *leads* with the way out — `esc→agent`, or `alt+s→agent` at a live
 shell — ahead of the pane's own title, so a long branch name cannot clip it
-off the end. Nothing else on screen says it: four of the six views draw no
-cursor, so a focused one leaves the window with no cursor anywhere at all.
+off the end. Nothing else on screen says it: four of the seven views draw no
+cursor, so a focused one leaves the window with no cursor anywhere at all. The
+pad draws one while you are editing and none in the rendering, for the same
+reason: there is nothing there to put it in front of.
 
 Once the right pane has focus, plain keys work — deliberately the same
 vocabulary as Claude's own transcript view:
@@ -316,12 +337,15 @@ o  outline of this document, when it has one
 `r` is the one of those that is not the same everywhere: it refreshes in the
 files and git views, and clears the finished rows in the queue.
 
-**Two views do not answer to that paragraph.** The **shell** takes every plain
+**Three views do not answer to that paragraph.** The **shell** takes every plain
 key, because a pane you type into cannot also read what you typed. The **ask**
 is the same: its composer is live the whole time the pane is, so `j`, `k`, `g`,
 `G`, `space`, `b`, `r` and `q` are letters there, and what scrolls is the
-arrows, PgUp/PgDn, Home/End and `Ctrl+D`/`Ctrl+U`. The F1 overlay says so in a
-row of its own.
+arrows, PgUp/PgDn, Home/End and `Ctrl+D`/`Ctrl+U`. So is the **pad** while you
+are editing, which is why `t` there is `Alt+T` — the letter is a letter. The
+pad's rendering is read-only, so the vocabulary comes back to it, `t` included.
+That is what the F1 overlay's mode rows are for: a pane whose keys mean
+something else, with nothing on screen saying so, reads as a broken pane.
 
 `Ctrl+\` exists so abeam can never permanently shadow a binding of the agent you
 are typing at. If a future release of an agent binds `Alt+G`, `Ctrl+\` then
@@ -388,10 +412,10 @@ Linux    $XDG_CONFIG_HOME/abeam/abeam.toml, or ~/.config/abeam/abeam.toml
 
 ```toml
 [defaults]
-view  = "git"    # git | files | shell | queue | ask — which right-hand view opens
-focus = "left"   # left | right                     — which pane has the keyboard
+view  = "git"    # git | files | shell | queue | pad | ask
+focus = "left"   # left | right               — which pane has the keyboard
 zoom  = false
-theme = "dark"   # light | dark                     — the reader's page
+theme = "dark"   # light | dark               — the reader's page
 
 [preset.fleet]
 host  = "claude"     # an agent abeam knows, or any program on PATH
@@ -438,7 +462,8 @@ before you install it.
   The Codex exception below is an unauthenticated smoke test; every other
   combination ships on tests rather than on use.
 - **Nobody has driven abeam on Linux by hand.** CI builds, tests and lints both
-  targets on every push, and the six manual pass criteria in
+  targets on every push to `main` and on every pull request, and the six manual
+  pass criteria in
   `docs/conpty-findings.md` have been confirmed on Windows only.
 - **abeam has never been run with GitHub Copilot CLI.** Not once. The selection,
   the launcher and the failure messages are tested; a session is not.
@@ -448,6 +473,10 @@ before you install it.
 - **Nobody has typed a question into the ask pane**, and the Copilot half of it
   has never been run by any process at all. What comes back from it is a model's
   answer, which can be fluent, specific and wrong about the file it read.
+- **Nobody has typed into the scratch pad by hand either**, on either platform.
+  It has tests and it has never had a user. It also has no undo and no
+  selection, it holds 64 KiB, and it saves two seconds after you stop typing —
+  so a machine that loses power in that gap loses that much.
 - **A turn in the ask pane that never ends has no way out** but `Alt+Q`. There is
   no cancel key and no timeout.
 - **Copying takes whole rows, of the right pane, that are on screen.** Not a
@@ -498,6 +527,8 @@ crates/abeam/src/select.rs         the rows a drag chose, and the keys that
 crates/abeam/src/ask/              the second agent, and a wire format abeam
                                    does not own
 crates/abeam/src/panes/            one file per view
+crates/abeam/src/panes/pad/        the scratch pad: the text, the caret in it,
+                                   and the one file abeam writes
 crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
 ```
 

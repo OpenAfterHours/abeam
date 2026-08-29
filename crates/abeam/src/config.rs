@@ -535,7 +535,7 @@ struct Wire {
 
 /// Which right-hand view opens.
 ///
-/// Five words, and `crate::panes::RightView` has six variants: `Diag` is the
+/// Six words, and `crate::panes::RightView` has seven variants: `Diag` is the
 /// pty instrument behind `F2`, which is somewhere you go to answer a question
 /// and then come back from. A session that opened there would be a session
 /// whose config file had accidentally been left in a debugging state, so it is
@@ -561,6 +561,22 @@ struct Wire {
 ///
 /// `files` rather than `viewer`, because that is what the pane is called
 /// everywhere a user meets it: the README's tour, the `F1` key list, the border.
+///
+/// `pad` opens the scratch pad, and it does **not** put the keyboard in it —
+/// [`Opening::focus`] decides that, here as for every other word in this list.
+/// It is worth saying because the key that opens the pad *does* move focus, so
+/// the two are not one thing said twice: `view = "pad"` on its own leaves you
+/// typing at the agent with the pad beside it, and `view = "pad"` with
+/// `focus = "right"` is exactly what `F9` does. The file can reach the pad; it
+/// spells the keystroke in two lines rather than one.
+///
+/// Which is the trade, and it is worth naming because the other way looks
+/// tidier from here. Three of these six words name a view whose key takes
+/// focus — `shell`, `pad` and `ask` — and three do not. A `focus` setting that
+/// deferred to the view would therefore mean one thing beside half this list
+/// and something else beside the other half, and a setting whose meaning
+/// depends on its neighbour is a worse surprise than a keystroke that needs a
+/// second line to write down.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum View {
@@ -568,6 +584,7 @@ enum View {
     Files,
     Shell,
     Queue,
+    Pad,
     Ask,
 }
 
@@ -578,6 +595,7 @@ impl View {
             View::Files => RightView::Viewer,
             View::Shell => RightView::Shell,
             View::Queue => RightView::Queue,
+            View::Pad => RightView::Pad,
             View::Ask => RightView::Ask,
         }
     }
@@ -963,7 +981,7 @@ mod tests {
         assert!(refused.contains("drak"), "got: {refused}");
         assert!(refused.contains("dark"), "the alternatives: {refused}");
 
-        // `diag` is deliberately not one of the four views: a session that
+        // `diag` is deliberately outside the vocabulary: a session that
         // opened on the pty instrument would be one whose config file had been
         // left in a debugging state.
         assert!(read("[defaults]\nview = \"diag\"\n").is_err());
@@ -1200,7 +1218,7 @@ mod tests {
 
     #[test]
     fn every_word_the_two_vocabularies_take_maps_to_something() {
-        // Five views and two sides, spelled as the file spells them. This is
+        // Six views and two sides, spelled as the file spells them. This is
         // the test that fails if a variant is added to `RightView` and its word
         // is not decided on here, which is the right way round: the vocabulary
         // is abeam's promise to a file somebody has already written.
@@ -1217,6 +1235,7 @@ mod tests {
             RightView::Viewer,
             RightView::Shell,
             RightView::Queue,
+            RightView::Pad,
             RightView::Diag,
             RightView::Ask,
         ] {
@@ -1225,6 +1244,7 @@ mod tests {
                 RightView::Viewer => Some("files"),
                 RightView::Shell => Some("shell"),
                 RightView::Queue => Some("queue"),
+                RightView::Pad => Some("pad"),
                 RightView::Ask => Some("ask"),
                 // Outside the vocabulary on purpose; [`View`]'s own docs carry
                 // the argument, and there is nothing to assert about a word

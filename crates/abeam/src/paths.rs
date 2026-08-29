@@ -20,13 +20,21 @@
 //! re-derived — slightly differently each time — at every call site that needs
 //! it.
 //!
-//! ## Two questions, one rule
+//! ## Three questions, one rule
 //!
 //! [`same_dir`] asks whether two spellings name the *same* directory.
 //! [`under`] asks whether one is *inside* the other. The second is emphatically
 //! not the first with a `starts_with` in front of it — see [`under`] for the
 //! sibling directory that a byte prefix swallows — but they are answered by one
 //! function, [`parts`], and that is a decision rather than tidiness.
+//!
+//! [`workspace_key`] is the third, and it is the same question wearing a hat:
+//! how do you write a directory down as a *file name*, so that state kept per
+//! workspace can be found again next week. A name derived from a spelling
+//! changes when the spelling changes, so it is derived from [`parts`] like the
+//! other two — a second normalisation living next to whichever pane needed one
+//! would have to agree with this one about case, about `/` against `\`, and
+//! about the trailing separator, for ever, in two places.
 //!
 //! This module came out of `crate::agentstate`, where the rule was a byte
 //! comparison of one spelled string and there was only ever one question to ask
@@ -115,6 +123,134 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 /// arriving through the back door.
 pub fn under(root: &Path, path: &Path) -> bool {
     parts(path).starts_with(&parts(root))
+}
+
+/// How long the readable half of a [`workspace_key`] is allowed to be.
+///
+/// Long enough to hold every repository name anybody actually types, short
+/// enough that the whole key and the two directories above it stay well inside
+/// the 260 characters a Windows path is held to unless every program in the
+/// chain has opted out of it.
+const PREFIX: usize = 32;
+
+/// The file name a workspace root's own state is written down under.
+///
+/// abeam keeps one thing per workspace outside the workspace —
+/// `crate::panes::pad::store`'s scratch pad — in a directory shared with every
+/// other workspace on the machine, so the root has to become a name. That is
+/// this module's question rather than the pad's, and the reason it is answered
+/// here rather than three lines from the caller is the failure a second answer
+/// would have: `C:\Repo` and `c:\repo` are one directory to [`same_dir`], and a
+/// naming rule written elsewhere would have to keep agreeing with [`parts`]
+/// about case, separators and the trailing `\` in order to say so. The first
+/// time it stopped agreeing, the pad somebody typed yesterday would not be
+/// there today — no error, no message, an empty pane that looks exactly like a
+/// pad they never wrote and a file on disk that nothing will ever open again.
+///
+/// Built from [`parts`], so it inherits the platform rule whole: case-folded
+/// and separator-agnostic on Windows, exact on Unix.
+///
+/// One thing that inheritance does not cover, and it is named because the
+/// failure it would make is exactly the one this function exists to prevent.
+/// The Windows half of [`parts`] folds *ASCII* case, and Windows itself folds
+/// more than that: `C:\Projekt-Ärger` and `C:\projekt-ärger` are one
+/// directory to that filesystem and two keys here, so a pad written under one
+/// spelling would not be there under the other. Nothing can reach it today,
+/// because every root in this program has been through [`resolve_root`] first
+/// and that answers with the spelling the disk itself holds — one spelling in,
+/// one key out. Unreachable by that route rather than by construction, which is
+/// the distinction worth having on the page: a caller that ever asked this
+/// about a root which had not been resolved would get the "typed yesterday, not
+/// there today" this module is written against. Folding the rest would mean
+/// carrying Windows' own case table, which is a larger and more breakable thing
+/// than the guarantee already in place.
+///
+/// ## The shape, and which half of it means anything
+///
+/// A readable prefix, a `-`, and sixteen hex digits. The prefix is the root's
+/// last component with everything a file name should not carry taken out of it,
+/// and it exists for the person who opens that directory and wants to know
+/// which of these is theirs. Nothing reads it back and nothing compares it; two
+/// roots whose last component is the same word are told apart entirely by the
+/// other half. The hash is the half that has to be right.
+///
+/// ## Not `DefaultHasher`, and not as a matter of taste
+///
+/// [`std::collections::hash_map::DefaultHasher`] documents in as many words
+/// that its output is not guaranteed to be stable across Rust releases, which
+/// makes it the wrong number to write on somebody's disk. A toolchain bump
+/// would rename every pad on the machine at once — each of them still there,
+/// none of them reachable, every pane opening empty — and the person it
+/// happened to would have nothing on screen to connect the two events.
+///
+/// FNV-1a is six lines, it is the same six lines it was in 1991, and it can be
+/// read back off this page by anybody who needs to find a file by hand. Nothing
+/// here is defending against an adversary — a collision costs two workspaces
+/// one shared pad rather than anything a person could aim — and sixty-four bits
+/// puts that far past the number of directories a machine has.
+///
+/// ## The separator inside the hash
+///
+/// Feeding the components in end to end with nothing between them makes
+/// `/a/bc` and `/ab/c` the same run of bytes and therefore the same file: two
+/// unrelated checkouts sharing one pad, each overwriting the other's notes on
+/// every keystroke. A zero byte cannot appear inside a path component on either
+/// platform, so it separates them and can never be mistaken for one. There is a
+/// test for exactly that pair below.
+pub fn workspace_key(root: &Path) -> String {
+    let parts = parts(root);
+
+    // The last component, in the one alphabet Windows, Linux and macOS all
+    // agree is safe in a file name. A run of bytes outside it collapses to a
+    // single `-` rather than becoming one `-` each, because a directory named
+    // in a script that is not Latin would otherwise come out as thirty-two
+    // dashes — noise, where the whole point of this half was recognising the
+    // place at a glance.
+    let mut prefix = String::new();
+    for byte in parts.last().map_or(&[][..], |part| part.as_slice()) {
+        let byte = byte.to_ascii_lowercase();
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        {
+            prefix.push(char::from(byte));
+        } else if !prefix.ends_with('-') {
+            prefix.push('-');
+        }
+        if prefix.len() >= PREFIX {
+            break;
+        }
+    }
+
+    // `/` has one component and nothing of it survives the alphabet above, and
+    // a path with no components at all has nothing to survive; both would
+    // otherwise open the file name with the separator or with nothing.
+    let prefix = match prefix.trim_matches('-') {
+        "" => "workspace",
+        trimmed => trimmed,
+    };
+
+    // A key therefore always ends in a hex digit, which quietly settles two
+    // Windows rules the prefix alone could break: a file name may not end in a
+    // `.`, and `con`, `nul` and `com1` are devices rather than names.
+    format!("{prefix}-{:016x}", fnv1a(&parts))
+}
+
+/// FNV-1a, 64 bits, over the components with a zero byte after each.
+///
+/// Hand-rolled for [`workspace_key`]'s reason: this number is part of a file
+/// name that has to mean the same thing after the next `rustup update`, and the
+/// standard library's hasher promises the opposite of that.
+fn fnv1a(parts: &[Vec<u8>]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET;
+    for part in parts {
+        for byte in part.iter().chain(std::iter::once(&0)) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
 }
 
 /// The directory abeam is standing in, spelled the way git will spell it.
@@ -474,6 +610,125 @@ mod tests {
         assert!(!under(below, top));
         assert!(!same_dir(top, Path::new("")), "nowhere is not the root");
         assert!(!under(top, Path::new("")));
+    }
+
+    // --- the name a root is written down under -----------------------------
+
+    #[test]
+    fn one_directory_written_two_ways_is_written_down_under_one_name() {
+        // The same table as `same_dir`'s, asserted against the same answers,
+        // because a key that disagreed with it would be a second rule — and
+        // the cost of the disagreement is a pad that was typed yesterday and
+        // is not there today.
+        for (spelling, is_the_same) in spellings() {
+            assert_eq!(
+                workspace_key(Path::new(&spelling)) == workspace_key(Path::new(ROOT)),
+                is_the_same,
+                "`{spelling}` and `{ROOT}` should {}be written down the same way",
+                if is_the_same { "" } else { "not " }
+            );
+        }
+    }
+
+    #[test]
+    fn two_roots_that_differ_only_in_where_the_separator_falls_are_two_names() {
+        // With the components fed to the hash end to end, these two are the
+        // same three bytes — so two unrelated checkouts would share one file,
+        // and each would overwrite the other's notes on every save.
+        #[cfg(windows)]
+        let (one, other) = (Path::new(r"C:\a\bc"), Path::new(r"C:\ab\c"));
+        #[cfg(unix)]
+        let (one, other) = (Path::new("/a/bc"), Path::new("/ab/c"));
+
+        assert_ne!(workspace_key(one), workspace_key(other));
+    }
+
+    #[test]
+    fn a_key_is_one_file_name_and_one_a_filesystem_will_take() {
+        // Everything awkward a root can be: a name with spaces and brackets in
+        // it, a name in another script, the top of a drive, and the path that
+        // has no components at all.
+        #[cfg(windows)]
+        let roots = [
+            ROOT.to_string(),
+            r"C:\".to_string(),
+            r"C:\Users\philm\My Repo (2)\проект".to_string(),
+            String::new(),
+        ];
+        #[cfg(unix)]
+        let roots = [
+            ROOT.to_string(),
+            "/".to_string(),
+            "/home/philm/My Repo (2)/проект".to_string(),
+            String::new(),
+        ];
+
+        let keys: Vec<String> = roots
+            .iter()
+            .map(|root| workspace_key(Path::new(root)))
+            .collect();
+
+        for (root, key) in roots.iter().zip(&keys) {
+            assert!(!key.is_empty(), "`{root}` was written down as nothing");
+            assert!(
+                key.bytes().all(|byte| byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')),
+                "`{key}` is not a name every filesystem here will take"
+            );
+            // One component, so a root can never name a directory of its own or
+            // climb out of the one it is put in.
+            assert_eq!(
+                Path::new(key).components().count(),
+                1,
+                "`{key}` is more than a file name"
+            );
+            assert!(
+                key.len() <= PREFIX + 1 + 16,
+                "`{key}` is longer than it may be"
+            );
+            // Windows refuses a name ending in either, and the hash is what
+            // guarantees neither can be the last character.
+            assert!(!key.ends_with('.') && !key.ends_with(' '), "`{key}`");
+        }
+
+        let mut unique = keys.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "two of {keys:?} are one file");
+    }
+
+    #[test]
+    fn a_root_is_written_down_under_the_same_name_it_was_last_year() {
+        // The number this test exists to freeze. `DefaultHasher` was refused
+        // because its output may change between Rust releases, and a key that
+        // changed under somebody would leave every pad they have written on
+        // disk and unreachable at once — so the value is written down here,
+        // where changing it has to be deliberate and has to be explained.
+        //
+        // Per platform, because `parts` is per platform: Windows folds the
+        // case of a root that Unix keeps.
+        #[cfg(windows)]
+        assert_eq!(workspace_key(Path::new(ROOT)), "forge-545f840039f981c1");
+        #[cfg(unix)]
+        assert_eq!(workspace_key(Path::new(ROOT)), "forge-94b2adccc4d44b8a");
+    }
+
+    #[test]
+    fn the_hash_is_the_fnv1a_that_everybody_elses_is() {
+        // The two constants, against the reference implementation's published
+        // vectors rather than against whatever this file last produced. A typo
+        // in either of them is the same failure `DefaultHasher` was refused
+        // over — every pad on the machine renamed at once — arriving from
+        // inside the house instead of from a toolchain bump, and a test that
+        // pinned this function's own output would agree with the typo.
+        //
+        // The empty input under FNV-1a 64 is the offset basis itself, and
+        // `foobar` is `0x85944171f73967e8`. What this function hashes is each
+        // component followed by a zero byte, so the second of those is that
+        // vector plus one more round of the same two lines.
+        assert_eq!(fnv1a(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(&[b"foobar".to_vec()]), 0x3453_1ca7_168b_8f38);
     }
 
     // --- the one spelling everything else starts from ----------------------

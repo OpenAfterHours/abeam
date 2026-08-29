@@ -19,7 +19,8 @@ job object behind it on Windows and a process group on Unix; the shell pane's
 candidate list is per-platform; and four places were folding case or reading `\`
 as a path separator, which is right on Windows and a correctness bug anywhere
 else. CI builds, tests and lints both targets on
-every push, which is the only reason the second one is a claim at all: a suite
+every push to `main` and on every pull request, which is the only reason the
+second one is a claim at all: a suite
 that names a platform is only ever run by that platform, and a `cfg` that
 excludes one is invisible from the other.
 
@@ -47,7 +48,7 @@ actionable. Add each target when someone can run it.
 Working, and used. Not finished.
 
 **Done.** The pty host layer, proven by a spike that ran a real Claude session
-against it on 2026-08-01. All six right-hand views, the file list, the
+against it on 2026-08-01. All seven right-hand views, the file list, the
 rendered/source toggle — which now has something to toggle on a documented
 `.rs` or `.py`, whose doc comments and docstrings are rendered where they stand
 — the outline behind `o` and the breadcrumb it puts in the title, the watcher
@@ -66,6 +67,17 @@ right pane: a drag copies when you let go, `Ctrl+C` copies whatever is
 highlighted, `F7` is the keyboard's way in, and `Enter` puts the rows in the
 agent's composer without sending them — with the limits listed at the foot of
 this document. The Windows test suite, and `clippy --all-targets` clean on both.
+
+The seventh view is the **scratch pad** on `F9`: a markdown pad per workspace
+that opens on its source with a caret in it, turns over to the rendering on
+`Alt+T`, and writes itself to `%APPDATA%\abeam\scratch\` on Windows and
+`$XDG_DATA_HOME/abeam/scratch/` — falling back to `~/.local/share` — on Linux,
+keyed by the workspace root. It is the first file abeam has ever written, and it
+is written through a temporary file and a rename so that a crash mid-save leaves
+the previous pad rather than half of one. What is done is the buffer, the two
+forms, the persistence and the tests over all three; what is not done is
+immediately below, and it is a longer list than most things in this document
+arrive with.
 
 Codex support means the interactive TUI in the left pty. The official Windows
 Codex 0.149.0 binary was hosted through abeam with an isolated `CODEX_HOME`:
@@ -163,6 +175,61 @@ work, on either platform.
 
 **Not done, and known.**
 
+- **Nobody has typed into the scratch pad by hand, on either platform.** That is
+  the sentence to read before trusting it with anything you would mind losing,
+  and it is the same sentence "Platforms" says about Linux, said about a feature
+  instead of an operating system. The pad has tests over the buffer, the two
+  forms, the caret arithmetic and the file on disk; what none of them can do is
+  press `F9` in a real terminal and find out whether the key arrives, whether
+  the caret lands where a hand expects it, or whether the pad that comes back
+  after a restart is the one that was typed. Until somebody does that, this is a
+  feature that passes its tests.
+- **There is no undo, no selection inside the pad, and no word motion.** It is a
+  caret, the four arrows, `Home`, `End`, `Backspace`, `Delete` and typing —
+  which is the whole editor, and less than any text field a user has met this
+  decade. `Ctrl+Z` in particular does nothing, and the failure that buys is the
+  ordinary one: a paste over the wrong place, or a `Backspace` held down a beat
+  too long, is not recoverable and the file on disk will agree with the mistake
+  two seconds later. It is deliberate to the extent that the first version of a
+  text buffer should not also be the first version of an undo stack; it is not
+  deliberate in the sense of being finished.
+- **The pad holds 64 KiB, and the number belongs to the syntax highlighter.**
+  Past that size syntect gives up and returns plain text, so a pad allowed to
+  grow beyond it would go grey one keystroke after it was fine with nothing on
+  screen explaining why — which is why what can be typed and what can be drawn
+  in colour are one number rather than two. At the cap, typing and pasting are
+  refused rather than truncated, and a paste that will not fit is refused whole:
+  half a pasted paragraph is worse than none of it, because the user has to
+  notice the cut and the place it happened is off the bottom of a pane they had
+  already stopped looking at.
+- **Saving is debounced by two seconds, so up to two seconds of typing can be
+  lost.** The pad is written when the text has been still that long, and on
+  quit; a machine that loses power between the last keystroke and the next save
+  loses whatever was typed in that window. Writing on every keystroke was the
+  alternative and it costs a file write per character on a pane somebody is
+  typing prose into. Two seconds is a judgement about which of those hurts
+  more, and it is a judgement rather than a guarantee.
+- **A pad file already larger than the cap is readable and not editable.** The
+  read stops at 64 KiB, the pane says so, and it then refuses to save for the
+  rest of the session — because the buffer holds a prefix, and one ordinary
+  autosave of a prefix over the whole file deletes everything past the cut. From
+  the outside that deletion would look exactly like the pad working. Nothing
+  abeam writes can reach that state, so the file has to have been grown by
+  something else; the way out is to move it aside with an editor that can hold
+  it. Refusing costs the user the feature for one session, and the other way
+  costs them the file.
+- **One of the persistence tests has a Linux expected value that was computed
+  rather than run.** `a_root_is_written_down_under_the_same_name_it_was_last_year`
+  freezes the name a workspace root is filed under, per platform, because a key
+  that changed under somebody would leave every pad they have written on disk
+  and unreachable at once. The Windows value was produced by running it here.
+  The Unix one, `forge-94b2adccc4d44b8a`, was worked out from the same FNV-1a
+  over the same components and has only ever been executed by CI — which does
+  run it, on every push to `main` and on every pull request, and would fail if
+  the arithmetic were wrong. It is
+  listed because "computed and then confirmed by a machine somewhere else" is a
+  different claim from "someone watched it pass", and this document is the place
+  that keeps those apart.
 - **Most of mermaid, by diagram type, is still shown as source.** Two families
   are drawn — `graph`/`flowchart` and `sequenceDiagram` — and `stateDiagram`,
   `classDiagram`, `erDiagram`, `gantt`, `pie`, `mindmap`, `journey`,
@@ -561,8 +628,14 @@ work, on either platform.
   lists the two steps that would upgrade it.
 - **Nine of abeam's `Alt` bindings are *probable* no-ops in Copilot, not
   verified ones, and six of the nine are worse than that.** The nine are every
-  `Alt` key abeam claims: `Alt+G`, `Alt+E`, `Alt+S`, `Alt+Q`, `Alt+Z`,
-  `Alt+J`, `Alt+K`, `Alt+PageUp` and `Alt+PageDown`. Each was looked for in
+  `Alt` key abeam claims **as a global**: `Alt+G`, `Alt+E`, `Alt+S`, `Alt+Q`,
+  `Alt+Z`, `Alt+J`, `Alt+K`, `Alt+PageUp` and `Alt+PageDown`. `Alt+T` is a
+  tenth `Alt` key abeam reads and is deliberately outside that list: the
+  scratch pad claims it while that pane has focus, `keys::global` declines it,
+  and no agent is listening for a key delivered to a focused pane. The
+  distinction is the one `docs/keymap.md` argues at length; the reason to keep
+  it out of this bullet rather than quietly counting it is that "every `Alt`
+  key abeam claims" is a wider phrase than the audit earned. Each was looked for in
   GitHub's tables and in about 150 changelog entries and found nowhere, which
   is the best a documentation-derived audit can do and is exactly the evidence
   that would have cleared `Alt+F` in Claude.
@@ -585,7 +658,9 @@ work, on either platform.
 - **`Alt+J` is on borrowed time.** Claude has a live `app:toggleTerminal` action
   with no default key, and its footer already prints `meta + j` as a fallback —
   so Claude's own UI advertises a key abeam has claimed. Nothing is bound today
-  and the invariant holds; the day it is bound, abeam has to move.
+  and the invariant holds; the day it is bound, abeam has to move. Re-checked in
+  2.1.251 on 2026-08-29, which is one build later than the audit and no
+  different: still an action, still a fallback string, still no binding.
   `docs/keymap.md` carries the details.
 - **An npm-installed agent is hosted now, and this README used to say it could
   not be.** All of what follows is about Windows, and a Linux reader can stop at
@@ -652,7 +727,8 @@ work, on either platform.
   deliberately, the entire problem `windows.rs` spends four hundred lines
   solving, in exchange for nothing.
 - **Nobody has driven abeam on Linux by hand.** CI compiles it, lints it and
-  runs the suite there on every push; the six pass criteria above have been
+  runs the suite there on every push to `main` and on every pull request; the
+  six pass criteria above have been
   confirmed on Windows only. "Platforms" says this where somebody deciding
   whether to install it will read it, which is the more important of the two
   places.
@@ -881,6 +957,34 @@ work, on either platform.
   next release of an agent, and gaining an agent can retire a key that
   was safe while there was only one, as `Alt+←`/`Alt+→` has already
   demonstrated. `Ctrl+\` is the mitigation.
+- **The Claude build that audit was read out of is no longer installed.** It was
+  2.1.220; the file at that path on 2026-08-29 is 2.1.251, a different binary,
+  and only the function-key half of the inventory has been re-derived from it —
+  which is the half `F9` needed and the half that has never been wrong. The
+  letters are the half that has been: `Alt+F` was found in a binary and not in
+  any published table. So every `Alt` row in `docs/keymap.md` is now a claim
+  about a build the user is not running. That document's provenance block exists
+  to make exactly this visible rather than to prevent it, and this is the first
+  time it has caught anything.
+
+  **Repeating the extraction is work to schedule, and here is the number that
+  argues for it.** 2.1.251 declares 143 keyboard actions; 113 have a default key
+  and **thirty have none at all**, `app:toggleTerminal` — the one the `Alt+J`
+  bullet above is about — among them. The `Alt+J` warning is therefore one
+  instance of a class thirty wide, in a product that ships weekly, and thirteen
+  of the thirty are a `strip:` family `docs/keymap.md` has never heard of. An
+  action with no default key is not necessarily unreachable, so thirty is the
+  size of the surface rather than a forecast; it is still the best available
+  answer to "how urgent is this really".
+- **`F9` has never been pressed in a real terminal.** `F10` and `F11` were
+  passed over for the pad because `F11` is fullscreen in Windows Terminal and
+  most other emulators and `F10` activates the menu bar in several, so neither
+  reliably reaches an application at all — and that is a fact about terminals
+  rather than about agents, which means no amount of reading an agent's source
+  establishes that `F9` is any better. `crates/abeam/examples/keyprobe.rs` is
+  what would, and it has been run against Windows consoles only and never for
+  this key. Run it in the terminal you launch abeam from before assuming the pad
+  opens there.
 
 ## A warning for anyone changing the pty layer
 
