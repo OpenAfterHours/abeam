@@ -174,9 +174,10 @@ const LEAD: usize = 16;
 /// One match, in the units the file has rather than the units the pane has.
 ///
 /// A *line* and not a row: nothing has been laid out, and the same file opened
-/// in the document view can wrap that line across three rows or — if it is
-/// markdown — reflow it into a paragraph that no longer contains it at all.
-/// See [`Hit::ordinal`].
+/// in the document view can wrap that line across three rows or reflow it into
+/// a paragraph that no longer contains it at all. The second used to be
+/// markdown's alone and is not any more — a doc comment in a `.rs` reflows in
+/// place. See [`Hit::ordinal`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
     /// Root-relative, `/`-separated: the path as `files::rel` spells it, which
@@ -193,10 +194,15 @@ pub struct Hit {
     /// Which match of *this file's* this is, counting from zero.
     ///
     /// The whole of what `Enter` can honestly hand to the document search. A
-    /// line number would be exact for a source file and meaningless for
-    /// rendered markdown, where the rows on screen are a reflow of the text
-    /// this was found in; an ordinal is approximate for both and wrong in the
-    /// same visible way, which the pane can then say out loud.
+    /// line number is not: the rows on screen are a reflow of the text this was
+    /// found in, and that is true of a `.md` and now equally of a `.rs` or a
+    /// `.py`, whose doc comments and docstrings are rendered where they stand —
+    /// so the line this hit is on may be inside a paragraph that has no row of
+    /// its own. It was once exact for a source file; it is exact today only for
+    /// a file the pane finds nothing in it to render. An ordinal is approximate
+    /// everywhere instead, and wrong in the same visible way everywhere, which
+    /// is what lets the pane say so out loud rather than quietly land somewhere
+    /// else.
     pub ordinal: usize,
 }
 

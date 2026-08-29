@@ -48,10 +48,18 @@
 //! about to press `Enter` on would be replaced, mid-reach, by a document they
 //! did not ask for.
 //!
-//! ## Three things to look at, one pane
+//! The outline is the fifth, and it is the plainest of them: `o` puts the
+//! document's own headings — or a source file's definitions — on screen as a
+//! list to jump into, and while that list is up the reader is choosing a place
+//! in *this* document. A file arriving would replace the document those places
+//! are places in, so the row under the selection would name somewhere that no
+//! longer exists. Same door, same lock, and the `◆` in `title` again.
 //!
-//! [`Mode`] is the document, the list, or the results of a search over every
-//! file under the root. `Alt+E` — [`ViewerPane::toggle_browse`] — moves between
+//! ## Four things to look at, one pane
+//!
+//! [`Mode`] is the document, the list, the results of a search over every file
+//! under the root, or the outline of the document. `Alt+E` —
+//! [`ViewerPane::toggle_browse`] — moves between
 //! the first two in both directions, and `Enter` on a file moves one way,
 //! because a list that stayed up after you chose something would need a second
 //! key to show you what you chose. They are the same reading position from
@@ -75,7 +83,17 @@
 //! each batch would pin the view and take the wheel away. That one line is what
 //! holds it, which is why it is pointed at from here.
 //!
-//! The list itself lives in [`browse`] and the search in [`grep`], because a
+//! The outline is a layer over the document as well, and carries nothing back
+//! because there is nowhere else it could have been opened from: `o` is a
+//! question about the document on screen, so the file list — which has no
+//! document — cannot ask it. `Esc` and a second `o` put the reader back exactly
+//! where they were, `Enter` moves them and leaves, and `q` means what it means
+//! everywhere else in this pane, which is back to the agent. It is the one mode
+//! whose rows are *indexes into another mode's rows*, which is the whole of what
+//! [`outline`] is careful about.
+//!
+//! The list itself lives in [`browse`], the search in [`grep`] and the outline
+//! in [`outline`], because a
 //! selectable, filterable directory tree is a pane's worth of code on its own,
 //! a worker thread that reads the repository is another, and this file is long
 //! enough. What being *in* a list means — which row is chosen, and keeping it on
@@ -130,20 +148,26 @@
 //! that costs, and why the alternative does not exist, is [`search`]'s argument.
 //!
 //! And it is what [`grep`] has to be reconciled with. A search over files on
-//! disk knows a *line*; this pane scrolls by *row*, and for rendered markdown
-//! the two are not relatable at all. So `Enter` on a result carries an ordinal
-//! rather than a position — the third match in that file is looked for again as
-//! the third match on the page — and when the page turns out to have fewer, the
-//! reader is told rather than parked at the top. See [`ViewerPane::show_at`]
-//! and [`ViewerPane::missed`].
+//! disk knows a *line*; this pane scrolls by *row*, and wherever anything is
+//! rendered the two are not relatable at all. That used to be a sentence about
+//! markdown. It is no longer: a `.py` drawn with its docstrings rendered in
+//! place reflows those lines exactly as a `.md` does, so the gap is now open in
+//! every file this pane knows how to render, which is most of the ones anybody
+//! opens. So `Enter` on a result carries an ordinal rather than a position —
+//! the third match in that file is looked for again as the third match on the
+//! page — and when the page turns out to have fewer, the reader is told rather
+//! than parked at the top. See [`ViewerPane::show_at`] and
+//! [`ViewerPane::missed`].
 
 mod browse;
+mod docs;
 mod files;
 mod grep;
 mod list;
 mod load;
 pub(crate) mod markdown;
 mod mermaid;
+mod outline;
 mod search;
 mod source;
 pub(crate) mod theme;
@@ -177,11 +201,44 @@ const DEFAULT_VIEWPORT: usize = 20;
 /// not worth it in a squeezed one.
 const LINE_NUMBER_MIN_WIDTH: usize = 30;
 
-/// Which of the three things the pane is showing. See the module doc.
+/// What an interior row of a rendered doc block wears where a line number would
+/// be — right-aligned in the number column, and dim.
+///
+/// **It costs no columns.** The gutter is already paid for by the numbered
+/// rows, and this fills a cell that was a space. That is the whole reason it is
+/// affordable in a pane that is routinely given forty-six columns, and the
+/// reason the alternative — a glyph in the text, pushing the prose one column
+/// further right than the code it belongs to — was not taken.
+///
+/// Dashed rather than solid, and taken from the same family
+/// `markdown::CODE_WRAP_GUTTER` draws a wrapped source line's continuation in,
+/// because it is making the same distinction one level out: this row is a
+/// continuation of something, not the start of something. It is deliberately
+/// not `│`, which inside a rendering already means "fenced code".
+///
+/// Below [`LINE_NUMBER_MIN_WIDTH`] there is no gutter at all and so nowhere to
+/// draw it. In those panes a doc row and a wrapped code row are genuinely
+/// indistinguishable, and that is accepted for the same reason the numbers are:
+/// four columns is too much to spend when there are twenty-nine.
+const DOC_ROW: &str = "┊";
+
+/// Which of the four things the pane is showing. See the module doc.
 #[derive(Clone, Copy)]
 enum Mode {
     Doc,
     Browse,
+    /// The headings, or the definitions, of the document behind it. Raised by
+    /// `o` from the document view and only from there, and it carries nothing
+    /// back because there is only one place to come back to.
+    ///
+    /// That asymmetry with [`Mode::Results`] is the whole of the difference
+    /// between them and is worth naming rather than noticing. The results are a
+    /// question about the *repository*, so they can sensibly be asked from
+    /// either settled view and have to remember which. An outline is a list of
+    /// the places in one document, so there is no document-less view it could
+    /// be asked from: `f` in the file list means something there, `o` would
+    /// mean nothing.
+    Outline,
     /// The search over every file under the root. Raised by `f` over either of
     /// the other two, and it remembers which — `Esc` out of it has to put the
     /// reader back where they pressed the key, and dropping somebody who was
@@ -195,10 +252,18 @@ enum Mode {
 /// Which of the two settled modes the results were raised over.
 ///
 /// A second enum rather than a boxed `Mode`, because there are exactly two
-/// answers and they are the two modes that are *not* the results: a `Mode`
-/// inside a `Mode` would make `Results { back: Results { .. } }` representable,
-/// and the thing it would mean is a pane that has to be `Esc`d out of twice
-/// through a state nothing on screen ever showed.
+/// answers and they are the two modes `f` can be pressed in: a `Mode` inside a
+/// `Mode` would make `Results { back: Results { .. } }` representable, and the
+/// thing it would mean is a pane that has to be `Esc`d out of twice through a
+/// state nothing on screen ever showed.
+///
+/// "The two that are not the results" is what this said, and the outline is the
+/// third mode that is not the results — so the sentence stopped being a
+/// description of anything. The rule it was reaching for is still the rule and
+/// is now stated as itself: `f` is only offered from the document and from the
+/// file list, so those are the only two places a `Back` can be made from. Why
+/// the outline does not offer `f` is [`Mode::Outline`]'s own doc and
+/// [`outline::View::key`]'s.
 #[derive(Clone, Copy)]
 enum Back {
     Doc,
@@ -224,6 +289,60 @@ struct Doc {
     body: Body,
     truncated: bool,
     bytes: u64,
+    /// Which runs of lines are code and which are documentation. See [`docs`].
+    ///
+    /// Scanned once, here, when the body is loaded — rather than by
+    /// `source_lines` each time it runs. That is not a micro-optimisation: a
+    /// window drag re-lays the document out on every frame, and the scan
+    /// allocates a `String` per doc block, so doing it there would put a
+    /// block's worth of garbage per block per frame on the thread that pumps
+    /// the agent's pty. Held beside the body it was derived from and replaced
+    /// by the same `show` that replaces it, which is the only arrangement in
+    /// which the two cannot disagree.
+    regions: Vec<docs::Region>,
+    /// Whether any of the above is documentation.
+    ///
+    /// A bool and not a scan of `regions`, because [`Pane::title`] asks this
+    /// question on **every frame** — it decides whether the title says
+    /// `· rendered` and whether a missed phrase is offered `t` as the way out —
+    /// and a file the length of this one has a few hundred regions to walk.
+    has_docs: bool,
+    /// What the body names its own parts, as `(source line, level, label)` — a
+    /// source file's definitions, or a markdown file's headings read off its
+    /// source. See [`outline::symbols`].
+    ///
+    /// Scanned once when the body is loaded, beside `regions` and for the same
+    /// reason: none of the three fields depends on the pane's width, and a
+    /// window drag re-lays the document out on every frame. Scanning from
+    /// `build` instead would put a `String` per definition per frame — two
+    /// hundred-odd of them in a file this size, 223 when this was measured, and
+    /// three hundred-odd in one at `load::MAX_BYTES` — on the thread that pumps
+    /// the agent's pty, for an answer that cannot have changed.
+    ///
+    /// What is *not* cached is the [`outline::Entry`] list built from this,
+    /// because that carries a row and a row is only ever right for one layout.
+    /// The split is the whole design: the width-independent half is scanned
+    /// once here, and the width-dependent half is rebuilt in `ensure_layout`
+    /// with the rows it indexes.
+    symbols: Vec<(usize, u8, String)>,
+}
+
+/// What one pass of [`ViewerPane::build`] produced.
+///
+/// A struct rather than the tuple this was, and the reason is not that three is
+/// one more than two. All three describe *the same rows*: the margin says how
+/// many columns at the left of them belong to the pane rather than to the
+/// document, and the outline says which of them a heading or a definition
+/// starts at. Neither means anything beside a different set of rows, and both
+/// are silent when wrong — a stale margin makes `/42` search the gutter, a
+/// stale outline lands `Enter` in the wrong paragraph. Returned as one value so
+/// the three arrive and are stored together, which is the version of "these are
+/// only ever right together" that a caller cannot get half of.
+#[derive(Default)]
+struct Layout {
+    lines: Vec<Line<'static>>,
+    margin: Margin,
+    outline: Vec<outline::Entry>,
 }
 
 enum State {
@@ -280,6 +399,26 @@ pub struct ViewerPane {
     /// is the single place that rebuilds one, which is why it is also the single
     /// place that refinds the other.
     search: Option<Search>,
+
+    /// The headings or definitions of the rows above, in reading order.
+    ///
+    /// Held beside `lines` and rebuilt with them, for the reason the field
+    /// above gives about the hits and [`outline`] restates about these: every
+    /// entry is an index into that vector, so the two are only ever right
+    /// together. It comes out of the same `build` call the rows do rather than
+    /// being derived from them afterwards — a heading is recorded by the
+    /// renderer at the instant it emits one, and a definition's row is recorded
+    /// by [`source_lines`] in the pass that emits it — so there is no
+    /// arrangement in which one exists without the other.
+    outline: Vec<outline::Entry>,
+    /// Where the reader is in that list while [`Mode::Outline`] is up.
+    ///
+    /// Beside the entries rather than holding them, which is `list::Cursor`'s
+    /// own rule and here it is load-bearing: the selection is an index the
+    /// cursor clamps against whatever count it is handed, so a rebuild that
+    /// changed the number of entries moves the selection rather than reaching
+    /// past the end of the list.
+    picker: outline::View,
     /// A phrase this pane is looking for in this document and cannot show, with
     /// the ordinal that was asked for.
     ///
@@ -370,6 +509,8 @@ impl ViewerPane {
             margin: Margin::default(),
             dirty: true,
             search: None,
+            outline: Vec::new(),
+            picker: outline::View::new(DEFAULT_VIEWPORT),
             missed: None,
             scroll,
             ask: None,
@@ -467,8 +608,15 @@ impl ViewerPane {
         // to leave somebody looking at. The mode is otherwise left alone —
         // somebody who was walking a directory is put in the new root's
         // directory, which is what `Browser::new` has just arranged.
-        if let Mode::Results { back } = self.mode {
-            self.mode = back.mode();
+        //
+        // The outline goes for the sharper version of the same reason: its rows
+        // are places in a document that is about to be `State::Empty`, so it
+        // would be a list of nothing with an `Enter` that scrolls a page the
+        // reader cannot see.
+        match self.mode {
+            Mode::Results { back } => self.mode = back.mode(),
+            Mode::Outline => self.mode = Mode::Doc,
+            Mode::Doc | Mode::Browse => {}
         }
         self.missed = None;
         self.root = root.clone();
@@ -542,6 +690,29 @@ impl ViewerPane {
         // for `Enter` in the git view and for `Tab`, where the shell can queue
         // and show within one pass of its loop.
         self.pending = None;
+        // The outline is a list of places in the document this call is
+        // replacing, so it goes with the document — `set_root`'s rule, arriving
+        // through a door `set_root` does not cover. It needs no contriving:
+        // `Alt+G` is a *global*, matched before the focus dispatch, so it
+        // reaches the git view with the outline still up, and `Enter` on a file
+        // there calls this method.
+        //
+        // Left standing, the selection is an index into the list that has gone,
+        // and it went wrong two different ways. A five-heading document open at
+        // its last row, then a three-heading file, left `sel` at 4 against three
+        // entries: no row highlighted anywhere on the page, and `Enter` silently
+        // doing nothing at all until `j` or `k` brought the cursor back into
+        // range. And a file that could not be read left this view up over a
+        // `State::Failed`, which has no outline — so the title came out
+        // ` · outline · 1/0`, opening with a space where the file name belongs.
+        // That second one is the arm in [`Pane::title`] below that calls itself
+        // unreachable; it is unreachable because of this line.
+        //
+        // The other two modes are deliberately not touched. They are lists of
+        // places in the *tree*, and a new document has not moved any of them.
+        if matches!(self.mode, Mode::Outline) {
+            self.mode = Mode::Doc;
+        }
         // Re-showing the file already on screen is a reload, and a reload must
         // not throw away the reader's place. An agent rewriting a document
         // someone is halfway through is the common case, not the rare one.
@@ -573,6 +744,27 @@ impl ViewerPane {
                 truncated,
                 bytes,
             }) => {
+                // Scanned before the body is moved into place, and only ever
+                // here. A markdown file gets a scan too and it costs one
+                // extension test: `docs::regions` has no rules for `.md` and
+                // hands back a single code region, which is exactly what raw
+                // markdown — which goes down `source_lines` like any other
+                // source — wants to be given.
+                let regions = docs::regions(&text, &path);
+                let has_docs = regions.iter().any(docs::Region::is_doc);
+                // Scanned here for `regions`' reason rather than a second one:
+                // it does not depend on the width, and everything that runs per
+                // frame does.
+                //
+                // A `.md` costs more than the line above does — a real
+                // `pulldown_cmark` pass over the source rather than an
+                // extension test — and it is paid here for the same reason and
+                // once. It is paid even when the document opens *rendered*,
+                // where the entries come from the renderer and this list is
+                // never read: the alternative is scanning on the `t` that first
+                // asks for it, which puts a parse of the file on a keystroke
+                // instead of on the load that already reads it off the disk.
+                let symbols = outline::symbols(&text, &path);
                 let body = if crate::watch::is_markdown(&path) {
                     Body::Markdown(text)
                 } else {
@@ -583,6 +775,9 @@ impl ViewerPane {
                     body,
                     truncated,
                     bytes,
+                    regions,
+                    has_docs,
+                    symbols,
                 })
             }
             Err(why) => State::Failed { path, why },
@@ -605,12 +800,14 @@ impl ViewerPane {
     /// caller has to be read past.
     ///
     /// An *ordinal* and not a line number, because the grep read the file's
-    /// logical lines and this pane is about to lay out physical rows. Rendered
-    /// markdown makes the gap obvious; a `.rs` hides it until a line is wider
-    /// than the pane, and then the two disagree there too. See
+    /// logical lines and this pane is about to lay out physical rows. That gap
+    /// used to be described as markdown's, with a `.rs` hiding it until a line
+    /// grew wider than the pane; a documented `.rs` now disagrees at every
+    /// width, because a run of `///` lines is reflowed into a paragraph exactly
+    /// as a `.md` is and the sixth line of the block is no longer a row. See
     /// [`grep::Hit::ordinal`], [`ViewerPane::missed`] for what the reader is
-    /// told when they do, and [`search`]'s module doc for the change that would
-    /// retire the disagreement.
+    /// told when the two disagree, and [`search`]'s module doc for the change
+    /// that would retire the disagreement.
     ///
     /// A file that cannot be read is not seeded at all, and that is not a
     /// shortcut. `build` turns an unreadable path into rows of the pane's *own
@@ -692,7 +889,11 @@ impl ViewerPane {
             self.grep.close_box();
         }
         self.mode = match self.mode {
-            Mode::Doc => {
+            // The outline is peeled off the same way and then `Alt+E` means
+            // what it has always meant. It is a layer over the document, so the
+            // view underneath it is the document — which is the arm below, and
+            // which is why this one falls into it rather than restating it.
+            Mode::Doc | Mode::Outline => {
                 // Open the list beside the document on screen. Whether that
                 // means moving is [`Browser::align_to`]'s judgement, not ours:
                 // it is the difference between a list that is a place and a
@@ -747,6 +948,103 @@ impl ViewerPane {
         Handled::Yes
     }
 
+    /// `o`, from the document view and from nowhere else.
+    ///
+    /// Pane-local and exempt from the invariant at the top of `crate::keys` for
+    /// the reason stated there and cited by `f` and `t` above: it is only ever
+    /// delivered to a focused pane with the document showing, so no agent is
+    /// listening for it. It is free — no `Char('o')` is claimed anywhere in the
+    /// program — and inside every box in this pane it is a letter, because the
+    /// box is asked first.
+    ///
+    /// **Declines a document with nothing to list**, which is
+    /// [`ViewerPane::toggle_raw`]'s rule applied rather than a new one: a pane
+    /// that advertises a key which does nothing is worse than one that
+    /// declines, because the reader is left pressing it again. An empty list
+    /// with a sentence in it would be the same failure dressed as an answer —
+    /// it costs a frame, it costs the reader the document they were looking at,
+    /// and `Esc` is then a key they have to press to undo a key that told them
+    /// nothing.
+    ///
+    /// Nothing anywhere advertises `o` per document, and it cannot: the title
+    /// is a line that already carries the name, the form, the query and the
+    /// position, and the F1 overlay is one table for the whole program. What
+    /// makes that acceptable is the same thing that makes `t`'s silence
+    /// acceptable — declining costs nothing and says so instantly.
+    ///
+    /// Before the first frame there is no layout and therefore no outline, so
+    /// `o` declines there too. That is `show_at`'s "skipped before the first
+    /// frame" again: a key drained from the same batch as the one that opened
+    /// the pane has nothing to be a list of yet.
+    fn open_outline(&mut self) -> Handled {
+        if self.outline.is_empty() {
+            return Handled::No;
+        }
+        // Opened on the entry the breadcrumb has been naming, and told the
+        // pane's real height — see [`outline::View::open`].
+        self.picker
+            .open(&self.outline, self.scroll.offset, self.scroll.viewport());
+        // The box does not survive leaving the document; the hits do. Exactly
+        // the trade `toggle_browse` makes one method up, and for the same
+        // reason: a box open behind a list would keep `takes_input` and
+        // `exit_hint` answering for a query nobody can see.
+        self.close_search();
+        self.mode = Mode::Outline;
+        Handled::Yes
+    }
+
+    /// Fold what the outline did back into the pane.
+    fn absorb_outline(&mut self, out: outline::Outcome) -> Handled {
+        match out {
+            outline::Outcome::Ignored => Handled::No,
+            outline::Outcome::Moved => Handled::Yes,
+            outline::Outcome::Leave => {
+                // Where the reader was, exactly. Nothing is done to `scroll`,
+                // which is the whole of what "never mind never costs you your
+                // place" is implemented as.
+                self.mode = Mode::Doc;
+                Handled::Yes
+            }
+            outline::Outcome::Jump(row) => {
+                // The heading goes to the *top* of the pane rather than being
+                // centred the way a search hit is, and the two differ because
+                // the moves differ. A hit is a word inside a paragraph and the
+                // reader needs to see what is either side of it to tell whether
+                // it is the one they wanted; a heading is the start of a
+                // section, and everything worth reading is below it. Centring
+                // one would spend half the pane on the section the reader has
+                // just chosen to leave.
+                //
+                // `Scroll::to` clamps to the last full page, so a heading in
+                // the final screenful lands part way down the pane instead of
+                // at the top — still on screen, which is the promise, and the
+                // only alternative is scrolling past the end of the document.
+                //
+                // And the half the first version of this was missing:
+                // **a heading already on screen moves nothing at all.** That is
+                // `reveal_hit`'s rule, and it is not the aiming policy — top
+                // rather than centred — it is the rule the two aiming policies
+                // share, because both exist to bring something into view and
+                // neither has anything to do when it is already in view.
+                // Without it, `o` `Enter` on a heading the reader can already
+                // see is a key that scrolls the page for no reason: parked at
+                // offset 1 with the next heading drawn seven rows down, the
+                // promise is already kept, and the move only takes the
+                // paragraph they were reading off the bottom.
+                let page = self.scroll.viewport().max(1);
+                let seen = row >= self.scroll.offset && row < self.scroll.offset + page;
+                if !seen {
+                    self.scroll.to(row);
+                }
+                // The list has answered its question. Staying in it would mean
+                // pressing another key to see what was chosen — `browse`'s
+                // rule, two lists along.
+                self.mode = Mode::Doc;
+                Handled::Yes
+            }
+        }
+    }
+
     /// Is a find box open? The border and the paste route both ask, and both
     /// are asking about this instant rather than about the pane's type.
     fn finding(&self) -> bool {
@@ -772,13 +1070,34 @@ impl ViewerPane {
         matches!(self.mode, Mode::Results { .. }) && self.grep.typing()
     }
 
-    /// Rendered markdown, or the source it was rendered from.
+    /// Does the document on screen have a second form for `t` to swap to?
     ///
-    /// Only markdown has two forms. On anything else this is a key the pane has
-    /// no answer for and says so, rather than reporting that it acted and
-    /// leaving a reader pressing something that visibly does nothing.
+    /// Two documents do. Markdown, which is rendered and has a source behind
+    /// it; and a source file with documentation in it, which is drawn with its
+    /// doc comments rendered as prose in place and has the file itself behind
+    /// *that*. Everything else — a `.txt`, a `.rs` with no doc comment in it,
+    /// the empty screen, the unreadable notice — has one form and only one.
+    ///
+    /// One predicate rather than the same `matches!` written twice, because
+    /// [`ViewerPane::toggle_raw`] decides whether the key acts and
+    /// [`Pane::title`] decides whether the title advertises it, and a pane that
+    /// says `· rendered` over a document `t` declines to toggle is naming a key
+    /// that does nothing. Cheap enough to be asked from `title` every frame:
+    /// an extension test and a bool that was worked out when the file loaded.
+    fn two_forms(&self) -> bool {
+        matches!(&self.state, State::Doc(d) if crate::watch::is_markdown(&d.path) || d.has_docs)
+    }
+
+    /// Rendered, or the source it was rendered from.
+    ///
+    /// Offered only where there is genuinely something on the other side — see
+    /// [`ViewerPane::two_forms`]. A `.rs` with no doc comment in it renders
+    /// identically to its own source, so a `t` there would report that it acted
+    /// and change nothing on screen, which is worse than a key that declines:
+    /// the reader is left pressing it again, and each press re-renders the
+    /// agent's whole screen.
     fn toggle_raw(&mut self) -> Handled {
-        if !matches!(&self.state, State::Doc(d) if crate::watch::is_markdown(&d.path)) {
+        if !self.two_forms() {
             return Handled::No;
         }
 
@@ -807,6 +1126,12 @@ impl ViewerPane {
         // strength of an argument for the opposite move. The notice survives the
         // trip instead, and is still true: `settle_search` will restate it, and
         // the remedy it names changes with the form under it.
+        //
+        // The direction is right for a source file with doc regions too, and for
+        // the same reason rather than a second one: rendering a `///` block eats
+        // the markers, reflows the prose and drops the URL behind a link, so it
+        // is the form a phrase can go missing from, and the raw file is the form
+        // the sweep actually read.
         if !self.raw
             && let Some((query, ordinal)) = self.missed.take()
         {
@@ -891,7 +1216,10 @@ impl ViewerPane {
     /// Lay the document out for `width`, if it is not already.
     ///
     /// The one place `lines` is rebuilt, and therefore the one place the hits
-    /// can be refound. Nothing else rebuilds them: `t`, `F3`, `r`, `set_theme`,
+    /// can be refound *and the one place the outline can be*. Both are vectors
+    /// of indexes into the rows, so both are wrong the instant the rows change,
+    /// and both are made out of this one call rather than wired to the routes
+    /// that reach it. Nothing else rebuilds them: `t`, `F3`, `r`, `set_theme`,
     /// `set_root`, a reload, a file taken up by the watcher and a window drag
     /// all say so by setting `dirty` or by arriving with a new width, and then
     /// wait for this. Counting those routes and wiring each one would be a list
@@ -907,7 +1235,18 @@ impl ViewerPane {
         if !self.dirty && width == self.laid_out {
             return;
         }
-        (self.lines, self.margin) = self.build(width);
+        // Destructured from one value rather than assigned from a tuple, which
+        // is what a third member turned this into: `(a, b, c) = f()` at a call
+        // site three hundred lines from the function is a positional puzzle,
+        // and the three are one thing anyway — see [`Layout`].
+        let Layout {
+            lines,
+            margin,
+            outline,
+        } = self.build(width);
+        self.lines = lines;
+        self.margin = margin;
+        self.outline = outline;
         self.laid_out = width;
         self.dirty = false;
         if let Some(search) = self.search.as_mut() {
@@ -958,14 +1297,17 @@ impl ViewerPane {
         self.missed = None;
     }
 
-    /// The rows, and how much of them is the pane's own margin rather than the
-    /// document. See [`search::Margin`].
-    fn build(&self, width: usize) -> (Vec<Line<'static>>, Margin) {
+    /// One layout of the document: the rows, and the two things that are only
+    /// ever true of *these* rows. See [`search::Margin`] and [`outline`].
+    fn build(&self, width: usize) -> Layout {
         if width == 0 {
-            return (Vec::new(), Margin::default());
+            return Layout::default();
         }
         let t = self.theme.theme();
-        let plain = |lines| (lines, Margin::default());
+        let plain = |lines| Layout {
+            lines,
+            ..Layout::default()
+        };
         match &self.state {
             State::Empty => plain(empty_hint(width, self.watching, t)),
             State::Failed { path, why } => {
@@ -994,12 +1336,59 @@ impl ViewerPane {
                 // file, gutter and all: syntect has a Markdown grammar, and a
                 // reader looking at the source of a document wants to see the
                 // line numbers they are about to talk about.
-                let (mut lines, gutter) = match &doc.body {
+                let (mut lines, gutter, outline) = match &doc.body {
                     Body::Markdown(text) if !self.raw => {
-                        (markdown::render(text, width, self.theme), 0)
+                        // The renderer's own answer, because it is the only
+                        // thing that knows which row a heading landed on. See
+                        // [`markdown::render_outlined`].
+                        let (lines, outline) = markdown::render_outlined(text, width, self.theme);
+                        (lines, 0, outline)
                     }
                     Body::Markdown(text) | Body::Source(text) => {
-                        source_lines(text, &doc.path, width, self.theme)
+                        // `raw` is one question asked of both bodies — "show me
+                        // the text as it is" — so it is one branch rather than
+                        // two. An empty region list is how `source_lines` is
+                        // told not to interleave, and `docs::regions` never
+                        // returns one, so "the reader pressed t" and "this file
+                        // has nothing to render" cannot be confused.
+                        let regions: &[docs::Region] = if self.raw { &[] } else { &doc.regions };
+                        // The definitions were scanned when the file loaded and
+                        // are in *source lines*; what is asked for here is the
+                        // row each of those lines came out on, which only the
+                        // pass that emits the rows can say. Handed in as a
+                        // sorted list of lines and answered in the same order,
+                        // so the mapping costs one cursor rather than a lookup
+                        // per line of the file. A `.md` shown as source comes
+                        // through here like any other body and with a list like
+                        // any other: `outline::symbols` parses it with the
+                        // renderer's own parser, so the source form has the
+                        // same headings the rendered form does, at the lines
+                        // they are written on. Its `regions` is `&[]`, so every
+                        // line below is drawn as code and every one of those
+                        // lines has a row to be mapped to.
+                        let want: Vec<usize> = doc.symbols.iter().map(|(at, ..)| *at).collect();
+                        let (lines, gutter, at) =
+                            source_lines(text, &doc.path, regions, width, self.theme, &want);
+                        // A symbol that was never drawn as a code row has no
+                        // row to name. It should not happen — a definition
+                        // inside a doc region would mean `docs` had swallowed a
+                        // line of code — and it is dropped rather than clamped,
+                        // because a wrong row in a jump list is the one thing
+                        // this feature must not produce and there is no such
+                        // thing as an approximately right one.
+                        let outline = doc
+                            .symbols
+                            .iter()
+                            .zip(at)
+                            .filter_map(|((_, level, text), row)| {
+                                row.map(|row| outline::Entry {
+                                    row,
+                                    level: *level,
+                                    text: text.clone(),
+                                })
+                            })
+                            .collect();
+                        (lines, gutter, outline)
                     }
                 };
                 // Measured before the notice below is appended, because the
@@ -1020,7 +1409,11 @@ impl ViewerPane {
                         t.dim(),
                     ));
                 }
-                (lines, margin)
+                Layout {
+                    lines,
+                    margin,
+                    outline,
+                }
             }
         }
     }
@@ -1327,6 +1720,36 @@ impl Pane for ViewerPane {
             let mark = if self.pending.is_some() { "◆ " } else { "" };
             return format!("{mark}{}", self.grep.title());
         }
+        if matches!(self.mode, Mode::Outline) {
+            // Fourth door, same mark and the same reason: this pane is on
+            // screen and still holding a file back, so the shell has no border
+            // to mark. Bare like the results' mark rather than naming a key,
+            // because two keys release it — `Esc` and a second `o` — and a
+            // mark that named one of them would be advertising the less likely
+            // of the two.
+            let mark = if self.pending.is_some() { "◆ " } else { "" };
+            let name = match &self.state {
+                State::Doc(doc) => self.label(&doc.path),
+                // Unreachable, and it takes the whole of `show` to say why
+                // rather than `o`'s guard alone: `o` declines an empty outline,
+                // so this mode is only entered over a document — and `show` and
+                // `set_root` are the only two writers of `state`, and both leave
+                // this mode as they write it. `show` did not, which is how this
+                // arm came to be reachable and drawn: the title read
+                // ` · outline · 1/0`, opening with a space where the file name
+                // belongs.
+                //
+                // Answered rather than asserted, for the reason
+                // `docs::partition` gives — an assertion on the draw path is a
+                // panic in the agent's pane, and this is a viewer. Answered with
+                // the words this pane's own title uses for those two states, so
+                // that if it is ever reachable again the border says something
+                // instead of starting with a gap.
+                State::Empty => "files".into(),
+                State::Failed { path, .. } => format!("{} · unreadable", self.label(path)),
+            };
+            return format!("{mark}{}", self.picker.title(&self.outline, &name));
+        }
         if matches!(self.mode, Mode::Browse) {
             // The one place this pane marks a pending file itself, and it has
             // to be: the shell draws `◆ Alt+E` only on the border of the view
@@ -1367,15 +1790,23 @@ impl Pane for ViewerPane {
         // given nothing to press.
         //
         // The remedy goes on the miss rather than beside it, and each body gets
-        // the one that is true of it. Rendered markdown names `t`, because the
+        // the one that is true of it. Anything *rendered* names `t`, because the
         // commonest reason to find nothing in a rendering is that the thing was
         // rendered away and `t` is where it went. Everything else names the
-        // width, because a wrap is the only way a phrase the sweep found can be
-        // missing from the rows it was wrapped into.
+        // width, because a wrap is then the only way a phrase the sweep found
+        // can be missing from the rows it was wrapped into.
+        //
+        // "Rendered" is no longer a synonym for "markdown", and that is the one
+        // clause here that changed. A `.py` drawn with its docstrings rendered
+        // in place has eaten its own `"""`, reflowed the prose between them and
+        // dropped the URL behind a link, exactly as a `.md` does — so a phrase
+        // inside a docstring's markdown syntax genuinely is not on the drawn
+        // page, and `t` is genuinely where it went. The question is therefore
+        // "does this document have a second form, and is the rendered one up",
+        // which is [`ViewerPane::two_forms`] and `!raw`; the body's *type* was
+        // only ever standing in for that.
         let miss = match &self.state {
-            State::Doc(doc) if matches!(doc.body, Body::Markdown(_)) && !self.raw => {
-                " · t for source"
-            }
+            State::Doc(_) if self.two_forms() && !self.raw => " · t for source",
             State::Doc(_) => " · widen if a wrap split it",
             _ => "",
         };
@@ -1398,13 +1829,28 @@ impl Pane for ViewerPane {
             }
             State::Doc(doc) => {
                 let trunc = if doc.truncated { " · truncated" } else { "" };
-                // Which of the two forms is on screen, but only for the file
-                // that has two: saying "rendered" about a `.rs` would be
-                // advertising a toggle that is not there.
-                let form = match &doc.body {
-                    Body::Markdown(_) if self.raw => " · source",
-                    Body::Markdown(_) => " · rendered",
-                    Body::Source(_) => "",
+                // Which of the two forms is on screen, but only for a file that
+                // has two. That used to mean markdown and nothing else, on the
+                // grounds that saying "rendered" about a `.rs` would advertise a
+                // toggle that is not there — and the premise, not the rule, is
+                // what has changed: a `.rs` with doc comments in it *is*
+                // rendered, and `t` really does show the source. What the word
+                // has to track is whether the toggle exists, so it asks the same
+                // predicate the toggle itself asks. A `.rs` with no doc comment
+                // anywhere still says nothing, because for that file the old
+                // sentence is still exactly true.
+                let form = match (self.two_forms(), self.raw) {
+                    (false, _) => "",
+                    (true, true) => " · source",
+                    (true, false) => " · rendered",
+                };
+                // Which section the reader is in, when the document knows. See
+                // [`outline::crumb`] for the eliding; where it *sits* is
+                // decided immediately below and is the whole of what this line
+                // has to get right.
+                let crumb = match outline::crumb(&self.outline, self.scroll.offset) {
+                    Some(crumb) => format!(" · {crumb}"),
+                    None => String::new(),
                 };
                 // Read left to right, this is what the reader gives up last
                 // first: the file name, then which form of it, then the query,
@@ -1414,8 +1860,41 @@ impl Pane for ViewerPane {
                 // the 46 columns this pane is routinely given, sitting second
                 // to last meant it was clipped off exactly when a long query
                 // was missing, which is the one moment it exists for.
+                //
+                // **The breadcrumb goes after the position, which is to say
+                // last, which is to say it is the first thing lost.** That is
+                // the rule above applied and not an exception to it. Every
+                // other part of this line is an *answer*: the name says which
+                // file, the form says why a phrase cannot be found, the notice
+                // says the search came up empty, the truncation says the file
+                // does not end where the rows do. The breadcrumb answers
+                // nothing — the reader can see the heading by scrolling to it,
+                // and `o` lists every one of them — so it is a convenience, and
+                // a convenience that can displace an answer is a bug in the
+                // ordering rather than a feature of the title.
+                //
+                // Which puts it to the right of `· 62%`, and that is deliberate
+                // rather than a place left over. Sitting *before* the position
+                // — which reads better, and is where a first draft put it —
+                // would mean a narrow border clipping the position away while a
+                // half-eaten section name survived, and "where am I in this
+                // file" is a question with an answer where "which section is
+                // this" is a nicety. The cost of being last is that a slightly
+                // clipped title shows a truncated crumb; the cost of being
+                // second to last is that it takes an answer down with it.
+                //
+                // It has a length cap of its own — [`outline::CRUMB_MAX`] — and
+                // the cap is not a second copy of the ordering above. The
+                // ordering decides what is given up when the border is too
+                // narrow for everything; the cap decides how much the crumb may
+                // *ask for* before that question is reached, so that a chain
+                // too long to show is shortened where its parts are still known
+                // to be levels rather than by a border cutting a string
+                // wherever it runs out. That is the whole of what the number is
+                // for, and `CRUMB_MAX` carries the measurement it was chosen
+                // against — including the one the old comment here got wrong.
                 format!(
-                    "{mark}{}{form}{find}{trunc} · {}",
+                    "{mark}{}{form}{find}{trunc} · {}{crumb}",
                     self.label(&doc.path),
                     self.position()
                 )
@@ -1458,6 +1937,34 @@ impl Pane for ViewerPane {
         // they never asked for.
         if matches!(self.mode, Mode::Results { .. }) {
             self.grep.render(f, inner);
+            return;
+        }
+
+        // The fourth, closed the same way and for a reason that is one of the
+        // other three rather than a new one: somebody choosing a section of
+        // *this* document is using the pane, and the file that arrived is a
+        // different document — so the row they were about to press `Enter` on
+        // would name a place in a page that no longer exists.
+        if matches!(self.mode, Mode::Outline) {
+            // **The document is laid out anyway, from in here.** It is not on
+            // screen, so this looks like work for nothing, and it is the one
+            // thing holding invariant that an outline row can never be stale:
+            // the entries index `lines`, the pane can be dragged narrower while
+            // this list is up, and skipping the layout would leave rows built
+            // for a width the reader has already left. `Enter` would then land
+            // by the old wrapping. It costs what a drag over the document
+            // already costs and nothing more, because `ensure_layout` returns
+            // immediately when neither the width nor `dirty` has moved.
+            let text_width = inner.width - scroll::bar_width(inner.width);
+            self.ensure_layout(text_width as usize);
+            // And measured, for the half of the same reason that is easy to
+            // miss: `Scroll::to` clamps against the row count a frame last told
+            // it, so an `Enter` after a drag would be aimed at a row of the new
+            // layout and clamped by the old one's length. A pane dragged
+            // narrower makes the document *longer*, so the clamp would land the
+            // reader short of the heading with nothing on screen to say why.
+            self.scroll.measure(self.lines.len(), inner.height as usize);
+            self.picker.render(f, inner, &self.outline, self.theme);
             return;
         }
 
@@ -1587,6 +2094,20 @@ impl Pane for ViewerPane {
             return Ok(self.absorb_result(out));
         }
 
+        // And the outline owns every key while it is up, for the same reason:
+        // `j` there moves a selection rather than the page, and a pane cannot
+        // hand the same key to two vocabularies and hope. Unlike the two lists
+        // above it, it claims `Esc` — it is a layer with a view behind it, so
+        // the press has somewhere to go that is not the agent. It does *not*
+        // claim `q`, which reaches `Outcome::Ignored` and leaves here as
+        // `Handled::No` exactly as it does in the document, the list and the
+        // results. See [`outline::View::key`] for why that is the choice, and
+        // `exit_hint` for what the border therefore has to say.
+        if matches!(self.mode, Mode::Outline) {
+            let out = self.picker.key(&self.outline, key);
+            return Ok(self.absorb_outline(out));
+        }
+
         // The list owns every key while it is up, including the scroll ones:
         // there they move a selection rather than an offset, and a pane cannot
         // hand the same key to two vocabularies and hope.
@@ -1653,6 +2174,11 @@ impl Pane for ViewerPane {
             // each other on the same screen because the question a reader has
             // is often the second one after the first has come up empty.
             _ if bare(key, 'f') => self.open_results(Back::Doc),
+            // Not a search at all, which is why it is not in that sentence: `/`
+            // and `f` are questions about words, and this is the document's own
+            // table of contents. See [`ViewerPane::open_outline`], including
+            // why it declines rather than opening an empty list.
+            _ if bare(key, 'o') => self.open_outline(),
             KeyCode::Char('n') => self.step_hit(true),
             KeyCode::Char('N') => self.step_hit(false),
             // `?` for the ask view, about the document on screen. Pane-local
@@ -1710,6 +2236,10 @@ impl Pane for ViewerPane {
             let out = self.grep.mouse(ev);
             return Ok(self.absorb_result(out));
         }
+        if matches!(self.mode, Mode::Outline) {
+            let out = self.picker.mouse(&self.outline, ev);
+            return Ok(self.absorb_outline(out));
+        }
         if matches!(self.mode, Mode::Browse) {
             let out = self.browse.mouse(ev);
             return Ok(self.absorb(out));
@@ -1739,6 +2269,12 @@ impl Pane for ViewerPane {
         if matches!(self.mode, Mode::Results { .. }) {
             return Ok(self.grep.scroll_view(key));
         }
+        // A third list, and the rule is the list's rather than this view's:
+        // `Down` in the outline moves the row `Enter` would jump to, and a
+        // glance from the other side of the window must not re-aim it.
+        if matches!(self.mode, Mode::Outline) {
+            return Ok(self.picker.scroll_view(key));
+        }
         if matches!(self.mode, Mode::Browse) {
             return Ok(self.browse.scroll_view(key));
         }
@@ -1767,13 +2303,17 @@ impl Pane for ViewerPane {
         self.finding() || self.typing() || self.grepping()
     }
 
-    /// Seven answers, and the border has to be true in every one of them
+    /// Eight answers, and the border has to be true in every one of them
     /// because it is the only place the way out is written down. It names what
     /// *this* press does, not where the sequence ends, which is what makes a
     /// three-press `Esc` describable one press at a time.
     ///
+    /// The eighth is the outline, and it is the only one of them with a single
+    /// unconditional answer: it has no box to close first and only the document
+    /// behind it, so `esc→page` is true of every state it can be in.
+    ///
     /// The results, which are a layer over one of the other two views, are worth
-    /// three of the seven. `esc→results` closes their box onto the matches
+    /// three of the eight. `esc→results` closes their box onto the matches
     /// behind it. With nothing behind it — the box has never been run — the same
     /// press leaves the whole view, and where it leaves *to* is the half a
     /// single answer could not have covered: `esc→list` when `f` was pressed in
@@ -1794,7 +2334,7 @@ impl Pane for ViewerPane {
     /// it names the file rather than the hits. The `◆` this pane has already put
     /// in the title is what makes that read.
     ///
-    /// A [notice](ViewerPane::missed) is deliberately not one of the seven. It
+    /// A [notice](ViewerPane::missed) is deliberately not one of the eight. It
     /// is a sentence in the title with no state behind it, so `Esc` passes
     /// straight through it to the shell and the answer is `esc→agent` — which is
     /// exactly what happens.
@@ -1805,6 +2345,14 @@ impl Pane for ViewerPane {
                 (_, _, Back::Browse) => "esc→list",
                 (_, _, Back::Doc) => "esc→page",
             };
+        }
+        // `esc→page`, the same words the results use when `f` was pressed in the
+        // document, because it is the same journey and the border has one
+        // vocabulary or it has none. It is unconditional where the others are
+        // not: this view has no box to close first and nothing behind it but
+        // the document, so there is only ever one thing the press can do.
+        if matches!(self.mode, Mode::Outline) {
+            return "esc→page";
         }
         if matches!(self.mode, Mode::Browse) {
             return if self.browse.finding() {
@@ -1866,48 +2414,345 @@ impl Pane for ViewerPane {
 }
 
 /// Source files get a line-number gutter, because "look at line 42" is how
-/// anyone talks about code. A wrapped continuation gets a blank number, which
-/// is the only thing distinguishing it from the next line.
+/// anyone talks about code. Three things can be in it, and they say three
+/// different things: a **number**, which is a line of the file starting here; a
+/// **blank**, which is the same line still going, wrapped; and a dim
+/// [`DOC_ROW`], which is a row of rendered documentation between the numbers at
+/// the two ends of the block it came from.
+///
+/// The blank and the pip used to be one signal, and that was the mistake worth
+/// naming. A rendered block put its first line's number on its first row and a
+/// blank on the rest, which is exactly what a source line too wide to fit
+/// looks like — so a thirteen-row paragraph read as one very long wrapped
+/// line 1. One glyph cannot mean both "still line 1" and "no line applies", and
+/// the second is what a doc row needs, because there is no mapping from a
+/// rendered row back to the source line it came from.
 ///
 /// Reports how wide that gutter came out, because it is the pane's own margin
 /// and the search steps over it — `/42` is a question about the code and not
 /// about which line it is on. Zero in a pane too narrow to have drawn one, and
 /// then there is nothing to step over rather than four columns to step over
 /// anyway. See [`search::Margin`].
+///
+/// `regions` is [`docs`]' partition of the same text, and it is what makes this
+/// more than a pager: a run of lines that is a doc comment or a docstring is
+/// rendered as markdown *in place*, between the code it is about, instead of
+/// being shown as the `///` and `"""` somebody typed. An empty slice means
+/// "draw it all as code", which is what `t` and raw markdown both want; see
+/// [`ViewerPane::build`].
+///
+/// The two halves are capped separately and deliberately are not capped
+/// together. Past `source::HIGHLIGHT_MAX_BYTES` the code comes back as plain
+/// text — that cap is a time budget on syntect, which is the expensive half at
+/// about 370 KB/s — and the documentation goes on being rendered. That is the
+/// choice, and the reason is that the cap governing markdown is
+/// `load::MAX_BYTES`, which was set from the cost of laying markdown out and is
+/// still being honoured: the doc regions are a *fraction* of a file already
+/// bounded by it, and rendering is several times cheaper per byte than
+/// highlighting. Giving up both at one threshold would mean a 100 KB Python
+/// file showing its docstrings as `"""` while a 100 KB `.md` next to it renders
+/// fine, with nothing on screen to explain the difference.
+/// `want` is a sorted list of source lines the caller needs the *row* of, and
+/// the third return value answers it in the same order — `None` for a line this
+/// pass never drew as a code row.
+///
+/// It is here rather than in a second walk of the file because this is the only
+/// function that knows the answer. A source line becomes one row or five,
+/// depending on the width; a run of them inside a doc region becomes a
+/// paragraph with no line-to-row mapping at all. Both facts are decided as the
+/// rows are emitted and are gone by the time the `Vec<Line>` comes back, so
+/// anything asking afterwards would be re-deriving the layout from the layout —
+/// which is the mistake [`search`] argues at length about mapping source
+/// offsets back onto rendered rows.
+///
+/// Answered with a cursor that only ever moves forwards, because `want` is
+/// sorted and the regions are walked in order: the cost is one comparison per
+/// wanted line for the whole file, not a lookup per line of it.
 fn source_lines(
     text: &str,
     path: &Path,
+    regions: &[docs::Region],
     width: usize,
     mode: theme::Mode,
-) -> (Vec<Line<'static>>, usize) {
+    want: &[usize],
+) -> (Vec<Line<'static>>, usize, Vec<Option<usize>>) {
+    // **One highlighter pass over the whole file, sliced afterwards.** Not a
+    // highlighter per code region, and this is the sharpest constraint in the
+    // function: `syntect::easy::HighlightLines` carries the grammar's context
+    // stack from one line to the next, so a fresh one started after each
+    // docstring would resume at the top level in the middle of an `impl` or a
+    // class body and colour everything below the first doc comment as whatever
+    // it now believes it is looking at. Slicing rows costs nothing; restarting
+    // is wrong, and wrong in a way nobody would report as a bug — it just looks
+    // like the theme going odd half way down long files.
     let rows = source::highlight_file(text, path, mode);
-    let numbers = width >= LINE_NUMBER_MIN_WIDTH;
-    let digits = if numbers {
-        rows.len().to_string().len().max(3)
+    let mut page = Page::new(rows, width, mode, want);
+    let count = page.rows.len();
+
+    let whole = [docs::Region::code(0, count)];
+    let regions = if regions.is_empty() {
+        &whole[..]
     } else {
-        0
+        regions
     };
 
-    let mut out = Vec::with_capacity(rows.len());
-    for (i, row) in rows.into_iter().enumerate() {
-        let (first, cont) = if numbers {
-            (
-                vec![Span::styled(
-                    format!("{:>digits$} ", i + 1),
-                    mode.theme().dim(),
-                )],
-                vec![Span::raw(format!("{:>digits$} ", ""))],
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        out.extend(wrap::hard_wrap(row, width, &first, &cont));
+    let mut next = 0;
+    for region in regions {
+        let start = region.start.min(count);
+        let end = region.end.min(count);
+        // `docs::regions` promises a partition and is tested for it. Closing the
+        // gap anyway is what keeps a broken promise a cosmetic bug rather than a
+        // line of somebody's file that is simply not on the page — and it costs
+        // an empty range per region in the case where the promise holds.
+        page.code(next..start);
+        match &region.kind {
+            docs::Kind::Code => page.code(start..end),
+            docs::Kind::Doc {
+                text,
+                indent,
+                first,
+                last,
+            } => page.doc(start..end, text, *indent, *first, *last),
+        }
+        next = end.max(next);
     }
-    // The gutter is the number plus the space after it, and every row wears it
-    // — a wrapped continuation gets a blank one of exactly the same width,
-    // which is what makes one number describe the whole layout.
-    let gutter = if numbers { digits + 1 } else { 0 };
-    (out, gutter)
+    page.code(next..count);
+
+    let gutter = page.gutter();
+    (page.out, gutter, page.at)
+}
+
+/// The rows of a source file being built, and the one thing that draws the
+/// line-number gutter.
+///
+/// A type rather than three locals threaded through two loops, because the
+/// gutter is the pane's own margin and [`search::Margin`] only holds if *every*
+/// row wears one of exactly the same width — the numbered first row of a source
+/// line, its blank continuations, and now the rows a rendered doc block turns
+/// into. One place decides how wide it is and one place draws it, so the three
+/// cannot drift apart.
+struct Page<'w> {
+    /// The highlighted file, one entry per source line, emptied as it is used.
+    rows: Vec<Vec<Span<'static>>>,
+    out: Vec<Line<'static>>,
+    width: usize,
+    mode: theme::Mode,
+    /// Digits in the number column, or zero in a pane too narrow to spend the
+    /// columns on one.
+    digits: usize,
+    /// Source lines somebody wants the row of, sorted, and how far down that
+    /// list this page has got. See [`source_lines`].
+    want: &'w [usize],
+    next: usize,
+    /// The answer, one slot per entry of `want`, filled as the rows are emitted
+    /// and left `None` for a line that was never drawn as code.
+    at: Vec<Option<usize>>,
+}
+
+impl<'w> Page<'w> {
+    fn new(
+        rows: Vec<Vec<Span<'static>>>,
+        width: usize,
+        mode: theme::Mode,
+        want: &'w [usize],
+    ) -> Self {
+        let digits = if width >= LINE_NUMBER_MIN_WIDTH {
+            rows.len().to_string().len().max(3)
+        } else {
+            0
+        };
+        Page {
+            out: Vec::with_capacity(rows.len()),
+            rows,
+            width,
+            mode,
+            digits,
+            want,
+            next: 0,
+            at: vec![None; want.len()],
+        }
+    }
+
+    /// Source line `line` starts at row `row`. Called from the one place a row
+    /// is emitted for a numbered source line, and from nowhere else.
+    ///
+    /// The cursor is dragged past every wanted line below `line` on the way,
+    /// which is what leaves a definition inside a doc region — or past the end
+    /// of the file — with the `None` it deserves rather than with the row of
+    /// whatever came next. Written as "skip, then take" rather than as a search
+    /// because `want` is sorted and the caller walks the file forwards, so the
+    /// whole mapping costs one pass over the shorter of the two lists.
+    fn mark(&mut self, line: usize, row: usize) {
+        while self.next < self.want.len() && self.want[self.next] < line {
+            self.next += 1;
+        }
+        while self.next < self.want.len() && self.want[self.next] == line {
+            self.at[self.next] = Some(row);
+            self.next += 1;
+        }
+    }
+
+    /// The gutter is the number plus the space after it, and every row wears it
+    /// — a wrapped continuation gets a blank one of exactly the same width,
+    /// which is what makes one number describe the whole layout.
+    fn gutter(&self) -> usize {
+        if self.digits == 0 { 0 } else { self.digits + 1 }
+    }
+
+    fn numbered(&self, line: usize) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::styled(
+            format!("{line:>digits$} "),
+            self.mode.theme().dim(),
+        )]
+    }
+
+    fn blank(&self) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::raw(format!("{:>digits$} ", ""))]
+    }
+
+    /// The interior of a rendered doc block. See [`DOC_ROW`].
+    ///
+    /// Right-aligned like a number and one cell wide, so it lands under the
+    /// units digit of the numbers above and below it and the gutter stays
+    /// exactly [`Page::gutter`] columns for every row on the page — which is
+    /// the whole of what [`search::Margin`] needs from this.
+    fn pip(&self) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::styled(
+            format!("{DOC_ROW:>digits$} "),
+            self.mode.theme().dim(),
+        )]
+    }
+
+    /// Source lines, numbered and hard-wrapped: the whole of what this function
+    /// used to do, and byte for byte what it still does for a file with no
+    /// documentation in it.
+    fn code(&mut self, range: std::ops::Range<usize>) {
+        for i in range {
+            // Before the wrap, so the row recorded is the one the line's
+            // *first* row lands on. A jump aimed at a wrapped continuation
+            // would put the head of the definition off the top of the pane,
+            // which is the same landing the heading arm in `markdown` refuses.
+            self.mark(i, self.out.len());
+            let row = std::mem::take(&mut self.rows[i]);
+            let first = self.numbered(i + 1);
+            let cont = self.blank();
+            self.out
+                .extend(wrap::hard_wrap(row, self.width, &first, &cont));
+        }
+    }
+
+    /// A doc block, rendered as markdown where the comment was.
+    ///
+    /// `first` and `last` are the file lines the block's words are actually on,
+    /// zero-based as [`docs::Region`] indexes them — not the lines its
+    /// delimiters are on. See [`docs::Kind::Doc`] for why the difference is
+    /// carried this far.
+    fn doc(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        indent: usize,
+        first: usize,
+        last: usize,
+    ) {
+        let avail = self.width.saturating_sub(self.gutter() + indent);
+        // Rendered before it is decided whether the rendering may be used, and
+        // that order is the point. `markdown::render` does not guarantee a row
+        // fits the width it was given — a two-cell glyph under a prefix it has
+        // already committed to (`▏ ` per quote level, `999. `, `- `) is wider
+        // than the column it has left — and the widths where that bites are not
+        // a constant this could compare `avail` against: `> > > > 日本語`
+        // overflows every width up to nine, and each further level of quoting
+        // adds two. A threshold would be a guess dressed as a rule, so the
+        // invariant is *measured* instead. One pass over rows that were just
+        // built, against a syntect pass on the same file costing several
+        // hundred times more; the arithmetic is not close.
+        let body = if avail == 0 {
+            Vec::new()
+        } else {
+            markdown::render(text, avail, self.mode)
+        };
+        if avail == 0 || body.iter().any(|l| wrap::spans_width(&l.spans) > avail) {
+            // Nothing this could be laid out in — a pane narrower than its own
+            // gutter plus a deeply indented block, or one where the renderer
+            // cannot honour the columns it was given. Falling back to the source
+            // lines is not a degradation to apologise for: it is the same rows
+            // `t` would show, at the widths where the rendering has no room to
+            // be different, and it keeps every line of the file on the page.
+            //
+            // The title still says `· rendered` here, and that is deliberate
+            // rather than overlooked. The word answers "does this document have
+            // a second form, and is it up" — a document-level question with a
+            // document-level answer — and this is one region of it declining at
+            // one width. A per-region caveat has nowhere honest to go in a
+            // one-line title already carrying the name, the form, the query and
+            // the position, and it would appear and vanish as the pane is
+            // dragged. What settles it is that the fallback shows the *source*,
+            // which this pane holds to be always true: the reader is being given
+            // the more truthful of the two forms, not a broken version of the
+            // other one.
+            self.code(range);
+            return;
+        }
+
+        // **N source lines become M rendered rows, and M is not N.** A paragraph
+        // reflows to the pane's width, a fence keeps its shape, a list grows a
+        // hanging indent — so there is no mapping from a rendered row back to
+        // the line it came from, and a number per row would have to be invented.
+        //
+        // What the gutter can say without inventing anything is where the block
+        // *starts* and where it *ends*: `first` on the first row, `last` on the
+        // last, and [`Page::pip`] on everything between. That is a range the
+        // reader can read off the screen — "this prose is lines 15 to 25" — and
+        // it is what makes `f`'s answer of `load.rs:20` findable again, where a
+        // single number at the top left every line of a long block unnumbered
+        // and unreachable.
+        //
+        // The last number is dropped when it would repeat the first, which is
+        // every block whose words are all on one line. `2 ┊ 2` claims a range
+        // that is not one; `2 ┊ ┊` says "line 2, still going", which is the
+        // truth and is what the pip means everywhere else.
+        let top = range.end.saturating_sub(1).max(range.start);
+        let first = first.clamp(range.start, top);
+        let last = last.clamp(first, top);
+        let pad = " ".repeat(indent);
+        let rendered = body.len();
+        for (n, mut line) in body.into_iter().enumerate() {
+            let mut prefix = match n {
+                0 => self.numbered(first + 1),
+                n if n + 1 == rendered && last > first => self.numbered(last + 1),
+                _ => self.pip(),
+            };
+            if indent > 0 {
+                prefix.push(Span::raw(pad.clone()));
+            }
+            // Spliced into the line rather than rebuilt from its spans, so
+            // whatever the renderer decided about the line as a whole survives
+            // being moved across the gutter.
+            line.spans.splice(0..0, prefix);
+            self.out.push(line);
+        }
+        if rendered == 0 {
+            // A block that renders to no rows at all — `///` with nothing after
+            // it, a docstring holding only whitespace. It still gets a row,
+            // because the alternative is a line number that never appears and a
+            // pair of lines the reader can see in the source and not in the
+            // rendering.
+            self.out.push(Line::from(self.numbered(first + 1)));
+        }
+    }
 }
 
 /// A letter with nothing held down with it.
@@ -1980,6 +2825,15 @@ mod tests {
         pane
     }
 
+    /// What is in the number column of each row: a line number, a [`DOC_ROW`]
+    /// pip, or nothing. Sliced by *character* rather than by byte, because the
+    /// pip is three of the latter.
+    fn gutters(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .map(|r| r.chars().take(4).collect::<String>().trim().to_string())
+            .collect()
+    }
+
     /// Lay out as if a frame of this size had been drawn.
     fn laid(pane: &mut ViewerPane, width: usize, height: usize) -> Vec<String> {
         pane.ensure_layout(width);
@@ -2035,7 +2889,14 @@ mod tests {
         let mut pane = quiet(dir.path());
         pane.show(&path);
 
-        assert_eq!(laid(&mut pane, 40, 10), ["# Plan", "", "Do the thing."]);
+        // The rule row under the title is the H1's level, now that the
+        // hashes are gone. It is part of the rendering and so part of what
+        // this fixture pins: one that skipped the rule would pass just as
+        // well against a renderer that had lost the level cue altogether.
+        assert_eq!(
+            laid(&mut pane, 40, 10),
+            ["Plan", &"━".repeat(40), "", "Do the thing."]
+        );
         assert!(pane.title().contains("plan.md"));
     }
 
@@ -2068,6 +2929,703 @@ mod tests {
         let mut pane = quiet(dir.path());
         pane.show(&path);
         assert_eq!(laid(&mut pane, 20, 10)[0], "let x = 1;");
+    }
+
+    // --- documentation rendered where it stands ---------------------------
+
+    /// A `.rs` and a `.py` saying the same thing, one with a doc comment and
+    /// one with a docstring. Written out rather than generated because what is
+    /// being tested is what a reader sees, and a fixture nobody can read is a
+    /// poor witness to that.
+    fn documented(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let rs = dir.write(
+            "add.rs",
+            b"/// Adds two numbers.\n\
+              ///\n\
+              /// Really **does** add them.\n\
+              fn add(a: i32, b: i32) -> i32 {\n\
+              \x20   a + b\n\
+              }\n",
+        );
+        let py = dir.write(
+            "add.py",
+            b"def add(a, b):\n\
+              \x20   \"\"\"Add two numbers.\n\
+              \n\
+              \x20   Args:\n\
+              \x20       a: the first.\n\
+              \x20   \"\"\"\n\
+              \x20   return a + b\n",
+        );
+        (rs, py)
+    }
+
+    #[test]
+    fn a_doc_comment_is_drawn_as_prose_in_the_middle_of_the_code_it_describes() {
+        // The whole feature in one assertion: the markers are gone, the `**`
+        // around `does` did what `**` means, and the function underneath is
+        // still highlighted source with its own numbers.
+        let dir = TempDir::new("view-docs-rs");
+        let (rs, _) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&rs);
+
+        assert_eq!(
+            laid(&mut pane, 40, 20),
+            [
+                "  1 Adds two numbers.",
+                "  ┊ ",
+                "  3 Really does add them.",
+                "  4 fn add(a: i32, b: i32) -> i32 {",
+                "  5     a + b",
+                "  6 }",
+                "  7 ",
+            ]
+        );
+        // The code is still coloured, which is the thing that would break if the
+        // highlighter were restarted per region rather than sliced.
+        assert!(
+            pane.lines[3]
+                .spans
+                .iter()
+                .skip(1)
+                .any(|s| s.style.fg.is_some()),
+            "the code after the doc block lost its highlighting"
+        );
+    }
+
+    #[test]
+    fn a_docstring_is_rendered_at_the_column_the_code_put_it_at() {
+        // **One thing, and only the one in the name.** The block keeps the
+        // indent of the `def` it belongs to, so the prose reads as part of the
+        // function rather than as a chapter heading — and the gutter is
+        // untouched by that, because the indent goes on after it.
+        //
+        // This test used to claim a second thing: that four spaces under
+        // `Args:` renders as prose rather than as a grey slab *because* the
+        // indentation was rewritten. It witnessed no such thing. `Args:` is a
+        // paragraph and the line under it is a lazy continuation of it, and an
+        // indented code block cannot interrupt a paragraph — so the row below
+        // comes out as `Args: a: the first.` whether anything moved the indent
+        // or not. The rewriting is gone and this row is unchanged, which is the
+        // proof rather than the coincidence; see `docs`' module doc.
+        let dir = TempDir::new("view-docs-py");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+
+        assert_eq!(
+            laid(&mut pane, 40, 20),
+            [
+                "  1 def add(a, b):",
+                "  2     Add two numbers.",
+                "  ┊     ",
+                "  5     Args: a: the first.",
+                "  7     return a + b",
+                "  8 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_doctest_keeps_its_prompts_and_the_shape_they_give_the_sample() {
+        // **The regression that must never come back.** An earlier pass pulled
+        // any indent of four or more columns down to two, which is under
+        // CommonMark's block-start threshold — so `>>> ` stopped being four
+        // columns of indentation holding a `>` and became three nested
+        // blockquote markers. Every prompt was *eaten*: the input merged with
+        // its expected output and the whole sample was drawn as a quotation,
+        // in a viewer whose one promise is that the source is always true.
+        //
+        // **And the fixture is three shapes, because it was one.** For a while
+        // this test held only the first of them — a sample indented four
+        // columns *past* the docstring body — which is the one arrangement
+        // CommonMark draws as code all on its own, and so the one arrangement
+        // that cannot witness the bug. The flush shape below is the one PEP
+        // 257, CPython and numpy actually write, and it was broken on this
+        // page, under a green test named for it, until `docs::doctests`. A
+        // regression test that pins only the surviving case is worse than none:
+        // it spends the reader's trust without buying anything with it.
+        //
+        // Asserted on the drawn rows rather than on the scanner's output,
+        // because the deletion happened in the renderer and a test on the text
+        // handed to it would not have seen it.
+        let dir = TempDir::new("view-docs-doctest");
+        let shapes: [(&str, &[u8]); 3] = [
+            (
+                "indented under a label, with a blank line",
+                b"def add(a, b):\n\
+                  \x20   \"\"\"Add two numbers.\n\
+                  \n\
+                  \x20   Example:\n\
+                  \n\
+                  \x20       >>> add(1, 2)\n\
+                  \x20       3\n\
+                  \x20   \"\"\"\n\
+                  \x20   return a + b\n",
+            ),
+            (
+                "indented under a label, with none",
+                b"def add(a, b):\n\
+                  \x20   \"\"\"Add two numbers.\n\
+                  \n\
+                  \x20   Example:\n\
+                  \x20       >>> add(1, 2)\n\
+                  \x20       3\n\
+                  \x20   \"\"\"\n\
+                  \x20   return a + b\n",
+            ),
+            (
+                "flush with the prose, as PEP 257 writes it",
+                b"def add(a, b):\n\
+                  \x20   \"\"\"Add two numbers.\n\
+                  \n\
+                  \x20   >>> add(1, 2)\n\
+                  \x20   3\n\
+                  \x20   \"\"\"\n\
+                  \x20   return a + b\n",
+            ),
+        ];
+
+        for (n, (shape, src)) in shapes.iter().enumerate() {
+            let path = dir.write(&format!("d{n}.py"), src);
+            let mut pane = quiet(dir.path());
+            pane.show(&path);
+            let rows = laid(&mut pane, 46, 20);
+            let page = rows.join("\n");
+
+            assert!(
+                page.contains(">>> add(1, 2)"),
+                "{shape}: the prompt was consumed as blockquote markers:\n{page}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("│ >>> add(1, 2)")),
+                "{shape}: the sample is a code block, not a paragraph:\n{page}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("│ 3")),
+                "{shape}: the expected output kept its own line:\n{page}"
+            );
+            assert!(
+                !page.contains("▏ "),
+                "{shape}: nothing here is a quotation:\n{page}"
+            );
+            // The statement and its output are two rows and not one reflowed
+            // line — which is the half of the damage that survives even if the
+            // prompts are somehow still on the page.
+            assert!(
+                !page.contains(">>> add(1, 2) 3"),
+                "{shape}: the sample was reflowed into a paragraph:\n{page}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flush_doctest_is_a_sample_and_not_three_nested_quotations() {
+        // The file that found it, rendered whole rather than asserted at.
+        // Before `docs::doctests` the last row of this docstring read
+        // `▏ ▏ ▏ w = Widget() w.render(buf)`: both prompts eaten as blockquote
+        // markers, two statements merged onto one row, and the sample drawn as
+        // a quotation. Content destroyed, in the pane whose stated promise is
+        // that the source is always true.
+        let dir = TempDir::new("view-docs-flush");
+        let path = dir.write(
+            "widget.py",
+            b"class Widget:\n\
+              \x20   def render(self, buf):\n\
+              \x20       \"\"\"Draw into *buf*.\n\
+              \n\
+              \x20       >>> w = Widget()\n\
+              \x20       >>> w.render(buf)\n\
+              \x20       \"\"\"\n\
+              \x20       return buf\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        assert_eq!(
+            laid(&mut pane, 46, 20),
+            [
+                "  1 class Widget:",
+                "  2     def render(self, buf):",
+                "  3         Draw into buf.",
+                "  ┊         ",
+                "  ┊         │ >>> w = Widget()",
+                "  6         │ >>> w.render(buf)",
+                "  8         return buf",
+                "  9 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quotation_in_a_docstring_is_still_a_quotation() {
+        // The other side of the doctest fix, and the reason it keys on `>>> `
+        // and not on `>`. A block quote in a docstring is a quotation the
+        // author wrote and meant, and it must keep its `▏ ` gutter rather than
+        // be promoted into a `│ ` one — which is a claim that the lines behind
+        // it are code, and would be false here.
+        let dir = TempDir::new("view-docs-quote");
+        let path = dir.write(
+            "q.py",
+            b"def f():\n\
+              \x20   \"\"\"Do it.\n\
+              \n\
+              \x20   > Somebody said this.\n\
+              \x20   > And more of it.\n\
+              \x20   \"\"\"\n\
+              \x20   return 1\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rows = laid(&mut pane, 46, 20);
+        let page = rows.join("\n");
+
+        assert!(
+            rows.iter().any(|r| r.contains("▏ Somebody said this.")),
+            "the quotation lost its gutter:\n{page}"
+        );
+        assert!(
+            !page.contains("│ "),
+            "a quotation was drawn as code:\n{page}"
+        );
+        assert!(
+            !page.contains("```"),
+            "a fence reached the page as text:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_google_style_section_is_left_as_the_run_on_sentence_it_is() {
+        // **Declined, and pinned so that declining it stays a decision.** A
+        // Google-style `Args:` block is a paragraph with lazy continuations
+        // under it, so it reflows into one sentence — poor reading, and a
+        // shape common enough to be worth wanting to fix.
+        //
+        // It is not fixed, for the reason the deleted `normalise` pass is not
+        // coming back. The transform that would be *additive* — a bullet
+        // inserted at each entry's own column — does nothing at all: a list
+        // marker four columns in cannot interrupt a paragraph any more than an
+        // indented code block can, so `Args:\n    - name: x` renders as
+        // `Args: - name: x` and the pass has bought two characters of noise per
+        // entry. The transform that *works* has to pull each entry within three
+        // columns of the label and re-indent its continuation lines to follow —
+        // which is moving the author's text by an amount derived from its
+        // surroundings, and is the thing this module says it does not do. The
+        // one strictly additive shape that separates the entries — a blank line
+        // under the label, making the block indented code — hangs a `│ ` gutter
+        // on them, and `markdown` says in as many words that that gutter is a
+        // claim the lines behind it are code. `name: what to call it.` is not.
+        //
+        // So the reader gets the rows below: every parameter present, in order,
+        // in the author's words, numbered by the lines they are on, with the
+        // source one `t` away. It reads badly and it has lost nothing, which is
+        // the line this pane draws — and the doctest above was on the far side
+        // of it, with two statements merged into one row and both prompts gone.
+        let dir = TempDir::new("view-docs-sections");
+        let path = dir.write(
+            "s.py",
+            b"def f(name, size):\n\
+              \x20   \"\"\"Do it.\n\
+              \n\
+              \x20   Args:\n\
+              \x20       name: what to call it.\n\
+              \x20       size: how many cells wide.\n\
+              \n\
+              \x20   Returns:\n\
+              \x20       A widget.\n\
+              \x20   \"\"\"\n\
+              \x20   return 1\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        assert_eq!(
+            laid(&mut pane, 46, 20),
+            [
+                "  1 def f(name, size):",
+                "  2     Do it.",
+                "  ┊     ",
+                "  ┊     Args: name: what to call it. size: how",
+                "  ┊     many cells wide.",
+                "  ┊     ",
+                "  9     Returns: A widget.",
+                " 11     return 1",
+                " 12 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn fencing_a_doctest_leaves_the_gutter_and_the_source_untouched() {
+        // The pass adds lines to the text handed to the renderer and to nothing
+        // else, so the two things the reader checks a rendering against have to
+        // come back unchanged: the numbers in the margin, which still name the
+        // lines the block's first and last words are on, and `t`, which is the
+        // whole reason a heuristic is allowed in this pane at all.
+        let dir = TempDir::new("view-docs-fence-gutter");
+        let path = dir.write(
+            "g.py",
+            b"def f():\n\
+              \x20   \"\"\"Do it.\n\
+              \n\
+              \x20   >>> f()\n\
+              \x20   1\n\
+              \x20   \"\"\"\n\
+              \x20   return 1\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rendered = laid(&mut pane, 46, 20);
+
+        // Line 2 is the summary and line 5 is the sample's last word; the `"""`
+        // on lines 3 and 6 carry none, and neither does the fence, which is not
+        // in the file.
+        assert_eq!(gutters(&rendered), ["1", "2", "┊", "┊", "5", "7", "8"]);
+        assert!(
+            !rendered.iter().any(|r| r.contains("```")),
+            "the fence reached the page as text:\n{}",
+            rendered.join("\n")
+        );
+
+        // And `t` still puts back exactly the file that was opened — the pass
+        // touches the rendered form and nothing that reaches this one.
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        assert_eq!(
+            laid(&mut pane, 46, 20),
+            [
+                "  1 def f():",
+                "  2     \"\"\"Do it.",
+                "  3 ",
+                "  4     >>> f()",
+                "  5     1",
+                "  6     \"\"\"",
+                "  7     return 1",
+                "  8 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_doc_block_is_numbered_at_both_ends_and_pipped_in_between() {
+        // N source lines become M rendered rows and M is not N, so no row in
+        // the middle has a number that could be put on it. What the two ends
+        // can say is true: the first row is the line the block's first word is
+        // on, the last row is the line its last word is on, and every row
+        // between them wears the pip.
+        //
+        // The pip is the fix for a real ambiguity and not decoration. A blank
+        // there means "the numbered line above is still going", which is what
+        // a wrapped source line wears — so a thirteen-row rendered paragraph
+        // read as one enormous wrapped line 1. One glyph cannot carry both
+        // claims.
+        let dir = TempDir::new("view-docs-number");
+        let (rs, _) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&rs);
+        let lines = laid(&mut pane, 40, 20);
+
+        assert_eq!(gutters(&lines), ["1", "┊", "3", "4", "5", "6", "7"]);
+        // Three source lines of documentation, three rendered rows — and the
+        // count agreeing here is a coincidence of this fixture, which is why the
+        // assertion above is about the numbers and not about the arithmetic.
+        assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn the_number_beside_a_row_of_prose_is_the_line_that_prose_is_on() {
+        // The bug this pins is what the gutter said before: `range.start + 1`,
+        // which is the line the `/**` or the bare `///` is on and not the line
+        // the words are on. A reader who pressed `f`, was told `x.rs:2`, and
+        // opened it, saw the sentence beside a `1`.
+        //
+        // Both openers are here because they fail differently: `/**` puts the
+        // marker on a line of its own, and a `///` block that starts with a
+        // bare marker does the same thing without looking like it.
+        let dir = TempDir::new("view-docs-first");
+        let path = dir.write(
+            "x.rs",
+            b"/**\n\
+              Adds two numbers.\n\
+              */\n\
+              fn add(a: i32, b: i32) -> i32 { a + b }\n\
+              \n\
+              ///\n\
+              /// A block that opens with a bare marker.\n\
+              ///\n\
+              fn g() {}\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        assert_eq!(
+            laid(&mut pane, 46, 20),
+            [
+                "  2 Adds two numbers.",
+                "  4 fn add(a: i32, b: i32) -> i32 { a + b }",
+                "  5 ",
+                "  7 A block that opens with a bare marker.",
+                "  9 fn g() {}",
+                " 10 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_block_reads_as_a_range_a_grep_result_can_be_found_in() {
+        // The second half of the same bug, and the one that reaches `f`. A doc
+        // block renders to more rows than it has lines, and numbering only its
+        // first row meant every other line in it had no number *anywhere on the
+        // page* — so a result reading `long.rs:6`, opened with `Enter`, landed
+        // on a page where line 6 could not be pointed at. Wrapping never does
+        // that: a wrapped line's number is still on the row above.
+        //
+        // Numbering both ends does not put line 6 on a row of its own, and
+        // cannot. It does make the block a visible span the reader can place a
+        // line inside, which is the most the layout can honestly say.
+        let dir = TempDir::new("view-docs-range");
+        let mut body = b"//! A module comment long enough to need several rows \
+                         when it is laid out into a pane this narrow.\n"
+            .to_vec();
+        for _ in 0..3 {
+            body.extend_from_slice(
+                b"//!\n//! Another paragraph, also long enough that it will not \
+                  fit on one row of a forty-six column pane.\n",
+            );
+        }
+        body.extend_from_slice(b"fn f() {}\n");
+        let path = dir.write("long.rs", &body);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let lines = laid(&mut pane, 46, 40);
+        let numbers = gutters(&lines);
+
+        assert!(lines.len() > 8, "the block has to wrap: {lines:#?}");
+        assert_eq!(numbers[0], "1", "the first line with a word on it");
+        let end = numbers.iter().position(|n| *n == "7").unwrap();
+        assert!(
+            numbers[1..end].iter().all(|n| *n == "┊"),
+            "the interior is pips and nothing else: {numbers:?}"
+        );
+        assert_eq!(
+            numbers[end + 1],
+            "8",
+            "and the code underneath resumes at its own number"
+        );
+    }
+
+    #[test]
+    fn every_row_of_a_rendered_block_still_wears_the_pane_s_own_margin() {
+        // [`search::Margin`] is a single width applied to a single prefix of the
+        // rows, so it only means anything if every row wears the same one. A doc
+        // row that skipped the gutter, or wore a narrower one, would put `/`
+        // four columns out for the rest of the document.
+        let dir = TempDir::new("view-docs-margin");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+        laid(&mut pane, 40, 20);
+
+        assert_eq!(pane.margin.width, 4);
+        assert_eq!(pane.margin.rows, pane.lines.len());
+        for (i, line) in pane.lines.iter().enumerate() {
+            let row: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let gutter: String = row.chars().take(4).collect();
+            // A number, or the pip a doc block's interior wears — and either way
+            // exactly four columns, which is the only thing the margin needs.
+            assert!(
+                wrap::spans_width(&[Span::raw(gutter.clone())]) == 4
+                    && gutter
+                        .trim()
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c.to_string() == DOC_ROW),
+                "row {i} does not open with a gutter: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_file_with_nothing_to_render_is_laid_out_exactly_as_it_was_before() {
+        // The promise to everyone who is not reading a `.rs` or a `.py`, and to
+        // most of the ones who are: a file with no documentation in it must come
+        // out of the interleaving path identical to what the plain one produced.
+        // Pinned by handing the same file down both paths, because "identical to
+        // what it used to do" is not otherwise a thing a test can hold on to.
+        let dir = TempDir::new("view-docs-none");
+        let body = b"fn main() {\n    println!(\"hi\");\n}\n";
+        dir.write("plain.rs", body);
+        let path = dir.path().join("plain.rs");
+        let text = String::from_utf8_lossy(body).into_owned();
+
+        let regions = docs::regions(&text, &path);
+        assert!(!regions.iter().any(docs::Region::is_doc));
+        for width in [12, 20, 30, 40, 80] {
+            let interleaved = source_lines(&text, &path, &regions, width, theme::Mode::Dark, &[]);
+            let plain = source_lines(&text, &path, &[], width, theme::Mode::Dark, &[]);
+            assert_eq!(interleaved, plain, "at width {width}");
+        }
+    }
+
+    #[test]
+    fn a_rendered_block_fits_the_pane_at_every_width_it_can_be_given() {
+        // Including the widths where there is no room to render into at all —
+        // below `LINE_NUMBER_MIN_WIDTH` the gutter goes, and below the block's
+        // own indent the prose has nowhere to go and falls back to the source.
+        // Neither may panic and neither may draw past the edge, because the
+        // pane is dragged through every one of these on the way to a new size.
+        //
+        // **The third fixture is the one that can fail.** This test passed for
+        // an ASCII-only pair while rows measured thirty columns in a pane
+        // twenty-nine wide, because nothing in it was two cells: seven nested
+        // `def`s put the docstring at column twenty-eight, which leaves one
+        // column for a glyph that needs two. `markdown::render` does not honour
+        // a width it cannot fit a grapheme into and `Page::doc` now measures
+        // rather than trusting it — a test whose fixture cannot produce the
+        // shape is confidence and not coverage.
+        let dir = TempDir::new("view-docs-widths");
+        let (rs, py) = documented(&dir);
+        let mut deep = String::new();
+        for (n, name) in ["a", "b", "c", "d", "e", "f", "g"].iter().enumerate() {
+            deep += &format!("{}def {name}():\n", "    ".repeat(n));
+        }
+        let at = "    ".repeat(7);
+        deep += &format!("{at}\"\"\"日本語のテキストです。\n\n");
+        deep += &format!("{at}> 引用 と 한국어\n{at}\"\"\"\n{at}return 1\n");
+        let wide = dir.write("wide.py", deep.as_bytes());
+        assert_eq!(at.len(), 28, "the docstring has to start at column 28");
+        // The CJK fixture starts at two, and only it. One column is not a width
+        // any layout can honour when a grapheme needs two: it cannot be halved,
+        // and dropping it would be losing a character of somebody's file to save
+        // a column nobody is reading. That is `crate::text::wrap`'s answer for a
+        // plain source row and it is pre-existing — press `t` on this file at
+        // one column and the same thing happens. What this function owes is
+        // below.
+        for (path, floor) in [(rs, 1), (py, 1), (wide, 2)] {
+            let mut pane = quiet(dir.path());
+            pane.show(&path);
+            for width in floor..=60usize {
+                pane.ensure_layout(width);
+                for line in &pane.lines {
+                    assert!(
+                        wrap::spans_width(&line.spans) <= width,
+                        "{} drew past {width} columns",
+                        path.display()
+                    );
+                }
+            }
+            // And below the floor the rendering is not attempted at all: the
+            // rows are byte for byte the ones the source path produces, so the
+            // interleaving is never what *added* an overflow.
+            let text = std::fs::read_to_string(&path).unwrap();
+            let regions = docs::regions(&text, &path);
+            for width in 0..floor {
+                assert_eq!(
+                    source_lines(&text, &path, &regions, width, theme::Mode::Dark, &[]),
+                    source_lines(&text, &path, &[], width, theme::Mode::Dark, &[]),
+                    "{} at width {width}",
+                    path.display()
+                );
+            }
+            // And a real frame at the sizes that have no columns to spare.
+            let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            for (w, h) in [(0, 0), (1, 1), (2, 20), (5, 6), (29, 4)] {
+                term.draw(|f| pane.render(f, Rect::new(0, 0, w, h)))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_too_big_to_highlight_still_renders_the_documentation_in_it() {
+        // The two caps are separate on purpose. `HIGHLIGHT_MAX_BYTES` is a time
+        // budget on syntect, which is the expensive half; markdown is several
+        // times cheaper per byte and is already bounded by `load::MAX_BYTES`.
+        // Dropping both at one threshold would show a big `.py`'s docstrings as
+        // `"""` while a `.md` of the same size beside it rendered, and nothing
+        // on screen would say why.
+        let dir = TempDir::new("view-docs-big");
+        let mut body = b"/// Adds two numbers.\n".to_vec();
+        while body.len() < source::HIGHLIGHT_MAX_BYTES + 1024 {
+            body.extend_from_slice(b"let x = 1;\n");
+        }
+        let path = dir.write("big.rs", &body);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let lines = laid(&mut pane, 40, 20);
+
+        assert!(lines[0].ends_with("Adds two numbers."), "{:?}", lines[0]);
+        assert!(lines[1].ends_with("let x = 1;"), "{:?}", lines[1]);
+        // And the code really is past the cap: plain, not highlighted. Past the
+        // gutter, which is the pane's own and dim on purpose.
+        let coloured = pane.lines[1]
+            .spans
+            .iter()
+            .skip(1)
+            .any(|s| s.style.fg.is_some());
+        assert!(!coloured, "it was highlighted, so this proves nothing");
+    }
+
+    #[test]
+    fn the_help_overlay_describes_t_as_the_key_it_became() {
+        // A shipped string, not a docs gap: this row is what F1 draws. It read
+        // "rendered markdown / its source", and the file in front of the reader
+        // pressing `t` is as likely to be a `.py`, which is neither markdown nor
+        // covered by that sentence. Pinned from here rather than from
+        // `crate::keys`, because what makes the row true or false is what this
+        // pane does, and this is where that changes.
+        let (_, said) = crate::keys::HELP
+            .iter()
+            .find(|(k, _)| *k == "t")
+            .expect("the key the overlay promises");
+        assert!(
+            !said.contains("markdown"),
+            "`t` is not markdown's alone any more: {said}"
+        );
+
+        // And the pane agrees: a `.py` with a docstring has two forms and `t`
+        // moves between them, which is the whole of what the row now claims.
+        let dir = TempDir::new("view-docs-help");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+        laid(&mut pane, 40, 20);
+        assert!(pane.title().contains(" · rendered"), "{}", pane.title());
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        laid(&mut pane, 40, 20);
+        assert!(pane.title().contains(" · source"), "{}", pane.title());
+    }
+
+    #[test]
+    fn a_rendered_source_file_can_hold_a_phrase_the_file_does_not() {
+        // Recorded, not fixed — see [`search`]'s module doc. Reflow *joins*
+        // lines, so a phrase spanning two `///` comments is on the page and in
+        // no logical line of the file. `f` reads the file's lines and cannot
+        // report it; `/` reads the page and finds it. That is the opposite
+        // direction from the wrap-split miss this pane has always had, and it
+        // is why "the page can only ever hold fewer matches than the file" is
+        // no longer an assumption anything here may make.
+        let dir = TempDir::new("view-docs-gain");
+        let path = dir.write("j.rs", b"/// Must be a\n/// non-empty string.\nfn f() {}\n");
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rows = laid(&mut pane, 46, 10);
+        assert!(
+            rows[0].contains("Must be a non-empty string."),
+            "the two lines have to reflow into one: {rows:?}"
+        );
+
+        query(&mut pane, "a non-empty");
+        assert!(
+            pane.title().contains("/a non-empty · 1/1"),
+            "the page holds it: {}",
+            pane.title()
+        );
+        // And the file does not: no single line of it contains the phrase.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.lines().any(|l| l.contains("a non-empty")),
+            "the fixture has to make the phrase exist only after reflow"
+        );
     }
 
     // --- the four things that must never panic ---------------------------
@@ -2506,7 +4064,10 @@ mod tests {
             "opening a file is something coming of the key"
         );
         assert!(matches!(pane.mode, Mode::Doc), "the list has done its job");
-        assert_eq!(laid(&mut pane, 40, 10), ["# Plan", "", "Do the thing."]);
+        assert_eq!(
+            laid(&mut pane, 40, 10),
+            ["Plan", &"━".repeat(40), "", "Do the thing."]
+        );
     }
 
     #[test]
@@ -2721,14 +4282,22 @@ mod tests {
         assert!(pane.title().contains("· source"), "{}", pane.title());
 
         pane.handle_key(key(KeyCode::Char('t'))).unwrap();
-        assert_eq!(laid(&mut pane, 40, 10), ["# Plan", "", "Do the thing."]);
+        assert_eq!(
+            laid(&mut pane, 40, 10),
+            ["Plan", &"━".repeat(40), "", "Do the thing."]
+        );
         assert!(pane.title().contains("· rendered"), "{}", pane.title());
     }
 
     #[test]
-    fn a_source_file_has_no_second_form_to_toggle_to() {
+    fn a_source_file_with_no_documentation_in_it_has_no_second_form_to_toggle_to() {
         // `Handled::No` rather than a no-op that claims to have acted: a frame
-        // here re-renders the agent's whole screen.
+        // here re-renders the agent's whole screen, and a reader who cannot see
+        // what the key did presses it again.
+        //
+        // The gate is what the file *contains* and not what it is called. This
+        // `main.rs` renders to itself, so there is nothing on the other side of
+        // `t` and the title must not advertise one either.
         let dir = TempDir::new("view-raw-rs");
         let path = dir.write("main.rs", b"fn main() {}\n");
         let mut pane = quiet(dir.path());
@@ -2738,12 +4307,88 @@ mod tests {
             Handled::No
         );
         assert!(!pane.raw, "and the pane's idea of raw is unchanged");
+        laid(&mut pane, 40, 10);
+        let title = pane.title();
+        assert!(!title.contains("rendered"), "{title}");
+        assert!(!title.contains("source"), "{title}");
 
         // Nor is there anything to toggle on a screen with no document on it.
         let mut empty = quiet(dir.path());
         assert_eq!(
             empty.handle_key(key(KeyCode::Char('t'))).unwrap(),
             Handled::No
+        );
+    }
+
+    #[test]
+    fn t_shows_a_documented_source_file_as_it_was_actually_written() {
+        // The other half of the gate. A `.py` whose docstrings are rendered has
+        // a second form in exactly the sense markdown does — prose on one side,
+        // the text somebody typed on the other — so the key acts and the title
+        // says which side is up.
+        let dir = TempDir::new("view-raw-docs");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+        laid(&mut pane, 40, 20);
+        assert!(pane.title().contains("· rendered"), "{}", pane.title());
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('t'))).unwrap(),
+            Handled::Yes
+        );
+        assert_eq!(
+            laid(&mut pane, 40, 20),
+            [
+                "  1 def add(a, b):",
+                "  2     \"\"\"Add two numbers.",
+                "  3 ",
+                "  4     Args:",
+                "  5         a: the first.",
+                "  6     \"\"\"",
+                "  7     return a + b",
+                "  8 ",
+            ],
+            "every line back, numbered one for one"
+        );
+        assert!(pane.title().contains("· source"), "{}", pane.title());
+
+        // And back, because a toggle that only goes one way is a mode.
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        assert_eq!(laid(&mut pane, 40, 20)[1], "  2     Add two numbers.");
+    }
+
+    #[test]
+    fn a_phrase_hidden_by_a_rendered_docstring_is_offered_the_key_that_shows_it() {
+        // The notice names the remedy that is true of the body under it, and
+        // `t` is now true of more bodies than markdown. `"""` is in this file
+        // and not on this page — the rendering ate it, exactly as it eats `**`
+        // in a `.md` — so telling the reader to widen the pane would be sending
+        // them after something no width will bring back.
+        let dir = TempDir::new("view-docs-miss");
+        let (_, py) = documented(&dir);
+        let mut pane = quiet(dir.path());
+        pane.show(&py);
+        laid(&mut pane, 40, 20);
+
+        query(&mut pane, "\"\"\"");
+        assert!(
+            pane.title().contains("no match · t for source"),
+            "{}",
+            pane.title()
+        );
+
+        // A file with nothing rendered gets the other remedy, unchanged: there
+        // is no second form to send anybody to, and a wrap is then the only way
+        // a phrase can be missing.
+        let plain = dir.write("plain.rs", b"fn main() {}\n");
+        pane.show(&plain);
+        laid(&mut pane, 40, 20);
+        query(&mut pane, "zzz");
+        assert!(
+            pane.title().contains("no match · widen if a wrap split it"),
+            "{}",
+            pane.title()
         );
     }
 
@@ -2815,7 +4460,14 @@ mod tests {
         laid(&mut pane, 40, 10);
 
         query(&mut pane, "thing");
-        assert_eq!(hits(&pane), [(2, 7)], "row 2 of ['# Plan', '', 'Do the…']");
+        // Row 3, not row 2: the rule the H1 now draws under itself is a row of
+        // the page like any other, and the search counts the rows the pane
+        // drew rather than the lines the file holds.
+        assert_eq!(
+            hits(&pane),
+            [(3, 7)],
+            "row 3 of ['Plan', '━━…', '', 'Do the…']"
+        );
         assert!(pane.title().contains("/thing · 1/1"), "{}", pane.title());
 
         // The documented cost of searching the page: what was rendered away is
@@ -3174,9 +4826,11 @@ mod tests {
             "{}",
             missing.title()
         );
-        // ...and the `t for source` answer belongs to rendered markdown only.
-        // Offering it on a screen with no source behind it names a key that
-        // does nothing there.
+        // ...and the `t for source` answer belongs to a document that has a
+        // source, which is any document the pane rendered — a `.md`, and now a
+        // `.rs` or a `.py` with documentation in it. This screen is neither: it
+        // is the pane's own apology for a file it could not read, and offering
+        // `t` on it names a key that does nothing here.
         query(&mut missing, "zzz");
         assert!(
             missing.title().ends_with("/zzz · no match"),
@@ -4259,5 +5913,654 @@ mod tests {
             pane.scroll.offset, 1,
             "the pane does not inspect kind, the shell does"
         );
+    }
+
+    // --- the outline ------------------------------------------------------
+
+    /// A document with enough headings to nest and enough prose between them
+    /// that the rows move when the pane's width does.
+    const SECTIONED: &[u8] = b"# Design\n\n\
+        This paragraph is long enough that the width it is wrapped to \
+        decides how many rows it takes up on the page.\n\n\
+        ## The panes\n\n\
+        Another paragraph of the same kind, so that every heading after \
+        this one sits at a different row in a narrow pane.\n\n\
+        ### ask\n\nA third.\n\n### git\n\nA fourth.\n\n## Keys\n\nA fifth.\n";
+
+    #[test]
+    fn the_outline_is_rebuilt_with_the_rows_so_that_a_stale_entry_cannot_exist() {
+        // The invariant the whole feature rests on. An entry's `row` indexes
+        // `lines`, and `lines` is re-wrapped whenever the width changes — so
+        // the entries must be rebuilt out of the same call, not carried across.
+        // Carried across, every jump after a window drag would land at the row
+        // the *old* wrapping put the heading at, silently.
+        let dir = TempDir::new("view-outline-rebuild");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+
+        laid(&mut pane, 60, 20);
+        let wide: Vec<(usize, u8, String)> = pane
+            .outline
+            .iter()
+            .map(|e| (e.row, e.level, e.text.clone()))
+            .collect();
+        assert_eq!(
+            wide.iter().map(|e| e.2.as_str()).collect::<Vec<_>>(),
+            ["Design", "The panes", "ask", "git", "Keys"]
+        );
+
+        let rows = laid(&mut pane, 24, 20);
+        let narrow: Vec<(usize, u8, String)> = pane
+            .outline
+            .iter()
+            .map(|e| (e.row, e.level, e.text.clone()))
+            .collect();
+
+        // The same headings, at the same levels, naming the same sections.
+        assert_eq!(
+            wide.iter().map(|e| (e.1, &e.2)).collect::<Vec<_>>(),
+            narrow.iter().map(|e| (e.1, &e.2)).collect::<Vec<_>>()
+        );
+        // At different rows, which is the half that proves they were rebuilt
+        // rather than merely still correct by luck.
+        assert_ne!(
+            wide.iter().map(|e| e.0).collect::<Vec<_>>(),
+            narrow.iter().map(|e| e.0).collect::<Vec<_>>()
+        );
+        // And every one of them still points at its own heading.
+        for (row, _, text) in &narrow {
+            assert!(*row < rows.len(), "{text} is at {row} of {}", rows.len());
+            let first = text.split(' ').next().expect("a word");
+            assert!(
+                rows[*row].contains(first),
+                "row {row} is {:?}, not {text}",
+                rows[*row]
+            );
+        }
+    }
+
+    #[test]
+    fn o_declines_a_document_with_nothing_to_list() {
+        // `toggle_raw`'s rule, applied to a second key: a pane that advertises
+        // a key which does nothing is worse than one that declines, because the
+        // reader is left pressing it again. An empty list with a sentence in it
+        // would cost them the document they were looking at to say nothing.
+        let dir = TempDir::new("view-outline-bare");
+        let path = dir.write("notes.txt", b"just some prose\nand a second line\n");
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        laid(&mut pane, 40, 10);
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::No
+        );
+        assert!(matches!(pane.mode, Mode::Doc));
+        // And markdown answers in *both* of its forms, which is the decision
+        // `outline`'s module doc records: the source is parsed by the same
+        // `pulldown_cmark` that renders it, so pressing `t` no longer costs the
+        // reader their table of contents.
+        let md = dir.write("design.md", SECTIONED);
+        pane.show(&md);
+        laid(&mut pane, 40, 10);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::Yes,
+            "rendered, it has one"
+        );
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        let raw = laid(&mut pane, 40, 10);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::Yes,
+            "as source, it has one too"
+        );
+        // And the rows it names are the source's own rows: every entry points
+        // at the `#` line it was written on, which is only true because the
+        // lines came out of the parser and the rows out of `source_lines`.
+        assert_eq!(pane.outline.len(), 5, "{:?}", pane.outline);
+        for entry in &pane.outline {
+            assert!(
+                raw[entry.row].contains(&entry.text),
+                "row {} is {:?}, not {}",
+                entry.row,
+                raw[entry.row],
+                entry.text
+            );
+            assert!(raw[entry.row].contains('#'), "{:?}", raw[entry.row]);
+        }
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+
+        // And in a box it is a letter, like every other printable key — the
+        // rule the F1 overlay states once as "in a find box".
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        laid(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('/'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        assert!(matches!(pane.mode, Mode::Doc), "an `o` typed into a query");
+        assert!(pane.title().contains("/o"), "{}", pane.title());
+    }
+
+    #[test]
+    fn enter_in_the_outline_lands_the_reader_on_the_heading_with_it_on_screen() {
+        let dir = TempDir::new("view-outline-jump");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rows = laid(&mut pane, 40, 8);
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::Yes
+        );
+        // Third row of the list, which is `ask`.
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert!(pane.title().contains("· outline · 3/5"), "{}", pane.title());
+        let want = pane.outline[2].row;
+
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(matches!(pane.mode, Mode::Doc), "and the list goes");
+        assert_eq!(pane.scroll.offset, want);
+        // On screen, and at the top of it: everything worth reading in a
+        // section is below its heading, so a centred landing would spend half
+        // the pane on the section just left.
+        assert_eq!(rows[want], "ask");
+        assert!(rows[want + 2].starts_with('A'), "{:?}", rows[want + 2]);
+    }
+
+    #[test]
+    fn a_heading_in_the_last_screenful_is_still_brought_into_view() {
+        // `Scroll::to` clamps to the last full page, so the offset is not the
+        // row here — and the promise is not "the row is the offset", it is "the
+        // heading is on screen". A jump that clamped and left the heading above
+        // the fold would be the one landing this feature must not produce.
+        let dir = TempDir::new("view-outline-end");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 12);
+
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        pane.handle_key(key(KeyCode::End)).unwrap();
+        let want = pane.outline.last().expect("a last heading").row;
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        draw(&mut pane, 40, 12);
+
+        assert!(want >= pane.scroll.offset, "{want} is above the fold");
+        assert!(
+            want < pane.scroll.offset + pane.scroll.viewport(),
+            "{want} is below it"
+        );
+    }
+
+    #[test]
+    fn esc_and_a_second_o_leave_the_outline_where_the_reader_was() {
+        // "Never mind" never costs you your place. Two keys mean it here, and
+        // neither may move the document — a list you can back out of for free is
+        // what makes it worth opening to look.
+        let dir = TempDir::new("view-outline-leave");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 8);
+        pane.scroll.to(6);
+
+        for code in [KeyCode::Esc, KeyCode::Char('o')] {
+            assert_eq!(
+                pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+                Handled::Yes
+            );
+            assert_eq!(pane.exit_hint(), "esc→page", "the border says where");
+            // Move the selection, so leaving has something to *not* act on.
+            pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+            assert_eq!(pane.handle_key(key(code)).unwrap(), Handled::Yes);
+            assert!(matches!(pane.mode, Mode::Doc), "{code:?} left the list");
+            assert_eq!(pane.scroll.offset, 6, "{code:?} moved the reader");
+        }
+    }
+
+    #[test]
+    fn q_in_the_outline_goes_back_to_the_agent_exactly_as_it_does_everywhere_else() {
+        // The one key in this view that had to be argued rather than chosen.
+        // `crate::keys`'s `Esc or q` row promises "back to the agent" and
+        // carries an *exhaustive* parenthetical of the views that deviate; the
+        // outline is deliberately not one of them, so this test is what stops
+        // it becoming one without the table being changed in the same commit.
+        //
+        // Two facts, and the pane needs both: `q` is declined here as it is in
+        // every other mode of this pane, and `Esc` is not — because the outline
+        // is a layer with the document behind it, which is the same pair of
+        // answers `GitPane::worktree_key` gives for the same shape.
+        let dir = TempDir::new("view-outline-q");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 8);
+
+        for mode in ["document", "outline"] {
+            if mode == "outline" {
+                pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+                assert!(matches!(pane.mode, Mode::Outline));
+            }
+            assert_eq!(
+                pane.handle_key(key(KeyCode::Char('q'))).unwrap(),
+                Handled::No,
+                "q in the {mode} is the shell's"
+            );
+        }
+        // And it is declined without leaving: the shell takes focus back and
+        // the list is still there to come back to, exactly as the results are.
+        assert!(
+            matches!(pane.mode, Mode::Outline),
+            "q did not close the list"
+        );
+        // The other half, and the reason `list::Cursor::key`'s "Esc and q fall
+        // through" needs a carve-out naming this view and not the other three.
+        assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::Yes);
+        assert!(matches!(pane.mode, Mode::Doc));
+        // The exhaustive list itself, so that adding a fifth deviation to the
+        // code without adding it to the table fails here.
+        let (_, said) = crate::keys::HELP
+            .iter()
+            .find(|(k, _)| *k == "Esc or q")
+            .expect("the row that promises the way out");
+        assert!(said.contains("a shell and a find box keep both"), "{said}");
+        assert!(said.contains("the ask keeps q"), "{said}");
+        assert!(said.contains("worktrees keep Esc"), "{said}");
+        assert!(!said.contains("outline"), "the outline is not a deviation");
+    }
+
+    #[test]
+    fn a_file_shown_from_outside_the_pane_takes_the_outline_with_the_document() {
+        // `set_root`'s rule, arriving through the door `set_root` does not
+        // cover. `Alt+G` is a *global*, matched before the focus dispatch, so
+        // it reaches the git view with the outline still up — and `Enter` on a
+        // file there calls `show` from `App::pump`.
+        //
+        // Left standing, the selection is an index into the list that has gone:
+        // a five-heading document open at its last row, then a three-heading
+        // file, leaves `sel` at 4 against three entries, which draws no
+        // highlight anywhere and makes `Enter` silently do nothing.
+        let dir = TempDir::new("view-outline-show");
+        let five = dir.write("design.md", SECTIONED);
+        let three = dir.write("short.md", b"# One\n\ntext\n\n# Two\n\ntext\n\n# Three\n");
+        let mut pane = quiet(dir.path());
+        pane.show(&five);
+        draw(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        pane.handle_key(key(KeyCode::End)).unwrap();
+        assert!(pane.title().contains("· outline · 5/5"), "{}", pane.title());
+
+        pane.show(&three);
+        assert!(matches!(pane.mode, Mode::Doc), "the outline went with it");
+        let title = pane.title();
+        assert!(!title.contains("outline"), "{title}");
+        assert!(title.starts_with("short.md"), "{title}");
+        // And the list is answerable again from the top, rather than opening on
+        // a row that is not there.
+        draw(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        assert!(pane.title().contains("· outline · 1/3"), "{}", pane.title());
+        assert_eq!(pane.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
+
+        // The other half of the same bug, and the one that reached the border:
+        // a file that cannot be read leaves the pane with no outline at all, so
+        // this view over it drew ` · outline · 1/0` — a leading space where the
+        // file name belongs. It is the arm in `title` that calls itself
+        // unreachable, and this is what makes it so.
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        assert!(matches!(pane.mode, Mode::Outline));
+        pane.show(dir.path().join("never-written.md"));
+        assert!(matches!(pane.mode, Mode::Doc));
+        let title = pane.title();
+        assert!(
+            title.starts_with("never-written.md · unreadable"),
+            "{title}"
+        );
+        assert!(!title.contains("outline"), "{title}");
+    }
+
+    #[test]
+    fn enter_on_a_heading_already_on_screen_moves_nothing() {
+        // `reveal_hit`'s rule, which is not the aiming policy — top rather than
+        // centred — but the rule both aiming policies share: a thing already in
+        // view has nothing to be brought into view. Without it, `o` `Enter` on
+        // the section the reader is sitting in scrolls the page for no reason
+        // and takes the paragraph they were reading off the bottom.
+        let dir = TempDir::new("view-outline-still");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 10);
+
+        // Park one row down, with the *next* heading still on the page.
+        pane.scroll.to(1);
+        draw(&mut pane, 40, 10);
+        let parked = pane.scroll.offset;
+        let at = pane.outline[1].row;
+        assert!(
+            at > parked && at < parked + pane.scroll.viewport(),
+            "the fixture has to put the heading on screen: {at} against {parked}"
+        );
+
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        // `o` opens on the section the reader is *in*, so the heading below
+        // them is one `j` away.
+        assert!(pane.title().contains("· outline · 1/5"), "{}", pane.title());
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.scroll.offset, parked,
+            "a heading already on screen moved the page"
+        );
+        assert!(matches!(pane.mode, Mode::Doc), "and the list still closed");
+
+        // A heading that is *not* on screen still moves, which is what the
+        // guard must not cost.
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        pane.handle_key(key(KeyCode::End)).unwrap();
+        let last = pane.outline.last().expect("a heading").row;
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_ne!(pane.scroll.offset, parked);
+        assert!(last >= pane.scroll.offset && last < pane.scroll.offset + pane.scroll.viewport());
+    }
+
+    #[test]
+    fn a_jump_aimed_before_the_relayout_is_re_wrapped_like_any_other_offset() {
+        // What the "an entry is never stale" invariant does *not* promise, and
+        // it is one frame wide. A frame is the only thing that tells this pane
+        // how wide it is, and the shell drains every queued event before it
+        // draws — so a resize followed in the same batch by `o` and `Enter` is
+        // answered against the previous frame's layout, correctly, and then the
+        // re-wrap moves the offset the jump has just set.
+        //
+        // The point of the test is the *second* half: this is not `Mode::Browse`
+        // and `Mode::Results` skipping `ensure_layout`, which is what it looks
+        // like. The document reaches the identical state by the shorter route
+        // of resize-then-`o`, so laying out from those two branches would not
+        // close it. Both routes are run and their answers held against each
+        // other.
+        let dir = TempDir::new("view-outline-window");
+        let path = dir.write("design.md", SECTIONED);
+
+        let aimed = |via_list: bool| -> (usize, usize) {
+            let mut pane = quiet(dir.path());
+            pane.show(&path);
+            draw(&mut pane, 60, 6);
+            if via_list {
+                // Into the file list, resize under it — `browse::render` never
+                // lays the document out — and back.
+                pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+                pane.toggle_browse();
+                draw(&mut pane, 24, 6);
+                pane.toggle_browse();
+            }
+            // No frame at 24 columns has reached the *document* either way.
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+            pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+            pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+            pane.handle_key(key(KeyCode::Enter)).unwrap();
+            let aimed = pane.scroll.offset;
+            // The first frame at the new width, which is where the re-wrap
+            // happens and where the offset stops meaning what it meant.
+            draw(&mut pane, 24, 6);
+            (aimed, pane.outline[2].row)
+        };
+
+        let (by_list, wanted) = aimed(true);
+        let (by_doc, same) = aimed(false);
+        assert_eq!(by_list, by_doc, "the file list is not what causes this");
+        assert_eq!(wanted, same);
+        // And the offset the jump set is a row of the layout it was aimed at,
+        // not of the one now on screen — which is exactly what happens to a
+        // reader who had simply scrolled there and then dragged the window.
+        assert_ne!(by_doc, wanted, "no re-wrap happened; the fixture is wrong");
+    }
+
+    #[test]
+    fn a_source_files_definitions_point_at_the_rows_they_were_drawn_on() {
+        // The other half of the index, and the half with a mapping in it: a
+        // symbol is found at a *source line*, and `source_lines` is what knows
+        // which row that line came out on once the gutter, the wrapping and the
+        // rendered doc blocks have had their say.
+        let dir = TempDir::new("view-outline-src");
+        let path = dir.write(
+            "lib.rs",
+            b"/// Something documented, at enough length that it reflows into \
+              more than one row of a narrow pane and moves what is under it.\n\
+              pub struct Entry {\n    row: usize,\n}\n\n\
+              impl Entry {\n    pub fn row(&self) -> usize {\n        self.row\n    }\n}\n",
+        );
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let rows = laid(&mut pane, 40, 20);
+
+        let listed: Vec<(&str, u8)> = pane
+            .outline
+            .iter()
+            .map(|e| (e.text.as_str(), e.level))
+            .collect();
+        assert_eq!(
+            listed,
+            [("struct Entry", 1), ("impl Entry", 1), ("fn row", 2)]
+        );
+        for entry in &pane.outline {
+            let first = entry.text.split(' ').nth(1).expect("a name");
+            assert!(
+                rows[entry.row].contains(first),
+                "row {} is {:?}, not {}",
+                entry.row,
+                rows[entry.row],
+                entry.text
+            );
+        }
+        // The doc block above the struct is several rows of reflowed prose with
+        // no source line behind them, which is exactly what makes the mapping
+        // necessary: the struct is not on row 1.
+        assert!(pane.outline[0].row > 1, "{:?}", pane.outline[0]);
+
+        // And `t` keeps it. The rendered doc block is gone, so every row moves
+        // and every entry has to move with it — a source file has an outline in
+        // both of its forms, which is where it differs from markdown.
+        pane.handle_key(key(KeyCode::Char('t'))).unwrap();
+        let raw = laid(&mut pane, 40, 20);
+        assert_eq!(pane.outline.len(), 3, "still listed as source");
+        for entry in &pane.outline {
+            let name = entry.text.split(' ').nth(1).expect("a name");
+            assert!(
+                raw[entry.row].contains(name),
+                "row {} is {:?}, not {}",
+                entry.row,
+                raw[entry.row],
+                entry.text
+            );
+        }
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('o'))).unwrap(),
+            Handled::Yes
+        );
+    }
+
+    #[test]
+    fn the_breadcrumb_names_the_section_the_reader_is_scrolled_into() {
+        let dir = TempDir::new("view-outline-crumb");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        // A short pane, so there is somewhere to scroll to: `Scroll::to` clamps
+        // to the last full page, and a document that fits has no sections below
+        // the fold to be in.
+        laid(&mut pane, 40, 6);
+
+        // At the top there is one heading above the reader and it is the title
+        // of the document, so that is all the crumb can say.
+        assert!(pane.title().ends_with("· Design"), "{}", pane.title());
+
+        // Scrolled into `ask`, which is three levels deep. The whole chain is
+        // 24 cells and `outline::CRUMB_MAX` is 14, so the outer levels go and
+        // the marker says so — which is the cap doing its job rather than a
+        // shortcoming of the fixture. A crumb allowed all 24 would be shortened
+        // by the *border* instead, and a border does not know that the parts it
+        // is cutting through are levels.
+        let at = pane
+            .outline
+            .iter()
+            .find(|e| e.text == "ask")
+            .expect("the heading")
+            .row;
+        pane.scroll.to(at + 1);
+        let title = pane.title();
+        assert!(title.ends_with("· … › ask"), "{title}");
+    }
+
+    #[test]
+    fn the_breadcrumb_is_the_last_thing_in_the_title_and_so_the_first_thing_clipped() {
+        // The constraint, pinned. A title is clipped from the right, so the
+        // order of this line *is* the priority order: the breadcrumb answers
+        // nothing that cannot be seen by scrolling, and it may never take the
+        // file name, the form word, the search notice or the truncation notice
+        // down with it. Which puts it after the position too — see `title`.
+        let dir = TempDir::new("view-outline-clip");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        laid(&mut pane, 60, 20);
+        pane.handle_key(key(KeyCode::Char('/'))).unwrap();
+        for c in "paragraph".chars() {
+            pane.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+
+        let title = pane.title();
+        let at = |needle: &str| {
+            title
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is missing from {title:?}"))
+        };
+        // Everything that is an *answer* comes first, in the order the comment
+        // on `title` sets out, and the convenience comes last.
+        assert!(at("design.md") < at("· rendered"), "{title}");
+        assert!(at("· rendered") < at("/paragraph"), "{title}");
+        assert!(at("/paragraph") < at("%"), "{title}");
+        assert!(at("%") < at("Design"), "{title}");
+        assert!(title.ends_with("· Design"), "{title}");
+    }
+
+    #[test]
+    fn a_file_arriving_while_the_outline_is_up_waits_rather_than_taking_over() {
+        // The fourth door onto the pane's one rule. Somebody choosing a section
+        // of *this* document is using the pane, and the row under their
+        // selection is a place in a page a new document would replace.
+        let dir = TempDir::new("view-outline-pending");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+
+        let fresh = dir.write("fresh.md", b"# fresh\n");
+        pane.follow(fresh.clone());
+        draw(&mut pane, 40, 10);
+        assert_eq!(
+            pane.path(),
+            Some(path.as_path()),
+            "the document is untouched"
+        );
+        assert!(pane.has_pending(), "and it is still waiting");
+        // No border for the shell to mark while this pane is the one showing,
+        // so the pane says it itself — as the list, the box and the results do.
+        assert!(pane.title().starts_with("◆ "), "{}", pane.title());
+
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+        draw(&mut pane, 40, 10);
+        assert_eq!(pane.path(), Some(fresh.as_path()));
+    }
+
+    #[test]
+    fn the_outline_survives_the_pane_being_dragged_while_it_is_open() {
+        // The reason `render` lays the document out from inside a view that is
+        // not showing it. Skip that and the entries stay built for a width the
+        // reader has already left, so this `Enter` lands by the old wrapping.
+        let dir = TempDir::new("view-outline-drag");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        // Short, so that nothing below is clamped by `Scroll::to` and the
+        // offset is the row rather than merely near it.
+        draw(&mut pane, 60, 6);
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        let wide = pane.outline[2].row;
+
+        // The drag itself, and the only frame drawn at the new width is this
+        // one — which is the point: no frame of the *document* has been drawn
+        // at 24 columns, so everything the jump below relies on has to have
+        // been done from inside a view that is not showing it.
+        draw(&mut pane, 24, 6);
+        let narrow = pane.outline[2].row;
+        let rows = text(&pane.lines);
+        assert_ne!(wide, narrow, "the drag re-wrapped the document");
+        assert_eq!(rows[narrow], "ask", "the row is the narrow layout's row");
+        // And `wide` is where a stale outline would have sent them, which in
+        // this layout is not the heading at all.
+        assert_ne!(rows[wide], "ask");
+
+        // The last heading, which is the row that catches the second half of
+        // this: `Scroll::to` clamps against the row count a *frame* last gave
+        // it, so an outline that laid the document out without also measuring
+        // it would aim this `Enter` at a row of the new layout and clamp it by
+        // the old one’s length. A narrower pane makes the document longer, so
+        // that clamp is short and the heading is below the fold.
+        pane.handle_key(key(KeyCode::End)).unwrap();
+        let last = pane.outline.last().expect("a heading").row;
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(last >= pane.scroll.offset, "clamped short of the heading");
+        assert!(last < pane.scroll.offset + pane.scroll.viewport());
+
+        // And the same again for a heading in the middle, where the offset is
+        // the row exactly. `Home` first, because `o` opens on the section the
+        // reader is *in* — which is the last one, after the jump above.
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        pane.handle_key(key(KeyCode::Home)).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(pane.scroll.offset, narrow);
+    }
+
+    #[test]
+    fn the_help_overlay_names_the_key_that_opens_the_outline() {
+        // The one place the key is written down: a title already carrying the
+        // name, the form, the query and the position has no room to advertise
+        // it, so the F1 table is what a reader has.
+        let (key, said) = crate::keys::HELP
+            .iter()
+            .find(|(k, _)| *k == "o")
+            .expect("the key the overlay promises");
+        assert_eq!(*key, "o");
+        assert!(said.contains("heading"), "got: {said}");
+        assert!(said.contains("definition"), "got: {said}");
+        // And it says the key can decline, because nothing else can.
+        assert!(said.contains("if it has any"), "got: {said}");
+    }
+
+    #[test]
+    fn the_outline_draws_at_every_pane_size_without_panicking() {
+        // The same sizes every other view in this pane is pinned at. A list
+        // narrower than its own indent, and one with no rows on screen at all.
+        let dir = TempDir::new("view-outline-sizes");
+        let path = dir.write("design.md", SECTIONED);
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        draw(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('o'))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        for (w, h) in [(0, 0), (1, 1), (2, 20), (5, 6), (29, 4), (60, 20)] {
+            term.draw(|f| pane.render(f, Rect::new(0, 0, w, h)))
+                .unwrap();
+        }
+        assert!(matches!(pane.mode, Mode::Outline), "and it is still up");
     }
 }

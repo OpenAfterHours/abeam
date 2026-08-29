@@ -243,7 +243,10 @@ half page · `g`/`G`, Home/End — ends · `Tab`/`Shift+Tab` — next/prev item 
 `Enter` — open · `r` — refresh · `Esc`/`q` — back to the agent, which is what
 the border says.
 
-The files view adds `t` — rendered markdown or its source — `Backspace` or `-`
+The files view adds `t` — the rendering or what was typed, which is markdown
+and, now, a Rust or Python file whose documentation is being drawn as prose —
+`o` for the outline of the document, which declines on a file that has none
+rather than opening an empty list, `Backspace` or `-`
 to climb a directory in the file list, and three searches: `/` finds a file
 anywhere under the root while the list is up and a phrase on the page while a
 document is, `n` and `N` walk that document's matches, and `f` reads every file
@@ -276,6 +279,15 @@ for any of them to be seen. That exemption is stated once rather than argued
 beside each key, and the place is the module doc at the top of `keys.rs`:
 *intercept* means what `global` claims before any pane is offered a key, and
 `global` returns `None` for every bare printable one of these.
+
+`o` is the newest of them and was checked the same way regardless, because the
+value of this document is the checking rather than the conclusion: no
+`Char('o')` or `Char('O')` arm exists anywhere in `crates/`, and `keys::global`
+claims only `Ctrl+\`, the function keys and `Alt` combinations — so nothing in
+abeam took it first. It is **not** cleared against Claude's, Copilot's or
+Codex's keymaps, and does not need to be, for the same reason `f`, `w` and `?`
+are not: a bare letter that only ever arrives at a focused right-hand pane is a
+letter no hosted agent is listening for.
 
 Inside the queue's composer, `Enter` commits the item and `Ctrl+Enter` or
 `Alt+Enter` puts a newline in it instead — and the first of that pair is a

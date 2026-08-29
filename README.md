@@ -142,9 +142,27 @@ is pointed at one.
 
 **files** (`Alt+E`) — read-only markdown and source. Markdown is rendered rather
 than shown as source: headings, lists, tables, quotes, GFM alerts, footnotes,
+YAML front matter as a header rather than a slab of source,
 syntax-highlighted code fences, and `graph`/`flowchart` and `sequenceDiagram`
-mermaid blocks drawn in box-drawing characters. `t` swaps the rendering for the
-source it came from, and back. On startup it opens the newest markdown under the
+mermaid blocks drawn in box-drawing characters. Nothing of the markup is left on
+the page — a heading carries its level in a rule under it or a pip before it,
+not in the `#` it was typed with.
+
+**Docstrings and doc comments are rendered where they stand.** A `.rs` or a
+`.py` is still highlighted code with a line-number gutter, but its `///`, `//!`
+and `"""` blocks are markdown by the time you read them, laid out in place
+between the code they describe. The gutter stays honest about it: a rendered
+block carries the first and last file lines its words come from, with a `┊` on
+the rows between, because N lines of docstring do not become N rows of prose and
+a number per row would be inventing one.
+
+`t` swaps any of that for the source it came from, and back — that is what it
+means on a documented `.rs` now as much as on a `.md`. `o` opens the **outline**:
+the document's headings, or a source file's definitions, indented by level;
+`Enter` jumps there and `Esc` leaves you where you were. The title carries a
+breadcrumb of the section you have scrolled into.
+
+On startup it opens the newest markdown under the
 root; after that it follows what the agent writes. A document arriving while you
 are looking at something else waits, and the border says `◆ Alt+E` rather than
 switching under you.
@@ -291,7 +309,8 @@ vocabulary as Claude's own transcript view:
 j / k, arrows   a line        g / G, Home / End   the ends
 space / b       a page        Tab / Shift+Tab     the selection
 Ctrl+D / Ctrl+U a half page   Enter               open · queue: do it now
-r  refresh      t  rendered markdown / source     Esc or q   back to the agent
+r  refresh      t  the rendering / what was typed  Esc or q   back to the agent
+o  outline of this document, when it has one
 ```
 
 `r` is the one of those that is not the same everywhere: it refreshes in the

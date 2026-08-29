@@ -105,8 +105,14 @@ impl Mode {
 pub struct Theme {
     pub bg: Color,
     pub fg: Color,
-    /// Everything the pane says in its own voice: gutters, line numbers, the
-    /// hashes on a heading, hints. Recessive, never invisible.
+    /// Everything the pane says in its own voice rather than the document's:
+    /// quote and code gutters, diagram frames, line numbers, the rules under a
+    /// heading, front-matter keys, the host a long link is elided to, hints.
+    /// Recessive, never invisible — several of those are the *only* thing
+    /// marking where a block begins and ends. It used to say "the hashes on a
+    /// heading" here; `markdown` stopped drawing those when the rules took the
+    /// job over, and the rules are in this colour for the same reason the
+    /// gutters are.
     pub dim: Color,
     /// Inline `code` spans.
     pub code: Color,
@@ -148,9 +154,24 @@ impl Theme {
         Style::new().fg(self.dim)
     }
 
-    /// Colour by level rather than size, since a terminal has no size. Distinct
-    /// hues beat shades: a reader skimming for the next section is pattern
-    /// matching, not reading.
+    /// A heading's *second* signal, not its first.
+    ///
+    /// A terminal has no font size, so the level cannot be a size — and by the
+    /// rule this whole module is written to, it cannot be a colour either:
+    /// colour alone is never a signal a reader receives, which is why every
+    /// link here is underlined and why the current search hit is. So the level
+    /// is carried by the shape `markdown` draws the block in — a full-width
+    /// rule under an H1, a shorter one under an H2, nothing under an H3, and a
+    /// `▸ ▹ ▫` pip on the three below that — and what is left for this method
+    /// is what the shape cannot do: distinct *hues* rather than shades, because
+    /// a reader skimming for the next section is pattern matching rather than
+    /// reading, and hue is what that eye is fastest at.
+    ///
+    /// Which is why H4, H5 and H6 deliberately share `warn`. Six hues on one
+    /// page is not six signals, it is a page nobody skims; those three are told
+    /// apart by their pips, and `markdown::heading_pip` is the code that has to
+    /// keep saying so. If a level is ever added or a colour split out here,
+    /// that is the file to change first.
     pub fn heading(&self, level: u8) -> Style {
         let colour = match level {
             1 => self.special,
@@ -333,20 +354,41 @@ mod tests {
         check("light", &LIGHT);
     }
 
+    /// Legible first, and then not *only* a colour — the rule the module note
+    /// states and the one this file was, before this test, the only place
+    /// contradicting. H4, H5 and H6 share `warn` on purpose, so the assertion
+    /// that they are distinguishable has to reach the thing that distinguishes
+    /// them: `markdown` draws each of the three with its own pip. Asserting the
+    /// hues alone is what let a scheme through review in which three of the six
+    /// levels differed by hue and nothing else.
     #[test]
-    fn every_heading_level_is_legible_and_distinct() {
+    fn every_heading_level_is_legible_and_marked_by_more_than_its_colour() {
+        use super::super::markdown::heading_pip;
+
         for t in [&DARK, &LIGHT] {
             let mut seen = Vec::new();
-            for level in 1..=4u8 {
+            for level in 1..=6u8 {
                 let fg = t.heading(level).fg.expect("a heading names a colour");
                 assert!(contrast(fg, t.bg) >= 4.0, "heading {level} is too faint");
                 seen.push(fg);
             }
             // H1..H3 are the three that carry structure in a document this
-            // size; H4 and below share a colour deliberately.
+            // size, and they get the three distinct hues.
             assert_ne!(seen[0], seen[1]);
             assert_ne!(seen[1], seen[2]);
             assert_ne!(seen[0], seen[2]);
+
+            // H4 and below share one deliberately, which is only safe while
+            // something else separates them. Stated both ways round so that
+            // splitting the colours here without dropping the pips, or dropping
+            // the pips because the colours look distinct enough, both fail.
+            assert_eq!(seen[3], seen[4]);
+            assert_eq!(seen[4], seen[5]);
+            let pips: Vec<_> = (1..=6).map(heading_pip).collect();
+            assert_eq!(pips[0..3], [None, None, None]);
+            let (a, b, c) = (pips[3], pips[4], pips[5]);
+            assert!(a.is_some() && b.is_some() && c.is_some());
+            assert!(a != b && b != c && a != c);
         }
     }
 

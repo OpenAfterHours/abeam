@@ -676,7 +676,12 @@ fn the_second_alt_e_opens_a_file_list_that_can_be_walked_to_a_file() {
     send(&session, b"/");
     send(&session, b"target");
     send(&session, b"\r");
-    wait_for(&session, "# found me");
+    // Without its hash: a rendered heading no longer carries the `#` it was
+    // written with, so the literal source text is the one form of this line
+    // that proves the pane is *not* rendering. The `rendered` above already
+    // pins which form is on screen; what is wanted here is only that the
+    // file the find reached is the file being read.
+    wait_for(&session, "found me");
 
     send(&session, &alt('q'));
     send(&session, &alt('q'));

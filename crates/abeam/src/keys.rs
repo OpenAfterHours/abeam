@@ -348,7 +348,14 @@ pub const HELP: &[(&str, &str)] = &[
     // directory — a live child's cwd is the child's — so this is the one place
     // the two halves of the window deliberately disagree about where they are.
     ("Enter (worktrees)", "point the right pane at that worktree"),
-    ("t", "files: rendered markdown / its source"),
+    // Not "rendered markdown", which is what this said and what it stopped
+    // meaning: a `.py` or a `.rs` with documentation in it is rendered too, and
+    // a reader looking for the key that put their `"""` back was reading a row
+    // about a file type they did not have open. The two words are the two forms
+    // the pane holds, in the order the key toggles them, and neither names a
+    // language — which is what keeps this row true the next time the list of
+    // languages grows.
+    ("t", "files: the rendering / what was typed"),
     // The three searches are three questions, and the rows name them as
     // questions: two keys that both ended "under the root" differed by five
     // characters read at a glance, which is not a difference anyone reads.
@@ -364,6 +371,33 @@ pub const HELP: &[(&str, &str)] = &[
         "files: which files say this — reads every file under the root",
     ),
     ("n / N", "document: next / previous match, outside the box"),
+    // A bare letter for the reason `f` and `w` are, which is the *intercept*
+    // paragraph at the top of this file: `global` claims only `Ctrl+\`, the
+    // F-keys and the Alt combinations, so a key a focused pane handles was
+    // never going to reach the agent whatever this table said. Cited rather
+    // than re-argued, the way those two rows do.
+    //
+    // "document" and not "files", for the reason the `?` row gives lower down:
+    // this is a row about the reader's *modes*. The file list and the `f`
+    // results each own every key while they are up, so `o` reaches nothing
+    // there.
+    //
+    // "if it has any" is doing real work rather than hedging. The key declines
+    // on a `.txt` and on a `.json` — see `panes::viewer::outline` — and this
+    // table is the only place that can say so, because a title already carrying
+    // the name, the form, the query and the position has no room to advertise a
+    // key per document.
+    //
+    // Markdown used to be in that list of refusals, in its `t` form, and is
+    // not any more: the source of a document is parsed by the same parser that
+    // renders it, so `o` answers in both forms and the reader does not pay a
+    // table of contents for pressing `t`. Which is why this row says "document"
+    // and not "rendered document" — the word here has to be about the reader's
+    // mode, and there is no form of a markdown file where the key is dead.
+    (
+        "o",
+        "document: jump to a heading or a definition, if it has any",
+    ),
     ("Backspace or -", "file list: up a directory"),
     ("r", "refresh · queue: clear what has finished (twice)"),
     // Not a fifth global view key: `Alt+W` is Claude's, and a fifth view
