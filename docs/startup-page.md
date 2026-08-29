@@ -263,3 +263,162 @@ mention the drag-and-`Enter` round trip.
 **C is the one that compounds**, and the only one worth waiting on. Its gate is
 not the pane — it is a binding cleared against Claude, Copilot and Codex, which
 is the same audit `docs/keymap.md` has already made twice.
+
+# The ones that move
+
+A second pass, on the question of whether any of the above is allowed to be
+fun. The short answer is yes, and cheaply, for a reason that is a fact about
+the loop rather than an opinion about taste.
+
+## Motion is already paid for
+
+The usual objection to an animation in a TUI is that it drags the process awake
+sixty times a second to redraw a screen nobody is reading. Here it does not.
+`App::drive` already waits on `TICK` — 10 ms — to poll the panes that have no
+doorbell: the git pane's channel, a viewer walk finishing, a shell child's
+`try_wait`. An animation is one more thing for a wake that already happens to
+advance, and it says so the same way those panes do, by returning `true` from
+`tick()`.
+
+| | |
+| --- | --- |
+| `TICK` | 10 ms — the wake that already happens |
+| `MIN_FRAME` | 8 ms — the floor, 125 fps of headroom |
+| a measured frame | ~0.75 ms, whole window |
+| twelve frames a second, for one second | about 1% of a core |
+
+And the cost does not have to be guessed at afterwards. `Frames` already records
+worst-frame and fps and `F2` already puts both on screen, so this is the rare
+flourish that arrives with its own instrument pointed at it.
+
+One more thing makes a boat the on-theme choice rather than a pasted-on one:
+*abeam* is a bearing. It is the direction at right angles to a vessel's keel —
+straight off the side, which is where this program puts the right pane.
+
+## The five
+
+**The crossing.** A boat sails the width of the left pane while the agent
+starts; it has arrived when the agent speaks. Its position is elapsed time at a
+fixed speed, not a percentage, because abeam does not know how long Node will
+take and a bar that creeps to 95% and stops is a lie told slowly. If the
+crossing finishes and the agent still has not spoken, a second boat enters from
+the left — two boats means slow, three means something is wrong, and that reads
+correctly without anybody being told what it means.
+
+```
+┌ claude ──────────────────────────────────────────────┐┌ git · main ↑2 · 12 changed ──────┐
+│ abeam 0.8.1                                          ││ Staged (1)            +40 -6     │
+│                                                      ││   M crates/abeam/src/app.rs      │
+│ hosting   claude                                     ││ Changed (1)            +7 -0     │
+│           ~/.local/bin/claude                        ││   M docs/design.md               │
+│ in        ~/src/abeam   main ↑2                      ││ Untracked (1)                    │
+│                                                      ││   ? notes/                       │
+│                                                      ││                                  │
+│                                                      ││ Recent                           │
+│                                                      ││   a1b2c3d  2m   parser skeleton  │
+│                        |\                            ││   9f0e1d2  1h   queue: arm sends │
+│                        | \                           ││                                  │
+│                     ___|__\                          ││                                  │
+│~~~~~_~~~~~~_~~~≈~≈~≈\______/~~~~_~~~~~~_~~~~~~_~~~~~~││                                  │
+│ ▍ waking claude…      3.3s                           ││                                  │
+└──────────────────────────────────────────────────────┘└──────────────────────────────────┘
+```
+
+**The regatta.** Four small craft, one per thing being made ready — the pty's
+size, whether the config file was found, the git pane's first answer, the
+watcher's first event. Each moors when its check lands and its lane turns into
+the fact it went to fetch. This is proposal A in motion, and it keeps rule 5
+because the motion *is* the truth: a boat still at sea is a check that has not
+come back, and a lane that never docks is a diagnosis on screen at the one
+moment somebody could still act on it. A spinner says a program is alive; this
+says which part of it is not.
+
+```
+┌ claude ──────────────────────────────────────────────┐┌ git · main ↑2 · 12 changed ──────┐
+│ abeam 0.8.1                                          ││ Staged (1)            +40 -6     │
+│                                                      ││   M crates/abeam/src/app.rs      │
+│                        |\                            ││ Changed (1)            +7 -0     │
+│ pty      · · · · · · ·\__/▐ 52 × 12                  ││   M docs/design.md               │
+│                                                      ││ Untracked (1)                    │
+│                        |\                            ││   ? notes/                       │
+│ config   · · · · · · ·\__/▐ …                        ││                                  │
+│                                                      ││ Recent                           │
+│                   |\                                 ││   a1b2c3d  2m   parser skeleton  │
+│ git      · · · · \__/· · ·▐ …                        ││   9f0e1d2  1h   queue: arm sends │
+│                                                      ││                                  │
+│                 |\                                   ││                                  │
+│ watcher  · · · \__/· · · ·▐ …                        ││                                  │
+│ ▍ starting…                                          ││                                  │
+└──────────────────────────────────────────────────────┘└──────────────────────────────────┘
+```
+
+**The beam.** The divider between the panes is the animation: a light travels it
+while the agent works and rests when the agent is idle. The only one of the five
+that outlives startup — `READINESS_EVERY` already re-reads the agent's own
+idle/busy record every 250 ms for the queue's sake, and nothing on screen uses
+it unless the queue is open. It costs one column and covers no character of
+anything. It also carries the only real ergonomic risk here: a light moving in
+peripheral vision for the whole of a four-minute turn is a light somebody will
+come to hate, so it wants to be slow, dim, three cells of gradient, and probably
+to fade out after the first thirty seconds of a long turn.
+
+```
+┌ claude ──────────────────────────────────────────────┐┌ git · main ↑2 · 12 changed ──────┐
+│                                                      ││ Staged (1)            +40 -6     │
+│ > rewrite the watcher's debounce                     ││   M crates/abeam/src/app.rs      │
+│                                                      ││ Changed (1)            +7 -0     │
+│ ● Editing crates/abeam/src/watch.rs                  ││   M docs/design.md               │
+│   working…                                           ┃┃ Untracked (1)                    │
+│                                                      ┃┃   ? notes/                       │
+│                                                      ││                                  │
+│                                                      ││ Recent                           │
+│                                                      ││   a1b2c3d  2m   parser skeleton  │
+│                                                      ││   9f0e1d2  1h   queue: arm sends │
+│                                                      ││                                  │
+│                                                      ││                                  │
+│                                                      ││                                  │
+│ readiness: busy                                      ││                                  │
+└──────────────────────────────────────────────────────┘└──────────────────────────────────┘
+```
+
+**The wipe.** One bright column crosses the window and draws the panes as it
+passes — four hundred milliseconds, once, never again. It holds no state past
+the frame it is on, it never waits for the agent, and it makes the window feel
+like something switched on rather than something that appeared. If the answer to
+all of this is "something, but barely", this is that something.
+
+**The horizon**, which is listed last because it should probably not ship on.
+When the agent has been idle a long while and nobody has typed, the boat comes
+back and drifts along the bottom of the pane. It is the most charming idea here
+and the one most likely to be turned off in a week: the moment the agent goes
+quiet is the moment its user starts thinking, and motion at the edge of vision is
+what thinking cannot have near it. Off by default, behind `[defaults]`, and it
+stops on the first keystroke rather than finishing its crossing.
+
+## Four rules that keep this fun rather than annoying
+
+1. **It stops the instant the agent speaks.** Not fades, not finishes the
+   crossing — stops. The first byte out of the pty ends the animation, because
+   from that moment the pane belongs to somebody else's output.
+2. **Nothing moves during `abeam -p`.** A one-shot is a scripted session nobody
+   is watching, and a boat drawn there is frames spent on an empty room.
+3. **It is a redraw, never a wake.** It advances on the `TICK` that already
+   happens. The moment it wants a timer of its own it has stopped being free.
+4. **One line of config turns it off.** `[defaults]` already exists and already
+   holds the light/dark choice. Somebody on a laptop on a train gets to say no,
+   and gets the boot log instead.
+
+## Recommendation
+
+**The regatta, with the crossing as its finale.** They are the same sprite and
+the same water: the four small craft dock as their checks land, and if the agent
+is still starting after the last one moors, a full-sized boat sets out across the
+pane. That is one feature, not two, and every frame of it is reporting something
+true.
+
+**The beam on its own schedule.** It is not a startup feature and should not be
+judged as one — it is the readiness record finally appearing on screen. Slow and
+dim, or not at all.
+
+**The horizon goes in the config file, off.** The best idea here and the worst
+default.
