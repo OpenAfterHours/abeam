@@ -984,12 +984,17 @@ pub struct App {
     /// first one.
     ///
     /// **[`pending_quit`](Self::pending_quit)'s mechanism, and an id where that
-    /// one is a bit.** The difference is not caution: the cursor can move
-    /// between the two presses — `F4` is a global and is delivered whatever the
-    /// left pane is showing — and a bare bit would let a `q` aimed at one pane
-    /// close whichever pane the second press found in front of it. Closing a
-    /// pane is not undoable, so the confirmation has to be about a *pane* and
-    /// not about a moment.
+    /// one is a bit.** The id is what lets the *border* name a pane: the prompt
+    /// is drawn on the pane the question is about, and a bare bit would have to
+    /// ask the cursor — which is a different fact, and the wrong one, since the
+    /// cursor is exactly what moves between two presses.
+    ///
+    /// It is a second fence as well as a label, and the fence is worth having
+    /// even though [`handle_key`](Self::handle_key) already takes this on every
+    /// keystroke — so `F4` between the presses withdraws the question outright
+    /// and the id has nothing left to catch. That is one line away from not
+    /// being true, and closing a pane is not undoable: the cheaper of the two
+    /// guarantees should not be the only one.
     ///
     /// **What it is protecting is smaller than what `Alt+Q` protects, and it is
     /// still worth a press.** The child has already gone: there is no turn to
