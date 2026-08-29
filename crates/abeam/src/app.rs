@@ -527,16 +527,69 @@ struct Agent {
     /// actually willing to go. Normally that is immediately; with a command
     /// still running in the shell view it is when the user says so.
     exit: Option<(ExitStatus, Vec<String>)>,
-    /// Stashed by the last frame that drew this pane. The pty is resized from
-    /// exactly this rect, so the two can never disagree.
+    /// Whether this agent is mid-turn, as of the last pass of
+    /// [`App::poll_readiness`].
+    ///
+    /// **Per agent because a collapsed pane is one row and that row has to be
+    /// worth having**, which is the trigger [`draft_open`](Self::draft_open)
+    /// names: there was no second probe read per pass, and there was not to be
+    /// one until something needed the answer. A stack is that something. A
+    /// title row saying only which agent it is reports a roster; the same row
+    /// saying whether it is *working* is most of what "see what several agents
+    /// are doing" means, and it is the whole reason a pane collapses rather
+    /// than disappearing.
+    ///
+    /// **This is not the queue's readiness and must not become it.** The queue
+    /// goes on reading `agents[0]`'s — see [`App::pump_queue`], where the rule
+    /// that its three inputs name one agent is argued — and this field is read
+    /// by a border and by nothing else. So per-pane *targeting* is still
+    /// phase 4's: what has arrived early is the half that cannot mis-send,
+    /// because nothing acts on it.
+    readiness: crate::agentstate::Readiness,
+    /// The rect the pty is sized from, and the one the child is drawn into.
     ///
     /// `crate::layout` opens by saying there is one calculation because two
     /// that must agree is where "off-by-one here is what makes hosted apps wrap
     /// strangely" comes from. Keeping the rect beside the pane it drew is the
-    /// same rule one level up: [`Agent::render`] and [`Agent::resize_to_drawn`]
+    /// same rule one level up: [`Agent::place`] and [`Agent::resize_to_drawn`]
     /// are the only readers, neither takes a rect, and so there is no call that
     /// can hand the pty a size the frame did not use.
+    ///
+    /// ## The one frame that deliberately does not write it
+    ///
+    /// **A collapsed pane draws a title row and leaves this alone, which breaks
+    /// the rule directly above and is the point of this paragraph.** The rule
+    /// is right for a pane that was drawn: what the pty is told and what the
+    /// frame used have to be the same rect or the agent wraps oddly. It is
+    /// wrong for a pane that was *not* drawn, because obeying it there means
+    /// resizing a live child to one row — and a one-row resize is not a small
+    /// change of layout to an agent. It reflows the whole transcript, and on
+    /// some agents it truncates the scrollback that reflow lands in, so
+    /// collapsing a pane for ten seconds would destroy work the pane exists to
+    /// keep. The cost of not obeying it is bounded and visible: the child goes
+    /// on believing it has the size it last had, and the first frame that draws
+    /// it whole again corrects that in the same statement that drew it.
+    ///
+    /// So [`place`](Self::place) writes this only when there was room inside
+    /// the border, and `Rect::ZERO` — a pane that has never been drawn at all —
+    /// is what [`resize_to_drawn`](Self::resize_to_drawn) refuses to hand to a
+    /// pty. A pane opened on a keystroke into a stack with no room for it keeps
+    /// the size `App::start_agent` spawned it at until a frame gives it one.
     inner: Rect,
+    /// The whole pane, border included, exactly as the last frame placed it.
+    ///
+    /// **Two rects rather than one, because a collapsed pane is on screen and
+    /// is not drawn.** [`inner`](Self::inner) answers "what size is this pty",
+    /// which a collapsed frame does not change; this answers "where is this
+    /// pane", which it does. A click in a collapsed pane's single row is a
+    /// click on that pane and has to reach it, and hit-testing `inner` would
+    /// send it to wherever that pane was last drawn whole — a rect somewhere
+    /// else on the screen, now belonging to somebody else.
+    ///
+    /// Written by every frame, whole or collapsed, so it is never staler than
+    /// the frame the mouse is being asked about. `Rect::ZERO` before the first
+    /// one, which no pointer can be inside.
+    outer: Rect,
 }
 
 impl Agent {
@@ -567,7 +620,14 @@ impl Agent {
             draft_open: false,
             submit_pending: false,
             exit: None,
+            // Nothing has been read yet, and `Unknown` is what "abeam cannot
+            // say" is spelled as everywhere else on this path. A pane opened a
+            // moment ago says nothing about itself in its border rather than
+            // claiming to be idle, which is the one answer that would be a lie
+            // worth acting on.
+            readiness: crate::agentstate::Readiness::Unknown,
             inner: Rect::ZERO,
+            outer: Rect::ZERO,
         }
     }
 
@@ -597,24 +657,128 @@ impl Agent {
         });
     }
 
-    /// Draw the pane into the rect the frame gave it, and remember that rect.
+    /// Put this pane at `outer`: the child inside it, if there is an inside.
     ///
     /// The write and the draw are one statement so that
-    /// [`inner`](Self::inner) cannot describe a frame that never happened.
-    fn render(&mut self, f: &mut Frame, inner: Rect) {
+    /// [`inner`](Self::inner) cannot describe a frame that never happened, and
+    /// the *decision* is here rather than at the call site so that there is one
+    /// place where a pane is either drawn or collapsed. The caller has already
+    /// put a border on `outer`; what is left is the question of whether
+    /// anything fits in it.
+    ///
+    /// **"Collapsed" is not a flag anybody sets: it is what
+    /// `crate::layout::inner` answers about the rect.** A pane one row tall has
+    /// no inside, so there is nothing to draw and nothing to resize to — which
+    /// is exactly the state [`crate::layout::stack`] produces on purpose when
+    /// the window will not carry another whole pane. Deriving it from the rect
+    /// rather than tracking it means the frame and the mouse cannot disagree
+    /// about which panes were collapsed.
+    fn place(&mut self, f: &mut Frame, outer: Rect) {
+        self.outer = outer;
+        let Some(inner) = Self::inside(outer) else {
+            // Deliberately not writing `inner`. See its own doc: this is the
+            // one place the "sized from the rect that drew it" rule is broken,
+            // and it is broken because the alternative resizes a live agent to
+            // one row.
+            return;
+        };
         self.inner = inner;
         self.pane.render(f, inner);
+    }
+
+    /// The area inside a pane of this size, or `None` when there is no inside.
+    ///
+    /// One function so that [`place`](Self::place) and
+    /// [`drawn_inner`](Self::drawn_inner) cannot come to different conclusions
+    /// about the same rect — the frame decides whether a pane was collapsed and
+    /// the mouse has to reach the same answer between frames.
+    fn inside(outer: Rect) -> Option<Rect> {
+        let inner = abeam_layout::inner(outer);
+        (inner.width > 0 && inner.height > 0).then_some(inner)
+    }
+
+    /// The area the child was drawn into by the last frame, or `None` if that
+    /// frame collapsed this pane to its title row.
+    ///
+    /// What a mouse event is hit-tested against and translated into. It is
+    /// recomputed from [`outer`](Self::outer) rather than read from
+    /// [`inner`](Self::inner) because those two are the same rect only for a
+    /// pane that was drawn — which is the question being asked.
+    fn drawn_inner(&self) -> Option<Rect> {
+        Self::inside(self.outer)
     }
 
     /// Size the pty to the rect the last frame actually drew.
     ///
     /// Takes no argument, which is the point of it: there is one rect, it is
-    /// the one [`render`](Self::render) used, and a caller has nothing to get
+    /// the one [`place`](Self::place) used, and a caller has nothing to get
     /// wrong. `on_resize` is a no-op when nothing changed, which is what makes
     /// calling it every frame the cheap option rather than the careless one.
+    ///
+    /// **A rect with no area is refused rather than passed on**, and it is the
+    /// only refusal here. It means one of two things and neither is a size: a
+    /// pane that has never been drawn, whose pty is at the size
+    /// [`App::start_agent`] spawned it at and should stay there; or — if
+    /// [`place`](Self::place) ever stops guarding the write — a pane the frame
+    /// collapsed, whose child must not be reflowed to nothing. Zero columns is
+    /// not a narrow terminal, it is a terminal that cannot exist.
     fn resize_to_drawn(&mut self) -> Result<()> {
         let inner = self.inner;
+        if inner.width == 0 || inner.height == 0 {
+            return Ok(());
+        }
         self.pane.on_resize(inner)
+    }
+
+    /// Read this agent's own record of whether it is mid-turn.
+    ///
+    /// **The three downgrades that were in [`App::poll_readiness`], moved here
+    /// whole so that there is still one calculation.** They are per-pane facts
+    /// — this child's bracketed paste, this child's exit — and the border and
+    /// the queue must not reach them by two different routes; `poll_readiness`
+    /// now reads what this returns and hands `agents[0]`'s copy to the queue
+    /// unchanged.
+    ///
+    /// `claude` is the session's, not the pane's: it is
+    /// [`App::has_claude_state`], which asks what kind of agent abeam is
+    /// hosting at all. The probe reads Claude's session records, and a record
+    /// in this repository is not evidence about a Codex or a Copilot hosted
+    /// beside it.
+    ///
+    /// **The bracketed-paste condition is the one that reads oddly for a
+    /// border**, and it is kept anyway. `Unknown` means "abeam cannot establish
+    /// that a send would be safe", which is a sentence about typing rather than
+    /// about working — so a busy agent that never asked for bracketed paste has
+    /// a collapsed row that says nothing instead of `busy`. Two calculations
+    /// that must agree is the more expensive mistake, and every agent abeam
+    /// hosts enables the mode, so the divergence is a floor rather than a case
+    /// anybody meets.
+    ///
+    /// **The three are asked before the probe rather than downgrading its
+    /// answer afterwards, which is the same result and not the same cost.** The
+    /// version this replaced read the record and then threw the answer away;
+    /// with one agent that was a wasted directory walk four times a second, and
+    /// with a stack it is one per pane. Each of the three is free and each is
+    /// permanent enough to lead with — a child that has exited will not come
+    /// back, and a child that never enabled bracketed paste will not start.
+    fn poll_readiness(&mut self, claude: bool) -> crate::agentstate::Readiness {
+        use crate::agentstate::Readiness;
+        // A session that has gone cannot be typed at, and its last record can
+        // sit at `idle` forever — a dead agent is the most convincingly idle
+        // thing there is.
+        if self.pane.has_exited() {
+            return Readiness::Unknown;
+        }
+        // Without bracketed paste every newline in a sent block submits, so a
+        // three-line prompt arrives as three — the second and third typed at an
+        // agent already busy with the first.
+        if !self.pane.bracketed_paste() {
+            return Readiness::Unknown;
+        }
+        if !claude {
+            return Readiness::Unknown;
+        }
+        self.probe.readiness()
     }
 }
 
@@ -752,15 +916,22 @@ pub struct App {
     /// child holding it is still running, and a record left behind by one that
     /// has gone is exactly as adoptable as a live one's.
     disowned: Vec<String>,
-    /// Why the last `a` in the worktree list started nothing.
+    /// Why the last gesture aimed at the roster of panes did nothing.
     ///
-    /// **A sentence in the left title, cleared by the next keystroke, and the
-    /// mechanism is [`pending_quit`](Self::pending_quit)'s on purpose.** There
-    /// is no pane to put this in — the pane it is about is the one that failed
-    /// to exist — and the alternatives were a note in a workspace's ask
-    /// transcript, which is a pane the reader was not looking at and did not
-    /// ask, or silence, which is a keystroke that does nothing with no way to
-    /// find out why.
+    /// **Two keys report here now, and they are one kind of answer.** `a` in
+    /// the worktree list, when no pane could be started; and `q` at an exited
+    /// pane, when [`close_agent`](Self::close_agent) refuses to remove it. The
+    /// second was the first one's own argument arriving from the other
+    /// direction: neither has a pane of its own to speak from — one is about a
+    /// pane that failed to exist, the other about a pane that must not stop
+    /// existing — and both are sentences about the session's list of agents,
+    /// which is why they are drawn on the session's border.
+    ///
+    /// **A sentence in `agents[0]`'s title, cleared by the next keystroke, and
+    /// the mechanism is [`pending_quit`](Self::pending_quit)'s on purpose.**
+    /// The alternatives were a note in a workspace's ask transcript, which is a
+    /// pane the reader was not looking at and did not ask, or silence, which is
+    /// a keystroke that does nothing with no way to find out why.
     ///
     /// Held whole and shortened where it is drawn, because which forty-odd
     /// columns of somebody else's sentence are worth keeping is a question
@@ -809,10 +980,38 @@ pub struct App {
     /// Quitting kills a live session, so it asks twice. One bit rather than a
     /// modal dialog: any other key cancels it, which is the whole interaction.
     pending_quit: bool,
+    /// The agent whose pane a second `q` would close, if the last key was the
+    /// first one.
+    ///
+    /// **[`pending_quit`](Self::pending_quit)'s mechanism, and an id where that
+    /// one is a bit.** The difference is not caution: the cursor can move
+    /// between the two presses — `F4` is a global and is delivered whatever the
+    /// left pane is showing — and a bare bit would let a `q` aimed at one pane
+    /// close whichever pane the second press found in front of it. Closing a
+    /// pane is not undoable, so the confirmation has to be about a *pane* and
+    /// not about a moment.
+    ///
+    /// **What it is protecting is smaller than what `Alt+Q` protects, and it is
+    /// still worth a press.** The child has already gone: there is no turn to
+    /// interrupt and nothing costs money to redo. What is destroyed is the
+    /// frozen screen and the scrollback behind it — the agent's last several
+    /// thousand rows of work, which is exactly what somebody is still reading
+    /// when they have not closed the pane yet, and which nothing in abeam can
+    /// get back. `crate::panes::git` predicted this, in the comment beside the
+    /// `a` that has no confirmation: "the gesture that will need a confirmation
+    /// is the one that *closes* a pane".
+    ///
+    /// Cleared by the next key, wherever it goes, exactly as `pending_quit` is
+    /// — and by a mouse press, for the same reason.
+    pending_close: Option<u64>,
     /// Whichever pane owned the last mouse press keeps drag and motion events
     /// even once the pointer leaves it. Without this, dragging a selection in
     /// the agent and crossing the divider silently retargets mid-gesture.
-    mouse_owner: Option<Focus>,
+    ///
+    /// An [`Aim`] rather than a [`Focus`] since the left side became several
+    /// panes: "the left" no longer says which of them a gesture was aimed at,
+    /// and the answer has to survive the cursor moving under it.
+    mouse_owner: Option<Aim>,
     /// Rows of the right pane the user is selecting, or `None` for not
     /// selecting. See `crate::select`; `F7` and a drag are the two ways in.
     ///
@@ -987,6 +1186,28 @@ struct Drag {
     /// Whether the pointer has moved since. A click leaves this false and
     /// copies nothing.
     moved: bool,
+}
+
+/// Where a pointer event is going.
+///
+/// **Not [`Focus`], and the difference arrived with the stack.** Focus answers
+/// which side of the divider has the *keyboard*, and it is two-valued for the
+/// reasons `agents`' own documentation gives — 126 call sites, a documented
+/// config value, and one choke point that the whole "typing goes to the agent"
+/// argument rests on. This answers a narrower question that only the mouse
+/// asks: which rectangle on the last frame did the pointer land in. The left
+/// side is several rectangles now, so the answer has to name one.
+///
+/// **The agent is named by id, not by index**, for the reason [`Agent::id`]
+/// exists: this value outlives the event that made it — it is what
+/// [`App::mouse_owner`] holds for the length of a drag — and an index does not
+/// survive the list it points into changing length. A pane closed mid-gesture
+/// leaves an id that resolves to nothing, which is a gesture with nowhere to go
+/// rather than a gesture delivered to a stranger.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Aim {
+    Agent(u64),
+    Right,
 }
 
 /// A command a reader chose out of an answer, on its way to a prompt.
@@ -1164,6 +1385,7 @@ impl App {
             help: false,
             literal_next: false,
             pending_quit: false,
+            pending_close: None,
             mouse_owner: None,
             select: None,
             select_took_focus: false,
@@ -1414,12 +1636,31 @@ impl App {
         // A first guess at the size, from the window the last frame measured
         // rather than from the rect that frame drew. `Agent::inner` is per pane
         // and this pane has never been drawn, so there is no rect of its own to
-        // read; the split is a pure function of the area, which is what lets a
-        // key ask what the next frame *would* do. The first frame resizes the
-        // pty from what it actually drew, so this only spares the child an
-        // immediate reflow — the same thing `main` does at startup, for the
-        // same reason.
-        let inner = abeam_layout::inner(abeam_layout::split(self.area, self.zoom).left);
+        // read; the split and the stack are pure functions of the area, which
+        // is what lets a key ask what the next frame *would* do. The first
+        // frame resizes the pty from what it actually drew, so this only spares
+        // the child an immediate reflow — the same thing `main` does at
+        // startup, for the same reason.
+        //
+        // **Asked of the stack the next frame will draw and not of the whole
+        // column**, which is what the guess used to be and what it stopped
+        // being worth the moment a second pane could be on screen beside this
+        // one: `agents.len() + 1` panes with the cursor on the new last one,
+        // which is exactly what this function is about to arrange. A guess a
+        // pane and a half too tall is not merely wasted, it is the reflow this
+        // line exists to avoid, arriving on the first frame instead of not at
+        // all. And when the stack has no room, the guess is a title row's worth
+        // of nothing — so the maximum is taken against a real minimum rather
+        // than against 1, or a child would open believing it had one row and
+        // `Agent::resize_to_drawn` would never correct it, because a collapsed
+        // pane is the case that deliberately does not.
+        let column = abeam_layout::split(self.area, self.zoom).left;
+        let rects = abeam_layout::stack(column, self.agents.len() + 1, self.agents.len());
+        let inner = rects
+            .last()
+            .copied()
+            .and_then(Agent::inside)
+            .unwrap_or_else(|| abeam_layout::inner(column));
         let started = TerminalPane::spawn_with(
             launch
                 .config()
@@ -1484,14 +1725,13 @@ impl App {
 
     /// Take an agent whose child has finished out of the vector.
     ///
-    /// **Nothing calls this yet, and the reason it is here now is the reason
-    /// [`Agent::id`] was: the rules are the interesting part and they are
-    /// easier to write beside each other than to reconstruct later.** The
-    /// gesture belongs with the stack, which is what first gives the panes a
-    /// list to press a key in, and with the exit contract, which is what
-    /// decides what a *live* agent's closing means. Killing one is the most
-    /// destructive thing in this program and it does not get a key on the way
-    /// past.
+    /// **The caller it was written for has arrived: [`close_key`](Self::close_key).**
+    /// It was here first because the rules are the interesting part and are
+    /// easier to write beside each other than to reconstruct later; what the
+    /// stack added is somewhere to press the key, since a pane removed from the
+    /// vector is now a row that visibly goes. The second refusal below still
+    /// stands: killing a live agent is the most destructive thing in this
+    /// program and it does not get a key on the way past.
     ///
     /// **By id and never by index**, which is `sync_workspaces`' worked
     /// argument one vector along: `at_agent` is a position, this call is what
@@ -1512,10 +1752,6 @@ impl App {
     ///   `Alt+Q`'s double press becomes — is the exit contract's question, and
     ///   answering it here by killing something would be answering it by
     ///   accident.
-    #[allow(
-        dead_code,
-        reason = "the gesture lands with the stack and the exit contract"
-    )]
     fn close_agent(&mut self, id: u64) -> Result<(), String> {
         let Some(ix) = self.agents.iter().position(|agent| agent.id == id) else {
             return Err("that pane has already gone.".to_string());
@@ -1557,6 +1793,70 @@ impl App {
         // gone.
         self.set_agent(to);
         Ok(())
+    }
+
+    /// `q` at an agent whose child has gone: once to ask, again to close.
+    ///
+    /// ## Which exemption this key is standing on
+    ///
+    /// `docs/keymap.md`'s invariant is that nothing abeam intercepts globally
+    /// may be a key a hosted agent can act on, and a bare `q` plainly is one.
+    /// This is not a global. It is the exemption `crate::panes::git` states
+    /// above its `Mode` — a key claimed inside a view, delivered only while
+    /// that view has it — and abeam holds a **stronger** version of it here
+    /// than that pane does. `w` and `Enter` and `Esc` are safe because the
+    /// worktree list is up and nothing is being typed at the agent. This one is
+    /// safe because **the agent it would be typed at has exited**: there is no
+    /// process left to have an opinion about `q`, and every key delivered to
+    /// this pane is already going into a closed pty and doing nothing. A key
+    /// that can only fire at a dead child cannot shadow a live one's binding in
+    /// any session, on any agent, ever.
+    ///
+    /// It is also why this sits inside the `Focus::Left` arm rather than in
+    /// `keys::global`: reached through focus, and past the escape hatch, so
+    /// `Ctrl+\` `q` still goes to the child — a hatch that stopped working on a
+    /// pane would be a hatch with an exception in it.
+    ///
+    /// **`q` and not `Esc`, and not `x`.** `q` is the word this program already
+    /// has for "I am done with this pane" — it is what the right pane's own
+    /// arm means by it — and one vocabulary across the divider is worth more
+    /// than agreeing with a multiplexer abeam spends a section of `docs/design.md`
+    /// arguing it is not. `Esc` is deliberately excluded: it means *back out*
+    /// everywhere else here, a reader's reflex when a screen surprises them,
+    /// and the screen it would be pressed at is the one thing closing destroys.
+    ///
+    /// **Two presses, and [`pending_close`](Self::pending_close) is where the
+    /// argument for that lives.** The refusals come back as sentences and go in
+    /// [`agent_refused`](Self::agent_refused) — including the one about
+    /// `agents[0]`, which is a session-level instruction ("Alt+Q is the way
+    /// out") and belongs on the border the session's facts are drawn on.
+    ///
+    /// `None` when the key was not this one, which is the caller's signal to go
+    /// on and hand it to the child.
+    fn close_key(&mut self, key: &KeyEvent, closing: Option<u64>) -> Option<Flow> {
+        // A chord is aimed past abeam at whatever is hosted — `chord`'s own doc
+        // has the `SHIFT`-for-uppercase caveat this relies on, and `Char('Q')`
+        // is a different code from `Char('q')` in any case.
+        if chord(key) || key.code != KeyCode::Char('q') {
+            return None;
+        }
+        // The whole of the exemption above. A live agent hears `q` and this
+        // function was never here.
+        if !self.current().pane.has_exited() {
+            return None;
+        }
+
+        let id = self.current().id;
+        if closing != Some(id) {
+            self.pending_close = Some(id);
+            return Some(Flow::redraw());
+        }
+        if let Err(why) = self.close_agent(id) {
+            self.agent_refused = Some(why);
+        }
+        // A frame either way: a pane has gone and the stack below it moves up,
+        // or a sentence has appeared saying why it has not.
+        Some(Flow::redraw())
     }
 
     // --- the workspaces --------------------------------------------------
@@ -2144,48 +2444,56 @@ impl App {
     ///
     /// Returns whether the answer changed, because a changed answer is the
     /// thing that starts and stops that countdown.
+    ///
+    /// ## Every agent is read, and only one of the answers reaches the queue
+    ///
+    /// **The loop is what a collapsed pane's title row is for.** A pane the
+    /// stack shrank to one row can say two things and the second is the one
+    /// worth the row: whether that agent is working. Nothing else on screen can
+    /// say it, because the pane it would be visible in is not being drawn. See
+    /// [`Agent::readiness`], which is where the cost of asking is booked.
+    ///
+    /// **What has *not* changed is the queue's input.** It is
+    /// `agents[0]`'s, taken from the same read the border uses rather than
+    /// computed again beside it — one calculation, so the sentence
+    /// [`pump_queue`](Self::pump_queue) rests on ("the queue's three inputs
+    /// must name one agent") stays a fact rather than a hope. The draft flag
+    /// that is cleared here is `agents[0]`'s too, and deliberately: clearing
+    /// every agent's would be right the day a `Send` can be aimed at one of
+    /// them and is a change to the gate today, which is phase 4's to make.
     fn poll_readiness(&mut self) -> bool {
         if self.readiness_at.elapsed() < READINESS_EVERY {
             return false;
         }
         self.readiness_at = Instant::now();
 
-        // **The session's agent, not the current one, and every read in this
-        // function names the same one.** See [`App::pump_queue`] — the queue is
-        // aimed at `agents[0]` outright, and the whole class of bug this
-        // replaced was these three inputs disagreeing about which pane they
-        // were describing.
-        //
-        // The probe reads Claude's session records. A record in the same
-        // repository is not evidence about a Codex, Copilot or generic program
-        // hosted beside it, and mistaking its `idle` for theirs would let the
-        // queue type without knowing whether the actual agent is ready.
-        let mut readiness = if self.has_claude_state() {
-            self.session_agent_mut().probe.readiness()
-        } else {
-            crate::agentstate::Readiness::Unknown
-        };
-        // Downgraded rather than reported separately, because `Unknown` already
-        // means exactly this: abeam cannot establish that a send would be safe.
-        // Without bracketed paste every newline in a sent block submits, so a
-        // three-line prompt arrives as three — the second and third typed at an
-        // agent already busy with the first. Every agent abeam hosts enables it,
-        // so this is a floor rather than a case anyone will meet.
-        if !self.session_agent().pane.bracketed_paste() {
-            readiness = crate::agentstate::Readiness::Unknown;
+        // Asked once, of the session rather than of a pane: it is whether abeam
+        // is hosting Claude at all, which decides whether Claude's session
+        // records are evidence about *any* of these children. See
+        // [`has_claude_state`](Self::has_claude_state), and the note in the
+        // proposal about what it would take to make the agent per-pane.
+        let claude = self.has_claude_state();
+        let mut redraw = false;
+        for agent in self.agents.iter_mut() {
+            let before = agent.readiness;
+            agent.readiness = agent.poll_readiness(claude);
+            // A border that has stopped saying `busy` is news, and this
+            // function is the only thing that notices. Without it the row goes
+            // on claiming the old answer until some other event happens to
+            // spend a frame.
+            redraw |= agent.readiness != before;
         }
-        // A session that has gone cannot be typed at, and its last record can
-        // sit at `idle` forever — a dead agent is the most convincingly idle
-        // thing there is.
-        if self.session_agent().pane.has_exited() {
-            readiness = crate::agentstate::Readiness::Unknown;
-        }
+
+        // **The session's agent, not the current one.** See
+        // [`App::pump_queue`] — the queue is aimed at `agents[0]` outright, and
+        // the whole class of bug that aiming replaced was these three inputs
+        // disagreeing about which pane they were describing.
+        let readiness = self.session_agent().readiness;
 
         // The one event that ends a draft, and the only place this flag is ever
         // cleared. See [`note_left_key`](Self::note_left_key) for why it is this
         // and not a keystroke: a message that was really submitted makes the
         // agent work, and nothing else the user can press does.
-        let mut redraw = false;
         if readiness == crate::agentstate::Readiness::Busy && self.session_agent().draft_open {
             self.session_agent_mut().draft_open = false;
             redraw |= self.queue.set_draft_open(false);
@@ -3168,6 +3476,10 @@ impl App {
         }
 
         let confirming = std::mem::take(&mut self.pending_quit);
+        // The same, one pane down. Taken here rather than read where it is used
+        // so that *any* key clears it — including `F4`, which is what moves the
+        // cursor between the two presses and is exactly why this carries an id.
+        let closing = std::mem::take(&mut self.pending_close);
         // Any key at all dismisses the help overlay: it says "any key to
         // dismiss" on it, and a reader who has started pressing keys has
         // stopped reading. Cleared *before* the bindings are matched, or Alt+G
@@ -3195,6 +3507,9 @@ impl App {
 
         match self.focus {
             Focus::Left => {
+                if let Some(flow) = self.close_key(&key, closing) {
+                    return Ok(flow);
+                }
                 self.note_left_key(&key);
                 self.current_mut().pane.handle_key(key)?;
                 Ok(Flow::redraw())
@@ -3497,6 +3812,28 @@ impl App {
                 let key = KeyEvent::new(code, KeyModifiers::NONE);
                 self.right_pane().scroll_key(key)?;
             }
+            // **There is no second zoom, and this is where somebody will come
+            // looking for one.** `Alt+Z` answers "is the right pane here",
+            // which is a question about the divider and is orthogonal to the
+            // stack. The stack raises a genuinely different one — "show me only
+            // this agent" — and the answer is that abeam already has it and it
+            // is not a key: at [`crate::layout::MIN_AGENT_ROWS`] the stack
+            // *is* one agent whole and the rest as title rows, which is the
+            // shape a zoom would produce, arrived at by making the window
+            // shorter or by opening more agents.
+            //
+            // What a key would add is that shape on demand in a window with
+            // room for two, and it would cost a global binding out of a
+            // namespace `docs/keymap.md` records as spent — `F4` is already
+            // carrying two meanings for this feature. It would also delete the
+            // thing the collapsed row was designed to keep: the other agents'
+            // busy signals, which are most of what watching several of them
+            // means. A mode whose whole effect is to hide the roster is not
+            // obviously the feature it sounds like.
+            //
+            // Out of scope deliberately, then, rather than forgotten. If it
+            // comes back, the honest form is the one `keys::global` prescribes
+            // for the reverse-cycle key: a row in a list, not a new chord.
             Action::ToggleZoom => {
                 self.zoom = !self.zoom;
                 if self.zoom {
@@ -3790,42 +4127,114 @@ impl App {
         }
     }
 
+    /// Route a pointer event to the pane it happened in — or to the pane that
+    /// is still holding the gesture.
+    ///
+    /// **Each agent is hit-tested against its own rect, which is what a stack
+    /// costs and what a stack is for.** With one pane drawn, testing
+    /// `current().inner` was the same question as "is this on the left". With
+    /// several, it is the wrong question twice over: a click on another agent
+    /// fell through to the right pane's test and then to nothing, and a click
+    /// that *did* land was delivered to whichever pane the cursor was on. A
+    /// collapsed pane is hit-tested too — its title row is one row and a click
+    /// in it is a click on that agent, which is how you bring one back up.
+    ///
+    /// **A press makes the pane it landed in the current one, and does so
+    /// through [`set_agent`](Self::set_agent)**, which is the only writer of
+    /// `at_agent`. It moves nothing else: not the workspace, not the right
+    /// view, not what the reader was looking at. That is the same ruling the
+    /// agent cursor already lives under — reaching for an agent must never cost
+    /// somebody their place in what they were reading — and a mouse is a
+    /// weaker claim on the right pane than `F4` is, not a stronger one.
+    ///
+    /// **[`mouse_owner`](Self::mouse_owner) names the pane and not just the
+    /// side, which it had to start doing here.** It exists so a drag that
+    /// leaves a pane keeps its target; with one agent, "the left" said that
+    /// completely, and with a stack it does not — a press could aim at
+    /// `agents[2]`, and anything moving the cursor before the button came up
+    /// would silently re-aim the rest of the gesture at somebody else. **By id
+    /// rather than by index**, for this file's standing reason: a list can
+    /// change length under a gesture, and an index remembered across that names
+    /// whichever pane slid into the slot. An id that no longer resolves is a
+    /// pane closed mid-drag, and the event is dropped.
     fn handle_mouse(&mut self, me: MouseEvent) -> Result<()> {
         let press = matches!(me.kind, MouseEventKind::Down(_));
         let release = matches!(me.kind, MouseEventKind::Up(_));
 
+        // Read before the press below writes it: "was a gesture already under
+        // way" is what decides whether the child hears an event from outside
+        // its own rows, and the press is the thing that starts one.
+        let owned = self.mouse_owner.is_some();
+
         let target = match self.mouse_owner {
             Some(owner) => Some(owner),
-            None if hit(self.current().inner, &me) => Some(Focus::Left),
-            None => match self.right_inner {
-                Some(r) if hit(r, &me) => Some(Focus::Right),
-                _ => None,
-            },
+            // In list order, and they cannot overlap — `stack` tiles the
+            // column — so the first hit is the only hit.
+            None => self
+                .agents
+                .iter()
+                .find(|agent| hit(agent.outer, &me))
+                .map(|agent| Aim::Agent(agent.id))
+                .or(match self.right_inner {
+                    Some(r) if hit(r, &me) => Some(Aim::Right),
+                    _ => None,
+                }),
         };
         let Some(target) = target else { return Ok(()) };
+        let side = match target {
+            Aim::Agent(_) => Focus::Left,
+            Aim::Right => Focus::Right,
+        };
 
         if press {
             // Click to focus. Wheel deliberately does not — the whole point of
             // scrolling the right pane is that it does not disturb typing.
-            self.set_focus(target);
+            self.set_focus(side);
+            if let Aim::Agent(id) = target
+                && let Some(ix) = self.agents.iter().position(|agent| agent.id == id)
+            {
+                self.set_agent(ix);
+            }
             self.mouse_owner = Some(target);
             // A press anywhere but the right pane is not the start of a
             // selection, and leaving the last one's row lying about would
             // anchor the next drag to a row nobody pressed.
-            if target == Focus::Left {
+            if side == Focus::Left {
                 self.drag = None;
             }
             // And a click cancels a pending quit, for the same reason any other
             // key does: the user has moved on to something else.
             self.pending_quit = false;
+            // ...and a pending close, which is the same bit one pane down. See
+            // [`pending_close`](Self::pending_close): a press is a reader doing
+            // something else, and a confirmation that survives it is one they
+            // are no longer looking at.
+            self.pending_close = None;
         }
 
         match target {
-            Focus::Left => {
-                let ev = relative(&me, self.current().inner);
-                self.current_mut().pane.handle_mouse(&ev)?;
+            // **Hit-tested on the whole pane above and delivered against the
+            // inside here, which is two rects doing two jobs.** The border is
+            // abeam's chrome: a press on it picks the pane — that is the whole
+            // of what a collapsed pane's title row can be clicked *for* — and
+            // goes no further, because the child had no part in it. Once a
+            // gesture is under way the pane hears everything, clamped by
+            // `relative`, since a drag that has left the pane is still that
+            // pane's drag and that is what `mouse_owner` exists to keep true.
+            //
+            // A pane the last frame collapsed has no inside at all, so nothing
+            // is forwarded to a child that is not on screen. The press has
+            // already made it current, and the next frame draws it whole.
+            Aim::Agent(id) => {
+                if let Some(ix) = self.agents.iter().position(|agent| agent.id == id)
+                    && let Some(inner) = self.agents[ix].drawn_inner()
+                    && (owned || hit(inner, &me))
+                {
+                    let ev = relative(&me, inner);
+                    self.agents[ix].pane.handle_mouse(&ev)?;
+                }
             }
-            Focus::Right => {
+            Aim::Right => {
                 if let Some(r) = self.right_inner {
                     let ev = relative(&me, r);
                     // Remembered *before* the pane is offered anything, and
@@ -3886,12 +4295,35 @@ impl App {
 
         self.frames.record(began);
 
-        // Sized from the rect that was just drawn, unconditionally, once per
-        // frame. `on_resize` is a no-op when nothing changed, which is what
-        // makes calling it every frame the cheap option rather than the
-        // careless one. The views without a pty behind them ignore it and
-        // learn their size inside `render`, from the same rect.
-        self.current_mut().resize_to_drawn()?;
+        self.resize_to_frame()
+    }
+
+    /// Size every pty to the rect the frame that just went out drew it at.
+    ///
+    /// Unconditionally, once per frame. `on_resize` is a no-op when nothing
+    /// changed, which is what makes calling it every frame the cheap option
+    /// rather than the careless one. The views without a pty behind them ignore
+    /// it and learn their size inside `render`, from the same rect.
+    ///
+    /// **Every agent, not the current one, and that was a live bug rather than
+    /// a preparation.** Phase 2 made it possible for a pane not to be the
+    /// current one, and resizing only `current_mut()` meant a backgrounded
+    /// agent kept its spawn-time size across a window resize — so the pane you
+    /// cycled back to had been drawing into the wrong rectangle for as long as
+    /// you were away, and the first thing it did on your return was reflow
+    /// everything you had gone back to read. [`Agent::resize_to_drawn`] is the
+    /// whole of what decides *what* size, including for the pane the stack
+    /// collapsed, which keeps the one it had.
+    ///
+    /// A step of its own rather than four lines at the end of
+    /// [`draw`](Self::draw), because `draw` needs a real terminal and this
+    /// needs only a frame to have happened — so the rule above is reachable
+    /// from a test without one, which is the difference between a rule and an
+    /// intention.
+    fn resize_to_frame(&mut self) -> Result<()> {
+        for agent in self.agents_mut() {
+            agent.resize_to_drawn()?;
+        }
         if let Some(right) = self.right_inner {
             self.right_pane().on_resize(right)?;
         }
@@ -3901,7 +4333,6 @@ impl App {
     fn ui(&mut self, f: &mut Frame) {
         self.area = f.area();
         let split = abeam_layout::split(f.area(), self.zoom);
-        let left_inner = abeam_layout::inner(split.left);
         self.right_inner = split.right.map(abeam_layout::inner);
 
         // The right pane can vanish under a narrow window while focused.
@@ -3923,18 +4354,21 @@ impl App {
         // kept that promise and the shell broke it. Two facts about the left
         // pane are two pieces of one title.
         //
-        // **Which facts belong on which border, decided here because the stack
-        // is about to draw several of them.** Four things on this line are the
-        // *session's* and not the pane's: the pending quit, a spawn that
-        // refused, why abeam is still up after the session's agent left, and
-        // the queue's countdown — which is now literally about `agents[0]`,
-        // since that is the pane the queue types into. Three things are the
-        // pane's: its name, its position in the list, and the root it is
-        // standing in. When there are N borders the session's four go on
-        // `agents[0]`'s and the pane's three go on each; with one border drawn
-        // they share it, and the countdown is the one that reads oddly in the
-        // meantime — attached to whichever pane the cursor is on rather than to
-        // the pane it is about. See [`App::pump_queue`], which books that cost.
+        // **Which facts belong on which border, and now there are several.**
+        // Four things below are the *session's* and not any pane's: the pending
+        // quit, a spawn that refused, why abeam is still up after the session's
+        // agent left, and the queue's countdown — which is literally about
+        // `agents[0]`, since that is the pane the queue types into. They go on
+        // `agents[0]`'s border and nowhere else. What is the pane's — its name,
+        // its position in the list, whether it is working, the root it is
+        // standing in — is built per pane in the loop below.
+        //
+        // That is what repays the cost phase 2 booked: with one border drawn,
+        // the countdown was attached to whichever pane the cursor happened to
+        // be on rather than to the pane the send was going to. Drawing
+        // `agents[0]`'s border alongside everybody else's is the whole of the
+        // fix, and it is the reason the stack is where that debt was owed. See
+        // [`App::pump_queue`].
         let state = if self.pending_quit {
             Some("Alt+Q again to quit".to_string())
         } else {
@@ -3976,7 +4410,27 @@ impl App {
         // it. Last, so that a title clipped at 46 columns loses the count
         // before it loses the announcement.
         let note = self.queue.title_note();
-        let name = format!(" {}{}", self.current().pane.title(), self.agent_tag());
+
+        // **One calculation, called once per frame** — `crate::layout`'s own
+        // rule, and the reason [`crate::layout::stack`] exists rather than the
+        // rects being worked out here and again on the way to a resize. Each
+        // pty is sized from the rect that drew it, and these are the rects.
+        let rects = abeam_layout::stack(split.left, self.agents.len(), self.at_agent);
+        // A name per pane, built before the refusal because that part is fitted
+        // to what the rest of `agents[0]`'s line leaves spare, and it cannot be
+        // measured until there is a line to measure.
+        let names: Vec<String> = rects
+            .iter()
+            .enumerate()
+            .map(|(ix, outer)| {
+                let collapsed = Agent::inside(*outer).is_none();
+                format!(
+                    " {}{}",
+                    self.agents[ix].pane.title(),
+                    self.agent_tag(ix, collapsed)
+                )
+            })
+            .collect();
 
         // **The refusal is fitted to what the line actually has spare, and it
         // is a separate part rather than an arm of the `if` above** — which is
@@ -3992,8 +4446,15 @@ impl App {
             // `handle_key` clearing one before the other can be set — the
             // arithmetic should not depend on an argument made two functions
             // away.
-            let width = abeam_layout::inner(split.left).width as usize;
-            let spent = name.width()
+            //
+            // Measured against `agents[0]`'s own rect, because that is the
+            // border this part is going on. Every pane in the stack is the
+            // width of the column, so this is the same number the whole
+            // left title used to be fitted to — said of the right rect
+            // rather than of the column, so it stays true if that ever stops
+            // being so.
+            let width = abeam_layout::inner(rects[0]).width as usize;
+            let spent = names[0].width()
                 + [state.as_ref(), door.as_ref(), note.as_ref()]
                     .into_iter()
                     .flatten()
@@ -4025,16 +4486,45 @@ impl App {
             }
         });
 
-        let left_title = [state, refusal, door, note]
-            .into_iter()
-            .flatten()
-            .fold(name, |title, part| format!("{title} · {part}"))
-            + " ";
-        f.render_widget(block(&left_title, left_focused), split.left);
-        // The rect goes in with the draw rather than being stashed above it:
-        // `Agent::inner` is what the pty is resized from, so the only honest
-        // moment to write it is the one that uses it.
-        self.current_mut().render(f, left_inner);
+        let session = [state, refusal, door, note];
+        for (ix, outer) in rects.into_iter().enumerate() {
+            let mut title = names[ix].clone();
+            // **On this pane's border and no other, which is the whole reason
+            // `pending_close` carries an id.** It is an answer to a key pressed
+            // at one pane, and the cursor can move before the second press; a
+            // prompt drawn on the pane the reader has arrived at would be
+            // offering to close something they never asked about. Ahead of the
+            // session's parts because it is the more local instruction and the
+            // one the next keystroke acts on.
+            if self.pending_close == Some(self.agents[ix].id) {
+                title.push_str(" · q again to close");
+            }
+            // **The session's four, on `agents[0]`'s border and no other.**
+            // They are appended rather than chosen between for the reason above
+            // — an `if` chain here is what once let a pending quit swallow the
+            // countdown — and they are last because everything in front of them
+            // identifies the pane, and a title clipped from the right must lose
+            // the instruction before it loses whose pane the instruction is
+            // about.
+            if ix == 0 {
+                for part in session.iter().flatten() {
+                    title = format!("{title} · {part}");
+                }
+            }
+            title.push(' ');
+            // **The focused border is the current agent's, not the column's.**
+            // With one pane the colour said "the keys are on the left"; with a
+            // stack it has to say which of them, and it is the only thing that
+            // does when the current pane draws no cursor of its own.
+            f.render_widget(block(&title, left_focused && ix == self.at_agent), outer);
+            // The rect goes in with the draw rather than being stashed above
+            // it: `Agent::inner` is what the pty is resized from, so the only
+            // honest moment to write it is the one that uses it. `place` is
+            // also what decides whether there was room to draw the child at
+            // all — see [`Agent::inner`] for why a collapsed pane deliberately
+            // does not update it.
+            self.agents[ix].place(f, outer);
+        }
 
         if let (Some(outer), Some(inner)) = (split.right, self.right_inner) {
             let focused = self.focus == Focus::Right;
@@ -4064,7 +4554,16 @@ impl App {
         // The read-only views have nothing to point at and say so by returning
         // `None`, which is also what hides it while they are up.
         let (rect, at) = match self.focus {
-            Focus::Left => (self.current().inner, self.current().pane.cursor()),
+            // `drawn_inner` and not `inner`, because a pane the frame did not
+            // draw has nowhere to put a cursor and `inner` still holds the rect
+            // of a frame that did. `stack` keeps the current pane whole
+            // wherever it can, so this is the window too short to draw even
+            // one — where a cursor at the pane's last known position would be
+            // painted over somebody else's title row.
+            Focus::Left => match self.current().drawn_inner() {
+                Some(inner) => (inner, self.current().pane.cursor()),
+                None => (Rect::ZERO, None),
+            },
             Focus::Right => match self.right_inner {
                 // Nothing is typing into this pane while a selection is up —
                 // the mode swallows every key — so the shell view's prompt must
@@ -4144,12 +4643,14 @@ impl App {
         self.select_rows = rows;
     }
 
-    /// Which agent this is and where it is standing, for its own border.
+    /// Which agent this is, what it is doing, and where it is standing, for its
+    /// own border.
     ///
-    /// **Two facts, suppressed on two different conditions, and getting that
-    /// wrong is what made this worth a second pass.** The position is
-    /// suppressed when there is one agent; the root is suppressed when it is
-    /// the repository abeam was started on. Suppressing both on the *root*
+    /// **Three facts now, each suppressed on its own condition, and getting
+    /// that wrong is what made this worth a second pass.** The position is
+    /// suppressed when there is one agent; the readiness is suppressed unless
+    /// the frame collapsed this pane; the root is suppressed when it is the
+    /// repository abeam was started on. Suppressing them on the *root*
     /// condition alone leaves the shortest use of the whole feature invisible:
     /// `Alt+G`, `w`, `a` on the row you are already on starts a second agent in
     /// the session's own root, so both panes draw byte-identical borders and
@@ -4198,12 +4699,41 @@ impl App {
     /// workspace of its own is not a case anyone can reach today, since the
     /// list `a` is pressed in is built from the same discovery `spaces` is, but
     /// it is one `git worktree remove` away from being one.
-    fn agent_tag(&self) -> String {
+    ///
+    /// ## What a collapsed pane's one row has to carry
+    ///
+    /// **`collapsed` buys the third fact, and only there.** A pane the stack
+    /// shrank has one row on screen and that row is its title, so the row has
+    /// to be worth the row it costs: which agent this is, and whether it is
+    /// working. The second half is the reason a pane collapses rather than
+    /// disappearing — "see what several agents are doing" is mostly "is
+    /// anything happening in there" — and it is the one thing a title row can
+    /// say that a reader cannot get by looking at the pane, because there is no
+    /// pane to look at.
+    ///
+    /// **Suppressed on a pane that was drawn whole, which is the same
+    /// discipline as the two facts above and the sharpest instance of it.** An
+    /// expanded pane shows its own state in its own rows, far better than a
+    /// word could; spending columns to repeat it in the border would be the
+    /// border saying what is already on screen. It also keeps every session
+    /// that has ever run byte-identical, because a lone agent is never
+    /// collapsed — [`crate::layout::stack`] gives one agent the whole column.
+    ///
+    /// **Ranked after the position and before the root**, and the two neighbours
+    /// are not arbitrary. A title clipped from the right loses the end, and of
+    /// the three the root is the one a reader can still recover: `F4` to that
+    /// pane and its whole border is there. The position and the readiness are
+    /// recoverable only by going and looking, which is exactly what a collapsed
+    /// row exists to save them.
+    fn agent_tag(&self, ix: usize, collapsed: bool) -> String {
         let mut tag = String::new();
         if self.agents.len() > 1 {
-            tag.push_str(&format!(" · {}/{}", self.at_agent + 1, self.agents.len()));
+            tag.push_str(&format!(" · {}/{}", ix + 1, self.agents.len()));
         }
-        let root = &self.current().root;
+        if collapsed && let Some(word) = readiness_word(self.agents[ix].readiness) {
+            tag.push_str(&format!(" · {word}"));
+        }
+        let root = &self.agents[ix].root;
         if !paths::same_dir(root, &self.root) {
             let label = self
                 .spaces
@@ -4506,6 +5036,29 @@ fn chord(key: &KeyEvent) -> bool {
 /// and then reads wrong forever.
 fn plural(n: u16) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+/// What a collapsed pane's title row calls this agent's readiness, or `None`
+/// when there is nothing to call it.
+///
+/// **`idle` and `busy` and not a third pair, because `crate::panes::queue`
+/// already draws those two words for the same fact.** Two halves of one window
+/// naming one state differently is how a reader comes to think they are two
+/// states.
+///
+/// `Unknown` is silence rather than a `?`. It means abeam has no record to read
+/// — no Claude behind the preset, a child that never asked for bracketed paste,
+/// or a pane whose agent has gone — and a border's rule here is the one
+/// [`App::agent_tag`] follows throughout: say the thing that is news, and
+/// spend no columns on the absence of it. An exited pane is the case that
+/// proves it, because `TerminalPane::title` has already said `exited` in the
+/// same row.
+fn readiness_word(readiness: crate::agentstate::Readiness) -> Option<&'static str> {
+    match readiness {
+        crate::agentstate::Readiness::Idle => Some("idle"),
+        crate::agentstate::Readiness::Busy => Some("busy"),
+        crate::agentstate::Readiness::Unknown => None,
+    }
 }
 
 fn hit(r: Rect, ev: &MouseEvent) -> bool {
@@ -4833,6 +5386,25 @@ mod tests {
             .content()
             .iter()
             .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// The same frame, kept as rows.
+    ///
+    /// [`screen`] flattens the buffer, which answers "is this on screen" and
+    /// nothing else. Once there is a border per agent the question becomes
+    /// "*whose* border is this on", and a stack of them is exactly the case a
+    /// flat string cannot tell apart.
+    fn rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.ui(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buf.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                    .collect()
+            })
             .collect()
     }
 
@@ -5290,7 +5862,7 @@ mod tests {
         );
         assert_eq!(fx.app.at_agent, 1, "nothing on screen would say it started");
         assert_eq!(
-            fx.app.agent_tag(),
+            fx.app.agent_tag(fx.app.at_agent, false),
             " · 2/2 · other",
             "the border does not say which agent this is or where it stands"
         );
@@ -5708,6 +6280,374 @@ mod tests {
             );
         }
         assert!(rang, "the pane opened on a keystroke rang nothing");
+    }
+
+    // --- the stack ---------------------------------------------------------
+    //
+    // Phase 3. `crate::layout::stack` is unit-tested where it lives; these are
+    // about what the app does with the rects — which pane the cursor draws
+    // into, which border a fact goes on, what a pty is told, and where a click
+    // lands. Every one of them needs two agents on screen at once, which is the
+    // thing that did not exist before this phase.
+
+    /// Every agent gets a border, and the session's facts are on `agents[0]`'s.
+    ///
+    /// **The cost phase 2 booked and this is where it is paid.** With one pane
+    /// drawn, the queue's countdown was attached to whichever border was up —
+    /// so a reader on the second agent watched a three-second warning about a
+    /// keystroke abeam was going to make *somewhere else*, on a border naming
+    /// the pane it was not going to. Two borders and the announcement can sit
+    /// on the pane it is about.
+    ///
+    /// [`rows`] rather than [`screen`], because "on `agents[0]`'s border" is a
+    /// claim about which row it is on and a flat string cannot tell.
+    #[test]
+    fn the_stack_draws_a_border_each_and_the_session_speaks_through_agents_zero() {
+        let mut fx = app();
+        second_agent(&mut fx);
+
+        // Armed rather than polled: which of the four conditions hold is
+        // `poll_readiness`' business and is tested elsewhere, and what is under
+        // test here is which border the countdown appears on.
+        fx.app.queue.stub_item("announce-on-agent-zero", Mode::Send);
+        fx.app.queue.set_readiness(Readiness::Idle);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(
+            fx.app
+                .queue
+                .title_note()
+                .is_some_and(|note| note.contains("sending in")),
+            "nothing is announcing a send, so this test proves nothing"
+        );
+
+        // The cursor on the pane the announcement is *not* about, which is the
+        // whole point: a countdown that followed the cursor would pass this
+        // test by standing in the wrong place.
+        fx.app.set_focus(Focus::Left);
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.at_agent, 1);
+
+        // Wide, for the reason every other title test here is: a departed
+        // child's own name is most of a 72-column border before anything is
+        // appended to it, and clipping is a different rule with its own test.
+        let drawn = rows(&mut fx.app, 300, 40);
+        let first = drawn
+            .iter()
+            .position(|row| row.contains("1/2"))
+            .expect("agents[0] has no border");
+        let second = drawn
+            .iter()
+            .position(|row| row.contains("2/2"))
+            .expect("the second agent was not drawn at all: one pane at a time");
+        assert!(
+            first < second,
+            "the stack is not in list order: {first} then {second}"
+        );
+
+        assert!(
+            drawn[first].contains("sending in"),
+            "the countdown is not on the border of the pane the send is going \
+             to: {:?}",
+            drawn[first]
+        );
+        assert!(
+            !drawn[second].contains("sending in"),
+            "the countdown followed the cursor onto a pane it is not about: {:?}",
+            drawn[second]
+        );
+    }
+
+    /// A pane the stack collapsed keeps its child at the size it had.
+    ///
+    /// **The one place [`Agent::inner`]'s rule — the pty is sized from exactly
+    /// the rect that drew it — is broken on purpose, so it is the one place
+    /// that needs a test saying the break is deliberate.** Obeying it here
+    /// means telling a live agent it now has one row: it reflows its entire
+    /// transcript to fit, and on some agents that reflow is what truncates the
+    /// scrollback. Collapsing a pane for as long as it takes to read something
+    /// in another one would destroy the work the pane exists to hold.
+    ///
+    /// So the first frame is what gives the pane a real size, the second is
+    /// what collapses it, and the assertion is that the *child* did not hear
+    /// about the second.
+    #[test]
+    fn a_collapsed_pane_does_not_resize_the_child_it_is_not_drawing() {
+        let mut fx = app();
+        second_agent_that_stays(&mut fx);
+
+        // Tall enough for two whole panes: `MIN_AGENT_ROWS` inside a border
+        // each, twice over, with room to spare.
+        rows(&mut fx.app, 120, 40);
+        fx.app.resize_to_frame().expect("a pty that exists");
+        let was = fx.app.agents[1].pane.diagnostics().parser_size;
+        let was_inner = fx.app.agents[1].inner;
+        assert!(
+            was.0 >= abeam_layout::MIN_AGENT_ROWS,
+            "the second pane was never drawn whole, so there is nothing to \
+             preserve: {was:?}"
+        );
+
+        // ...and now too short for two. The cursor is on `agents[0]`, so
+        // `agents[1]` is the one that collapses.
+        assert_eq!(fx.app.at_agent, 0);
+        let short = rows(&mut fx.app, 120, 20);
+        fx.app.resize_to_frame().expect("a pty that exists");
+
+        assert!(
+            short.iter().any(|row| row.contains("2/2")),
+            "the collapsed pane vanished instead of keeping its title row: {short:?}"
+        );
+        // **Both halves, because there are two guards and only one of them is
+        // the rule.** The rule is that a collapsed frame leaves `Agent::inner`
+        // alone; `resize_to_drawn` refusing a rect with no area is the second
+        // line, there for the pane that has never been drawn at all. Asserting
+        // only the pty's size would go on passing with the rule deleted, on the
+        // strength of the backstop — which is exactly the shape of a test that
+        // is not testing what its name says.
+        assert_eq!(
+            fx.app.agents[1].inner, was_inner,
+            "a collapsed frame overwrote the rect the pty is sized from"
+        );
+        assert_eq!(
+            fx.app.agents[1].pane.diagnostics().parser_size,
+            was,
+            "a collapsed pane reflowed its child to a title row"
+        );
+    }
+
+    /// Every pane on screen is resized, not just the one with the keys.
+    ///
+    /// **A real bug from the moment phase 2 could create a second pane.** The
+    /// resize named `current_mut()`, so an agent that was not the current one
+    /// kept its spawn-time size across a window resize — it went on drawing
+    /// into a rectangle the window no longer had, and the pane you cycled back
+    /// to reflowed everything you had gone away to let it finish.
+    ///
+    /// Both panes are drawn whole here, so both have a rect the frame really
+    /// used; the assertion is that the child was told about it.
+    #[test]
+    fn a_window_resize_reaches_every_pane_and_not_only_the_current_one() {
+        let mut fx = app();
+        second_agent_that_stays(&mut fx);
+
+        rows(&mut fx.app, 120, 40);
+        fx.app.resize_to_frame().expect("a pty that exists");
+        let wide = fx.app.agents[1].pane.diagnostics().parser_size;
+
+        rows(&mut fx.app, 200, 40);
+        fx.app.resize_to_frame().expect("a pty that exists");
+        let wider = fx.app.agents[1].pane.diagnostics().parser_size;
+
+        assert_ne!(
+            wider, wide,
+            "the window got eighty columns wider and the backgrounded agent \
+             was never told"
+        );
+        assert_eq!(
+            wider,
+            (
+                fx.app.agents[1].inner.height,
+                fx.app.agents[1].inner.width
+            ),
+            "the pty is not the size of the rect that drew it"
+        );
+    }
+
+    /// A click picks the pane it landed in, and moves nothing on the right.
+    ///
+    /// **Two halves and the second is the settled ruling of the whole design.**
+    /// The first: `handle_mouse` hit-tested `current().inner` alone, so with a
+    /// stack a click on any other agent was either dropped or delivered to the
+    /// pane that already had the keys. The second: reaching for an agent must
+    /// never cost somebody their place in what they were reading, and a mouse
+    /// has no better claim on the right pane than `F4` has.
+    ///
+    /// The collapsed case is the one worth having on its own: a title row is
+    /// the only thing on screen of a pane the window had no room for, so
+    /// clicking it is how a reader brings it back, and it is also the click
+    /// that has no inside to be delivered into.
+    #[test]
+    fn a_click_picks_the_pane_it_landed_in_and_the_right_pane_stays_put() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        fx.app.set_right_view(RightView::Viewer);
+        let was_at = fx.app.at;
+        let was_view = fx.app.right_view;
+
+        // Both panes whole, and the rects come from the frame rather than from
+        // arithmetic repeated here — which is the same reason `Agent::outer`
+        // exists at all.
+        rows(&mut fx.app, 120, 40);
+        let second = fx.app.agents[1].outer;
+        assert!(second.height > 1, "the second pane was not drawn whole");
+        // The whole gesture, press and release. `mouse_owner` deliberately
+        // holds a target until the button comes up — that is what keeps a drag
+        // that leaves a pane pointed at the pane it started in — so a test that
+        // only pressed would be testing that rule instead of this one.
+        clicks_at(&mut fx.app, second.x + 3, second.y + 2);
+
+        assert_eq!(fx.app.at_agent, 1, "the click did not reach the pane it hit");
+        assert_eq!(fx.app.focus, Focus::Left);
+        assert_eq!(fx.app.at, was_at, "a click moved the workspace cursor");
+        assert_eq!(fx.app.right_view, was_view, "a click moved the right view");
+
+        // ...and back, by clicking the *collapsed* row of the other one. The
+        // cursor is on `agents[1]` now, so `agents[0]` is what the short window
+        // shrinks.
+        let short = rows(&mut fx.app, 120, 20);
+        let title = fx.app.agents[0].outer;
+        assert_eq!(title.height, 1, "agents[0] was not collapsed: {short:?}");
+        clicks_at(&mut fx.app, title.x + 3, title.y);
+        assert_eq!(
+            fx.app.at_agent, 0,
+            "a click on a collapsed title row does not bring that pane up"
+        );
+        assert_eq!(fx.app.at, was_at, "and it still moved the right pane");
+    }
+
+    /// A whole left-button click at a point on the last frame: down, then up.
+    fn clicks_at(app: &mut App, column: u16, row: u16) {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("a pane that can be clicked");
+        }
+    }
+
+    /// `q` twice closes a pane whose child has gone, and never the session's.
+    ///
+    /// **A pane-local key, and the exemption it stands on is stronger than the
+    /// one `crate::panes::git` states for `w`.** That letter is safe because
+    /// the worktree list is up and nothing is being typed at the agent; this
+    /// one is safe because *the agent it would be typed at has exited*. The
+    /// live half below is the assertion that keeps it that way: a `q` at a
+    /// child that is still there is the child's, and this key was never here.
+    #[test]
+    fn q_twice_closes_an_exited_pane_and_is_refused_by_the_sessions_own() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        fx.app.set_focus(Focus::Left);
+        until("both children to go", || {
+            fx.app.reap().expect("try_wait on a child that exists");
+            fx.app.agents[0].pane.has_exited() && fx.app.agents[1].pane.has_exited()
+        });
+
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.at_agent, 1);
+        let closing = fx.app.agents[1].id;
+
+        // One press asks, and says so where the reader is looking.
+        fx.app.handle_key(key(KeyCode::Char('q'))).unwrap();
+        assert_eq!(fx.app.pending_close, Some(closing));
+        assert_eq!(fx.app.agents.len(), 2, "one press closed it");
+        let asking = rows(&mut fx.app, 300, 40);
+        assert!(
+            asking.iter().any(|row| row.contains("q again to close")),
+            "nothing on screen says a press is owed: {asking:?}"
+        );
+
+        // ...and any other key withdraws the question, `pending_quit`-fashion.
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.pending_close, None, "the question outlived a keystroke");
+        assert_eq!(fx.app.at_agent, 0, "F4 did not move");
+
+        // Two presses at the pane itself, and it goes. The cursor lands on
+        // `agents[0]` because the pane it was on is the one that left.
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('q'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('q'))).unwrap();
+        assert_eq!(fx.app.agents.len(), 1, "two presses did not close it");
+        assert_eq!(fx.app.at_agent, 0);
+        assert!(fx.app.agent_refused.is_none(), "a close that worked complained");
+
+        // The session's own is refused, in a sentence that names the way out.
+        fx.app.handle_key(key(KeyCode::Char('q'))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('q'))).unwrap();
+        assert_eq!(fx.app.agents.len(), 1);
+        let why = fx
+            .app
+            .agent_refused
+            .clone()
+            .expect("closing the session's pane said nothing");
+        assert!(why.contains("Alt+Q"), "the refusal names no way out: {why}");
+    }
+
+    /// A live agent hears `q`, and the key that closes panes was never there.
+    ///
+    /// The whole of the exemption in one assertion. Split from the test above
+    /// because it needs a child that stays, and because a key that leaks to a
+    /// live agent is a different failure from one that closes the wrong pane —
+    /// it is `docs/keymap.md`'s invariant broken, and it would be broken for
+    /// every session rather than for a state somebody has to reach.
+    #[test]
+    fn a_live_agent_hears_q_like_any_other_key() {
+        let mut fx = app();
+        stays(&mut fx);
+        fx.app.set_focus(Focus::Left);
+        let before = keys_sent(&fx);
+
+        fx.app.handle_key(key(KeyCode::Char('q'))).unwrap();
+
+        assert_eq!(
+            keys_sent(&fx),
+            before + 1,
+            "abeam swallowed a keystroke aimed at a live agent"
+        );
+        assert_eq!(
+            fx.app.pending_close, None,
+            "a live pane was offered a close it may not have"
+        );
+    }
+
+    /// A collapsed title row says which agent it is and whether it is working.
+    ///
+    /// **That second half is what the row is for.** A roster of names says who
+    /// exists, which the reader already knows; "is anything happening in there"
+    /// is the question a pane that cannot be looked at is being asked, and one
+    /// row can answer it. The suppression is the other half of the same
+    /// decision: an expanded pane shows its own state in its own rows, and
+    /// spending border columns to repeat it would be the border saying what is
+    /// already on screen.
+    #[test]
+    fn a_collapsed_row_says_who_it_is_and_whether_it_is_working() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        // Set rather than polled. What `poll_readiness` reads is tested where
+        // the probe is; what is under test here is what a border does with the
+        // answer, and a real record would make this a test of two things.
+        fx.app.agents[1].readiness = Readiness::Busy;
+
+        // Too short for two whole panes, with the cursor on the first — so the
+        // second is the collapsed one.
+        let short = rows(&mut fx.app, 120, 20);
+        let row = short
+            .iter()
+            .find(|row| row.contains("2/2"))
+            .expect("the collapsed pane has no title row at all");
+        assert!(
+            row.contains("busy"),
+            "a row that cannot be looked at does not say whether anything is \
+             happening in it: {row:?}"
+        );
+
+        // ...and the pane that *is* drawn does not repeat it.
+        let tall = rows(&mut fx.app, 120, 40);
+        let row = tall
+            .iter()
+            .find(|row| row.contains("2/2"))
+            .expect("the second pane has no border");
+        assert!(
+            !row.contains("busy"),
+            "a whole pane spends border columns saying what its own rows \
+             already show: {row:?}"
+        );
     }
 
     /// A live agent holds the door at quit, and the title says which.

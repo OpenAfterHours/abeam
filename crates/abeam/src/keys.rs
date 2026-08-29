@@ -505,6 +505,23 @@ pub const HELP: &[(&str, &str)] = &[
         "a (worktrees)",
         "start another agent there (F4 again reaches it)",
     ),
+    // The other half of that pair, and the only row in this block that is about
+    // the *left* column — which the key column says, as it does for every other
+    // conditional row here. It is in the table for the reason `a` is: a key
+    // whose condition is a state you have to arrive at is one nobody discovers
+    // by pressing things, and the state this one needs is a pane you are
+    // already looking at wondering how to get rid of.
+    //
+    // "that has exited" is load-bearing twice over. It is the whole of what
+    // makes a bare letter legal here — the child that would have received it
+    // has gone, so no hosted agent can ever be shadowed — and it is the answer
+    // to the question the row otherwise invites, which is whether this kills
+    // anything. It does not, and the pane it will not close is named because
+    // pressing twice at the wrong one is how a reader finds out.
+    (
+        "q (exited agent)",
+        "close that pane, twice over — never the session's own agent",
+    ),
     // Not "rendered markdown", which is what this said and what it stopped
     // meaning: a `.py` or a `.rs` with documentation in it is rendered too, and
     // a reader looking for the key that put their `"""` back was reading a row

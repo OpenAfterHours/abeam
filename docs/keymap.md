@@ -155,6 +155,22 @@ that is only up while the right pane has focus, and the exemption is
 direction, deliberately: a modified F-key is a key abeam knows nothing about and
 therefore the agent's, which `keys.rs` says in a comment about `Ctrl+F12`.
 
+**The gesture that *closes* one is `q`, and it is not in the table for a
+stronger reason than `a` is.** `a` leans on the worktree list's exemption — a
+key claimed inside a view that is only up while the right pane has focus, so it
+is never delivered while anything is being typed at an agent. `q` is claimed in
+the **left** column, which is where typing at an agent happens, and it is
+nevertheless outside this document's invariant: it is only ever offered to a
+pane **whose child has exited**. There is no process left to have a binding for
+it. Every key delivered to such a pane is already going into a closed pty and
+doing nothing, so a letter intercepted there cannot shadow any agent's binding
+in any session — which is a claim no audit could make about a live one, and the
+reason the audits below are unaffected. It sits inside `handle_key`'s
+`Focus::Left` arm and *after* the literal-next hatch, so `Ctrl+\` `q` still goes
+to the child; `crates/abeam/src/app.rs`'s `close_key` is where that is written
+down. Two presses, because what closing destroys is the frozen last screen and
+the scrollback behind it, and nothing in abeam can get either back.
+
 One consequence is worth disclosing rather than leaving to be discovered.
 **While the right pane is hidden — `Alt+Z`, or a window narrower than
 `MIN_SPLIT_COLS` — every `F4` cycles, including the first.** Focus cannot be on
