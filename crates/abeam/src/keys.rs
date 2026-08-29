@@ -527,6 +527,22 @@ pub const HELP: &[(&str, &str)] = &[
         "x (exited agent)",
         "close that pane, twice over — never the session's own agent",
     ),
+    // The third of the trio, and the row that has to say where it is pressed
+    // *and* what it costs. It is in this table for `a`'s reason — a key whose
+    // condition is a state you have to arrive at is one nobody discovers by
+    // pressing things — and it is worded harder than the row above because
+    // what it destroys is different: not a frozen screen but a turn somebody
+    // is paying for.
+    //
+    // "worktrees" in the key column and not "agent", which is the whole of why
+    // this is not the row above with a wider condition. `x` at a live agent is
+    // that child's letter and abeam never takes it; the only place the key can
+    // be claimed is a list that is up while the right pane has focus. The
+    // detour is also the guard, and `docs/keymap.md` carries the argument.
+    (
+        "x (worktrees)",
+        "kill the agent standing there, twice over — the pane's border says which",
+    ),
     // Not "rendered markdown", which is what this said and what it stopped
     // meaning: a `.py` or a `.rs` with documentation in it is rendered too, and
     // a reader looking for the key that put their `"""` back was reading a row

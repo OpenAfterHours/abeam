@@ -155,21 +155,62 @@ that is only up while the right pane has focus, and the exemption is
 direction, deliberately: a modified F-key is a key abeam knows nothing about and
 therefore the agent's, which `keys.rs` says in a comment about `Ctrl+F12`.
 
-**The gesture that *closes* one is `x`, and it is not in the table for a
-stronger reason than `a` is.** `a` leans on the worktree list's exemption — a
-key claimed inside a view that is only up while the right pane has focus, so it
-is never delivered while anything is being typed at an agent. `x` is claimed in
+**The gesture that *closes* one is `x`, in two places, and neither is in the
+table.** `a` leans on the worktree list's exemption — a key claimed inside a
+view that is only up while the right pane has focus, so it is never delivered
+while anything is being typed at an agent. The two `x`es split along exactly
+that line, and the split is not tidiness: it is what the letter costs.
+
+**At an agent pane, `x` closes one whose child has exited.** That is claimed in
 the **left** column, which is where typing at an agent happens, and it is
-nevertheless outside this document's invariant: it is only ever offered to a
-pane **whose child has exited**. There is no process left to have a binding for
-it. Every key delivered to such a pane is already going into a closed pty and
-doing nothing, so a letter intercepted there cannot shadow any agent's binding
-in any session — which is a claim no audit could make about a live one, and the
-reason the audits below are unaffected. It sits inside `handle_key`'s
-`Focus::Left` arm and *after* the literal-next hatch, so `Ctrl+\` `x` still goes
-to the child; `crates/abeam/src/app.rs`'s `close_key` is where that is written
-down. Two presses, because what closing destroys is the frozen last screen and
-the scrollback behind it, and nothing in abeam can get either back.
+nevertheless outside this document's invariant, for a reason stronger than the
+exemption: it is only ever offered to a pane whose child has **gone**. There is
+no process left to have a binding for it. Every key delivered to such a pane is
+already going into a closed pty and doing nothing, so a letter intercepted there
+cannot shadow any agent's binding in any session — which is a claim no audit
+could make about a live one, and the reason the audits below are unaffected. It
+sits inside `handle_key`'s `Focus::Left` arm and *after* the literal-next hatch,
+so `Ctrl+\` `x` still goes to the child; `crates/abeam/src/app.rs`'s `close_key`
+is where that is written down. Two presses, because what closing destroys is the
+frozen last screen and the scrollback behind it, and nothing in abeam can get
+either back.
+
+**In the worktree list, `x` closes the agent standing on that row, alive or
+not.** This is where a *running* agent is ended, and where it had to go. The
+argument for the left column above inverts exactly: a live child is listening,
+so intercepting `x` in front of one would eat the letter out of every word
+somebody types at it, and forwarding it while arming a confirmation anyway would
+make `box` — or any second `x` in a sentence — kill a running session. Neither
+is a program anybody can type at. Nor is there a global to spend: this document
+records the `Alt` namespace as close to spent, and a new letter would need the
+whole extraction below repeated against three agents' current builds, which is
+not an afternoon's work and would be a claim resting on nothing until it was
+done. So the key lives in the one list that shows abeam's own panes, next to the
+`a` that starts them.
+
+Three things about it are deliberate. **Two presses**, `Alt+Q`'s shape, and the
+question is carried by the row it was asked about, so `x`, `Tab`, `x` is not a
+kill. **The confirmation is drawn on the border of the pane it would destroy**,
+not in the list — `x` `x` in a list is two presses on a key with no memory of
+what it destroyed — and it reads `x again to kill this running agent`, which is
+different wording from the exited pane's `x again to close this pane` because
+what is at stake is different. And **the detour is part of the guard**: reaching
+this key means `Alt+G`, `w`, and finding the row, which is harder than the two
+presses at a dead pane by exactly the margin a running agent deserves.
+
+Two panes in one checkout are one row, and abeam refuses rather than guessing:
+the answer names the count and says `F4` to the one you mean, which makes the
+gesture two-factor where it is ambiguous and leaves it alone where it is not.
+The session's own agent is refused on the first press, so no confirmation is
+ever drawn for it — a border promising something the program will not do is the
+failure `App::cannot_close` is shaped around.
+
+The question survives `F4` and back — it has to, or the sentence above about
+choosing between two panes would be impossible to act on — and it is withdrawn
+by any other key in the list and by leaving the git view. What keeps a
+long-lived one honest is that it is not a memory: the border of the pane it
+would destroy carries the words for as long as it stands, so a second press an
+hour later is made in front of the same sentence the first one was.
 
 **`x` and not `q`, which was the first choice and was wrong.** `q` looked like
 the program's own word for "I am done with this pane", on the strength of the

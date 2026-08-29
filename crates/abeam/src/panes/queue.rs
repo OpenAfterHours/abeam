@@ -7,26 +7,44 @@
 //!
 //! ## The two modes, and why they are one pane
 //!
-//! - [`Mode::Send`] — typed into the session abeam was started with, the moment
-//!   it goes idle. It *continues the conversation*: everything above it is
-//!   still context, which is what makes these strictly sequential — one
-//!   conversation, one turn at a time.
+//! - [`Mode::Send`] — typed into one hosted agent's session, the moment that
+//!   agent goes idle. It *continues the conversation*: everything above it is
+//!   still context.
 //!
-//!   **"The session abeam was started with" is `agents[0]`, and it used to be
-//!   possible to write "the left pane" and mean the same thing.** It is not any
-//!   more: `crate::app` can hold several hosted agents and `F4` moves between
-//!   them, so an item enqueued while looking at one pane and released while
-//!   looking at another had two candidate destinations. This pane is aimed at
-//!   the first — `crate::app::App::pump_queue` carries the argument, and the
-//!   short version is that a `Send` continues *this session's* conversation and
-//!   the session is the agent whose exit is abeam's exit. Sequential is
-//!   therefore still true, and is a fact about one conversation rather than
-//!   about how many panes there are.
+//!   **Which agent is written on the item, once, when the item is made.** An
+//!   [`Item`] carries a [`Target`] — a `crate::app::Agent::id`, never an index
+//!   into anything, for the reason that field's own doc gives: panes come and
+//!   go on a keystroke and a position does not survive a list changing length.
+//!   It is fixed at that moment and nothing moves it afterwards, which is the
+//!   whole property. A prompt written while watching one pane and released
+//!   three seconds later, with `F4` pressed in between, goes where it was
+//!   written for; retargeting it to whatever the cursor had wandered onto is
+//!   the failure this file exists to prevent, and it is not a failure a
+//!   countdown can warn you about, because the countdown was truthful when it
+//!   was made.
 //!
-//!   What is not yet expressible is a `Send` aimed at some other pane. That
-//!   wants an item that carries its target — a pane id, decided when the item
-//!   is enqueued rather than when it fires — and it is a change to all four
-//!   conditions below, because two of them name an agent.
+//!   **If that agent has gone by the time the item comes due, the item
+//!   disarms.** It is marked [`ItemState::Orphaned`], it says so on its own
+//!   row, and it is not sent anywhere. That is a deliberate refusal rather than
+//!   a gap: the nearest surviving pane is not the pane it was written for, and
+//!   "somewhere" is the one place a queued prompt may never go. It also has to
+//!   leave [`ItemState::Pending`] to do it — an undeliverable item left pending
+//!   is the head of the queue for ever and blocks every item behind it, which
+//!   is a stall with no explanation on screen.
+//!
+//!   **"Strictly sequential" was true of this list and is now true of each
+//!   target.** It used to read "there is one left pane, so these are strictly
+//!   sequential", which was a fact about the program rather than about the
+//!   queue. What holds is the part that mattered: one conversation takes one
+//!   turn at a time, so at most one send is ever in flight *per agent*.
+//!   [`QueuePane::retime`] keeps the stronger promise — at most one item in the
+//!   whole list is ever due at once, whatever it is aimed at — because
+//!   `crate::app::App::pump_queue` writes one prompt per pass and owes it an
+//!   `Enter` on the next one.
+//! - [`Mode::Dispatch`] — started as its own background agent
+//!   (`crate::dispatch`), with none of that context, running beside you. These
+//!   are parallel, and there can be many. It carries a target like everything
+//!   else and reads it nowhere: it never types at anybody.
 //! - [`Mode::Dispatch`] — started as its own background agent
 //!   (`crate::dispatch`), with none of that context, running beside you. These
 //!   are parallel, and there can be many.
@@ -48,11 +66,12 @@
 //! 1. **The queue is armed, or this item was asked for by hand.** `a` is the
 //!    switch on the sender that runs unattended; `Enter` on a selected item is
 //!    the attended path and does not need it. See [`QueuePane::now`].
-//! 2. **`crate::agentstate` reports [`Readiness::Idle`]** — read from the
-//!    agent's own record, never inferred from output going quiet.
-//! 3. **Nothing is sitting unsubmitted in the agent's composer.** abeam
+//! 2. **`crate::agentstate` reports [`Readiness::Idle`] for *this item's
+//!    target*** — read from that agent's own record, never inferred from output
+//!    going quiet, and never read from another pane's.
+//! 3. **Nothing is sitting unsubmitted in *that same agent's* composer.** abeam
 //!    forwards every keystroke, so typing sets that flag without asking
-//!    anyone; only *watching the agent go busy* clears it. A submit cannot be
+//!    anyone; only *watching that agent go busy* clears it. A submit cannot be
 //!    inferred from the keystroke that looks like one — a bare `Enter` that
 //!    Claude's inline autocomplete consumes accepts a completion and leaves the
 //!    text sitting in the composer, with the record still reading `idle`. The
@@ -62,10 +81,27 @@
 //! 4. **The item's own announcement has elapsed.** A by-hand ask is due at
 //!    once; the automatic sender waits out [`ARM_DELAY`] first.
 //!
+//! **Two of the four name an agent, and until phase 4 both named the wrong
+//! one.** They were asked of `agents[0]` however the item was aimed, which was
+//! right for the only aim there was and would have been a live misdelivery the
+//! moment there were two — a prompt let through because *some other* pane was
+//! idle. They are asked of [`Item::target`] now, through
+//! [`QueuePane::gate`], and the target has to be in the list the shell last
+//! handed over or there is no answer and nothing is sent. An agent this pane
+//! has never been told about is not an idle one.
+//!
+//! **What the shell owes this pane, therefore, is a whole roster and not a
+//! reading**: [`QueuePane::set_targets`], every quarter second and on every
+//! keystroke that opens a draft. The obligation is stated here because it is
+//! the load-bearing half of condition 3 — `crate::app::App::poll_readiness` is
+//! what clears a pane's draft flag, so a target nothing polls has no gate in
+//! front of it at all, and would take a queued prompt with a half-written
+//! message already in its composer.
+//!
 //! That announcement is the fourth condition and the visible one: a pause drawn
-//! in the left pane's title, during which a keystroke at the agent defers the
-//! send — condition 3 goes false, the announcement is withdrawn, and the next
-//! one is made from the beginning rather than resumed. It is the same
+//! in the *target's* own title, during which a keystroke at that agent defers
+//! the send — condition 3 goes false, the announcement is withdrawn, and the
+//! next one is made from the beginning rather than resumed. It is the same
 //! interaction as the quit confirmation in `crate::app`, and for the same
 //! reason: a thing that types on your behalf must be interruptible by the
 //! reflex of starting to type. A keystroke *here* is not one of those — this
@@ -129,13 +165,53 @@ const PROMPT: &str = "› ";
 /// line over and clipped itself in half.
 const DISPATCH_WARNING: &str = "⇉ edits files unattended";
 
-/// Where a queued item is meant to go.
+/// Which of the two things a queued item does.
+///
+/// **Not "where it goes", which is what this used to say and is now
+/// [`Target`]'s question.** The two were the same while there was one place a
+/// `Send` could land; separating them is the whole of phase 4's change to this
+/// file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Into the live session in the left pane, when it is idle.
+    /// Into one hosted agent's live session, when *that* agent is idle.
     Send,
     /// Into a background agent of its own.
     Dispatch,
+}
+
+/// One hosted agent, as this pane needs to see it.
+///
+/// **The whole roster, refreshed, rather than one agent's reading**, and that
+/// is the shape the four conditions force. Two of them are asked of the
+/// [`Item::target`] rather than of any fixed pane, so the pane has to be able
+/// to answer them about *whichever* agent an item names — and it cannot ask,
+/// because [`Pane::tick`] re-asks the conditions on a loop the shell is not
+/// standing in. So the shell pushes and this pane holds a copy.
+///
+/// **A copy that is replaced whole and never edited in place**, which is the
+/// lesson of the two-copies bug phase 2 removed: `crate::app::App` maintained a
+/// per-agent draft flag and this pane maintained a second one, they were kept
+/// in step by hand, and the syncing was itself the mechanism of a
+/// misdelivery. There is one authority — `crate::app::Agent` — and
+/// [`QueuePane::set_targets`] is a projection of it. Nothing in this file
+/// writes a field of a `Target`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    /// `crate::app::Agent::id`. Opaque here, and deliberately: this pane must
+    /// not be able to derive a pty, a position or a path from it.
+    pub id: u64,
+    /// What a row calls this agent — the worktree it is standing in.
+    ///
+    /// The shell's word, because only the shell knows what the *border* calls
+    /// it and a queue row that named a pane differently from its own title
+    /// would be two names for one thing. Deliberately not a position: a
+    /// position is exactly what closing a pane changes, and a row that said
+    /// `→ 2` would start naming somebody else.
+    pub label: String,
+    /// Condition 2, about this agent.
+    pub readiness: Readiness,
+    /// Condition 3, about this agent.
+    pub draft_open: bool,
 }
 
 /// What has become of an item.
@@ -143,7 +219,7 @@ pub enum Mode {
 pub enum ItemState {
     /// Waiting its turn.
     Pending,
-    /// Typed into the left pane. abeam cannot follow it further than that —
+    /// Typed into its target's pane. abeam cannot follow it further than that —
     /// once it is in the agent's composer it is the agent's.
     Sent,
     /// Started as a background agent. `id` joins it to a row in
@@ -151,6 +227,21 @@ pub enum ItemState {
     Dispatched { id: Option<String> },
     /// It could not be started, and this is what went wrong.
     Failed(String),
+    /// The agent this was written for has gone, so it will not be sent.
+    ///
+    /// **A state of its own rather than a [`Failed`](Self::Failed) with a
+    /// sentence in it, and the difference is what `Enter` does.** A `Failed`
+    /// item that never reached a dispatcher goes back to `Pending` on `Enter`,
+    /// which is a retry — and retrying this one re-aims at nothing, orphans
+    /// again on the next pass, and gives the reader a key that visibly does
+    /// nothing twice. Nothing here failed, either: the item was never
+    /// attempted, and the thing that changed is on the other side of the
+    /// window.
+    ///
+    /// It carries no reason, because there is only one: the pane closed. The
+    /// row says which pane, off [`Item::whose`], which is the last thing
+    /// anybody can still be told about an agent that no longer exists.
+    Orphaned,
 }
 
 /// A send that is coming, and why.
@@ -177,6 +268,38 @@ pub struct Item {
     pub text: String,
     pub mode: Mode,
     pub state: ItemState,
+    /// The agent this was written for: a [`Target::id`], decided once, here, at
+    /// the moment the item was made.
+    ///
+    /// **Decided at enqueue and not at delivery, which is the entire point of
+    /// the field.** The alternative is not "a field abeam did not need" — it is
+    /// the send reading a cursor, and a cursor is a thing the user moves while
+    /// the countdown runs. `F4` during those three seconds, or `a` on another
+    /// worktree while an item was armed, and somebody's prompt arrives at a
+    /// session it was never written for, reported sent, with the pane it was
+    /// meant for never having heard it. Two reviews found that independently
+    /// while it was still `agents[0]`-or-the-cursor; the fix is that the
+    /// question is asked once, early, and never again.
+    ///
+    /// The aim comes from the shell — [`QueuePane::set_targets`]'s second
+    /// argument — and is the agent whose pane had the left column's cursor.
+    /// That is "the one you were watching", which is what somebody writing a
+    /// prompt means and is the only answer that needs no key of its own.
+    ///
+    /// **There is no way to change it afterwards**, and that is a gap rather
+    /// than a decision: re-aiming an item wants a key in this pane's list, and
+    /// a key here is cheap to add and impossible to take back. The way to aim
+    /// somewhere else today is `F4` to that pane and write it there.
+    target: u64,
+    /// What that agent was called when the item was written.
+    ///
+    /// **Read only once the target has gone**, which is the one moment nothing
+    /// live can be asked. While the target exists the row is drawn from
+    /// [`Target::label`], so a worktree that changes branch under a live pane
+    /// renames itself everywhere at once rather than in one place and not the
+    /// other. When it has gone this is all there is, and a queued prompt whose
+    /// row could not say who it had been for would be a note about nothing.
+    whose: String,
     /// The announcement, which belongs to this item and to no other. Created
     /// and withdrawn in exactly one place, [`QueuePane::retime`].
     due: Option<Due>,
@@ -246,13 +369,26 @@ pub struct QueuePane {
     /// work" — dispatching is unaffected, and so is `Enter` — it is "do not
     /// type at the agent unless I am asking for it".
     armed: bool,
-    /// Last told by the shell, never worked out here: the pane does not know
-    /// what a pty is.
-    readiness: Readiness,
-    /// Set by the shell when a key reaches the agent, and cleared when the
-    /// agent is next seen to go *busy* — see condition 3 in the module docs. A
-    /// send while this is true would splice into a half-written message.
-    draft_open: bool,
+    /// Every hosted agent, last as the shell described them. Never worked out
+    /// here: the pane does not know what a pty is.
+    ///
+    /// **Empty means the shell has not spoken yet, and that is not the same as
+    /// "every agent has gone".** `crate::app::App` always holds at least one
+    /// agent — `agents[0]` is never removed — so an empty list is only ever the
+    /// state between [`QueuePane::with_dispatcher`] and the first
+    /// [`set_targets`](Self::set_targets), which `App::new` closes before any
+    /// key can be pressed. Nothing is sent while it is empty either way, since
+    /// no item's target can be found in it; what the distinction buys is that
+    /// items are not orphaned by a pane that has merely never been told
+    /// anything.
+    targets: Vec<Target>,
+    /// The [`Target::id`] a new item is aimed at: the agent with the left
+    /// column's cursor, as of the last [`set_targets`](Self::set_targets).
+    ///
+    /// Read in exactly one place, [`QueuePane::push`], and read there at the
+    /// moment the item is made. It moves when the cursor moves; the items it
+    /// has already stamped do not.
+    aim: u64,
     /// How long a countdown runs. [`ARM_DELAY`] in every real session; a field
     /// so a test can prove the number on screen came off the clock rather than
     /// out of the constant it is being compared with.
@@ -302,8 +438,8 @@ impl QueuePane {
             composing: None,
             confirm: None,
             armed: false,
-            readiness: Readiness::Unknown,
-            draft_open: false,
+            targets: Vec::new(),
+            aim: 0,
             arm_delay: ARM_DELAY,
             shown: None,
             roster: Vec::new(),
@@ -315,28 +451,39 @@ impl QueuePane {
 
     // --- what the shell tells it -----------------------------------------
 
-    /// Returns whether anything the next frame would show has changed, so the
-    /// shell can decline to spend a frame. A frame re-renders the agent's
-    /// whole screen; see `crate::app::App::tick_panes`.
-    pub fn set_readiness(&mut self, readiness: Readiness) -> bool {
-        if self.readiness == readiness {
-            return false;
-        }
-        self.readiness = readiness;
-        // Whatever it changed to, the announcement is now either owed or void.
-        self.retime();
-        true
-    }
-
-    /// Whether the user has an unsubmitted message in the agent's composer:
-    /// condition 3 in the module docs, including why only the shell can know it.
-    pub fn set_draft_open(&mut self, open: bool) -> bool {
-        if self.draft_open == open {
-            return false;
-        }
-        self.draft_open = open;
-        self.retime();
-        true
+    /// Everything this pane may know about the hosted agents, and which of them
+    /// a new item is for.
+    ///
+    /// **One call rather than the two scalar setters it replaces, and the
+    /// merger is the fix rather than a tidy-up.** `set_readiness` and
+    /// `set_draft_open` each described one agent, which was the whole
+    /// vocabulary a pane aimed at `agents[0]` needed; with a per-item target
+    /// the same two facts are wanted about *every* agent, and two setters and a
+    /// third for the aim would be three things the shell has to remember to
+    /// keep in step. Replacing the list whole means there is no state in here
+    /// that can disagree with `crate::app::Agent`, which is where both facts
+    /// actually live.
+    ///
+    /// Called from [`crate::app::App::poll_readiness`] every quarter second,
+    /// and again on the keystroke that opens a draft so the countdown is
+    /// withdrawn on the press rather than up to a quarter second later.
+    ///
+    /// Returns whether a frame is owed. **It compares the whole list, which
+    /// over-claims by exactly one case**: a draft ending at an agent that was
+    /// already busy is not drawn anywhere in this pane, and it will cost a
+    /// frame. The alternative is a second description of what this pane draws
+    /// from a target — the gate's readiness, the gate's draft, every targeted
+    /// item's label, and which targets still exist — kept beside the code that
+    /// draws them, which is the kind of pair that goes quietly out of step. One
+    /// frame on a keystroke made at a busy agent is the cheaper of the two.
+    pub fn set_targets(&mut self, targets: Vec<Target>, aim: u64) -> bool {
+        let changed = self.targets != targets || self.aim != aim;
+        self.targets = targets;
+        self.aim = aim;
+        // Whatever changed, an announcement is now either owed or void — and
+        // an item whose target has gone is orphaned here rather than found to
+        // be undeliverable later.
+        self.retime() | changed
     }
 
     /// Live state for the dispatched items.
@@ -358,8 +505,31 @@ impl QueuePane {
 
     // --- what the shell asks of it ---------------------------------------
 
-    /// The next item to type into the left pane, if all four conditions in the
-    /// module docs are met.
+    /// The next item to type at an agent, and which agent that is, if all four
+    /// conditions in the module docs are met.
+    ///
+    /// **`deliverable` is the shell's half of the gate, and it is a parameter
+    /// rather than a check the caller makes afterwards.** Two of the things
+    /// standing between a queued prompt and a pty are facts only the shell
+    /// holds: whether that pane is still owed the `Enter` for the *last* thing
+    /// pasted into it, and whether its child ever enabled bracketed paste —
+    /// without which every newline in a block is a submit and a three-line
+    /// prompt arrives as three. Asked after the drain, both would be refusals
+    /// arriving too late: this is a drain, the item is marked
+    /// [`ItemState::Sent`] on the way out, and a queue reading `✓` over a
+    /// prompt no pty received is the one failure the whole path is built to
+    /// prevent. Asked here, a target the shell cannot write to simply leaves
+    /// the item pending, which is what it is.
+    ///
+    /// **It answers with whatever the caller needs in order to deliver, and
+    /// that is why it is generic rather than a `bool`.** A predicate would make
+    /// the shell look the agent up twice — once to answer, once to write — with
+    /// nothing but reading to say the two lookups found the same pane. Handing
+    /// the answer back through here means the pane that was vetted is the pane
+    /// that is typed into, by construction. This module never inspects it.
+    ///
+    /// The target is not returned, for the same reason: there is nothing left
+    /// for the caller to resolve.
     ///
     /// Draining, not peeking: a request left sitting fires late, at whatever
     /// unrelated moment next reads it. The same contract as
@@ -374,7 +544,10 @@ impl QueuePane {
     /// the whole point of announcing it, and anything that has happened since —
     /// a keystroke at the agent, a turn starting, the item being deleted —
     /// voids it.
-    pub fn take_send_request(&mut self) -> Option<String> {
+    pub fn take_send_request<To>(
+        &mut self,
+        deliverable: impl FnOnce(u64) -> Option<To>,
+    ) -> Option<(To, String)> {
         self.retime();
         let i = self.next_send()?;
         let elapsed = match self.items[i].due? {
@@ -384,6 +557,10 @@ impl QueuePane {
         if !elapsed {
             return None;
         }
+        // Last, after every condition this pane can answer for itself, so that
+        // the shell is asked about an item that is otherwise ready to go and
+        // about no other.
+        let to = deliverable(self.items[i].target)?;
         // Marked before the text leaves the pane, and by the only path that can
         // hand it out. There is no state in which the same item is returned
         // twice, because after this line it is no longer `Pending` and
@@ -391,7 +568,7 @@ impl QueuePane {
         // by the next `retime` for exactly that reason, rather than by a second
         // line here that no test could ever fail without.
         self.items[i].state = ItemState::Sent;
-        Some(self.items[i].text.clone())
+        Some((to, self.items[i].text.clone()))
     }
 
     /// The next item to start as a background agent. Independent of readiness
@@ -454,7 +631,7 @@ impl QueuePane {
         };
     }
 
-    /// What the left pane's title says about the queue, in two parts of
+    /// What an agent pane's title says about the queue, in two parts of
     /// different **rank**.
     ///
     /// **One string until the stack made the ranking the shell's business.** It
@@ -476,19 +653,39 @@ impl QueuePane {
     /// count because the two have different *ranks* in a border and only this
     /// pane knows which one is in play — the shell owns the columns and has to
     /// be told what may be clipped. `crate::app::App::ui` puts this in front of
-    /// everything else on `agents[0]`'s border, including the pane's own name,
-    /// which is the treatment `App::right_title` already gives the one thing on
-    /// a border that a reader has to be able to act on.
+    /// everything else on that border, including the pane's own name, which is
+    /// the treatment `App::right_title` already gives the one thing on a border
+    /// that a reader has to be able to act on.
+    ///
+    /// **It answers *which* border, and that is phase 4's change to it.** It
+    /// used to be a string and to be drawn on `agents[0]` by construction,
+    /// because that is where every send went. A send now goes where its item
+    /// says, so the warning has to as well: an announcement on the wrong pane's
+    /// title is a reader watching the wrong composer for three seconds. The id
+    /// comes out of the same item the seconds were computed from, in one read,
+    /// so the two cannot describe different items.
+    ///
+    /// **It does not name the target, and the id is how it is placed rather
+    /// than described.** Naming it in the words would spend a branch name's
+    /// worth of columns on the one part of a border that must survive being
+    /// clipped — a 46-column pane in a session with a long branch has room for
+    /// the seconds or the name and not both, and the seconds are what a reader
+    /// acts on. Where the note has to be *borrowed* onto another pane's border,
+    /// which a window with fewer rows than agents forces, saying whose it is is
+    /// the shell's to add: that is a fact about the layout it chose, and
+    /// `crate::app::App::ui` is the only thing that knows it happened.
     ///
     /// The count rides along behind the seconds rather than being left to the
     /// caller, because it is meaningless without them: "queue 3" beside a
     /// countdown says how much more is coming after this one.
-    pub fn due_note(&self) -> Option<String> {
+    pub fn due_note(&self) -> Option<(u64, String)> {
+        let i = self.next_send()?;
         let secs = self.countdown()?;
-        Some(match self.pending() {
+        let note = match self.pending() {
             0 | 1 => format!("sending in {secs}s"),
             n => format!("sending in {secs}s · queue {n}"),
-        })
+        };
+        Some((self.items[i].target, note))
     }
 
     /// The half that is only a number: how much is waiting, and how much has
@@ -525,15 +722,18 @@ impl QueuePane {
     }
 
     /// Test seam, mirroring `GitPane::stub_open_request`.
+    ///
+    /// Built through [`aimed`](Self::aimed) rather than as an `Item` literal,
+    /// so a stubbed item is aimed exactly as a typed one is — a literal here
+    /// would let a test stamp a target the pane would never choose, and *which*
+    /// target the pane chooses is the property most worth testing. It stops
+    /// short of the rest of [`push`](Self::push) on purpose: that moves the
+    /// selection and scrolls the list, which is right for a key somebody
+    /// pressed and wrong for a fixture setting a scene.
     #[cfg(test)]
     pub fn stub_item(&mut self, text: &str, mode: Mode) {
-        self.items.push(Item {
-            text: text.to_string(),
-            mode,
-            state: ItemState::Pending,
-            due: None,
-            started: false,
-        });
+        let item = self.aimed(text.to_string(), mode);
+        self.items.push(item);
     }
 
     /// Forget a question this pane was in the middle of asking.
@@ -552,12 +752,139 @@ impl QueuePane {
         self.confirm = None;
     }
 
-    /// Whether the shell has told this pane about a draft. A test seam for the
-    /// wiring in `crate::app`, which is the only thing that can set it — and the
-    /// attribute comes off the day the shell needs the answer at runtime.
+    /// Whether the shell has told this pane about a draft at `id`. A test seam
+    /// for the wiring in `crate::app`, which is the only thing that can set it
+    /// — and the attribute comes off the day the shell needs the answer at
+    /// runtime.
+    ///
+    /// `false` for an agent this pane has never been told about, which is the
+    /// same answer the gate gives it and for the same reason: an unknown agent
+    /// is not a described one.
     #[cfg(test)]
-    pub fn is_draft_open(&self) -> bool {
-        self.draft_open
+    pub fn is_draft_open(&self, id: u64) -> bool {
+        self.target(id).is_some_and(|t| t.draft_open)
+    }
+
+    /// What has become of each item, in list order. A test seam for the shell,
+    /// which can otherwise only see what a row *drew* and so cannot tell an
+    /// item that is waiting from one that has disarmed.
+    #[cfg(test)]
+    pub fn states(&self) -> Vec<ItemState> {
+        self.items.iter().map(|item| item.state.clone()).collect()
+    }
+
+    /// What this pane was last told about one agent, if it was told anything.
+    fn target(&self, id: u64) -> Option<&Target> {
+        self.targets.iter().find(|target| target.id == id)
+    }
+
+    /// Conditions 2 and 3, asked of one agent.
+    ///
+    /// **`None` for an agent that is not in the list, and the distinction from
+    /// `Some(false)` is what the caller does about it**: a target that is
+    /// merely busy is waited for, and one that is not there at all has gone and
+    /// the item is orphaned. Neither is ever sent to.
+    ///
+    /// `is_idle` and not `== Readiness::Idle`. The two spellings are the same
+    /// question asked twice and only one of them refuses to compile when the
+    /// vocabulary grows — see [`Readiness::is_idle`], which is the only gate in
+    /// the program.
+    fn gate(&self, id: u64) -> Option<bool> {
+        self.target(id)
+            .map(|target| target.readiness.is_idle() && !target.draft_open)
+    }
+
+    /// The agent the status line is describing: the next send's target, or —
+    /// with nothing queued — the one a new item would be aimed at.
+    ///
+    /// **Two answers because the line answers two questions and a reader asks
+    /// whichever is live.** With something waiting, "why has this not gone
+    /// yet" is about the agent it is waiting on. With nothing waiting, the same
+    /// row is a standing report of the pane you are about to write for, which
+    /// is [`aim`](Self::aim) — and it is the only reading that keeps the line
+    /// meaningful in an empty queue, where the alternative is a state word
+    /// about no agent at all.
+    fn gate_target(&self) -> u64 {
+        self.next_send()
+            .map_or(self.aim, |i| self.items[i].target)
+    }
+
+    /// What the status line says about that agent: what to call it, its
+    /// readiness, and whether a draft is sitting at it.
+    ///
+    /// `agent` and `Unknown` for a target this pane has no row for, which is
+    /// the honest pair: "abeam cannot say" is what `Unknown` means everywhere
+    /// on this path, and a name it does not have is not one to invent.
+    fn gate_state(&self) -> (&str, Readiness, bool) {
+        let id = self.gate_target();
+        match self.target(id) {
+            // The word rather than the label while there is one agent: a name
+            // for the only thing there is buys a reader nothing and costs the
+            // line its columns.
+            Some(target) if self.targets.len() > 1 => {
+                (target.label.as_str(), target.readiness, target.draft_open)
+            }
+            Some(target) => ("agent", target.readiness, target.draft_open),
+            None => ("agent", Readiness::Unknown, false),
+        }
+    }
+
+    /// Mark every pending [`Mode::Send`] item whose agent has gone.
+    ///
+    /// **It has to happen, and it has to happen to the item rather than to the
+    /// send.** An item aimed at a pane that has closed can never satisfy
+    /// conditions 2 and 3 — there is nothing to ask — so leaving it `Pending`
+    /// parks it at the head of [`next_send`](Self::next_send) for ever and
+    /// every item written afterwards waits behind a prompt that is never going
+    /// anywhere. The queue would stop, permanently, with `armed` on the status
+    /// line and no explanation beside it, which is the failure shape
+    /// `crate::agentstate` refuses by name.
+    ///
+    /// **Retargeting is the thing this is instead of.** The nearest surviving
+    /// agent is not the agent the prompt was written for, and a prompt is a
+    /// sentence somebody wrote to a particular conversation. `crate::app` has
+    /// spent three phases making sure a queued send cannot wander; delivering
+    /// it to a substitute at the last moment would be the same failure with a
+    /// tidier implementation.
+    ///
+    /// Only [`Mode::Send`] and only [`ItemState::Pending`]. A dispatch reads no
+    /// target, and an item already `Sent` describes something that happened
+    /// back when the pane was there.
+    ///
+    /// Returns whether anything changed, so the row that now says so gets a
+    /// frame.
+    fn orphan_lost_targets(&mut self) -> bool {
+        // See [`targets`](Self::targets): empty is the shell not having spoken,
+        // which is not evidence that anybody has gone.
+        //
+        // **Unreachable in the program, and kept for what it costs to be
+        // wrong.** `App::new` seeds the list before it returns and `agents[0]`
+        // is never removed, so this is only ever the state between two
+        // statements in a constructor. Every other guard in this file fails
+        // safe by refusing to send; this one would fail by throwing items away
+        // — a queue that disarmed itself the first time it was built one
+        // statement early. That asymmetry is the whole reason it is a line
+        // rather than a comment.
+        if self.targets.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for i in 0..self.items.len() {
+            let item = &self.items[i];
+            if item.mode != Mode::Send
+                || item.state != ItemState::Pending
+                || self.target(item.target).is_some()
+            {
+                continue;
+            }
+            self.items[i].state = ItemState::Orphaned;
+            // Any announcement it was holding is withdrawn by the loop in
+            // `retime` directly below, which visits every item and keeps a due
+            // only on the one that is still next in line. Withdrawing it again
+            // here would be a line no test could fail without.
+            changed = true;
+        }
+        changed
     }
 
     // --- the announcement -------------------------------------------------
@@ -578,20 +905,32 @@ impl QueuePane {
     /// withdrawn here rather than firing unannounced once the promoted item has
     /// gone.
     ///
+    /// **It is also where an item finds out its agent has gone**, which is here
+    /// rather than in the drain for the reason above: this runs from everything
+    /// that can change a condition and from `tick`, so there is no pass on
+    /// which an orphan can be missed. Doing it in `take_send_request` instead
+    /// would leave the row reading `pending` until something asked for a send —
+    /// which, with the queue disarmed, is never.
+    ///
     /// Returns whether any of that changed, which is exactly when the title and
     /// the status line differ from what is on screen.
     fn retime(&mut self) -> bool {
-        // Conditions 2 and 3. They govern both kinds of due: a by-hand ask is
-        // attended, not exempt, and the agent can go busy between the keystroke
+        let mut changed = self.orphan_lost_targets();
+
+        // Conditions 2 and 3, asked of the item that is next in line and of no
+        // other agent. They govern both kinds of due: a by-hand ask is
+        // attended, not exempt, and an agent can go busy between the keystroke
         // that asked for it and the pass that would deliver it.
-        // `is_idle` and not `== Readiness::Idle`, which is what this line used
-        // to be. The two spellings were the same question asked twice, and only
-        // one of them refuses to compile when the vocabulary grows — see
-        // [`Readiness::is_idle`], which is now the only gate in the program.
-        let safe = self.readiness.is_idle() && !self.draft_open;
-        let armed = self.armed;
+        //
+        // **Only `next`'s target is consulted, and that is exact rather than an
+        // approximation.** At most one item is ever due and it is always the
+        // one next in line — the invariant three paragraphs up — so the loop
+        // below can only ever *keep* a due on `next`, and `safe` is only ever
+        // read for it. An item further down the list whose own agent is busy is
+        // not being announced, so there is nothing to withdraw.
         let next = self.next_send();
-        let mut changed = false;
+        let safe = next.is_some_and(|i| self.gate(self.items[i].target) == Some(true));
+        let armed = self.armed;
 
         for (i, item) in self.items.iter_mut().enumerate() {
             let Some(due) = item.due else { continue };
@@ -850,17 +1189,41 @@ impl QueuePane {
     /// without asking. The mode that does nothing until told is the one a new
     /// item gets; `m` is one key away, and the status line says what that key
     /// has just changed.
+    ///
+    /// The target is [`aimed`](Self::aimed)'s to stamp, and it is stamped here
+    /// and nowhere else.
     fn push(&mut self, text: String) {
-        self.items.push(Item {
-            text,
-            mode: Mode::Send,
-            state: ItemState::Pending,
-            due: None,
-            started: false,
-        });
+        let item = self.aimed(text, Mode::Send);
+        self.items.push(item);
         self.selected = self.items.len() - 1;
         self.reveal();
         self.retime();
+    }
+
+    /// A new item, aimed.
+    ///
+    /// **The single place a target is chosen**, which is what makes
+    /// [`Item::target`]'s promise checkable by reading one function: it is
+    /// stamped from [`aim`](Self::aim) here and nothing else in this file
+    /// assigns to it. `m` does not — an item switched to `Dispatch` and back
+    /// keeps the agent it was written for — and neither does anything the shell
+    /// can call.
+    fn aimed(&self, text: String, mode: Mode) -> Item {
+        Item {
+            text,
+            mode,
+            state: ItemState::Pending,
+            target: self.aim,
+            // Empty when the shell has not spoken, which `App::new` makes
+            // unreachable and which reads as an unnamed agent rather than as a
+            // wrong one if it ever stops being.
+            whose: self
+                .target(self.aim)
+                .map(|target| target.label.clone())
+                .unwrap_or_default(),
+            due: None,
+            started: false,
+        }
     }
 
     /// `Enter` in the list: do the selected item now.
@@ -914,7 +1277,14 @@ impl QueuePane {
             }
             ItemState::Pending => match mode {
                 Mode::Send => {
-                    if !self.readiness.is_idle() || self.draft_open {
+                    // Asked of *this item's* target, which is the same question
+                    // `retime` asks of whatever is next in line and is asked
+                    // separately here because promotion has not happened yet:
+                    // the item under the cursor is about to become next, and
+                    // whether it may is a fact about the agent it names.
+                    // `Some(true)` and not a truthiness test — an agent that
+                    // has gone answers `None`, and `None` is a refusal.
+                    if self.gate(self.items[self.selected].target) != Some(true) {
                         // Nothing changed, so nothing is redrawn — and the
                         // status line already says which of the two it was.
                         return Handled::No;
@@ -1139,8 +1509,30 @@ impl QueuePane {
             // That agent is running; abeam simply cannot name it.
             ItemState::Dispatched { id: None } => "starting…".to_string(),
             ItemState::Failed(why) => why.clone(),
+            // **Named off the item and not off the list, because there is
+            // nothing in the list to name.** This is the one row that reports a
+            // pane that no longer exists.
+            ItemState::Orphaned => format!("{} closed", self.whose(item)),
+            // Who this is for. **Suppressed while there is one agent**, and
+            // that is the same judgement `crate::app::App::right_title` makes
+            // about the workspace label: this pane is forty-six columns, a
+            // prompt is most of them, and spending four or five saying the one
+            // thing that is true by default would push the text a reader is
+            // scanning off the end of its own row. It appears exactly when it
+            // is news.
+            _ if item.mode == Mode::Send && self.targets.len() > 1 => self.whose(item).to_string(),
             _ => String::new(),
         }
+    }
+
+    /// What to call an item's target.
+    ///
+    /// The live label wherever there is one, so a worktree that changes branch
+    /// renames every row about it at once; [`Item::whose`] when there is not,
+    /// which is the only thing left to say about an agent that has gone.
+    fn whose<'a>(&'a self, item: &'a Item) -> &'a str {
+        self.target(item.target)
+            .map_or(item.whose.as_str(), |target| target.label.as_str())
     }
 
     /// The bottom row: what is being typed, or what the queue is doing.
@@ -1178,8 +1570,15 @@ impl QueuePane {
         } else {
             Span::styled("disarmed", dim())
         });
-        spans.push(Span::styled(" · agent ", dim()));
-        spans.push(match self.readiness {
+        // **Whose state this is, and it is the gate's rather than any fixed
+        // pane's.** With one agent the word `agent` is exact and the label
+        // would be a name for the only thing there is; with several, "the
+        // agent is busy" is a sentence about nobody in particular, and the one
+        // a reader needs is about the pane the next send is going to. See
+        // [`gate_target`](Self::gate_target).
+        let (whose, readiness, drafting) = self.gate_state();
+        spans.push(Span::styled(format!(" · {whose} "), dim()));
+        spans.push(match readiness {
             Readiness::Idle => Span::styled("idle", Style::default().fg(Color::Green)),
             Readiness::Busy => Span::styled("busy", Style::default().fg(Color::Yellow)),
             // The one refusal a person can end, and the only thing on this
@@ -1193,7 +1592,7 @@ impl QueuePane {
             // until it does.
             Readiness::Unknown => Span::styled("state unknown", dim()),
         });
-        if self.draft_open {
+        if drafting {
             spans.push(Span::styled(" · you are typing", dim()));
         }
         if let Some(secs) = self.countdown() {
@@ -1359,7 +1758,7 @@ impl Pane for QueuePane {
     /// boundary. Returning true each loop would re-render the agent's screen
     /// at the frame ceiling to redraw a number that has not changed.
     fn tick(&mut self) -> bool {
-        // Cheap, and the belt to `set_readiness`'s braces: every path that
+        // Cheap, and the belt to `set_targets`'s braces: every path that
         // changes a condition already calls this, and a path that is added
         // later and forgets to is an announcement that outlives its promise.
         let mut dirty = self.retime();
@@ -1501,6 +1900,12 @@ fn marker(state: &ItemState) -> (&'static str, Style) {
         ItemState::Sent => ("✓", Style::default().fg(Color::Green)),
         ItemState::Dispatched { .. } => ("»", Style::default().fg(Color::Cyan)),
         ItemState::Failed(_) => ("✗", err()),
+        // Dim rather than `err()`, which is the colour this program keeps for
+        // something that went wrong. Nothing did: the item is intact, it was
+        // never attempted, and what changed is that its pane is not there any
+        // more. The glyph is what says it will not go; the aside beside it says
+        // which pane it was for.
+        ItemState::Orphaned => ("⊘", dim()),
     }
 }
 
@@ -1541,8 +1946,52 @@ mod tests {
         unavailable("no claude on PATH")
     }
 
+    /// The one agent nearly every test in this file has.
+    ///
+    /// **Deliberately not `0`, and not a small number.** An id is opaque and
+    /// this file must never be able to use one as an index; a fixture that
+    /// numbered its agent `0` would let an off-by-a-meaning bug — reading a
+    /// target as a position — pass every test here by coincidence.
+    const AGENT: u64 = 41;
+
+    /// A second agent, for the tests that are about which of the two an item
+    /// names.
+    const OTHER: u64 = 42;
+
     fn unavailable(why: &str) -> QueuePane {
-        QueuePane::with_dispatcher(PathBuf::from("/repo"), Err(Unavailable(why.to_string())))
+        let mut p =
+            QueuePane::with_dispatcher(PathBuf::from("/repo"), Err(Unavailable(why.to_string())));
+        // What `App::new` does before any key can be pressed. Without it the
+        // pane has no agents at all, which is a state the program never reaches
+        // and in which nothing can be aimed anywhere.
+        p.set_targets(vec![target(AGENT, "main", Readiness::Unknown)], AGENT);
+        p
+    }
+
+    fn target(id: u64, label: &str, readiness: Readiness) -> Target {
+        Target {
+            id,
+            label: label.to_string(),
+            readiness,
+            draft_open: false,
+        }
+    }
+
+    /// Tell the pane what the shell would tell it about its one agent.
+    ///
+    /// A helper rather than a field poke, because the field is a `Vec` now and
+    /// because `set_targets` is the path the program actually takes — a test
+    /// that wrote `targets[0].readiness` directly would skip the `retime` that
+    /// makes an announcement appear.
+    fn says(p: &mut QueuePane, readiness: Readiness) -> bool {
+        p.set_targets(vec![target(AGENT, "main", readiness)], AGENT)
+    }
+
+    /// The same, with a draft sitting in that agent's composer.
+    fn says_drafting(p: &mut QueuePane, readiness: Readiness, draft_open: bool) -> bool {
+        let mut t = target(AGENT, "main", readiness);
+        t.draft_open = draft_open;
+        p.set_targets(vec![t], AGENT)
     }
 
     /// Armed, idle, one thing to send: the state every safety test starts from
@@ -1550,9 +1999,37 @@ mod tests {
     fn ready(text: &str) -> QueuePane {
         let mut p = pane();
         p.stub_item(text, Mode::Send);
+        says(&mut p, Readiness::Idle);
+        // Last, and a bare write rather than the key that toggles it, so that
+        // nothing has yet been *announced*: `set_targets` retimes and would
+        // otherwise start the countdown inside this helper. The tests below
+        // want the state before the announcement, so that the pass which makes
+        // it is one of theirs.
         p.armed = true;
-        p.readiness = Readiness::Idle;
         p
+    }
+
+    /// The shell's half of the gate, answered `yes` unconditionally.
+    ///
+    /// Every test below is about the *pane's* four conditions, so the two facts
+    /// only `crate::app` holds — a pane already owed an `Enter`, a child with
+    /// no bracketed paste — are out of scope here and are exercised where they
+    /// live. The unit it hands back is what a real caller would send the text
+    /// to; nothing in this module looks at it.
+    fn drain(p: &mut QueuePane) -> Option<(u64, String)> {
+        p.take_send_request(Some)
+    }
+
+    /// The same, for the tests that are about *whether* something went rather
+    /// than about where.
+    fn sent(p: &mut QueuePane) -> Option<String> {
+        drain(p).map(|(_, text)| text)
+    }
+
+    /// The announcement's words, for the tests that are about the wording
+    /// rather than about which border it lands on.
+    fn note(p: &QueuePane) -> Option<String> {
+        p.due_note().map(|(_, note)| note)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1640,14 +2117,14 @@ mod tests {
         p.stub_item("the second thing", Mode::Send);
         p.items[0].due = elapsed();
 
-        assert_eq!(p.take_send_request().as_deref(), Some("the first thing"));
+        assert_eq!(sent(&mut p).as_deref(), Some("the first thing"));
         p.items[1].due = elapsed();
-        assert_eq!(p.take_send_request().as_deref(), Some("the second thing"));
+        assert_eq!(sent(&mut p).as_deref(), Some("the second thing"));
 
         for _ in 0..200 {
             p.items[0].due = elapsed();
             p.items[1].due = elapsed();
-            assert_eq!(p.take_send_request(), None, "an item came back");
+            assert_eq!(drain(&mut p), None, "an item came back");
         }
         assert_eq!(states(&p), [ItemState::Sent, ItemState::Sent]);
     }
@@ -1708,22 +2185,43 @@ mod tests {
         // until its answer has been stated at the gate itself. These lines
         // exercise that answer; they do not enforce it.
         for break_it in [
-            |p: &mut QueuePane| p.readiness = Readiness::Busy,
-            |p: &mut QueuePane| p.readiness = Readiness::Waiting,
-            |p: &mut QueuePane| p.readiness = Readiness::Unknown,
+            |p: &mut QueuePane| {
+                says(p, Readiness::Busy);
+            },
+            |p: &mut QueuePane| {
+                says(p, Readiness::Waiting);
+            },
+            |p: &mut QueuePane| {
+                says(p, Readiness::Unknown);
+            },
             |p: &mut QueuePane| p.armed = false,
-            |p: &mut QueuePane| p.draft_open = true,
+            |p: &mut QueuePane| {
+                says_drafting(p, Readiness::Idle, true);
+            },
+            // **The fifth refusal, and the one the other four are not.** Every
+            // line above is an agent that is there and not ready; this is an
+            // agent that is not there — the pane it was written for has been
+            // closed. It is in this list because it is the same answer at the
+            // gate, and it is called out because what happens to the *item*
+            // differs: the four leave it pending and this one orphans it, so
+            // the assertions below are relaxed to cover both.
+            |p: &mut QueuePane| {
+                p.set_targets(vec![target(OTHER, "elsewhere", Readiness::Idle)], OTHER);
+            },
         ] {
             let mut p = ready("do not send me");
             p.items[0].due = elapsed();
             break_it(&mut p);
 
-            assert_eq!(p.take_send_request(), None);
-            assert_eq!(states(&p), [ItemState::Pending]);
+            assert_eq!(drain(&mut p), None);
+            assert!(matches!(
+                states(&p)[..],
+                [ItemState::Pending] | [ItemState::Orphaned]
+            ));
             // ...and the announcement is withdrawn with it, so the title stops
             // promising a send that is no longer coming.
             assert_eq!(p.items[0].due, None);
-            assert_eq!(p.queued_note().as_deref(), Some("queue 1"));
+            assert_eq!(p.due_note(), None);
         }
     }
 
@@ -1734,22 +2232,22 @@ mod tests {
         // rather than a bool: a probe that guesses idle when it cannot tell
         // types a prompt into a permission dialog.
         let mut p = ready("do not guess");
-        p.readiness = Readiness::Unknown;
+        says(&mut p, Readiness::Unknown);
         p.items[0].due = elapsed();
 
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
         assert_eq!(states(&p), [ItemState::Pending]);
 
         // Not even by the explicit key, which skips the countdown and the
         // arming switch and nothing else.
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
 
         // And it is unsafe in exactly the way `Busy` is: the same lines pass
         // for both.
-        p.readiness = Readiness::Busy;
+        says(&mut p, Readiness::Busy);
         p.items[0].due = elapsed();
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
         assert_eq!(states(&p), [ItemState::Pending]);
 
@@ -1760,9 +2258,9 @@ mod tests {
         // because a queued prompt would be answering a question nobody read.
         // It used to reach here as `Unknown` and be refused; it now reaches
         // here as itself and must be refused by the same comparison.
-        p.readiness = Readiness::Waiting;
+        says(&mut p, Readiness::Waiting);
         p.items[0].due = elapsed();
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
         assert_eq!(states(&p), [ItemState::Pending]);
     }
@@ -1777,16 +2275,16 @@ mod tests {
         // Most of the way through the announcement, and then somebody starts
         // typing at the agent.
         p.items[0].due = Some(Due::Announced(Instant::now() + Duration::from_millis(20)));
-        assert!(p.set_draft_open(true));
+        assert!(says_drafting(&mut p, Readiness::Idle, true));
         assert_eq!(p.items[0].due, None, "a keystroke withdraws it");
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
 
         // What comes back is a *whole* delay rather than the twenty
         // milliseconds that were left. The warning is for the person who has
         // just stopped doing something else.
-        assert!(p.set_draft_open(false));
+        assert!(says_drafting(&mut p, Readiness::Idle, false));
         assert_eq!(p.countdown(), Some(9));
-        assert_eq!(p.take_send_request(), None, "and it has not elapsed");
+        assert_eq!(drain(&mut p), None, "and it has not elapsed");
         assert_eq!(states(&p), [ItemState::Pending]);
     }
 
@@ -1807,7 +2305,7 @@ mod tests {
         assert_eq!(p.handle_key(key(KeyCode::Char('d'))).unwrap(), Handled::Yes);
         assert_eq!(texts(&p), ["the item nobody chose"]);
         assert_eq!(
-            p.take_send_request(),
+            drain(&mut p),
             None,
             "a due outlived the item it was granted for"
         );
@@ -1826,7 +2324,7 @@ mod tests {
 
         // Exact, because the number is what a reader acts on: a pane counting
         // down from thirty must not read as one counting down from three.
-        assert_eq!(p.due_note().as_deref(), Some("sending in 3s"));
+        assert_eq!(note(&p).as_deref(), Some("sending in 3s"));
         // ...and the count does not appear twice. It rides inside the
         // announcement, so the low-ranked half stands down while one is due —
         // a border that drew both parts would say `queue n` at each end of it.
@@ -1836,7 +2334,7 @@ mod tests {
         let mut p = ready("announce me");
         p.arm_delay = Duration::from_secs(9);
         p.tick();
-        assert_eq!(p.due_note().as_deref(), Some("sending in 9s"));
+        assert_eq!(note(&p).as_deref(), Some("sending in 9s"));
         assert!(screen(&mut p, 60, 8).contains("sending in 9s"));
 
         // Nothing queued and nothing to say, in either rank.
@@ -1853,7 +2351,7 @@ mod tests {
         let mut p = pane();
         p.stub_item("in the background", Mode::Dispatch);
         p.armed = true;
-        p.readiness = Readiness::Idle;
+        says(&mut p, Readiness::Idle);
 
         assert!(!p.tick());
         assert_eq!(p.countdown(), None);
@@ -1870,8 +2368,9 @@ mod tests {
         // Every condition a send needs is false, and none of them is a
         // dispatch's business: nothing is being typed at.
         p.armed = false;
-        p.readiness = Readiness::Busy;
-        p.draft_open = true;
+        says(&mut p, Readiness::Busy);
+        let was = p.targets[0].readiness;
+        says_drafting(&mut p, was, true);
 
         assert_eq!(
             p.take_dispatch_request().as_deref(),
@@ -1883,7 +2382,7 @@ mod tests {
             ItemState::Pending,
             "the send item was taken by the wrong drain"
         );
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
     }
 
     #[test]
@@ -1991,7 +2490,7 @@ mod tests {
             Readiness::Waiting,
             Readiness::Unknown,
         ] {
-            p.readiness = readiness;
+            says(&mut p, readiness);
             for armed in [false, true] {
                 p.armed = armed;
                 let text = screen(&mut p, 60, 8);
@@ -2009,21 +2508,23 @@ mod tests {
     #[test]
     fn enter_skips_the_countdown_and_still_refuses_while_the_agent_is_busy() {
         let mut p = ready("do it now");
-        p.readiness = Readiness::Busy;
+        says(&mut p, Readiness::Busy);
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
 
-        p.readiness = Readiness::Idle;
-        p.draft_open = true;
+        says(&mut p, Readiness::Idle);
+        let was = p.targets[0].readiness;
+        says_drafting(&mut p, was, true);
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
 
         // With both of them true it goes at once — no three seconds of warning,
         // because the warning is for a send nobody asked for and this one was
         // asked for by hand.
-        p.draft_open = false;
+        let was = p.targets[0].readiness;
+        says_drafting(&mut p, was, false);
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
-        assert_eq!(p.take_send_request().as_deref(), Some("do it now"));
+        assert_eq!(sent(&mut p).as_deref(), Some("do it now"));
     }
 
     #[test]
@@ -2035,18 +2536,18 @@ mod tests {
         let mut p = pane();
         p.stub_item("not this one", Mode::Send);
         p.stub_item("this one", Mode::Send);
-        p.readiness = Readiness::Idle;
+        says(&mut p, Readiness::Idle);
         p.selected = 1;
         assert!(!p.armed);
 
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
-        assert_eq!(p.take_send_request().as_deref(), Some("this one"));
+        assert_eq!(sent(&mut p).as_deref(), Some("this one"));
         assert!(!p.armed, "sending one item must not arm the queue");
 
         // And the rest of the list stays exactly where it was, however long the
         // shell goes on asking.
         for _ in 0..50 {
-            assert_eq!(p.take_send_request(), None);
+            assert_eq!(drain(&mut p), None);
         }
         assert_eq!(p.pending(), 1);
         assert_eq!(p.queued_note().as_deref(), Some("queue 1"));
@@ -2059,7 +2560,7 @@ mod tests {
         p.selected = 1;
 
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
-        assert_eq!(p.take_send_request().as_deref(), Some("the urgent thing"));
+        assert_eq!(sent(&mut p).as_deref(), Some("the urgent thing"));
         assert_eq!(p.pending(), 1);
         assert_eq!(p.items[1].text, "the first thing");
 
@@ -2069,7 +2570,7 @@ mod tests {
         assert_eq!(p.countdown(), None, "nothing is due until it is announced");
         assert!(p.tick());
         assert_eq!(p.countdown(), Some(3));
-        assert_eq!(p.take_send_request(), None);
+        assert_eq!(drain(&mut p), None);
     }
 
     #[test]
@@ -2170,7 +2671,7 @@ mod tests {
     fn a_arms_and_disarms_and_m_switches_an_item_between_the_modes() {
         let mut p = pane();
         p.stub_item("a thing", Mode::Send);
-        p.readiness = Readiness::Idle;
+        says(&mut p, Readiness::Idle);
 
         assert_eq!(p.handle_key(key(KeyCode::Char('a'))).unwrap(), Handled::Yes);
         assert!(p.armed);
@@ -2438,13 +2939,19 @@ mod tests {
     #[test]
     fn being_told_the_same_thing_twice_is_never_worth_a_frame() {
         let mut p = ready("quiet please");
-        assert!(!p.set_readiness(Readiness::Idle));
-        assert!(p.set_readiness(Readiness::Busy));
-        assert!(!p.set_readiness(Readiness::Busy));
-        assert!(!p.set_draft_open(false));
-        assert!(p.set_draft_open(true));
-        assert!(!p.set_draft_open(true));
-        assert!(p.is_draft_open());
+        // The announcement first, because making one is news and this test is
+        // about *not* making news. `ready` leaves the countdown unstarted on
+        // purpose — see its own comment — so without this the first line below
+        // would be told nothing new and still owe a frame, for the right
+        // reason and not the one under test.
+        assert!(p.tick(), "the announcement was already up");
+        assert!(!says(&mut p, Readiness::Idle));
+        assert!(says(&mut p, Readiness::Busy));
+        assert!(!says(&mut p, Readiness::Busy));
+        assert!(!says_drafting(&mut p, Readiness::Busy, false));
+        assert!(says_drafting(&mut p, Readiness::Busy, true));
+        assert!(!says_drafting(&mut p, Readiness::Busy, true));
+        assert!(p.is_draft_open(AGENT));
         assert!(!p.set_roster(Vec::new()));
     }
 
@@ -2489,7 +2996,7 @@ mod tests {
         assert!(screen(&mut p, 60, 8).contains("idle"));
 
         p.armed = false;
-        p.readiness = Readiness::Unknown;
+        says(&mut p, Readiness::Unknown);
         let text = screen(&mut p, 60, 8);
         assert!(text.contains("disarmed"), "{text}");
         assert!(text.contains("state unknown"), "{text}");

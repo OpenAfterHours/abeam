@@ -1,14 +1,14 @@
 # More than one agent in the window
 
-> **Phases 1, 2 and 3 are built. Phase 4 is not.** This began as a proposal and
-> is now half a record, which is a state worth being explicit about rather than
-> leaving a reader to date it from the tense. The argument is why it is here;
+> **All four phases are built. This is a record, not a proposal.** It began as
+> one, and the tense of a paragraph is not a safe way to date it, so: nothing
+> below is waiting to be done. The argument is why the code is the shape it is;
 > the parts that survived have moved into module documentation, and where the
-> code disagrees with a paragraph below, the code is the answer and the
+> code disagrees with a paragraph here, the code is the answer and the
 > paragraph says so.
 >
-> **What the first three phases changed about this document**, so nobody has to
-> diff it against the source:
+> **What the four phases changed about this document**, so nobody has to diff
+> it against the source:
 >
 > - `MIN_AGENT_ROWS` is **12**, written into `crate::layout` with the arithmetic
 >   the section below asks for. The guess became a number with an argument
@@ -16,15 +16,29 @@
 > - `stack` takes **three** arguments, not two — `stack(area, n, at)`. The
 >   cursor is an input because the pane holding the keys must be one that is
 >   drawn.
-> - **Closing a pane is answered**, and it left the open questions: `x` twice at
->   a pane whose child has exited. A *live* agent still cannot be closed, and
->   that is phase 4's with the exit contract.
+> - **Closing a pane is answered twice**, and both answers are `x`. Phase 3
+>   took the easy half — `x` twice at a pane whose child has **exited**, in the
+>   left column, safe because there is no child left to shadow. Phase 4 took
+>   the other half and could not put it in the same place: `x` twice on a row
+>   of the **worktree list** ends a *live* agent. The section below has the
+>   argument for why the key had to move rooms.
 > - **A zoom that shows one agent was declined**; the argument is in the section
 >   below.
 > - **Per-pane readiness arrived early**, in phase 3 rather than phase 4,
 >   because a collapsed pane's title row has to say whether its agent is
->   working. `crate::agentstate::Readiness` grew a fourth variant for it. The
->   queue's *targeting* is untouched and is still phase 4's.
+>   working. `crate::agentstate::Readiness` grew a fourth variant for it.
+> - **The queue's targeting landed in phase 4, as designed and later than
+>   designed.** Phase 2 could not defer the *failure* it prevents, so it aimed
+>   every send at `agents[0]` as an interim that was byte-identical for one
+>   agent; phase 4 replaced the fixed point with a target on each item.
+> - **`Row.agents_here` stayed a count and did not become a list of pane ids**,
+>   which is one prediction below that did not come true. What the closing
+>   gesture needed was not ids on a row but a *guaranteed* row: `workspace::rows`
+>   now promises one for every agent's root, which the section on the roster
+>   revises.
+> - **Nothing was built for re-aiming a queued item.** It is written where it
+>   was written and cannot be moved. That is a gap rather than a decision, and
+>   it is named at the foot of the queue section.
 
 ## What is being asked for
 
@@ -46,7 +60,7 @@ that shortens the design considerably:
 
 So this is not a rework of the right-hand half. It is one field on `App`.
 
-## The field
+## The field it started from
 
 ```rust
 pub struct App {
@@ -55,10 +69,12 @@ pub struct App {
 }
 ```
 
-One hosted child, owning the left column outright. Twenty-one references to
-`self.left` outside the tests, and each of them is a real decision rather than
-plumbing: the readiness probe, the queue's send, the selection hand-off, the
-resize, the title, the cursor, the exit.
+That is what was there. One hosted child, owning the left column outright, with
+twenty-one references to `self.left` outside the tests — and each of them a real
+decision rather than plumbing: the readiness probe, the queue's send, the
+selection hand-off, the resize, the title, the cursor, the exit. Sorting those
+twenty-one into "every agent", "the session's" and "the current one" was phase
+1, and it is why phase 1 shipped nothing a user could see.
 
 ## The shape to copy is already in the file
 
@@ -165,9 +181,32 @@ is working in which checkout, so the gesture that fixes an empty worktree is
 next to the evidence that it is empty. A row that went on reading empty after
 `a` had started something takes that away — and takes with it the reason the key
 needs no confirmation, since what a confirmation buys is that the second press
-is an informed one. It is `agents_here: usize` now. The list of pane ids is
-still phase 4's, and it arrives with the queue's per-pane targeting, which is
-what first needs to *name* a pane rather than count them.
+is an informed one.
+
+**It is `agents_here: usize` and it stayed one, which is this paragraph's other
+prediction not coming true.** A list of pane ids was going to arrive with the
+queue's targeting, on the reasoning that targeting is what first needs to *name*
+a pane rather than count them. Targeting does name panes — by
+`crate::app::Agent::id`, on the item — and it never asks this list about them:
+it asks the shell, which holds the vector. What the list needed turned out to be
+something else entirely, and it came from the *closing* gesture rather than the
+queue: `x` on a row has to resolve a checkout to a pane, and it resolves it in
+`crate::app::App::agent_in` against the same vector. Ids on a row would have
+been a second copy of what `crate::app` already knows, kept up to date on a
+ten-second discovery timer, which is exactly the kind of mirror this design has
+been deleting.
+
+**What the list did owe, and now pays, is a row for every agent's root.**
+`workspace::rows` guaranteed a row for the workspace on screen and for the one
+abeam was started in, and for a while it declined a third guarantee on the
+grounds that an agent is started *from* a row so its root has one by
+construction. That was true and too narrow — an agent standing in a worktree
+`git worktree list` has stopped naming had no row at all — and it stopped being
+survivable when the close gesture arrived, because a pane whose root has no row
+is a pane with no way out, in the very list that is meant to be its roster. It
+is a guarantee now, and the cost is the one that argument named: a row for a
+directory git no longer mentions, carrying a directory name because there is no
+branch to carry.
 
 ## What `main` has to hand over
 
@@ -343,6 +382,47 @@ If the target has gone, the item disarms with a note. It is not retargeted.
 obvious neighbour it should probably not gain yet: "dispatch, then open it in a
 pane" is a real feature and a different one.
 
+**That is what was built, and four things about it were decided in the
+building.**
+
+- **The aim is the pane with the left column's cursor when the item is
+  written.** "The agent you were watching" is what somebody writing a prompt
+  means, and it is the one answer that needs no key of its own — which matters,
+  because this document has already spent the key budget. It is stamped in one
+  function, `QueuePane::push`, and nothing else assigns to it: `m` switching an
+  item between the two modes and back leaves the agent it was written for
+  alone.
+- **The queue holds a roster, not a reading.** The pane cannot ask the shell
+  anything — `Pane::tick` re-asks the four conditions on a loop the shell is not
+  standing in — so `crate::app` pushes a row per agent, every quarter second and
+  again on every keystroke that opens a draft. That is the shape that makes
+  conditions 2 and 3 answerable *about an arbitrary pane*, and it also disarms
+  the landmine phase 1 left: a per-agent draft flag whose only reader was
+  `agents[0]`'s. Whatever polls a pane's record is what clears its draft, so a
+  target nothing polls has no gate in front of it at all.
+- **An orphan leaves `Pending`, and that is not cosmetic.** `next_send` takes
+  the first pending `Send`, so an undeliverable item left pending parks itself
+  at the head of the queue for ever and every item written afterwards waits
+  behind a prompt that is never going anywhere — the automatic sender off for
+  the rest of the session with `armed` still on the status line, which is the
+  silent-stall shape `crate::agentstate` refuses by name.
+- **The announcement moved with the send.** Phase 3 put the countdown at the
+  *front* of `agents[0]`'s border, because appended it was clipped off the end
+  by the pane's own name; phase 4 has to choose a border as well as a position,
+  and it is the target's. A three-second warning on the wrong pane's title is a
+  reader watching the wrong composer. The one case where it cannot be the
+  target's is a window with fewer rows than agents, where `layout::stack` gives
+  some panes no rows at all; it is borrowed onto a neighbour's border there and
+  the shell adds the target's name, because which border a note ended up on is a
+  fact about the layout and belongs to whatever chose the layout.
+
+**What is not built: there is no way to re-aim an item once it is written.** The
+target is decided at enqueue and nothing moves it, which is the property the
+whole section is about — and the honest reading is that the property was easy to
+get right by refusing to offer the feature. Re-aiming wants a key in this pane's
+list, and a key here is cheap to add and impossible to take back. The way to aim
+somewhere else today is `F4` to that pane and write it there.
+
 **Phase 2 could not defer all of this, and what it did instead is worth writing
 down because it is not the interim anyone would have guessed.** The failure
 above arrives the moment a second pane exists, by two routes with no new feature
@@ -368,6 +448,14 @@ time as everybody else's. Everything above this paragraph still stands as the
 end state; what changed is that phase 2 is no longer sitting on a live
 misdelivery while it waits.
 
+**Phase 4 promoted that interim rather than reversing it, and the distinction is
+worth keeping.** Both versions refuse the same thing — a target read at the
+moment of delivery — and phase 2's rule that *the queue's three inputs must name
+one agent* survives word for word. What changed is that the one agent comes off
+the item instead of out of a constant. A reader who finds `agents[0]` in this
+file's history should not read it as a bug that was fixed; it was the same
+invariant with a fixed point, and the fixed point is what went.
+
 **Phase 3 paid that and found the bill was larger.** Putting the countdown on
 `agents[0]`'s border is only worth anything if it is *legible* there, and it was
 not: the note was appended to the end of a line clipped from the right, behind a
@@ -381,20 +469,69 @@ the shell owns the columns.
 
 ## The exit contract
 
-Today the agent leaving ends abeam, `main` prints its last screen to the primary
+The agent leaving ends abeam, `main` prints its last screen to the primary
 buffer and exits with its status. `abeam -p "fix the tests" && next-step` depends
-on that, and `Outcome::Exited` is single-valued because there is one child.
+on that, and `Outcome::Exited` is single-valued because there is one *session*.
 
-**The agent abeam was started with is the one that ends the session.** Panes
-opened afterwards that exit freeze on their last screen under a title saying so,
-until they are closed; they are not the session and their status is not the exit
-code. The alternative — last one out — makes the exit code of a scripted run
-depend on a pane somebody opened by hand, which is the kind of thing that is
-noticed months later.
+**`agents[0]` alone ends the session, and it is the only one that can.** Not the
+last one out, and not whichever pane has the keys. The loop reads
+`App::session_agent` and so does `App::finish`, which are named that way so the
+sites that mean "whose exit is abeam's exit" cannot be spelled the same as the
+sites that mean "whose keys are these" — with one agent those are the same
+object, so the two names are the whole of what stops a later edit picking the
+wrong one. The alternative makes the exit code of a scripted run depend on a
+pane somebody opened by hand, which is the kind of thing that is noticed months
+later.
+
+**A pane opened afterwards that exits freezes on its last screen under a title
+saying so, and abeam stays up.** The screen is frozen because nothing clears a
+`vt100::Parser` and nothing has to: the pane goes on rendering what the child
+left. The title says so because `TerminalPane::title` appends `· exited (n)`
+once `poll_exit` has reaped the child — which `App::reap` does for *every*
+agent, and that is the load-bearing word. Nothing else in the loop calls
+`try_wait`, so an agent nobody reaped could never be observed to have left, and
+its border would go on naming a live session while `has_exited` answered `false`
+to the readiness read and to the selection hand-off, both of which consult it
+before they will type at a pty.
 
 `any_shell_live`'s rule extends unchanged and should: a live agent holds the
-door open at quit for exactly the reason a live shell does, and the title
-already has a place to say why abeam is still here.
+door open at quit for exactly the reason a live shell does, and the title says
+which — `another agent · Alt+Q to quit`, or `shell open · Alt+Q to quit`, one of
+the two and never both, with the agent leading because it is the more expensive
+thing to end. Without that word the window merely looks stuck, and the one thing
+the reader needs to know is that something of theirs is still running.
+
+**Closing a live agent is the exit contract's other half, and it is the most
+destructive thing in the program.** `agents[0]` may never be closed — its exit
+is the status code — and every other pane may, twice over, from the worktree
+list. The kill itself is nobody's code: removing the element drops the `Agent`,
+the `TerminalPane` and the `PtySession`, whose `Drop` kills the child and then
+closes the process group or job object it was started in, so a `cargo build` the
+agent had running goes with it rather than being orphaned onto `init`. That is
+the same teardown every child gets at the end of a session and it has the
+`abeam-pty` test named for it; a second explicit kill here would be a second
+thing to keep correct.
+
+**Why the key is in a list and not at the pane**, which is the one decision in
+this phase that reads like an inconvenience and is not. `x` at an agent pane is
+legal only because the child has exited: there is no process left to hold a
+binding, so the letter cannot shadow anything. A live child *is* listening.
+Intercepting `x` in front of one eats the letter out of every word typed at it;
+forwarding it and arming a confirmation anyway makes `box`, or any second `x` in
+a sentence, end a running session. And there is no global left — `docs/keymap.md`
+records the `Alt` namespace as close to spent, and taking a new letter means
+repeating that document's whole extraction against three agents' current builds,
+which is a claim nobody can make on an afternoon. What remains is the exemption
+the worktree list already stands on, which is where `a` lives, and the detour
+turns out to be part of the guard: `Alt+G`, `w`, find the row, `x`, `x` is
+harder than two presses at a dead pane by about the margin a running agent
+deserves. The confirmation is drawn on the border of the pane it would destroy
+rather than in the list, because `x` `x` in a list is two presses on a key with
+no memory of what it destroyed.
+
+Two panes in one checkout are one row, and abeam refuses rather than guessing —
+the answer counts them and says `F4` to the one you mean, which makes the
+gesture two-factor exactly where it is ambiguous.
 
 ## What it costs, said out loud
 
@@ -448,10 +585,16 @@ pass.
    collapsed row, per-pane mouse routing, and the resize of *every* pane rather
    than the current one — which was a live bug from the moment phase 2 could
    make a pane you were not looking at.
-4. **The rest of the contract.** Queue targeting by pane id, the exit rule —
-   including what closing a *live* agent means, which phase 3 deliberately left
-   refused — and `docs/status.md` updated. `docs/keymap.md` has been kept
-   current as each key landed rather than left to this phase.
+4. ~~**The rest of the contract.**~~ **Done.** Queue targeting by pane id, with
+   the target stamped at enqueue and an orphan when the pane it names has gone;
+   the exit rule made explicit and tested, including what closing a *live* agent
+   means, which phase 3 deliberately left refused. Two things this list did not
+   have: the closing key had to move rooms — a live child is listening, so `x`
+   ended up in the worktree list rather than at the pane — and
+   `workspace::rows` gained a guaranteed row per agent, without which a pane in
+   a worktree git has stopped naming would have had no way out. `docs/keymap.md`
+   has been kept current as each key landed; `docs/status.md` is updated here,
+   and its entry is mostly about what nobody has watched work.
 
 Each phase ships something on its own, and phase 1 shipped nothing, which was
 the point of it.
@@ -489,17 +632,21 @@ untouched.
 
 ## Open questions
 
-- ~~**Closing a pane.**~~ **Half answered, and the half that is left is the
-  hard one.** Phase 3 closes a pane whose child has **already exited**: `x` at
-  it, twice, `Alt+Q`'s double-press one pane down. It is not the key this
-  section guessed at — not a list, and not `q`, which is documented as the way
-  *out* of the right pane and would have taught one letter for "leave this" and
-  "destroy this" — and the safety argument is not the one phase 2's list gives
-  either: the letter is legal in the left column because *the child that would
-  have received it has gone*. Killing a **live** agent is still refused, in a
-  sentence, and is phase 4's with the exit contract. What closing already
-  destroys is a frozen last screen and its scrollback, which is what the second
-  press is for.
+- ~~**Closing a pane.**~~ **Answered, in two places, and the section's own guess
+  was half right in a way worth recording.** It guessed a key in a list; phase 3
+  put the easy half in the left column instead — `x` twice at a pane whose child
+  has **already exited**, `Alt+Q`'s double press one pane down — on a safety
+  argument this section did not anticipate: the letter is legal there because
+  *the child that would have received it has gone*. Phase 4 then found that the
+  hard half could not go in the same room, because a live child is listening,
+  and put `x` twice on a row of the worktree list, which is where this section
+  guessed it would be all along. So the answer is a bare letter in two places
+  with two different arguments for it, and the wording differs — `close this
+  pane` against `kill this running agent` — because what the second press
+  destroys differs: a frozen screen and its scrollback, or a turn somebody is
+  paying for. `q` was refused in both: it is documented as the way *out* of the
+  right pane, and one letter for "leave this" and "destroy this" is a shared
+  vocabulary teaching a mistake.
 - **How many is too many?** Still open, and now with two measurements against
   it. The rows floor is a soft cap that bites earlier than it sounds — 28 rows
   for two agents, 42 for three — so a 24-row terminal is capped at one whole
@@ -516,3 +663,21 @@ untouched.
   session's would need a second cursor or pinning, and either is a feature.
 - **The diag pane** reads the current agent's `diagnostics()`, which is almost
   certainly right and is still worth one sentence in its border saying which.
+- **A queued item cannot be re-aimed.** New in phase 4 and named in the queue
+  section: the target is stamped when the item is written and nothing moves it,
+  which is the property that whole section exists to protect, and it was easy to
+  hold because nothing offers the feature. Somebody who writes three prompts and
+  then realises they meant the other pane has to write them again. The honest
+  form is a key in the queue's own list, which needs no audit; the reason it is
+  not there is that a key which re-points a prompt is a key that can misdeliver
+  one, and it wants its own argument rather than a spare afternoon.
+- **Two agents in one checkout are one row, and one name.** The worktree list
+  counts them and cannot tell them apart, so `x` there refuses and points at
+  `F4`; the queue's rows call both by the same worktree label. A position would
+  distinguish them and is exactly what closing a pane changes, so it is the one
+  thing that must not be used. What would fix it is a name a person chose —
+  panes have none, and giving them one is a feature with a keystroke and a
+  border in it.
+- **Nobody has watched any of this work.** Not an open question about the
+  design, and the most important line in the section all the same. See
+  `docs/status.md`, which is the document that keeps tests and use apart.

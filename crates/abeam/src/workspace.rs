@@ -416,21 +416,36 @@ pub struct Row {
 /// stopped naming because a child is still running in it, which is exactly the
 /// moment the right pane may be pointed at it.
 ///
-/// **`agents` is deliberately not a third guarantee**, and the gap is worth
-/// naming rather than closing on the way past. An agent is started *from* a row
-/// of this list, so its root has one by construction; the only way to lose it
-/// is `git worktree remove` under a live pane, and then the honest thing is
-/// that the list stops mentioning a worktree git has stopped having. A row
-/// synthesised for it would be a row nothing else on screen agrees exists.
-/// What that costs is a count that vanishes while the pane it counts does not,
-/// and phase 4's per-pane roster is where that is answered.
+/// **Every agent's root is a third guarantee, and it stopped being optional in
+/// phase 4.** It was declined once, on the argument that an agent is started
+/// *from* a row of this list so its root has one by construction, that the only
+/// way to lose it is `git worktree remove` under a live pane, and that a row
+/// synthesised for a worktree git has stopped having would be a row nothing
+/// else on screen agrees exists. Two things were wrong with that.
+///
+/// The first is that the premise was too narrow: `at` drops off the list
+/// whenever `crate::app::sync_workspaces` retains a workspace git has stopped
+/// naming, and an agent standing in one of those is in exactly the same
+/// position with no guarantee of its own. The second is what the row is now
+/// *for*. `x` twice on a row is how a **live** agent is closed —
+/// `crate::app::App::agent_in` resolves the row's root to a pane — so an agent
+/// whose root has no row is an agent that cannot be closed at all, in the one
+/// list that is meant to be the roster of them. A missing row was a cosmetic
+/// undercount; it is now a pane with no way out.
+///
+/// What it costs is the thing that argument was right about: a row naming a
+/// directory `git worktree list` no longer does. That is the honest report of
+/// the state — there really is a child of abeam's standing there — and the row
+/// carries a directory name rather than a branch, which is what
+/// [`dir_label`] is for.
 ///
 /// They are added in front rather than appended, so that the workspace you are
-/// in and the one abeam was started in are the first things on a list you
-/// opened to find them, and git's own order is otherwise untouched. Nothing is
-/// added when git named the directory itself: a discovered row carries a branch
-/// name and a synthesised one can only carry a directory name, and the branch
-/// is the better answer wherever it is available.
+/// in, the one abeam was started in, and the ones its agents are standing in
+/// are the first things on a list you opened to find them, and git's own order
+/// is otherwise untouched. Nothing is added when git named the directory
+/// itself: a discovered row carries a branch name and a synthesised one can
+/// only carry a directory name, and the branch is the better answer wherever it
+/// is available.
 pub fn rows(
     worktrees: &[Worktree],
     roster: &[Session],
@@ -459,13 +474,13 @@ pub fn rows(
         watched: watch_root.is_some_and(|watched| paths::under(watched, root)),
     };
 
-    let mut rows: Vec<Row> = Vec::with_capacity(worktrees.len() + 2);
-    for root in [session_root, at] {
+    let mut rows: Vec<Row> = Vec::with_capacity(worktrees.len() + agents.len() + 2);
+    for root in [session_root, at].into_iter().chain(agents.iter().copied()) {
         let known = worktrees
             .iter()
             .any(|worktree| paths::same_dir(&worktree.root, root))
-            // ...and against what has already been added, because `at` and
-            // `agent_root` are the same directory in most sessions.
+            // ...and against what has already been added, because these three
+            // are the same directory in most sessions.
             || rows.iter().any(|row| paths::same_dir(&row.root, root));
         if !known {
             rows.push(row_for(root, dir_label(root)));
@@ -1012,6 +1027,60 @@ mod tests {
             "the branch name, not the directory"
         );
         assert!(ordinary[0].here && ordinary[0].agents_here == 1);
+    }
+
+    /// An agent standing where git names nothing still gets a row.
+    ///
+    /// **The third guarantee, and it is the one that stopped being cosmetic.**
+    /// This list is the roster of abeam's own panes and, since phase 4, the
+    /// only place a *live* agent can be closed: `x` twice on a row, resolved
+    /// through `crate::app::App::agent_in`. An agent whose root has no row is
+    /// therefore an agent with no way out, in the very list that is meant to be
+    /// its roster.
+    ///
+    /// The session's own root is deliberately somewhere else here. Reading the
+    /// guarantee off `session_root` would cover this case by accident in every
+    /// session that started at the top of a repository, which is most of them,
+    /// and the two really are different questions — see this function's own
+    /// argument about what conflating them costs.
+    #[test]
+    fn an_agent_in_a_worktree_git_has_stopped_naming_keeps_its_row() {
+        let worktrees = [on_branch(Path::new(ROOT), "main")];
+        let removed = nested("removed-under-a-live-pane");
+
+        let listed = rows(
+            &worktrees,
+            &[],
+            Path::new(ROOT),
+            // Two agents: the session's at the root git does name, and one in a
+            // worktree it does not.
+            &[Path::new(ROOT), removed.as_path()],
+            Path::new(ROOT),
+            Some(Path::new(ROOT)),
+        );
+        assert_eq!(listed.len(), 2, "the pane in {removed:?} has no row");
+        assert_eq!(
+            listed[0].label, "removed-under-a-live-pane",
+            "named by its directory, because git has no branch to offer"
+        );
+        assert_eq!(listed[0].agents_here, 1);
+        assert!(!listed[0].here, "the right pane is not standing there");
+        // ...and the row git did name is untouched, still carrying its branch.
+        assert_eq!(listed[1].label, "main");
+        assert_eq!(listed[1].agents_here, 1);
+
+        // Two agents in one undiscovered worktree is one row and a count of
+        // two, which is what stops this being a list with duplicates in it.
+        let both = rows(
+            &worktrees,
+            &[],
+            Path::new(ROOT),
+            &[removed.as_path(), removed.as_path()],
+            Path::new(ROOT),
+            None,
+        );
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0].agents_here, 2);
     }
 
     #[test]

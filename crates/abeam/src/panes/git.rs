@@ -160,6 +160,63 @@ pub struct GitPane {
     /// at a worktree and then work in it — a request that silently overwrote
     /// the other.
     agent: Option<PathBuf>,
+    /// The worktree an `x` has been pressed at **once**, waiting to be meant.
+    ///
+    /// **The most destructive thing in the program is asked for here and not in
+    /// the left column, and the reason is a key rather than a preference.**
+    /// `crate::app::App::close_key` claims `x` at an agent pane whose child has
+    /// **exited**, and the whole of what makes a bare letter legal there is
+    /// that the child which would have received it has gone. A *live* agent is
+    /// listening: intercepting `x` in front of one would eat the letter out of
+    /// every word somebody types at it, and forwarding it and arming a
+    /// confirmation anyway would make `box` — or any second `x` in a sentence —
+    /// kill a running session. Neither is a program anybody can type at. There
+    /// is no global left to spend either; `docs/keymap.md` records the `Alt`
+    /// namespace as close to spent and a new letter would need an audit of
+    /// three agents' shipped defaults, which is a claim nobody can make on an
+    /// afternoon.
+    ///
+    /// This list is where the key can be claimed, and it is also where it
+    /// belongs: `a` on a row starts an agent there, the occupancy column says
+    /// how many are standing there, and `x` is the same gesture undone. The
+    /// comment above [`Mode`] states the exemption once — a key claimed inside
+    /// a view that is only up while the right pane has focus is never delivered
+    /// while anything is being typed at an agent — and `w`, `Enter`, `Esc` and
+    /// `a` have stood on it since this list existed.
+    ///
+    /// **Pane-local like the queue's `d`, and not
+    /// `crate::app::App::pending_close`.** That one is cleared by the next key
+    /// wherever it goes, which is a stronger guard and an unavailable one:
+    /// `handle_key` takes it before any pane is offered the keystroke, so it is
+    /// already gone by the time the shell drains this pane's request. What is
+    /// kept instead is the same shape one level down — the question is taken at
+    /// the top of [`worktree_key`](Self::worktree_key), so any other key in
+    /// this list is the answer no, and the shell cancels it when the view
+    /// leaves the screen.
+    ///
+    /// **The gap that leaves, and what stands in it.** A question armed here
+    /// survives `F4` to an agent and back, for as long as the list is the view
+    /// on screen — which is deliberate, because `F4` is exactly how a reader
+    /// says *which* pane they mean when two share a checkout, and a guard that
+    /// withdrew on focus would make that path impossible. What keeps a
+    /// long-lived question honest is that it is not a memory: the border of the
+    /// pane it would destroy carries the words for the whole time it stands, so
+    /// a second press an hour later is made in front of the same sentence the
+    /// first one was. That is a stronger disclosure than either `Alt+Q`'s or
+    /// the queue's `d`, which say what they are about in a title the reader may
+    /// have looked away from.
+    ///
+    /// It holds the *root* rather than an agent, because a root is all this
+    /// pane knows. Which agent that names, and whether it may be closed at all,
+    /// is `crate::app::App::agent_in`'s answer and is re-asked on the second
+    /// press rather than remembered from the first.
+    kill: Option<PathBuf>,
+    /// The worktree `x` asked about twice, waiting to be drained by the shell.
+    ///
+    /// A third request slot for [`agent`](Self::agent)'s reason, one key along:
+    /// the two act on opposite halves of the same list and neither may
+    /// overwrite the other.
+    close: Option<PathBuf>,
     /// The list has been opened at least once. Sticky, and read by the shell:
     /// occupancy comes from `claude agents --json`, which is a *process*, and
     /// the rule `crate::app` keeps is that a session which never uses a feature
@@ -225,6 +282,8 @@ impl GitPane {
             wt_scroll: Scroll::default(),
             workspace: None,
             agent: None,
+            kill: None,
+            close: None,
             worktrees_wanted: false,
         };
         pane.rebuild();
@@ -310,6 +369,40 @@ impl GitPane {
     /// sitting fires late, and this one fires by starting a *process*.
     pub fn take_agent_request(&mut self) -> Option<PathBuf> {
         self.agent.take()
+    }
+
+    /// The worktree the user pressed `x` on **twice**, if any.
+    ///
+    /// Drained like the two above and with more riding on it than either: what
+    /// a request left sitting fires late is the killing of a running agent.
+    pub fn take_close_request(&mut self) -> Option<PathBuf> {
+        self.close.take()
+    }
+
+    /// The worktree an `x` has been pressed at once and is waiting to be meant.
+    ///
+    /// **Peeked rather than drained, which is the opposite of the three above
+    /// and is right for this one.** A question is not a request: it belongs to
+    /// this pane until it is answered or cancelled, and the shell reads it to
+    /// draw the confirmation on the border of the pane that is about to be
+    /// destroyed. Draining it would be the shell taking the question away in
+    /// order to display it.
+    pub fn closing(&self) -> Option<&Path> {
+        self.kill.as_deref()
+    }
+
+    /// Forget the question, because the shell has found it unanswerable — no
+    /// agent stands there, or several do and this list cannot tell them apart —
+    /// or because the view has left the screen.
+    ///
+    /// **The shell has to be able to say so, and that is the whole reason this
+    /// is public.** This pane knows which worktree a row is and knows nothing
+    /// about panes; whether there is an agent to close is `crate::app`'s
+    /// question. A confirmation offered for something the program will then
+    /// refuse is a border promising what it will not do, which is the failure
+    /// `App::cannot_close` is shaped around.
+    pub fn cancel_close(&mut self) {
+        self.kill = None;
     }
 
     /// Whether anything has asked to see the worktree list yet.
@@ -562,7 +655,19 @@ impl GitPane {
     /// pane shares and the one thing a bare letter here can really collide
     /// with: `j k g G b` and space are spoken for there, `d` and `u` under
     /// `Ctrl`, and `a` is none of them.
+    ///
+    /// **`x` needed no audit either, and it needs the exemption more than `a`
+    /// does.** See [`kill`](Self::kill): it is the gesture that ends a running
+    /// agent, it cannot live in the left column because a live child is
+    /// listening there, and there is no global left to give it. Against
+    /// `crate::scroll`'s shared vocabulary — `j k g G b`, space, `Ctrl+d`,
+    /// `Ctrl+u` — `x` is free, as `a` was.
     fn worktree_key(&mut self, key: KeyEvent) -> Handled {
+        // Taken before a single key is matched, so that *any* other key in this
+        // list is the answer no. The same shape the queue's `d` has and the
+        // same shape `Alt+Q`'s double press has one level up; only the `x` arm
+        // below puts it back.
+        let asked = self.kill.take();
         match key.code {
             KeyCode::Tab | KeyCode::Down => self.wt_select(1),
             KeyCode::BackTab | KeyCode::Up => self.wt_select(-1),
@@ -595,6 +700,35 @@ impl GitPane {
             KeyCode::Char('a') => match self.worktrees.get(self.wt_sel) {
                 Some(row) => {
                     self.agent = Some(row.root.clone());
+                    Handled::Yes
+                }
+                None => Handled::No,
+            },
+            // The inverse of `a`, and the one key in this list that destroys
+            // something. Two presses, because it is what ends a running agent —
+            // a turn somebody is paying for, and a conversation nothing in
+            // abeam can get back.
+            //
+            // **The question is asked about the row, and answered about the
+            // row.** Carried rather than trusted to `wt_sel`, exactly as the
+            // queue's `Confirm::Delete` carries the text it asked about: `x`,
+            // `Tab`, `x` would otherwise be one warning shown about one
+            // worktree and a kill performed in another. `Tab` cancels it
+            // anyway, by the `take` at the top — this is the second fence, and
+            // the cheaper of the two guarantees should not be the only one in
+            // front of the only unrecoverable action in the program.
+            //
+            // What is *on screen* while the question stands is not here: the
+            // shell draws it on the border of the pane that is about to be
+            // destroyed, which is the one thing this pane cannot name. See
+            // [`closing`](Self::closing).
+            KeyCode::Char('x') => match self.worktrees.get(self.wt_sel) {
+                Some(row) => {
+                    if asked.is_some_and(|root| root == row.root) {
+                        self.close = Some(row.root.clone());
+                    } else {
+                        self.kill = Some(row.root.clone());
+                    }
                     Handled::Yes
                 }
                 None => Handled::No,
