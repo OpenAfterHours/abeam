@@ -31,6 +31,7 @@
 
 use std::io::{BufWriter, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::atomic;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
@@ -368,14 +369,23 @@ impl Space {
     }
 }
 
+/// Where [`Agent::id`] comes from.
+///
+/// A counter and not a random number, because the only property asked of it is
+/// that no two panes in one window share one. It is never written down and
+/// never compared across processes, and a restart resets it — which is exactly
+/// the lifetime of the vector whose elements it names.
+static NEXT_AGENT_ID: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
 /// One hosted agent, and everything that is about *it* rather than about the
 /// session it is running in.
 ///
-/// **The six fields below were on `App` and were all secretly about the left
-/// pane.** Finding them was most of this refactor and none of it is arbitrary:
-/// each is keyed to one child. The probe is keyed by pid, cwd and the session
-/// ids it has disowned — one session's record, and asking it about a second
-/// child would be asking it about a process it has never heard of. A
+/// **Six of the fields below were on `App` and were all secretly about the
+/// left pane** — the pane, the probe, the draft, the pending submit, the exit
+/// and the rect. Finding them was most of this refactor and none of it is
+/// arbitrary: each is keyed to one child. The probe is keyed by pid, cwd and
+/// the session ids it has disowned — one session's record, and asking it about
+/// a second child would be asking it about a process it has never heard of. A
 /// half-written composer belongs to the agent it was typed at, and so does the
 /// `Enter` still owed to it. An exit status is one child's. And a pty is sized
 /// from the rect that drew it, which is a different rect per pane.
@@ -391,6 +401,25 @@ impl Space {
 /// Two strings, two questions, and collapsing them would let a preset named
 /// "reviewer" acquire or lose background dispatch on the strength of its label.
 struct Agent {
+    /// This agent, named in a way that survives the list it is in changing
+    /// length.
+    ///
+    /// **The three obvious identities are each ruled out by something already
+    /// written down.** A position is not one: `sync_workspaces` spends a
+    /// paragraph on why an index does not survive a list a worker thread can
+    /// reorder, and panes come and go on a keystroke. A pid is not one either —
+    /// `crate::agentstate::Probe::disown` refuses pids for exactly this reason,
+    /// because the kernel hands them out again and a stale pid is a future
+    /// process mistaken for a past one. And [`root`](Self::root) is not unique:
+    /// two agents in one checkout is an ordinary thing to want.
+    ///
+    /// Nothing reads it yet. It is here now because [`Agent::new`] is the only
+    /// constructor there will ever be, so a field added on the day the queue
+    /// needs to address a pane would be a field the second spawn site could be
+    /// written without — and a `Send` item aimed at nobody is a prompt typed
+    /// into whichever composer happened to be in front.
+    #[expect(dead_code, reason = "read by the queue's per-pane targeting")]
+    id: u64,
     pane: TerminalPane,
     /// Reads this agent's own record of whether it is mid-turn. See
     /// `crate::agentstate` — this is the only thing standing between a queued
@@ -411,6 +440,14 @@ struct Agent {
     /// and abeam started it in the repository it was pointed at. Writing one of
     /// them in terms of the other would make that coincidence into a rule, and
     /// the first agent started in a worktree would then re-root the watcher.
+    ///
+    /// Only the probe reads it today, and that is not an oversight to tidy
+    /// away. Its two other readers are the spawn that opens a pane in the
+    /// workspace the right pane is on, and the worktree list once
+    /// `workspace::rows` can be handed more than one agent's root — see
+    /// [`App::refresh_worktree_rows`], which explains why it must not be handed
+    /// *this* one in place of the repository's.
+    #[expect(dead_code, reason = "read by the per-pane spawn and worktree rows")]
     root: PathBuf,
     /// Whether the user has typed something at this agent that they have not
     /// submitted.
@@ -420,6 +457,25 @@ struct Agent {
     /// through [`App::handle_key`]. A queued prompt sent while this is true
     /// would be spliced into the middle of a half-written message, which is the
     /// failure nobody would think to look for.
+    ///
+    /// **`QueuePane` keeps a second copy of this and there is now one of these
+    /// per agent, which is the mismatch a cycling key turns into the bug
+    /// above.** The queue's copy is what its own send gate reads; this one is
+    /// what maintains it. They cannot disagree today, because every write moves
+    /// both halves in the same statement and there is one agent to write about.
+    /// The first key that moves [`App::at_agent`] ends that: with the keys at
+    /// agent 1, [`App::poll_readiness`] reads *its* record, sees it go busy,
+    /// and clears the queue's single flag — while agent 0 is still sitting on
+    /// an unsubmitted sentence nobody has withdrawn. One idle pass at agent 0
+    /// after that and the queue types a prompt into the middle of it, which is
+    /// precisely the splice this pair of flags exists to prevent, arrived at by
+    /// two mechanisms that were each individually correct.
+    ///
+    /// So the gate has to learn which agent it is gating before the cursor can
+    /// move — a `set_draft_open` that names a pane, or a queue that asks rather
+    /// than being told. Not a phase-1 problem and not a phase-1 fix: with one
+    /// agent the two flags are one flag, and widening the queue's interface for
+    /// a caller that does not exist would be a second thing to keep true.
     draft_open: bool,
     /// A sent prompt is sitting in this agent's composer, waiting for the
     /// `Enter` that submits it on the next pass. See [`App::pump_queue`].
@@ -458,6 +514,10 @@ impl Agent {
             .unwrap_or(0);
         let probe = Probe::new(root.clone(), pane.process_id(), spawned_at);
         Self {
+            // Relaxed, because nothing is ordered against it: the only property
+            // wanted is that two calls answer differently, and `fetch_add` is
+            // that on its own whatever the ordering.
+            id: NEXT_AGENT_ID.fetch_add(1, atomic::Ordering::Relaxed),
             pane,
             probe,
             root,
@@ -531,6 +591,17 @@ pub struct App {
     /// [`App::current`] can index rather than answer an `Option` nobody has a
     /// sensible fallback for.
     ///
+    /// **Nothing upholds either of them yet, and the difference from `spaces`
+    /// is worth being exact about.** That field names
+    /// [`App::set_workspace`] and [`App::sync_workspaces`], which is a promise
+    /// with an enforcer; this one holds because the vector is built with one
+    /// element and no code path appends, removes or reassigns. A key that moves
+    /// this cursor needs the enforcer that `set_workspace` already is — one
+    /// function that refuses an index it cannot use — and the key that closes a
+    /// pane needs the half of `sync_workspaces` that reconciles by identity
+    /// (see [`Agent::id`]) rather than by position. Until both exist, what is
+    /// written above is a description of the code and not a guarantee it makes.
+    ///
     /// A `Vec` and an index rather than a map, and that is a borrow decision
     /// rather than a taste one, for the reason spelled out three fields below:
     /// `at_agent` is a `Copy` `usize` that can be read *before* the index,
@@ -552,9 +623,12 @@ pub struct App {
     ///
     /// **Two invariants, upheld by [`App::sync_workspaces`] and
     /// [`App::set_workspace`] and relied on by every accessor below.**
-    /// `spaces[0].root` is the agent's own root and is never removed — it is the
-    /// one workspace that exists before git has said anything and the one that
-    /// survives git saying nothing. And `at < spaces.len()`, so
+    /// `spaces[0].root` is the root abeam was started on and is never removed —
+    /// it is the one workspace that exists before git has said anything and the
+    /// one that survives git saying nothing. It is [`App::root`] and not
+    /// [`Agent::root`], which are the same path today and are two different
+    /// facts; see the note in [`App::refresh_worktree_rows`] about what reading
+    /// it as the agent's would cost. And `at < spaces.len()`, so
     /// [`App::workspace`] can index rather than answer an `Option` nobody has a
     /// sensible fallback for.
     ///
@@ -731,13 +805,21 @@ pub struct App {
     ///
     /// `crate::agent::Hosted::agent`: the built-in a preset resolves to, so a
     /// Claude preset arrives here as `claude` whatever it was called in the
-    /// config file. [`App::has_claude_state`] is the whole of what it decides —
-    /// whether the readiness probe and the background roster mean anything —
-    /// and it is also what each workspace's ask pane is built with. That makes
-    /// it a fact about the session rather than about a child, which is why it
-    /// did not move into [`Agent`] with the six fields that did. The word that
-    /// appears in the border is `TerminalPane::title`, from `Hosted::name`, and
-    /// it is a different string on purpose.
+    /// config file. [`App::has_claude_state`] is what it decides — whether the
+    /// readiness probe and the background roster mean anything — and it is also
+    /// what each workspace's ask pane is built with. That makes it a fact about
+    /// the session rather than about a child, which is why it did not move into
+    /// [`Agent`] with the six that did. The word that appears in the border is
+    /// `TerminalPane::title`, from `Hosted::name`, and it is a different string
+    /// on purpose.
+    ///
+    /// **It is a session-wide answer gating a per-agent question, and that is
+    /// the seam to watch.** The probe `has_claude_state` stands in front of now
+    /// belongs to an [`Agent`]; this string does not. While every pane hosts
+    /// what abeam was started to host the two cannot disagree. A pane hosting a
+    /// *different* preset would need its kind carried beside
+    /// [`Agent::root`] — and every reader of this field re-read to ask whether
+    /// it wants the session's answer or that pane's.
     agent: String,
 }
 
@@ -844,6 +926,17 @@ impl App {
     /// somewhere to write an answer down — `crate::config` is that somewhere,
     /// and its [`Opening::default`] is exactly what they used to say.
     pub fn new(left: TerminalPane, root: PathBuf, agent: &str, opening: Opening) -> Self {
+        // **First, and the ordering is the whole of why it is a statement here
+        // rather than an expression in the literal below.** `Agent::new` reads
+        // the clock the probe compares records against, and everything after
+        // this line takes time — `Watch::start` walks a directory tree. A
+        // `spawned_at` taken after that work is a `spawned_at` the child's own
+        // record can be *older* than, and `crate::agentstate` answers that by
+        // falling through to some other session in the same repository. It
+        // memoises what it finds, so the wrong answer is stable rather than a
+        // flicker: a neighbour's `idle` reported as this agent's, and a queued
+        // prompt typed at a busy composer on the strength of it.
+        let agent_pane = Agent::new(left, root.clone());
         // Bounded and small: at most one roster refresh and one dispatch are
         // ever in flight, so anything deeper would be a queue nobody drains.
         let (work_tx, work_rx) = mpsc::sync_channel::<Work>(8);
@@ -859,16 +952,17 @@ impl App {
 
         Self {
             // One agent, and the invariant that it is `agents[0]` and stays
-            // there: it is the session's, and the clock its probe wants is read
-            // inside `Agent::new` at the moment nearest the spawn.
-            agents: vec![Agent::new(left, root.clone())],
+            // there: it is the session's. Built at the top of this function,
+            // for the clock the comment up there is about.
+            agents: vec![agent_pane],
             at_agent: 0,
             git: GitPane::new(root.clone()),
             viewer,
-            // The agent's own root, and the invariant that it is `spaces[0]`
-            // and stays there. No child in it yet: it is spawned by the first
-            // frame that draws it, so a session that never asks for a command
-            // line never pays for one.
+            // The root abeam was started on, and the invariant that it is
+            // `spaces[0]` and stays there — `App::root` rather than the
+            // agent's, which are one path here and two facts. No child in it
+            // yet: it is spawned by the first frame that draws it, so a session
+            // that never asks for a command line never pays for one.
             spaces: vec![Space::new(
                 root.clone(),
                 workspace::dir_label(&root),
@@ -949,6 +1043,14 @@ impl App {
     /// keystroke apart while meaning entirely different things. `current` says
     /// the only thing that distinguishes this one from the others in the
     /// vector, which is that it is the one on the near end of the keyboard.
+    ///
+    /// **The coincidence to watch for runs in both directions.** With one agent
+    /// this, [`session_agent`](Self::session_agent) and every element of
+    /// [`agents_mut`](Self::agents_mut) are the same object, so a site that
+    /// should say one of the other two compiles, passes and is wrong later. The
+    /// question to ask at every call is not "which agent is this" but "why
+    /// *that* one": the keys are here, the exit code is the session's, and a
+    /// fact about the repository is everybody's.
     fn current(&self) -> &Agent {
         &self.agents[self.at_agent]
     }
@@ -966,14 +1068,15 @@ impl App {
     ///
     /// **A second accessor for what is today the same element, because the two
     /// questions are not the same question.** [`current`](Self::current) is
-    /// "whose keys are these"; this is "whose exit is abeam's exit". Only three
+    /// "whose keys are these"; this is "whose exit is abeam's exit". Four
     /// callers want the second one — the loop's exit check, the title that
-    /// explains why abeam is still on screen after it, and [`finish`](
-    /// Self::finish), which turns it into a status code — and they must all
-    /// name the same child or a scripted `abeam -p … && next-step` gets its
-    /// answer from whichever pane happened to be in front.
+    /// explains why abeam is still on screen after it, the `Alt+Q` that leaves
+    /// without confirming because that child has already gone, and
+    /// [`finish`](Self::finish), which turns the status into abeam's own — and
+    /// they must all name the same child or a scripted `abeam -p … &&
+    /// next-step` gets its answer from whichever pane happened to be in front.
     ///
-    /// Writing `current()` at those three sites would be right by coincidence
+    /// Writing `current()` at those four sites would be right by coincidence
     /// while there is one agent and wrong the moment there are two, in a way no
     /// test written today could catch.
     fn session_agent(&self) -> &Agent {
@@ -983,6 +1086,20 @@ impl App {
     /// The same, mutably, and for the same reason.
     fn session_agent_mut(&mut self) -> &mut Agent {
         &mut self.agents[0]
+    }
+
+    /// All of them, for the facts that are not about any one.
+    ///
+    /// **A spelling for "every agent", so that the sites which mean it look
+    /// different from the sites which mean the current one.** Two things told
+    /// to a [`Probe`] are like this and neither is about the keyboard: the
+    /// worktree list is the repository's, and a disowned session id is abeam's
+    /// own reader, which *any* probe could otherwise adopt and then report a
+    /// reader's `idle` as its child's. With one agent a loop and an index are
+    /// indistinguishable; the point of the loop is that it stays right when
+    /// they stop being.
+    fn agents_mut(&mut self) -> impl Iterator<Item = &mut Agent> {
+        self.agents.iter_mut()
     }
 
     // --- the workspaces --------------------------------------------------
@@ -1212,9 +1329,10 @@ impl App {
             .iter()
             .position(|space| paths::same_dir(&space.root, &at_root))
             // Unreachable: the space `at` pointed at is one of the three that
-            // are never removed. Falling back to the agent's root rather than
-            // panicking, because a wrong workspace is a thing somebody can see
-            // and press a key about, and an aborted session is not.
+            // are never removed. Falling back to the root abeam was started on
+            // rather than panicking, because a wrong workspace is a thing
+            // somebody can see and press a key about, and an aborted session is
+            // not.
             .unwrap_or(0);
     }
 
@@ -1229,12 +1347,21 @@ impl App {
         let rows = workspace::rows(
             &self.worktrees,
             &self.roster,
-            // The agent's own root, from the agent, and no longer from
-            // [`App::root`] by way of the two being equal. `workspace::rows`
-            // marks that row `agent_here`, so what it is asking is where the
-            // child is standing — and the fifth argument below, the watcher's,
-            // is the other question and stays on the repository.
-            &self.current().root,
+            // The root abeam was started on, and **deliberately not
+            // [`Agent::root`]**, however much the parameter's name invites it.
+            // `workspace::rows` guarantees this argument a row whatever git
+            // said, and `spaces[0]` is built from the same path — which is what
+            // makes the one workspace that is never removed always reachable
+            // from the `w` list. Handing it the *current* agent's root instead
+            // would drop that guarantee the first time the two differ, and
+            // silently: a session started in a subdirectory of the repository
+            // is one git does not name, so `spaces[0]` would simply have no row
+            // to switch back to.
+            //
+            // The honest end state is plural — every agent's root gets a row —
+            // and that is a change to `rows`' signature, which belongs with the
+            // rest of the per-pane work rather than here.
+            &self.root,
             &self.workspace().root,
             self.watch.as_ref().map(|_| self.root.as_path()),
         );
@@ -1294,6 +1421,31 @@ impl App {
         for agent in &self.agents {
             agent.arm_waker(tx);
         }
+    }
+
+    /// Ask every agent's child whether it has gone.
+    ///
+    /// **`try_wait` is the only thing that turns a live child into an exited
+    /// one, and nothing else in the loop calls it.** `Pane::tick` reads the
+    /// parser's dirty flag — which a child that has gone answers `false` to
+    /// exactly as a child sitting idle does — so an agent nobody polled could
+    /// never be *observed* to have left. Its border would go on naming a live
+    /// session for the rest of the window, and `has_exited` would go on
+    /// answering `false` to the readiness read and to the selection's hand-off,
+    /// which both consult it before they will type at a pty.
+    ///
+    /// **Every** one, therefore, and which of them ends abeam is a different
+    /// question with a different answer — see [`App::session_agent`], which is
+    /// what the caller reads immediately after this.
+    ///
+    /// A method rather than three lines inside [`drive`](Self::drive), for
+    /// [`flush_pads`](Self::flush_pads)'s reason: a test cannot reach into the
+    /// loop, and the word this one is here to pin is *every*.
+    fn reap(&mut self) -> Result<()> {
+        for agent in self.agents_mut() {
+            agent.pane.poll_exit()?;
+        }
+        Ok(())
     }
 
     /// Write every workspace's pad, now.
@@ -1381,11 +1533,15 @@ impl App {
                 continue;
             }
 
+            self.reap()?;
+
             // The session's agent, not the current one: this is the exit that
             // becomes abeam's status code, and `session_agent` says why the two
-            // may not be spelled the same way.
+            // may not be spelled the same way. Read back rather than polled
+            // again — the loop above already asked, and `poll_exit` keeps the
+            // answer.
             if self.session_agent().exit.is_none()
-                && let Some(status) = self.session_agent_mut().pane.poll_exit()?
+                && let Some(status) = self.session_agent().pane.exit_status().cloned()
             {
                 // try_wait can report an exit while the last of the output is
                 // still in flight. Let the reader drain, then take the screen
@@ -1442,10 +1598,11 @@ impl App {
     /// that switches, so nothing is missed.
     fn tick_panes(&mut self) -> bool {
         let mut redraw = false;
-        // Every agent, for the reason the loop over the spaces below gives: a
-        // child that is never ticked is never reaped, and an agent nobody is
-        // looking at is exactly as capable of exiting as one in front of them.
-        for agent in &mut self.agents {
+        // Every agent, because every one of them can have produced something
+        // and a pane that is not asked has nothing to draw. This is *not* the
+        // loop that reaps them — `tick` reads the parser's dirty flag and
+        // nothing else; [`drive`](Self::drive) calls `poll_exit` and says why.
+        for agent in self.agents_mut() {
             redraw |= agent.pane.tick();
         }
         redraw |= self.git.tick();
@@ -2022,9 +2179,18 @@ impl App {
         let root = self.spaces[ix].root.clone();
         match AskSession::start(flavour, &launch, &root, ask::new_session_id()) {
             Ok(session) => {
-                self.current_mut()
-                    .probe
-                    .disown(session.session_id().to_string());
+                // **Every probe, and not the current one.** This function is
+                // reached with a workspace index and has nothing to do with
+                // which pane has the keyboard, so "the agent this is about" was
+                // never a question it could answer. What is being disowned is a
+                // Claude abeam started itself, one that writes records in this
+                // repository like any other — so a probe that had not been told
+                // would be free to adopt it and report a reader's `idle` as its
+                // own child's. Idempotent, so the loop costs nothing.
+                let id = session.session_id().to_string();
+                for agent in self.agents_mut() {
+                    agent.probe.disown(id.clone());
+                }
                 self.spaces[ix].ask_session = Some(session);
             }
             Err(why) => self.spaces[ix].ask.note(format!("{why:#}")),
@@ -2317,9 +2483,18 @@ impl App {
                     // spells out that discovery is strict and only revalidation
                     // consults this list, precisely because what is being handed
                     // over here is a list with the neighbours on it.
-                    self.current_mut().probe.set_worktrees(
-                        found.iter().map(|worktree| worktree.root.clone()).collect(),
-                    );
+                    //
+                    // Every probe, because what git printed is a fact about
+                    // the repository rather than about whichever pane has the
+                    // keyboard. This list arrives on a ten-second timer, so an
+                    // agent that routing missed is not late — it is one that
+                    // will be missed again, and the paragraph above says what
+                    // that costs.
+                    let roots: Vec<PathBuf> =
+                        found.iter().map(|worktree| worktree.root.clone()).collect();
+                    for agent in self.agents_mut() {
+                        agent.probe.set_worktrees(roots.clone());
+                    }
                     self.worktrees = found;
                     // A frame only if the list is the thing on screen. This
                     // runs every ten seconds for the whole session, and a
@@ -3999,7 +4174,7 @@ mod tests {
     /// have come from the second, which is exactly what a loop that stopped at
     /// index 0 would never deliver.
     #[test]
-    fn arming_the_wakers_reaches_every_agent() {
+    fn an_agent_nobody_is_watching_still_rings_the_loop_when_it_writes() {
         let mut fx = app();
         let staying = asks_and_stays(&fx.dir);
         let pane = TerminalPane::spawn_with(staying).expect("a child in a pty");
@@ -4047,6 +4222,47 @@ mod tests {
             );
         }
         assert!(rang, "the second agent's output rang nothing");
+    }
+
+    /// An agent that is neither current nor the session's is still reaped.
+    ///
+    /// The sibling of the waker test and the same shape of failure. `try_wait`
+    /// is the only call that turns a live child into an exited one, so a pane
+    /// the loop skipped would go on reporting a session that ended minutes ago
+    /// — to the border, to the readiness read, and to the selection's hand-off,
+    /// which refuses to type at a pty it believes is gone and happily types at
+    /// one it believes is not.
+    ///
+    /// `at_agent` is left at 0, so the agent this is really about is neither
+    /// the one with the keys nor the one that ends the session. Nothing but the
+    /// word *every* reaches it.
+    #[test]
+    fn an_agent_that_is_neither_current_nor_the_sessions_is_still_reaped() {
+        let mut fx = app();
+        second_agent(&mut fx);
+
+        assert!(
+            !fx.app.agents[1].pane.has_exited(),
+            "nothing has asked yet, so nothing can know yet"
+        );
+
+        // Both children leave on their own; the wait is for the operating
+        // system rather than for abeam, which is why it is a deadline and not a
+        // fixed pause.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.app.agents[1].pane.has_exited() && Instant::now() < deadline {
+            fx.app.reap().expect("try_wait on a child that exists");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            fx.app.agents[1].pane.has_exited(),
+            "an agent that is neither current nor the session's was never reaped"
+        );
+        assert!(
+            fx.app.agents[0].pane.has_exited(),
+            "and the session's agent was skipped on the way past it"
+        );
     }
 
     // --- the queue's two wires, and what stands between them and the pty ---
