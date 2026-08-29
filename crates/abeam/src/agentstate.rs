@@ -651,6 +651,33 @@ impl Probe {
         }
     }
 
+    /// What this probe has been told, for the one question a behavioural test
+    /// cannot ask.
+    ///
+    /// **A pair of readers rather than a test that plants records, because the
+    /// subject is a probe that was built with neither.** `crate::app` seeds a
+    /// pane opened on a keystroke from what the session already knows — the
+    /// repository's worktrees and the sessions abeam has disowned — and both
+    /// arrive here as an absence when they are forgotten: an `Unknown` that
+    /// looks exactly like the feature having been deleted, and an `Idle`
+    /// belonging to somebody else. Neither absence can be told from the
+    /// outside on a probe reading the machine's real `~/.claude`, and
+    /// [`Probe::over`] cannot help, because replacing the probe is replacing
+    /// the thing under test.
+    ///
+    /// `#[cfg(test)]` and `pub` for that function's reason: reachable from any
+    /// test in the crate, and not part of what abeam ships.
+    #[cfg(test)]
+    pub fn disowned(&self) -> &[String] {
+        &self.disowned
+    }
+
+    /// The other half of the pair above.
+    #[cfg(test)]
+    pub fn worktrees(&self) -> &[PathBuf] {
+        &self.worktrees
+    }
+
     /// The hosted agent's record, found by pid where that works and by
     /// `(kind, cwd, started_at)` where it does not.
     ///

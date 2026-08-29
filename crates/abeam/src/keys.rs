@@ -412,7 +412,13 @@ pub const HELP: &[(&str, &str)] = &[
         "F9",
         "right pane: the scratch pad, focused (again to leave)",
     ),
-    ("F4 / F5", "move focus left / right"),
+    // The parenthetical is the whole of what a second agent costs this table.
+    // `F4` has always meant "give the keys to the left" and a second press did
+    // nothing at all, so "again" is a meaning added to a dead press rather than
+    // a key taken from anybody — which is why there is no new row here and no
+    // new audit under docs/keymap.md. One direction, because a modified F-key
+    // is deliberately not abeam's; see `global` above on `Ctrl+F12`.
+    ("F4 / F5", "move focus left / right (F4 again: next agent)"),
     ("Alt+J / Alt+K", "scroll right pane, without focusing it"),
     (
         "Alt+PgDn / Alt+PgUp",
@@ -465,6 +471,16 @@ pub const HELP: &[(&str, &str)] = &[
     // directory — a live child's cwd is the child's — so this is the one place
     // the two halves of the window deliberately disagree about where they are.
     ("Enter (worktrees)", "point the right pane at that worktree"),
+    // Beside `Enter` because they are the two keys on one row and the pair is
+    // the whole of what a reader has to hold: one moves the right pane, the
+    // other starts a child in the left column and moves neither. "another" is
+    // load-bearing — the session already has one — and "there" is the half that
+    // cannot be undone later, since a live child's working directory belongs to
+    // the child.
+    (
+        "a (worktrees)",
+        "start another agent there (F4 again reaches it)",
+    ),
     // Not "rendered markdown", which is what this said and what it stopped
     // meaning: a `.py` or a `.rs` with documentation in it is rendered too, and
     // a reader looking for the key that put their `"""` back was reading a row

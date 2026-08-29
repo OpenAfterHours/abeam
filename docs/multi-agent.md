@@ -143,7 +143,20 @@ becomes a count or a list of pane ids, and the list stops being able to say
 `PtyConfig` out of `hosted.launch.config()`, spawns the pane and hands the
 *result* to `App::new(left, root, agent, opening)`. To start an agent on a
 keystroke, `App` needs the recipe rather than the result — `hosted` itself,
-kept, so a later pane is built from the same `Launch` with a different `.cwd()`.
+kept, so a later pane is built from the same program with a different `.cwd()`.
+
+**Not from the same `Launch`, which is what this paragraph said and is the one
+correction phase 2 made to it.** A `Launch` carries the command line, and
+`abeam -p "fix the tests"` is in there: a pane opened on a keystroke and built
+from it would re-run that prompt non-interactively in a worktree nobody wrote it
+about and exit as soon as it had answered, and `--resume` would resume a
+conversation belonging to somewhere else. Blanking the arguments is not the fix
+either, and the reason is the install shape most people have: an npm `claude.cmd`
+is routed through `cmd.exe`, so the arguments are the interpreter's wrapper and
+the user's prompt is in the *environment* — dropping one and keeping the other
+keeps the prompt and loses the agent. What is kept is `Launch::target`, the file
+that does the work, and `crate::launch::resolve` is asked again with no
+arguments at all. `crate::app::Recipe` is where that lives.
 
 It is a small move and a safe one, and the safety is not incidental.
 `crate::launch`'s guarantee is that nothing leaves that module which is not an

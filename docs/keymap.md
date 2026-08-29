@@ -130,7 +130,7 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `Alt+E` | right pane → files / markdown view (focus unchanged) |
 | `Alt+S` | right pane → a shell, **and focus it**; again to hand focus back |
 | `F8` | right pane → the queue of work for the agent (focus unchanged) |
-| `F4` / `F5` | move focus left / right |
+| `F4` / `F5` | move focus left / right; `F4` again moves along the agents |
 | `Alt+J` / `Alt+K` | scroll right pane one line — **without focusing it** |
 | `Alt+PageDown` / `Alt+PageUp` | scroll right pane one page — without focusing it |
 | `Alt+Z` | zoom: hide / show the right pane |
@@ -142,6 +142,18 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `F7` | select rows of the right pane by keyboard, **and focus it**; again to put the selection away |
 | `F9` | right pane → the scratch pad, **and focus it**; again to hand focus back |
 | `Ctrl+\` or `F12` | literal-next: send the following key to the agent verbatim |
+
+**`F4`'s second meaning cost this document no audit, and that is the point of
+it.** A press while the keys are already on the left used to do nothing at all,
+so "again" is a meaning added to a dead press rather than a key taken from any
+agent — the table above is one row longer in words and no rows longer in keys.
+The gesture that *starts* another agent is `a` on a row of the worktree list,
+which is not in this table either: it is a pane-local key, claimed inside a list
+that is only up while the right pane has focus, and the exemption is
+`crates/abeam/src/panes/git.rs`'s, stated above `enum Mode` and standing since
+`w` and `Enter` were claimed there. There is no `Shift+F4` for the other
+direction, deliberately: a modified F-key is a key abeam knows nothing about and
+therefore the agent's, which `keys.rs` says in a comment about `Ctrl+F12`.
 
 **"Focus unchanged" holds in both directions.** The four rows marked so —
 `Alt+G`, `Alt+E`, `F8` and `F2` — neither take focus nor hand it back:

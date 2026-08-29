@@ -225,12 +225,17 @@ fn main() -> Result<()> {
                 .cwd(&root)
                 .size(inner.height.max(1), inner.width.max(1)),
         )?;
-        // `hosted.agent` and not `hosted.name`: what the shell needs here is
-        // what is actually taking the typing, because the question it goes on
-        // to ask is whether `--bg` is a flag it has. A preset hosting Claude
-        // answers `claude`, and a border reading `fleet` does not cost the
-        // queue its dispatch mode.
-        App::new(left, root, &hosted.agent, opening).run(&mut terminal)
+        // `hosted` whole, rather than the one string the shell used to need.
+        // Three of its fields are read and they go to three different places —
+        // `agent` decides whether `--bg` dispatch exists at all, `name` is the
+        // border's word, and `launch` is how a pane opened on a keystroke is
+        // started. That last one is the reason this is no longer a `&str`: the
+        // resolution happened up there, before `term::setup` and before abeam
+        // walked away from the repository, and `main` is the only place holding
+        // it. `crate::app::Recipe` is where the argument lives about what such
+        // a pane may inherit from the command line this function read — and the
+        // short version is nothing, because `-p` and `--resume` are in there.
+        App::new(left, root, &hosted, opening).run(&mut terminal)
     })();
 
     // Every frame ends by emptying the frame buffer, so this should have

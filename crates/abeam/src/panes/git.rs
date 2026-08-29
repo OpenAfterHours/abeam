@@ -148,6 +148,18 @@ pub struct GitPane {
     wt_scroll: Scroll,
     /// The workspace `Enter` asked for, waiting to be drained by the shell.
     workspace: Option<PathBuf>,
+    /// The worktree `a` asked for an agent in, waiting to be drained the same
+    /// way.
+    ///
+    /// A second field rather than a flag beside [`workspace`](Self::workspace),
+    /// because the two keys ask for different things about *different* halves
+    /// of the window and only one of them moves this pane: `Enter` points the
+    /// right pane somewhere else, and `a` starts a child in the left column and
+    /// leaves the list exactly where it was. Sharing one slot would make
+    /// pressing both in one batch — which is the ordinary way to use them, look
+    /// at a worktree and then work in it — a request that silently overwrote
+    /// the other.
+    agent: Option<PathBuf>,
     /// The list has been opened at least once. Sticky, and read by the shell:
     /// occupancy comes from `claude agents --json`, which is a *process*, and
     /// the rule `crate::app` keeps is that a session which never uses a feature
@@ -212,6 +224,7 @@ impl GitPane {
             wt_sel: 0,
             wt_scroll: Scroll::default(),
             workspace: None,
+            agent: None,
             worktrees_wanted: false,
         };
         pane.rebuild();
@@ -288,6 +301,15 @@ impl GitPane {
     /// left sitting fires late, at whatever unrelated moment next reads it.
     pub fn take_workspace_request(&mut self) -> Option<PathBuf> {
         self.workspace.take()
+    }
+
+    /// The worktree the user pressed `a` on, if any.
+    ///
+    /// Drained the same way and for the same reason as
+    /// [`take_workspace_request`](Self::take_workspace_request): a request left
+    /// sitting fires late, and this one fires by starting a *process*.
+    pub fn take_agent_request(&mut self) -> Option<PathBuf> {
+        self.agent.take()
     }
 
     /// Whether anything has asked to see the worktree list yet.
@@ -527,10 +549,39 @@ impl GitPane {
     /// Everything else falls through to the shared scroll vocabulary and then
     /// to `No`, including `q` — it means what it has always meant here, which is
     /// back to the agent.
+    ///
+    /// **`a` needed no `docs/keymap.md` audit and that is not an oversight.**
+    /// The invariant that document states is about *global* bindings — what
+    /// `crate::keys::global` claims before any pane is offered a key — and this
+    /// letter is claimed here, inside a list that is only up because somebody
+    /// pressed `w`, only reached while the right pane has focus, and therefore
+    /// only ever delivered when nothing is being typed at the agent. The
+    /// comment above [`Mode`] states the exemption once; `w`, `Enter` and `Esc`
+    /// have stood on it since this list existed. What the letter *is* checked
+    /// against is `crate::scroll`, which is the vocabulary every right-hand
+    /// pane shares and the one thing a bare letter here can really collide
+    /// with: `j k g G b` and space are spoken for there, `d` and `u` under
+    /// `Ctrl`, and `a` is none of them.
     fn worktree_key(&mut self, key: KeyEvent) -> Handled {
         match key.code {
             KeyCode::Tab | KeyCode::Down => self.wt_select(1),
             KeyCode::BackTab | KeyCode::Up => self.wt_select(-1),
+            // The list stays up, where `Enter` below closes it, and the
+            // difference is the whole distinction between the two keys. A
+            // switch is *for* looking at the other worktree's git, so the list
+            // has done its job and gets out of the way. Starting an agent
+            // changes nothing about what this pane is showing — the occupancy
+            // column is the only row that moves — and the ordinary next thing
+            // to do is start another one somewhere else. Closing the list to
+            // announce a child that does not appear in it would cost the
+            // reader their place for nothing.
+            KeyCode::Char('a') => match self.worktrees.get(self.wt_sel) {
+                Some(row) => {
+                    self.agent = Some(row.root.clone());
+                    Handled::Yes
+                }
+                None => Handled::No,
+            },
             KeyCode::Enter => match self.worktrees.get(self.wt_sel) {
                 Some(row) => {
                     self.workspace = Some(row.root.clone());
@@ -2731,6 +2782,44 @@ mod tests {
             &pane.take_workspace_request().expect("a switch"),
             Path::new(ONE)
         ));
+    }
+
+    #[test]
+    fn a_on_a_row_asks_for_an_agent_there_and_leaves_the_list_up() {
+        // The two keys on a row ask about the two halves of the window, and
+        // the difference shows up here: `Enter` closes the list because what a
+        // switch is for is the other worktree's git, and `a` leaves it up
+        // because the child it starts does not appear in this pane at all.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('a'))).unwrap(),
+            Handled::Yes
+        );
+        let asked = pane.take_agent_request().expect("an agent was asked for");
+        assert!(crate::paths::same_dir(&asked, Path::new(TWO)));
+        // Drained, not left to fire late — and this one fires by starting a
+        // process.
+        assert_eq!(pane.take_agent_request(), None);
+        // Nothing about the right pane was asked for, which is the half the
+        // whole feature rests on.
+        assert_eq!(pane.take_workspace_request(), None);
+        assert_eq!(
+            pane.exit_hint(),
+            "esc→git",
+            "the list closed itself over a key that does not move it"
+        );
+
+        // ...and the two requests can be made in one batch without either
+        // overwriting the other, which is the ordinary way to use them: look
+        // at a worktree, then work in it.
+        pane.handle_key(key(KeyCode::Char('a'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(pane.take_agent_request().is_some());
+        assert!(pane.take_workspace_request().is_some());
     }
 
     #[test]
