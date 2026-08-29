@@ -486,21 +486,32 @@ struct Agent {
     /// **`QueuePane` keeps a second copy of this, and only `agents[0]`'s is in
     /// step with it.** The queue's copy is what its own send gate reads, and
     /// the queue is aimed at the session's agent outright — see
-    /// [`App::pump_queue`], where the argument is — so
-    /// [`App::note_left_key`] writes the queue's copy on a keystroke at
-    /// `agents[0]` and not on one anywhere else, and [`App::poll_readiness`]
-    /// clears `agents[0]`'s and the queue's together.
+    /// [`App::pump_queue`], where the argument is. So the three sites that open
+    /// a draft — [`App::note_left_key`], the paste arm of
+    /// [`App::handle_event`], and [`App::send_selection`] — write the queue's
+    /// copy on a keystroke at `agents[0]` and not on one anywhere else, and
+    /// [`App::poll_readiness`] clears `agents[0]`'s and the queue's together.
     ///
-    /// **So this field is maintained for every agent and consulted for one, and
-    /// the difference is worth being exact about.** For `agents[0]` it is
-    /// complete: set by typing, cleared by that agent being seen busy. For a
-    /// pane opened later it is set-only — nothing clears it, because nothing
-    /// polls that pane's record — so it says "something was typed here at some
-    /// point" rather than "there is a draft here now". Nothing reads it in that
-    /// state, which is why an incomplete flag is not a bug today; it becomes
-    /// one the moment a `Send` item can be aimed at a pane other than the
-    /// session's, and that is the same change that makes readiness per-pane.
-    /// The two land together or neither does.
+    /// ## Read this before making the gate per-agent
+    ///
+    /// **For every agent but `agents[0]` this flag is write-only, and it is
+    /// stuck `true` from the first keystroke at that pane onwards.** The three
+    /// writers above set it unconditionally, which is right — a draft belongs
+    /// to the pane it was typed at — and the only thing that *clears* one is
+    /// `poll_readiness` seeing an agent go busy, which asks about `agents[0]`
+    /// and nobody else. There is no second probe read per pass and there should
+    /// not be one until something needs the answer.
+    ///
+    /// Nothing reads it in that state today, so this is not a bug. It becomes
+    /// one on the day a `Send` item can be aimed at a pane other than the
+    /// session's, because the gate would then consult a flag that has been
+    /// `true` since somebody typed a single character at that pane an hour ago
+    /// — and the symptom is the same permanent silent stall that an unguarded
+    /// writer produced here, arriving from the other direction. **The fix is
+    /// not to guard the writers.** It is that per-pane targeting and per-pane
+    /// readiness are one change: whatever polls a pane's record is also what
+    /// can clear its draft, and a `Send` aimed at a pane whose record nothing
+    /// reads is a send with no gate in front of it at all.
     draft_open: bool,
     /// A sent prompt is sitting in this agent's composer, waiting for the
     /// `Enter` that submits it on the next pass. See [`App::pump_queue`].
@@ -667,7 +678,10 @@ impl Recipe {
     /// a lossy round trip through `to_string_lossy` is a *different path*
     /// wherever it is lossy, and this one is about to be looked up on the
     /// filesystem — so a pane opened on a keystroke would refuse where the
-    /// session's own agent started fine.
+    /// session's own agent started fine. It does not make such a path *work*:
+    /// `Launch::config` converts again on the way to the pty, so an install
+    /// abeam cannot spell is one it cannot start from any pane. What goes is
+    /// the asymmetry between the first pane and the rest.
     fn launch(&self) -> Result<crate::launch::Launch, String> {
         crate::launch::resolve_at(&self.target, &[])
     }
@@ -3664,8 +3678,24 @@ impl App {
                 // has to know: it holds an automatic send back while one is
                 // open, and a queued prompt pasted on top of these rows would
                 // be one message made of two things nobody joined.
+                //
+                // **On the same condition as the other two writers**, and the
+                // guard is not symmetry for its own sake — see
+                // [`note_left_key`](Self::note_left_key), which carries the
+                // argument. Written unconditionally, the third site was a
+                // permanent silent stall rather than the splice the flag exists
+                // to prevent: `F4` to another agent, `F7`, hand a selection
+                // off, and the queue's gate shuts over a composer in a pane
+                // whose record nothing polls — so the one thing that reopens
+                // it, [`poll_readiness`](Self::poll_readiness) seeing
+                // `agents[0]` go busy, is asking about the wrong pane and never
+                // fires. The automatic send is then off for the rest of the
+                // session with nothing on screen saying why, which is the
+                // failure `crate::agentstate` refuses in almost these words.
                 self.current_mut().draft_open = true;
-                self.queue.set_draft_open(true);
+                if self.at_agent == 0 {
+                    self.queue.set_draft_open(true);
+                }
                 self.select = None;
                 self.set_focus(Focus::Left);
             }
@@ -5543,6 +5573,79 @@ mod tests {
             "the Enter that submits it went somewhere else, or nowhere"
         );
         assert!(!fx.app.agents[0].submit_pending);
+    }
+
+    /// A selection handed to another agent does not shut the gate in front of
+    /// the session's.
+    ///
+    /// **The third writer of the queue's flag, and the one that fails in the
+    /// other direction.** `F7` and `Enter` put rows in the composer of the pane
+    /// that has the keys, which is a draft like any other and is recorded on
+    /// that pane. Told to the queue as well, it shuts a gate whose only opener
+    /// is `poll_readiness` seeing `agents[0]` go busy — and `agents[0]` is not
+    /// the pane holding the draft, so nothing ever reopens it. Not a splice but
+    /// a **permanent silent stall**: the automatic send off for the rest of the
+    /// session, with nothing on screen saying why, which is the failure
+    /// `crate::agentstate` refuses by name.
+    ///
+    /// The second half is what makes the first mean something. "The gate is
+    /// open" is also what a queue with nothing in it says, so the same pass is
+    /// asked to deliver.
+    #[test]
+    fn a_selection_handed_to_another_agent_leaves_the_queues_gate_alone() {
+        let mut fx = app();
+        let _records = records_at(&mut fx, 0, "idle");
+        stays_at(&mut fx, 0);
+        second_agent(&mut fx);
+        stays_at(&mut fx, 1);
+        polled(&mut fx);
+        assert!(!fx.app.queue.is_draft_open(), "the gate is shut before it starts");
+
+        // The keys on the pane the rows will land in, which is not the one the
+        // queue types into.
+        fx.app.set_focus(Focus::Left);
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.at_agent, 1);
+
+        // Something on screen to select. The queue's own view, for
+        // `what_is_copied_is_what_was_drawn`'s reason: it is the one right-hand
+        // pane a test can put a known string into without a worker thread.
+        fx.app.queue.stub_item("handoff-check-alpha", Mode::Send);
+        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        selecting(&mut fx.app);
+        let row = fx
+            .app
+            .select_rows
+            .iter()
+            .position(|row| row.contains("handoff-check-alpha"))
+            .expect("the queue never drew the item");
+        for _ in 0..row {
+            fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        }
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            fx.app.agents[1].draft_open,
+            "the rows went into a composer and nothing recorded it"
+        );
+        assert!(
+            !fx.app.agents[0].draft_open,
+            "a hand-off to one agent opened a draft at another"
+        );
+        assert!(
+            !fx.app.queue.is_draft_open(),
+            "a hand-off to another agent shut the gate that guards the session's, \
+             and nothing polls that pane's record to open it again"
+        );
+
+        // ...and the send still goes, to the pane it was always for.
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(fx.app.pump_queue(), "a send is worth a frame");
+        assert!(
+            fx.app.agents[0].submit_pending,
+            "the automatic send was stalled by a draft in another pane"
+        );
     }
 
     /// A pane opened on a keystroke is armed, seeded and told what the session

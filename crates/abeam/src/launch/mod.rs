@@ -121,6 +121,16 @@ pub fn resolve(program: &str, args: &[String]) -> Result<Launch, String> {
 /// below would fail to find a file that is sitting right there. A pane opened
 /// on a keystroke would refuse where the session's own agent started fine, on a
 /// machine where nothing else about abeam is unusual.
+///
+/// **What this removes is the asymmetry and not the limitation, and the
+/// difference is worth being exact about.** [`Launch::config`] still spells the
+/// program with `to_string_lossy` on the way to the pty, so an install path
+/// that has no faithful `String` is one abeam cannot start *at all* — at
+/// startup as much as on a keystroke. That is pre-existing, it is the same
+/// answer for every pane, and it is a fix somewhere else entirely: it belongs
+/// in `PtyConfig`, which takes a `String` where it wants an `OsString`. What
+/// this stops is a later pane failing where the first one succeeded, which is
+/// the shape nobody would think to look for.
 pub fn resolve_at(program: &Path, args: &[String]) -> Result<Launch, String> {
     into_launch(find_at(program, None)?, args)
 }
