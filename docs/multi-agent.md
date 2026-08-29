@@ -1,9 +1,30 @@
 # More than one agent in the window
 
-> A proposal, not a record. Nothing in here is implemented. It is written in
-> this directory's voice because the point of it is the argument, and because
-> the parts that survive should end up in module documentation rather than in a
-> file called `proposal.md` that nobody reads twice.
+> **Phases 1, 2 and 3 are built. Phase 4 is not.** This began as a proposal and
+> is now half a record, which is a state worth being explicit about rather than
+> leaving a reader to date it from the tense. The argument is why it is here;
+> the parts that survived have moved into module documentation, and where the
+> code disagrees with a paragraph below, the code is the answer and the
+> paragraph says so.
+>
+> **What the first three phases changed about this document**, so nobody has to
+> diff it against the source:
+>
+> - `MIN_AGENT_ROWS` is **12**, written into `crate::layout` with the arithmetic
+>   the section below asks for. The guess became a number with an argument
+>   rather than a measurement; what would settle it is still unmeasured.
+> - `stack` takes **three** arguments, not two — `stack(area, n, at)`. The
+>   cursor is an input because the pane holding the keys must be one that is
+>   drawn.
+> - **Closing a pane is answered**, and it left the open questions: `x` twice at
+>   a pane whose child has exited. A *live* agent still cannot be closed, and
+>   that is phase 4's with the exit contract.
+> - **A zoom that shows one agent was declined**; the argument is in the section
+>   below.
+> - **Per-pane readiness arrived early**, in phase 3 rather than phase 4,
+>   because a collapsed pane's title row has to say whether its agent is
+>   working. `crate::agentstate::Readiness` grew a fourth variant for it. The
+>   queue's *targeting* is untouched and is still phase 4's.
 
 ## What is being asked for
 
@@ -228,15 +249,32 @@ the cheaper axis: a 40-row window gives two agents about 19 each.
 
 `crate::layout` opens by saying there is one calculation and it is called once
 per frame, because two calculations that must agree is where "off-by-one here is
-what makes hosted apps wrap strangely" comes from. A third function joins it —
-`stack(left: Rect, n: usize) -> Vec<Rect>` — under exactly that rule, since each
-pty is resized from the rect that drew it.
+what makes hosted apps wrap strangely" comes from. A third function joins it,
+under exactly that rule, since each pty is resized from the rect that drew it.
+
+**It was sketched here as `stack(left: Rect, n: usize)` and it is
+`stack(area: Rect, n: usize, at: usize)`, which is phase 3's one correction to
+this section.** Which panes collapse cannot be decided from `n` alone: the pane
+holding the keys has to be one that is drawn, or the reader is typing into a
+title row with no cursor and no screen. So the cursor is an input, and the rule
+is *the pane with the keys first, then list order from the top*.
 
 It needs the floor that `MIN_SPLIT_COLS` is on the other axis, and for the same
 stated reason: *collapsing is the right degradation; squeezing is not.* Below
-some rows per agent — twelve inside the border is a guess worth measuring, not a
-number to write into the code on my say-so — the stack must stop expanding and
-start collapsing.
+some rows per agent the stack must stop expanding and start collapsing.
+
+**Twelve is what went in, and the caveat this paragraph made has been half
+answered.** It said twelve was "a guess worth measuring, not a number to write
+into the code on my say-so", and it is now in the code — as an argument rather
+than a measurement. `crate::layout::MIN_AGENT_ROWS` adds up what the rows are
+spent on: five of permanent furniture, seven of transcript, which is what a
+permission prompt needs to be on screen at all. What would still settle it is
+the measurement nobody has made, and that constant is where it goes.
+
+The arithmetic it implies is worth having here too, because it decides how much
+of this feature most people ever see: a whole pane is twelve plus its border, so
+**two agents want 28 rows and three want 42**. A 24-row terminal draws one agent
+and a title row, whatever the user does.
 
 **Collapsed, not hidden.** A pane that is not the current one shrinks to its
 title row rather than disappearing. One row per agent keeps the roster and the
@@ -246,7 +284,39 @@ falling off a cliff at the point where the window runs out. It also means the
 one-visible-at-a-time mode and the two-visible mode are the same code path with
 a different number in it.
 
-`Alt+Z` is untouched. It answers "is the right pane here", which is orthogonal.
+**That row is why `Readiness` grew a fourth variant, which is a phase-4 cost
+paid in phase 3.** "The busy/idle signal" was the easy half. The signal that
+matters is an agent *stopped on a permission dialog* — the one a reader has to
+go and answer — and `waiting` mapped to `Unknown`, which a border draws as
+nothing. So the agent you most need to be told about was the one the row stayed
+silent about, in the feature whose floor is set by keeping permission prompts on
+screen. `Readiness::Waiting` splits that refusal out. It cannot widen the send
+gate: every gate in the program tests for `Idle` and nothing else, so splitting
+a refusal in two is not loosening an acceptance.
+
+## `Alt+Z` is untouched, and there is no second zoom
+
+`Alt+Z` answers "is the right pane here", which is orthogonal — and, more to the
+point for a *vertical* stack, it buys the left column **columns**. Hiding the
+right pane makes every agent wider and not one of them taller.
+
+The different question a stack raises is "show me only this agent", and phase 3
+declined it. Three reasons, in order of weight:
+
+- It would cost a **global binding** out of a namespace this document records as
+  spent, and `F4` is already carrying two meanings for this feature.
+- Its whole effect is to **delete the roster**, which is the thing collapsed
+  rows were designed to keep. A mode that hides the other agents' busy signals
+  is not obviously the feature it sounds like, in a feature about watching
+  several agents.
+- The stack already produces that shape at its floor, though not on demand: one
+  pane whole and the rest as title rows is what a short window or a fourth agent
+  gives you. That is a weaker argument than it first looks — arriving somewhere
+  by resizing a terminal is not the same as a keystroke — which is why it is
+  third rather than first.
+
+If it comes back, the honest form is the one `keys::global` prescribes for the
+reverse-cycle key: a row in a list, not a new chord.
 
 ## The sentence in the queue that becomes false
 
@@ -297,6 +367,17 @@ not going to. The stack fixes it by drawing `agents[0]`'s border at the same
 time as everybody else's. Everything above this paragraph still stands as the
 end state; what changed is that phase 2 is no longer sitting on a live
 misdelivery while it waits.
+
+**Phase 3 paid that and found the bill was larger.** Putting the countdown on
+`agents[0]`'s border is only worth anything if it is *legible* there, and it was
+not: the note was appended to the end of a line clipped from the right, behind a
+pane name, a position, a worktree label and — in the very state that produces
+this — an exit status. So the announcement was on the line and off the screen.
+It now **leads** that border, in front of the pane's own name, which is the
+treatment `App::right_title` already gives the one thing on a border a reader
+has to act on. `QueuePane` reports its note in two parts of different rank
+rather than one string, because only that pane knows which is in play and only
+the shell owns the columns.
 
 ## The exit contract
 
@@ -352,25 +433,28 @@ pass.
 
 ## Phasing
 
-1. **The refactor alone.** `agents: Vec<Agent>` and `at_agent`, with exactly one
-   agent in the vector and no user-visible change whatsoever. The seven fields
-   move, `Focus` does not, and the existing tests are the proof. All of the
-   architectural risk is here and none of the design risk.
-2. **A second agent, one visible at a time.** `a` in the worktree list starts
-   one; `F4` again cycles. Already the feature, minus the simultaneity — several
-   sessions on the go, each with its own workspace, switched between in one
-   keystroke.
-3. **The stack.** `layout::stack`, the rows floor, collapsed title rows. This is
-   the part the request actually asked for, and it lands on a foundation that
-   two phases of tests have already been run against.
-4. **The rest of the contract.** Queue targeting, the exit rule,
-   `docs/keymap.md` and `docs/status.md` updated. The occupancy count left this
-   list during phase 2 — see above; a key whose only effect is invisible is a
-   key nobody presses twice, and that was not a cost phase 2 could book and
-   defer.
+1. ~~**The refactor alone.**~~ **Done.** `agents: Vec<Agent>` and `at_agent`,
+   with exactly one agent in the vector and no user-visible change whatsoever.
+   The seven fields moved, `Focus` did not, and the existing tests were the
+   proof. All of the architectural risk was here and none of the design risk.
+2. ~~**A second agent, one visible at a time.**~~ **Done.** `a` in the worktree
+   list starts one; `F4` again cycles. Already the feature, minus the
+   simultaneity. The occupancy count left phase 4 and landed here — a key whose
+   only effect is invisible is a key nobody presses twice, and that was not a
+   cost phase 2 could book and defer.
+3. ~~**The stack.**~~ **Done.** `layout::stack`, the rows floor, collapsed title
+   rows. It brought four things this list did not have: closing a pane with `x`
+   (the exited ones only), per-pane readiness and `Readiness::Waiting` for the
+   collapsed row, per-pane mouse routing, and the resize of *every* pane rather
+   than the current one — which was a live bug from the moment phase 2 could
+   make a pane you were not looking at.
+4. **The rest of the contract.** Queue targeting by pane id, the exit rule —
+   including what closing a *live* agent means, which phase 3 deliberately left
+   refused — and `docs/status.md` updated. `docs/keymap.md` has been kept
+   current as each key landed rather than left to this phase.
 
-Each phase ships something on its own, and phase 1 ships nothing, which is the
-point of it.
+Each phase ships something on its own, and phase 1 shipped nothing, which was
+the point of it.
 
 ## The right pane does not follow, and this is settled
 
@@ -405,13 +489,30 @@ untouched.
 
 ## Open questions
 
-- **Closing a pane.** Killing a live agent is the most destructive thing in the
-  program and there is no precedent for it — `Alt+Q` asks twice, which is the
-  model, but it asks about the whole session. Probably a key in whatever list
-  phase 2 gives the panes, with the same double-press.
-- **How many is too many?** A hard cap is easy to defend and easy to resent. The
-  rows floor may be the only cap needed, since it already refuses to expand a
-  stack that cannot be read.
-- **The diag pane** reads `self.left.diagnostics()`. It becomes the current
-  agent's, which is almost certainly right and is worth one sentence in its
-  border saying which.
+- ~~**Closing a pane.**~~ **Half answered, and the half that is left is the
+  hard one.** Phase 3 closes a pane whose child has **already exited**: `x` at
+  it, twice, `Alt+Q`'s double-press one pane down. It is not the key this
+  section guessed at — not a list, and not `q`, which is documented as the way
+  *out* of the right pane and would have taught one letter for "leave this" and
+  "destroy this" — and the safety argument is not the one phase 2's list gives
+  either: the letter is legal in the left column because *the child that would
+  have received it has gone*. Killing a **live** agent is still refused, in a
+  sentence, and is phase 4's with the exit contract. What closing already
+  destroys is a frozen last screen and its scrollback, which is what the second
+  press is for.
+- **How many is too many?** Still open, and now with two measurements against
+  it. The rows floor is a soft cap that bites earlier than it sounds — 28 rows
+  for two agents, 42 for three — so a 24-row terminal is capped at one whole
+  pane by arithmetic. And each live pane costs a readiness poll: 66 µs in the
+  steady state, which is nothing at ten panes, against 11 ms while a pane cannot
+  find its session record, which is a startup transient per pane and would
+  matter if it ever stopped being transient. `App::poll_readiness` carries both
+  numbers and the shape that would go wrong.
+- **Two later agents cannot be read together.** New, and a consequence of the
+  stack rather than a gap in it: rects come out in list order and panes never
+  swap places, so with three agents and room for two, the two are `agents[0]`
+  and whichever has the keys. Moving the cursor to `agents[2]` collapses
+  `agents[1]` on the way past. Comparing two panes neither of which is the
+  session's would need a second cursor or pinning, and either is a feature.
+- **The diag pane** reads the current agent's `diagnostics()`, which is almost
+  certainly right and is still worth one sentence in its border saying which.

@@ -460,12 +460,11 @@ impl QueuePane {
     /// **One string until the stack made the ranking the shell's business.** It
     /// used to be a single note appended to the end of the left border, ordered
     /// internally so that a clip took the count before the countdown. That is
-    /// not enough once the border it joins can be long on its own — a pane
-    /// whose child has exited is titled
-    /// `cmd.exe · exited (ExitStatus { code: 0, signal: None })`, which is most
-    /// of a 72-column column — because then the *whole* note is what goes, and
-    /// abeam types into an agent with nothing on screen having warned it was
-    /// about to. Only this pane knows which of the two is in play, and only the
+    /// not enough once the border it joins can be long on its own — a pane's
+    /// name, its position in a stack, the worktree it stands in and an exit
+    /// status fill a 72-column column between them — because then the *whole*
+    /// note is what goes, and abeam types into an agent with nothing on screen
+    /// having warned it was about to. Only this pane knows which of the two is in play, and only the
     /// shell owns the columns, so the pane says which is which and the shell
     /// puts them at opposite ends of the line. See `crate::app::App::ui`.
     ///
@@ -1179,6 +1178,12 @@ impl QueuePane {
         spans.push(match self.readiness {
             Readiness::Idle => Span::styled("idle", Style::default().fg(Color::Green)),
             Readiness::Busy => Span::styled("busy", Style::default().fg(Color::Yellow)),
+            // The one refusal a person can end, and the only thing on this
+            // line that is a request. Yellow like `busy`, because it is the
+            // same class of "not now" and the word is what separates them —
+            // spending a third colour on a state that already has a word buys
+            // nothing a reader was not already told.
+            Readiness::Waiting => Span::styled("waiting on you", Style::default().fg(Color::Yellow)),
             // Named rather than hidden. It is not a worse `busy`, it is the
             // state in which abeam does not know, and nothing will be sent
             // until it does.
@@ -1692,6 +1697,12 @@ mod tests {
     fn nothing_is_sent_while_the_agent_is_busy_or_the_queue_is_disarmed() {
         for break_it in [
             |p: &mut QueuePane| p.readiness = Readiness::Busy,
+            // Every state that is not `Idle`, so that a variant added to
+            // `Readiness` for a border's sake has to be added here too before
+            // this test will pass — which is the mechanical half of "splitting
+            // a refusal is not widening an acceptance".
+            |p: &mut QueuePane| p.readiness = Readiness::Waiting,
+            |p: &mut QueuePane| p.readiness = Readiness::Unknown,
             |p: &mut QueuePane| p.armed = false,
             |p: &mut QueuePane| p.draft_open = true,
         ] {
@@ -1729,6 +1740,19 @@ mod tests {
         // And it is unsafe in exactly the way `Busy` is: the same lines pass
         // for both.
         p.readiness = Readiness::Busy;
+        p.items[0].due = elapsed();
+        assert_eq!(p.take_send_request(), None);
+        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
+        assert_eq!(states(&p), [ItemState::Pending]);
+
+        // **And so is `Waiting`, which is the assertion that keeps splitting
+        // `Unknown` in two a change to what a border says and not to what this
+        // gate does.** `waiting` is the permission dialog: an agent stopped
+        // with a question on screen is the *most* dangerous thing to type at,
+        // because a queued prompt would be answering a question nobody read.
+        // It used to reach here as `Unknown` and be refused; it now reaches
+        // here as itself and must be refused by the same comparison.
+        p.readiness = Readiness::Waiting;
         p.items[0].due = elapsed();
         assert_eq!(p.take_send_request(), None);
         assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);

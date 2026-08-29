@@ -109,14 +109,44 @@ use crate::text::clip;
 pub const PEER_PROTOCOL: u64 = 1;
 
 /// Whether the hosted agent is mid-turn.
+///
+/// **Four variants, and the fourth is the one [`Session::readiness`] predicted
+/// would be worth having "on the day anything wants to explain itself".** That
+/// day is the stacked left column: a pane the window has no room for collapses
+/// to its title row, and that row is all a reader gets about the agent inside
+/// it. `Unknown` on such a row draws nothing at all — abeam cannot say — which
+/// left the agent *stopped on a permission dialog* as the one agent a reader
+/// must go and look at and the one the row stayed silent about.
+///
+/// **Splitting a refusal is not widening an acceptance, and that distinction is
+/// the whole safety argument.** Every gate in this program tests for `Idle` and
+/// nothing else — `crate::panes::queue` compares against it and calls
+/// [`is_idle`](Self::is_idle) — so a state that was `Unknown` and is now
+/// `Waiting` is refused by exactly the same comparison it was refused by
+/// before. What a border wanted was never a *looser* answer, which would need
+/// its own function and its own argument; it was a **more specific** one, and
+/// specificity cannot let a prompt through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Readiness {
     /// The agent is at its prompt. A queued item may be sent.
     Idle,
     /// The agent is working, or waiting on something that is not us.
     Busy,
-    /// No record, an unreadable one, or one from a protocol this does not
-    /// know. **Never treated as `Idle`.**
+    /// The agent has **stopped and is waiting for a person**: Claude's
+    /// `waiting` status, which is the permission dialog, or the `blocked`
+    /// state, which is a background agent that has gone quiet on a question.
+    ///
+    /// A refusal exactly as `Unknown` is — nothing may be typed at it — and a
+    /// different sentence about why. It is the one refusal the reader can *do*
+    /// something about, which is why it is worth a word on a border where
+    /// `Unknown` gets none: an agent stopped on a dialog stays stopped until
+    /// somebody answers it, and a stack exists to show several agents at once
+    /// precisely so that the one that has stopped can be noticed.
+    Waiting,
+    /// No record, an unreadable one, one from a protocol this does not know, or
+    /// a session abeam cannot type at for a reason of its own — a shell over
+    /// the agent, a child with no bracketed paste, a child that has gone.
+    /// **Never treated as `Idle`.**
     Unknown,
 }
 
@@ -248,21 +278,34 @@ impl Session {
         match self.status.as_deref() {
             Some(word) if word.eq_ignore_ascii_case("idle") => Readiness::Idle,
             Some(word) if word.eq_ignore_ascii_case("busy") => Readiness::Busy,
-            // Both spelled out rather than left to the catch-all below, even
-            // though all three answers are the same word. What the catch-all
-            // says is "abeam has never heard of this"; what these two say is
-            // "abeam knows exactly what this is, and it is still not a
-            // permission to type" â€” and only one of those survives Claude
+            // Both spelled out rather than left to the catch-all below. What
+            // the catch-all says is "abeam has never heard of this"; what these
+            // two say is "abeam knows exactly what this is, and it is still not
+            // a permission to type" — and only one of those survives Claude
             // adding a fifth status.
-            Some(word) if word.eq_ignore_ascii_case("waiting") => Readiness::Unknown,
+            //
+            // **They stopped being the same answer when [`Readiness::Waiting`]
+            // arrived, and the split is between what a person can act on and
+            // what they cannot.** `waiting` is a dialog with somebody's name on
+            // it: it will sit there until a human answers, and a border that
+            // says so is a border that gets it answered. `shell` is the agent
+            // being fine and abeam's own keystroke being aimed at `bash`
+            // instead — nothing is stuck, nobody is being waited for, and the
+            // reader has nothing to do about it. Refused identically; reported
+            // differently.
+            Some(word) if word.eq_ignore_ascii_case("waiting") => Readiness::Waiting,
             Some(word) if word.eq_ignore_ascii_case("shell") => Readiness::Unknown,
             // A status this version has never seen is not one it may guess at:
             // the guess that costs something is the one that guesses `Idle`.
             Some(_) => Readiness::Unknown,
             None => match self.state.as_deref() {
                 Some(word) if word.eq_ignore_ascii_case("working") => Readiness::Busy,
-                // `blocked` and `failed` arrive here with everything else, and
-                // that is the whole of the paragraph above.
+                // `blocked` is the same shape of stop as `waiting` and gets the
+                // same word: an agent that has gone quiet on a question, which
+                // a person can end and nothing else can. `failed` arrives here
+                // with everything else, because a failed background task is not
+                // waiting for anybody.
+                Some(word) if word.eq_ignore_ascii_case("blocked") => Readiness::Waiting,
                 _ => Readiness::Unknown,
             },
         }
@@ -1469,18 +1512,23 @@ mod tests {
         assert_eq!(readiness(r#","status":"Busy""#), Readiness::Busy);
         assert_eq!(readiness(r#","state":"Working""#), Readiness::Busy);
 
-        // The other two of Claude's four statuses, both `Unknown` and both for
-        // a reason rather than by falling off the end of the list.
+        // The other two of Claude's four statuses. Both refuse a send and
+        // neither does so by falling off the end of the list — and they stopped
+        // being the *same* refusal when a collapsed pane's title row needed one
+        // of them by name.
         //
         // `waiting` is the permission dialog â€” the state the module header's
         // nightmare is about, and the proof that reading this file rather than
         // watching the pty is what makes the nightmare impossible: a queued
-        // prompt is only ever sent on `idle`.
-        assert_eq!(readiness(r#","status":"waiting""#), Readiness::Unknown);
+        // prompt is only ever sent on `idle`. It is `Waiting` rather than
+        // `Unknown` because a person can end it and a border can say so.
+        assert_eq!(readiness(r#","status":"waiting""#), Readiness::Waiting);
         assert!(!readiness(r#","status":"waiting""#).is_idle());
         // `shell` is idle with a shell open over it. Not `Busy`, because
         // nothing is working; not `Idle`, because what is in front of the
-        // keyboard is `bash` and a prompt sent now goes there.
+        // keyboard is `bash` and a prompt sent now goes there; and not
+        // `Waiting`, because nobody is being waited *for* — there is nothing
+        // for a reader to go and answer.
         assert_eq!(readiness(r#","status":"shell""#), Readiness::Unknown);
 
         // A record with neither field knows nothing, and says so.
@@ -1504,9 +1552,12 @@ mod tests {
         );
 
         // Only `Idle` is idle. Nothing else in this module may be treated as a
-        // permission to type.
+        // permission to type, and the list is exhaustive on purpose: a variant
+        // added so that something can *describe* an agent has to be brought
+        // past this line before it can describe one.
         assert!(Readiness::Idle.is_idle());
         assert!(!Readiness::Busy.is_idle());
+        assert!(!Readiness::Waiting.is_idle());
         assert!(!Readiness::Unknown.is_idle());
     }
 
@@ -1519,13 +1570,26 @@ mod tests {
         // prompt, and the first character of a queued prompt answers that
         // prompt instead of arriving as a prompt. `failed` is here for the same
         // reason: it has stopped too, and it is no more at its own input.
-        for state in ["blocked", "failed", "BLOCKED", "Failed"] {
+        //
+        // **The assertion that matters is `!is_idle`, and it is the one written
+        // second.** The two states answer differently now — `blocked` is
+        // somebody waiting for a person, which a border says out loud, and
+        // `failed` is a task that has ended, which nobody can act on — and a
+        // test that pinned the *word* rather than the refusal would have to be
+        // rewritten every time a border learns to say something new. What may
+        // never change is that neither is a permission to type.
+        for (state, expected) in [
+            ("blocked", Readiness::Waiting),
+            ("failed", Readiness::Unknown),
+            ("BLOCKED", Readiness::Waiting),
+            ("Failed", Readiness::Unknown),
+        ] {
             let session = parse_session(&format!(r#"{{"sessionId":"s","state":"{state}"}}"#))
                 .expect("a record");
             assert_eq!(
                 session.readiness(),
-                Readiness::Unknown,
-                "`{state}` was not read as unknown"
+                expected,
+                "`{state}` was not read as {expected:?}"
             );
             assert!(
                 !session.readiness().is_idle(),
@@ -1537,9 +1601,11 @@ mod tests {
         // entries came from.
         let roster = parse_roster(ROSTER).expect("the real roster");
         assert_eq!(roster[0].state.as_deref(), Some("blocked"));
-        assert_eq!(roster[0].readiness(), Readiness::Unknown);
+        assert_eq!(roster[0].readiness(), Readiness::Waiting);
+        assert!(!roster[0].readiness().is_idle());
         assert_eq!(roster[1].state.as_deref(), Some("failed"));
         assert_eq!(roster[1].readiness(), Readiness::Unknown);
+        assert!(!roster[1].readiness().is_idle());
     }
 
     // --- what is not a record ---------------------------------------------

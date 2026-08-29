@@ -518,8 +518,13 @@ pub const HELP: &[(&str, &str)] = &[
     // to the question the row otherwise invites, which is whether this kills
     // anything. It does not, and the pane it will not close is named because
     // pressing twice at the wrong one is how a reader finds out.
+    //
+    // `x` rather than `q` deliberately: `q` is documented three rows down as
+    // the way *out* of the right pane, and a table that taught one letter for
+    // "leave this" and the same letter for "destroy this" would be teaching a
+    // mistake. `docs/keymap.md` has the argument.
     (
-        "q (exited agent)",
+        "x (exited agent)",
         "close that pane, twice over — never the session's own agent",
     ),
     // Not "rendered markdown", which is what this said and what it stopped

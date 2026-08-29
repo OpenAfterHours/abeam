@@ -155,10 +155,10 @@ that is only up while the right pane has focus, and the exemption is
 direction, deliberately: a modified F-key is a key abeam knows nothing about and
 therefore the agent's, which `keys.rs` says in a comment about `Ctrl+F12`.
 
-**The gesture that *closes* one is `q`, and it is not in the table for a
+**The gesture that *closes* one is `x`, and it is not in the table for a
 stronger reason than `a` is.** `a` leans on the worktree list's exemption — a
 key claimed inside a view that is only up while the right pane has focus, so it
-is never delivered while anything is being typed at an agent. `q` is claimed in
+is never delivered while anything is being typed at an agent. `x` is claimed in
 the **left** column, which is where typing at an agent happens, and it is
 nevertheless outside this document's invariant: it is only ever offered to a
 pane **whose child has exited**. There is no process left to have a binding for
@@ -166,10 +166,20 @@ it. Every key delivered to such a pane is already going into a closed pty and
 doing nothing, so a letter intercepted there cannot shadow any agent's binding
 in any session — which is a claim no audit could make about a live one, and the
 reason the audits below are unaffected. It sits inside `handle_key`'s
-`Focus::Left` arm and *after* the literal-next hatch, so `Ctrl+\` `q` still goes
+`Focus::Left` arm and *after* the literal-next hatch, so `Ctrl+\` `x` still goes
 to the child; `crates/abeam/src/app.rs`'s `close_key` is where that is written
 down. Two presses, because what closing destroys is the frozen last screen and
 the scrollback behind it, and nothing in abeam can get either back.
+
+**`x` and not `q`, which was the first choice and was wrong.** `q` looked like
+the program's own word for "I am done with this pane", on the strength of the
+right pane's `Esc`/`q`. That is not abeam's key: it is a pane answering
+`Handled::No`, which the shell reads as the reader being finished, and all it
+does is move focus — `F5` puts it back and nothing is lost. This table
+documents `q` as the way *out* of the right pane, so the habit it teaches is
+"press q to leave this", and aiming that habit at the one irreversible action in
+the program is the opposite of a shared vocabulary. `x` teaches nothing it has
+to unlearn, and the gate in front of it is identical.
 
 One consequence is worth disclosing rather than leaving to be discovered.
 **While the right pane is hidden — `Alt+Z`, or a window narrower than
@@ -896,7 +906,12 @@ them fall past the `!alt` guard. `plain_typing_is_never_a_global` pins the bare
 `Esc` and `Tab` halves of that; the modified spelling of `Shift+Tab` is pinned
 by nothing and is safe by the same structural argument as every other
 unmentioned key. The right pane's own `Esc` and `q` are reachable only when that
-pane has focus, so Copilot never loses them.
+pane has focus, so Copilot never loses them — and the same is now true of `x` in
+the *left* column, which is claimed only at a pane whose child has exited and is
+therefore only ever taken from a Copilot that is no longer running. Every bare
+letter abeam claims is claimed somewhere a live agent is not listening; that is
+the whole of the exemption, and it is stated twice above because the two places
+it applies are reached by different routes.
 
 `Alt+Enter` is Copilot's newline on Windows and Linux both, and abeam already
 excluded it for a reason belonging to only one of those (Windows Terminal

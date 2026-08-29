@@ -63,12 +63,26 @@ pub fn inner(pane: Rect) -> Rect {
 /// row this stack collapses to, because that row still says which agent it is
 /// and whether it is working and does not pretend to be a window on anything.
 ///
+/// **The arithmetic this implies, said out loud, because it decides who ever
+/// sees two agents at once.** A whole pane is this plus its border, so two of
+/// them want 28 rows and three want 42. A 24-row terminal — the default on a
+/// great many machines — therefore never draws two agents whole, whatever the
+/// user does: it draws one and a title row. That is the floor working rather
+/// than failing, and it is the number to argue with if the feature feels
+/// smaller than it sounded.
+///
 /// **What would make it wrong is a measurement nobody has made.** It is
 /// reasoned from the layout these agents draw rather than timed against them,
 /// and the number that would settle it is the tallest permission dialog any
 /// hosted agent puts up. If one of them wants fourteen, this constant is where
 /// that goes: the rest of [`stack`] is written in terms of it and knows no
 /// other number.
+///
+/// It is also not true of *every* agent, which the paragraph above overstated.
+/// `abeam +pwsh` hosts a shell: no composer, no hint line, and a prompt that is
+/// useful in four rows. The number is set by the agents this program exists for
+/// rather than by everything it can host, and a shell in a collapsed pane loses
+/// less than a permission dialog would.
 pub const MIN_AGENT_ROWS: u16 = 12;
 
 /// Where the agents go down the left column: one rect each, in list order.
@@ -100,6 +114,40 @@ pub const MIN_AGENT_ROWS: u16 = 12;
 /// also keeps `agents[0]` on screen wherever there is room for two, and
 /// `agents[0]` is the border the session's own facts and the queue's countdown
 /// are drawn on.
+///
+/// **The floor that rule holds at, exactly, because the obvious statement of it
+/// is false.** `inner(rects[at])` has at least one row **iff
+/// `area.height >= n + 2`** — a title row each, and two more for the focused
+/// pane's own border. Below that *no* pane has an inside: the window is shorter
+/// than the number of agents plus their chrome, and there is nothing left to
+/// degrade to. At or above it the focused pane is the only one that can have an
+/// inside when just one can, and it has [`MIN_AGENT_ROWS`] of it as soon as the
+/// column will carry a whole pane at all.
+///
+/// **What that costs at the very bottom is worth naming rather than implying.**
+/// Below `n + 2` rows, `crate::app::App::ui` finds no rect to put the cursor in
+/// and draws none, while keystrokes still reach the focused pane's pty at
+/// whatever size it was last drawn at — typing into a child with nothing on
+/// screen. A three-row window with two agents in it is the whole of the
+/// reachable case, and the honest answer to it is a taller window; what would
+/// be dishonest is a doc claiming the focused pane is always drawn.
+///
+/// **Panes never swap places, at any height, and that is a property worth
+/// having on purpose.** The rects come out in list order and only their heights
+/// change, so growing or shrinking the window, or moving the cursor, never
+/// moves a pane past another one: what was second from the top stays second
+/// from the top. A stack that reordered itself to keep the focused pane whole
+/// would be the "pane that yanks itself into view" `app.rs` opens by refusing,
+/// one axis along.
+///
+/// The cost of that is real and is not the collapsing itself. With three agents
+/// and room for two whole panes, `agents[0]` and the focused pane are the two,
+/// so **any two later agents can never be read side by side** — moving the
+/// cursor to `agents[2]` collapses `agents[1]` on the way past. Comparing two
+/// panes neither of which is the session's is a thing somebody will want, and
+/// this layout cannot express it; what it would take is a second cursor, or a
+/// rule that pins panes rather than picking them, and either is a feature
+/// rather than a tweak.
 ///
 /// The rects tile `area` exactly — no overlap, no gap, nothing outside it — at
 /// every height, including the ones too short to give every pane even a row.
@@ -305,22 +353,76 @@ mod tests {
         assert_eq!(rects[2].height, 1, "{rects:?}");
     }
 
-    /// The pane with the keys is never the one that collapses.
+    /// The pane with the keys is the one that is drawn — down to the exact
+    /// height at which nothing can be.
     ///
     /// The reason `at` is an argument at all. A collapsed pane is a title row:
     /// no cursor, no screen, and typing into it goes somewhere the typist
-    /// cannot see. Asked of every cursor position at a height that can only
-    /// carry one whole pane, because the failure is one particular index being
-    /// special and the loop is what stops index 0 being it by accident.
+    /// cannot see.
+    ///
+    /// **Swept from zero rather than asserted at one comfortable height, which
+    /// is what the first version of this did and what let a false claim stand.**
+    /// "The focused pane is always drawn" is not true and cannot be: at `n + 1`
+    /// rows there is a title row each and one over, and two rows have no inside.
+    /// What is true is the floor in [`stack`]'s doc — an inside iff
+    /// `height >= n + 2` — and the only way to find out that the obvious
+    /// statement was wrong is to ask every height including the ones nobody
+    /// would choose.
     #[test]
     fn the_agent_with_the_keys_is_the_one_that_is_drawn() {
-        let height = MIN_AGENT_ROWS + 2 + 3;
-        for n in 1..=4usize {
+        for n in 1..=6usize {
             for at in 0..n {
-                let rects = stack(Rect::new(0, 0, 72, height), n, at);
+                let floor = u16::try_from(n).expect("a small n") + 2;
+                for height in 0..=2 * floor {
+                    let rects = stack(Rect::new(0, 0, 72, height), n, at);
+                    let focused = inner(rects[at]).height;
+
+                    if height < floor {
+                        // Nothing has an inside, the focused pane included.
+                        // This is the degradation `stack`'s doc names, not a
+                        // case where somebody else got the rows.
+                        assert!(
+                            rects.iter().all(|rect| inner(*rect).height == 0),
+                            "{height}/{n}/{at}: a pane has an inside below the \
+                             floor: {rects:?}"
+                        );
+                        // ...and the focused pane is still the *last* to lose
+                        // its title row. Below `n` rows somebody gets nothing
+                        // at all, and it is never the pane with the keys: a
+                        // stack that drew every pane but that one would be a
+                        // window with no evidence in it that the agent taking
+                        // the keystrokes exists.
+                        assert!(
+                            height == 0 || rects[at].height >= 1,
+                            "{height}/{n}/{at}: the pane with the keys is the \
+                             one that vanished: {rects:?}"
+                        );
+                        continue;
+                    }
+                    assert!(
+                        focused >= 1,
+                        "{height}/{n}/{at}: the focused pane has no inside at \
+                         or above the floor: {rects:?}"
+                    );
+                    // ...and nobody is drawn whole while the focused pane is
+                    // not, which is the half that would let a reader type into
+                    // a title row with a readable pane beside it.
+                    for (ix, rect) in rects.iter().enumerate() {
+                        assert!(
+                            ix == at || inner(*rect).height <= focused,
+                            "{height}/{n}/{at}: pane {ix} is taller than the \
+                             one with the keys: {rects:?}"
+                        );
+                    }
+                }
+
+                // And once the column will carry a whole pane, the focused one
+                // is whole rather than merely non-empty.
+                let tall = (MIN_AGENT_ROWS + 2) + u16::try_from(n).expect("a small n");
+                let rects = stack(Rect::new(0, 0, 72, tall), n, at);
                 assert!(
                     inner(rects[at]).height >= MIN_AGENT_ROWS,
-                    "{n}/{at}: the focused pane was collapsed: {rects:?}"
+                    "{n}/{at}: the focused pane was squeezed: {rects:?}"
                 );
             }
         }

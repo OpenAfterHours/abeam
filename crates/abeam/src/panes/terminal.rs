@@ -269,9 +269,20 @@ pub struct Diagnostics {
 }
 
 impl Pane for TerminalPane {
+    /// **The status is a number, not a `Debug` dump, and the difference is
+    /// forty columns.** `{:?}` on a `portable_pty::ExitStatus` renders
+    /// `ExitStatus { code: Some(0), signal: None }` — fifty-odd cells of a
+    /// struct literal, spent to say `0`, in a border that is seventy cells wide
+    /// and shared with everything the pane and the session have to report.
+    /// Where that fell it was the queue's countdown and the confirmation before
+    /// an irreversible close, so the cost was not cosmetic.
+    ///
+    /// `exit_code()` and the same shape `crate::panes::shell` has always drawn
+    /// for a command that has finished, so both halves of the window say a
+    /// child's ending the same way.
     fn title(&self) -> String {
         match &self.exited {
-            Some(status) => format!("{} · exited ({:?})", self.title, status),
+            Some(status) => format!("{} · exited ({})", self.title, status.exit_code()),
             None => self.title.clone(),
         }
     }
