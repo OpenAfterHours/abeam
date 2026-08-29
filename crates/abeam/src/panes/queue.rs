@@ -257,7 +257,7 @@ pub struct QueuePane {
     /// so a test can prove the number on screen came off the clock rather than
     /// out of the constant it is being compared with.
     arm_delay: Duration,
-    /// The whole second [`QueuePane::title_note`] last put on screen.
+    /// The whole second [`QueuePane::due_note`] last put on screen.
     ///
     /// The countdown is the one thing in this pane that changes without anyone
     /// touching it, and [`Pane::tick`] runs at the speed of the loop rather
@@ -454,23 +454,61 @@ impl QueuePane {
         };
     }
 
-    /// What the left pane's title should say about the queue, or `None` when
-    /// there is nothing worth the columns. This is the only place a send is
-    /// announced before it happens, so it must never be silent while an item is
-    /// due.
+    /// What the left pane's title says about the queue, in two parts of
+    /// different **rank**.
     ///
-    /// Ordered so that the countdown survives a clip: the title it joins is
-    /// the *agent's*, which already carries a program name and whatever else
-    /// the left border says, and the seconds are the half of this a reader
-    /// must be able to act on.
-    pub fn title_note(&self) -> Option<String> {
-        let pending = self.pending();
-        if let Some(secs) = self.countdown() {
-            return Some(match pending {
-                0 | 1 => format!("sending in {secs}s"),
-                n => format!("sending in {secs}s · queue {n}"),
-            });
+    /// **One string until the stack made the ranking the shell's business.** It
+    /// used to be a single note appended to the end of the left border, ordered
+    /// internally so that a clip took the count before the countdown. That is
+    /// not enough once the border it joins can be long on its own — a pane
+    /// whose child has exited is titled
+    /// `cmd.exe · exited (ExitStatus { code: 0, signal: None })`, which is most
+    /// of a 72-column column — because then the *whole* note is what goes, and
+    /// abeam types into an agent with nothing on screen having warned it was
+    /// about to. Only this pane knows which of the two is in play, and only the
+    /// shell owns the columns, so the pane says which is which and the shell
+    /// puts them at opposite ends of the line. See `crate::app::App::ui`.
+    ///
+    /// The half that must survive a clip: a send is due and abeam is about to
+    /// type at the agent.
+    ///
+    /// **This is the only place a send is announced before it happens, and it
+    /// must never be silent while an item is due.** It is split out from the
+    /// count because the two have different *ranks* in a border and only this
+    /// pane knows which one is in play — the shell owns the columns and has to
+    /// be told what may be clipped. `crate::app::App::ui` puts this in front of
+    /// everything else on `agents[0]`'s border, including the pane's own name,
+    /// which is the treatment `App::right_title` already gives the one thing on
+    /// a border that a reader has to be able to act on.
+    ///
+    /// The count rides along behind the seconds rather than being left to the
+    /// caller, because it is meaningless without them: "queue 3" beside a
+    /// countdown says how much more is coming after this one.
+    pub fn due_note(&self) -> Option<String> {
+        let secs = self.countdown()?;
+        Some(match self.pending() {
+            0 | 1 => format!("sending in {secs}s"),
+            n => format!("sending in {secs}s · queue {n}"),
+        })
+    }
+
+    /// The half that is only a number: how much is waiting, and how much has
+    /// failed.
+    ///
+    /// Nothing is about to happen on the strength of it, so it is the last
+    /// thing on a border and the first thing a narrow window may take away.
+    ///
+    /// **`None` while a send is due, and the exclusion is here rather than at
+    /// the caller.** [`due_note`](Self::due_note) already carries the count
+    /// behind its seconds, because a count is meaningless without them; a
+    /// border drawing both parts unconditionally would otherwise say `queue 2`
+    /// twice. A caller that has to remember not to ask is a caller that will
+    /// forget.
+    pub fn queued_note(&self) -> Option<String> {
+        if self.countdown().is_some() {
+            return None;
         }
+        let pending = self.pending();
         let failed = self.failed();
         match (pending, failed) {
             (0, 0) => None,
@@ -1666,7 +1704,7 @@ mod tests {
             // ...and the announcement is withdrawn with it, so the title stops
             // promising a send that is no longer coming.
             assert_eq!(p.items[0].due, None);
-            assert_eq!(p.title_note().as_deref(), Some("queue 1"));
+            assert_eq!(p.queued_note().as_deref(), Some("queue 1"));
         }
     }
 
@@ -1747,23 +1785,32 @@ mod tests {
     #[test]
     fn a_send_is_announced_before_it_happens_and_never_silently() {
         let mut p = ready("announce me");
-        assert!(p.title_note().is_some());
+        // Before the tick there is no countdown, so the pane is not silent but
+        // it is not announcing either: the low rank is what has something to
+        // say. The two swap over on the tick, which is the whole of the split.
+        assert!(p.due_note().is_none());
+        assert!(p.queued_note().is_some());
         p.tick();
 
         // Exact, because the number is what a reader acts on: a pane counting
         // down from thirty must not read as one counting down from three.
-        assert_eq!(p.title_note().as_deref(), Some("sending in 3s"));
+        assert_eq!(p.due_note().as_deref(), Some("sending in 3s"));
+        // ...and the count does not appear twice. It rides inside the
+        // announcement, so the low-ranked half stands down while one is due —
+        // a border that drew both parts would say `queue n` at each end of it.
+        assert_eq!(p.queued_note(), None);
 
         // ...and it is read off the clock rather than printed from a constant.
         let mut p = ready("announce me");
         p.arm_delay = Duration::from_secs(9);
         p.tick();
-        assert_eq!(p.title_note().as_deref(), Some("sending in 9s"));
+        assert_eq!(p.due_note().as_deref(), Some("sending in 9s"));
         assert!(screen(&mut p, 60, 8).contains("sending in 9s"));
 
-        // Nothing queued and nothing to say.
+        // Nothing queued and nothing to say, in either rank.
         let mut empty = pane();
-        assert_eq!(empty.title_note(), None);
+        assert_eq!(empty.due_note(), None);
+        assert_eq!(empty.queued_note(), None);
         assert!(!empty.tick());
     }
 
@@ -1778,7 +1825,7 @@ mod tests {
 
         assert!(!p.tick());
         assert_eq!(p.countdown(), None);
-        assert_eq!(p.title_note().as_deref(), Some("queue 1"));
+        assert_eq!(p.queued_note().as_deref(), Some("queue 1"));
     }
 
     // --- dispatching ------------------------------------------------------
@@ -1958,7 +2005,7 @@ mod tests {
             assert_eq!(p.take_send_request(), None);
         }
         assert_eq!(p.pending(), 1);
-        assert_eq!(p.title_note().as_deref(), Some("queue 1"));
+        assert_eq!(p.queued_note().as_deref(), Some("queue 1"));
     }
 
     #[test]

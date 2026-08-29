@@ -761,7 +761,20 @@ impl Agent {
     /// with a stack it is one per pane. Each of the three is free and each is
     /// permanent enough to lead with — a child that has exited will not come
     /// back, and a child that never enabled bracketed paste will not start.
-    fn poll_readiness(&mut self, claude: bool) -> crate::agentstate::Readiness {
+    ///
+    /// ## Read this before making it friendlier
+    ///
+    /// **The question this answers is the *gate's* — may abeam type here — and
+    /// the border only borrows the answer.** Named `send_readiness` for that
+    /// reason: every widening that would make a border more informative is a
+    /// widening of what [`App::pump_queue`] is allowed to type into. The two
+    /// obvious ones are already refused above and each would be a live
+    /// misdelivery: an exited pane reported `Idle` is a queued prompt written
+    /// into a dead pty and reported sent, and a pane with no bracketed paste
+    /// reported `Idle` is a three-line prompt arriving as three submits. If a
+    /// border ever wants a looser answer than the gate's, it needs a second
+    /// function and its own argument — not a relaxation of this one.
+    fn send_readiness(&mut self, claude: bool) -> crate::agentstate::Readiness {
         use crate::agentstate::Readiness;
         // A session that has gone cannot be typed at, and its last record can
         // sit at `idle` forever — a dead agent is the most convincingly idle
@@ -1483,6 +1496,27 @@ impl App {
     /// The same, mutably, and for the same reason.
     fn session_agent_mut(&mut self) -> &mut Agent {
         &mut self.agents[0]
+    }
+
+    /// The readiness the queue's send gate reads: `agents[0]`'s, always.
+    ///
+    /// **A name for a rule that had become a field access, which is a weaker
+    /// fence than it looks.** [`Agent::readiness`] gained a second reader when
+    /// the stack arrived — a collapsed pane's title row — and one field read by
+    /// a border and by a gate is one edit away from a border's convenience
+    /// moving the gate. The border reads the field; the gate comes through
+    /// here, so a change aimed at one of them has to be written past a function
+    /// whose doc says what the other one is for.
+    ///
+    /// **`agents[0]` and never [`current`](Self::current).** See
+    /// [`pump_queue`](Self::pump_queue) — the queue is aimed at the session's
+    /// agent outright, and the whole class of bug that aiming replaced was the
+    /// gate's three inputs disagreeing about which pane they were describing.
+    /// It is the *stored* answer rather than a fresh read, so it is the same
+    /// value a border is drawing: one calculation, per
+    /// [`poll_readiness`](Self::poll_readiness).
+    fn queue_readiness(&self) -> crate::agentstate::Readiness {
+        self.session_agent().readiness
     }
 
     /// All of them, for the facts that are not about any one.
@@ -2481,7 +2515,7 @@ impl App {
         let mut redraw = false;
         for agent in self.agents.iter_mut() {
             let before = agent.readiness;
-            agent.readiness = agent.poll_readiness(claude);
+            agent.readiness = agent.send_readiness(claude);
             // A border that has stopped saying `busy` is news, and this
             // function is the only thing that notices. Without it the row goes
             // on claiming the old answer until some other event happens to
@@ -2489,11 +2523,7 @@ impl App {
             redraw |= agent.readiness != before;
         }
 
-        // **The session's agent, not the current one.** See
-        // [`App::pump_queue`] — the queue is aimed at `agents[0]` outright, and
-        // the whole class of bug that aiming replaced was these three inputs
-        // disagreeing about which pane they were describing.
-        let readiness = self.session_agent().readiness;
+        let readiness = self.queue_readiness();
 
         // The one event that ends a draft, and the only place this flag is ever
         // cleared. See [`note_left_key`](Self::note_left_key) for why it is this
@@ -4354,10 +4384,16 @@ impl App {
         // failure rather than a tidy-up. These used to be arms of one `if`, so
         // a pending quit or an exited agent took the title and the queue's
         // countdown vanished from it — leaving abeam three seconds from typing
-        // at the agent with nothing on screen saying so. `title_note`'s own
+        // at the agent with nothing on screen saying so. `due_note`'s own
         // contract is that it is never silent while a send is due; the pane
         // kept that promise and the shell broke it. Two facts about the left
         // pane are two pieces of one title.
+        //
+        // **The same failure came back through the layout and is fixed below
+        // rather than here**, which is worth saying next to its first version:
+        // appending kept every part on the line, and a part on the line can
+        // still be clipped off the end of it by a long pane name. See where
+        // `due` is built.
         //
         // **Which facts belong on which border, and now there are several.**
         // Four things below are the *session's* and not any pane's: the pending
@@ -4412,29 +4448,46 @@ impl App {
         // The queue reports in the *left* title because everything it says is
         // about the left pane: how much is waiting to be typed there, and — the
         // part that has to be impossible to miss — that abeam is about to type
-        // it. Last, so that a title clipped at 46 columns loses the count
-        // before it loses the announcement.
-        let note = self.queue.title_note();
+        // it.
+        //
+        // **Two parts, ranked at opposite ends of the line, and taking them as
+        // one string was a real defect rather than an untidiness.** Appended
+        // last, the announcement was clipped off `agents[0]`'s border by that
+        // pane's own name — and the name is at its longest in exactly the state
+        // that produces this: a child that has exited draws
+        // `cmd.exe · exited (ExitStatus { code: 0, signal: None })`, which is
+        // most of a 72-column column on its own. abeam would then type into an
+        // agent with nothing on screen having said it was about to, which is
+        // the failure `crate::panes::queue` calls impossible to miss and the
+        // same failure the `if` chain above once produced by another route.
+        //
+        // So the countdown leads the border, in front of the pane's own name.
+        // That is [`right_title`](Self::right_title)'s treatment of the focus
+        // hint and it is here for that paragraph's reason: appended, the one
+        // thing a reader has to be able to act on is lost precisely when the
+        // rest of the line is busy. The title *moving* when a send falls due is
+        // a stronger signal than a phrase arriving at the end, and it costs
+        // nothing to identify the pane — the send always goes to `agents[0]`
+        // and this is `agents[0]`'s border.
+        let due = self.queue.due_note();
+        let queued = self.queue.queued_note();
 
         // **One calculation, called once per frame** — `crate::layout`'s own
         // rule, and the reason [`crate::layout::stack`] exists rather than the
         // rects being worked out here and again on the way to a resize. Each
         // pty is sized from the rect that drew it, and these are the rects.
         let rects = abeam_layout::stack(split.left, self.agents.len(), self.at_agent);
-        // A name per pane, built before the refusal because that part is fitted
-        // to what the rest of `agents[0]`'s line leaves spare, and it cannot be
-        // measured until there is a line to measure.
-        let names: Vec<String> = rects
+        // A name and a tag per pane, kept apart rather than joined, because the
+        // announcement goes *between* them on `agents[0]` and nowhere else.
+        // Built before the refusal, which is fitted to what the rest of that
+        // line leaves spare and cannot be measured until there is a line.
+        let names: Vec<String> = (0..rects.len())
+            .map(|ix| format!(" {}", self.agents[ix].pane.title()))
+            .collect();
+        let tags: Vec<String> = rects
             .iter()
             .enumerate()
-            .map(|(ix, outer)| {
-                let collapsed = Agent::inside(*outer).is_none();
-                format!(
-                    " {}{}",
-                    self.agents[ix].pane.title(),
-                    self.agent_tag(ix, collapsed)
-                )
-            })
+            .map(|(ix, outer)| self.agent_tag(ix, Agent::inside(*outer).is_none()))
             .collect();
 
         // **The refusal is fitted to what the line actually has spare, and it
@@ -4459,12 +4512,20 @@ impl App {
             // rather than of the column, so it stays true if that ever stops
             // being so.
             let width = abeam_layout::inner(rects[0]).width as usize;
+            // The tag carries its own separators, so it is added as it stands;
+            // the rest are parts this line will join with one each.
             let spent = names[0].width()
-                + [state.as_ref(), door.as_ref(), note.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .map(|part| SEPARATOR + part.width())
-                    .sum::<usize>();
+                + tags[0].width()
+                + [
+                    due.as_ref(),
+                    state.as_ref(),
+                    door.as_ref(),
+                    queued.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|part| SEPARATOR + part.width())
+                .sum::<usize>();
             // This part's own separator, and the space the title closes with.
             let budget = width.saturating_sub(spent + SEPARATOR + 1);
             // **Elided from the left, which is the opposite of everything else
@@ -4491,26 +4552,34 @@ impl App {
             }
         });
 
-        let session = [state, refusal, door, note];
+        let session = [state, refusal, door, queued];
         for (ix, outer) in rects.into_iter().enumerate() {
-            let mut title = names[ix].clone();
-            // **On this pane's border and no other, which is the whole reason
-            // `pending_close` carries an id.** It is an answer to a key pressed
-            // at one pane, and the cursor can move before the second press; a
-            // prompt drawn on the pane the reader has arrived at would be
-            // offering to close something they never asked about. Ahead of the
-            // session's parts because it is the more local instruction and the
-            // one the next keystroke acts on.
+            let mut title = String::new();
+            // **In front of everything, the pane's own name included.** See
+            // where `due` is built: anywhere else on the line it is what a long
+            // name clips away, and it is the only part of this border warning
+            // about something abeam is about to do on its own.
+            if ix == 0 && let Some(due) = &due {
+                title.push_str(&format!(" {due} ·"));
+            }
+            title.push_str(&names[ix]);
+            title.push_str(&tags[ix]);
+            // **On this pane's border and no other, which is what
+            // `pending_close` carrying an id buys.** It is an answer to a key
+            // pressed at one pane; a prompt drawn on the pane the reader has
+            // arrived at would be offering to close something they never asked
+            // about. Ahead of the session's parts because it is the more local
+            // instruction and the one the next keystroke acts on.
             if self.pending_close == Some(self.agents[ix].id) {
                 title.push_str(" · q again to close");
             }
             // **The session's four, on `agents[0]`'s border and no other.**
             // They are appended rather than chosen between for the reason above
             // — an `if` chain here is what once let a pending quit swallow the
-            // countdown — and they are last because everything in front of them
-            // identifies the pane, and a title clipped from the right must lose
-            // the instruction before it loses whose pane the instruction is
-            // about.
+            // countdown — and they are last because each of them is either an
+            // instruction the reader can find another way or a number nothing
+            // is about to act on. The one that *is* acted on left this group
+            // and now leads the line.
             if ix == 0 {
                 for part in session.iter().flatten() {
                     title = format!("{title} · {part}");
@@ -6320,7 +6389,7 @@ mod tests {
         assert!(
             fx.app
                 .queue
-                .title_note()
+                .due_note()
                 .is_some_and(|note| note.contains("sending in")),
             "nothing is announcing a send, so this test proves nothing"
         );
@@ -6359,6 +6428,130 @@ mod tests {
             !drawn[second].contains("sending in"),
             "the countdown followed the cursor onto a pane it is not about: {:?}",
             drawn[second]
+        );
+    }
+
+    /// A neighbour's readiness cannot reach the queue's send gate.
+    ///
+    /// **The fence around what the stack added.** Readiness is per pane now,
+    /// because a collapsed title row has to say whether that agent is working
+    /// — and that put a second reader on the answer the send gate uses. One
+    /// value read by a border and by a gate is one edit from a border's
+    /// convenience deciding when abeam may type; [`App::queue_readiness`] is
+    /// the name that edit has to be written past, and this is what goes red if
+    /// it is not.
+    ///
+    /// Both panes are really read, which is asserted rather than assumed: a
+    /// version that polled only `agents[0]` would pass the gate assertion and
+    /// prove nothing about the field the border draws.
+    #[test]
+    fn a_neighbours_readiness_never_reaches_the_queues_gate() {
+        let mut fx = app();
+        let at_zero = records_at(&mut fx, 0, "busy");
+        stays_at(&mut fx, 0);
+        second_agent(&mut fx);
+        let _at_one = records_at(&mut fx, 1, "idle");
+        stays_at(&mut fx, 1);
+        // The cursor on the idle neighbour, which is what makes this a test:
+        // with `at_agent` at 0 the session's agent and the current one are the
+        // same object and a gate wired to either would pass.
+        fx.app.set_focus(Focus::Left);
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.at_agent, 1);
+        polled(&mut fx);
+
+        assert_eq!(
+            fx.app.agents[1].readiness,
+            Readiness::Idle,
+            "the second pane's own record was never read, so the border has \
+             nothing to draw and this test guards nothing"
+        );
+        assert_eq!(fx.app.agents[0].readiness, Readiness::Busy);
+        assert_eq!(
+            fx.app.queue_readiness(),
+            Readiness::Busy,
+            "a neighbour's idle reached the gate that decides when abeam types"
+        );
+        // And the queue was told that answer and no other. `set_readiness`
+        // reports whether it changed anything, so a `false` here is the pane
+        // saying it already held `Busy`.
+        assert!(
+            !fx.app.queue.set_readiness(Readiness::Busy),
+            "the queue is holding some other answer than the session agent's"
+        );
+
+        // The control: the session's agent goes idle and the gate follows it.
+        // Without this, a gate wired to nothing at all would pass every
+        // assertion above.
+        say(&at_zero, fx.dir.path(), "idle");
+        polled(&mut fx);
+        assert_eq!(
+            fx.app.queue_readiness(),
+            Readiness::Idle,
+            "the gate does not follow the session's agent at all"
+        );
+    }
+
+    /// A due send is legible on the narrowest border the stack will draw.
+    ///
+    /// **The defect this pins is the one the `if`-chain fix was about, arriving
+    /// through the layout instead.** Appending kept the countdown on the line;
+    /// it did not keep it *on the screen*, because the line is clipped from the
+    /// right and `agents[0]`'s own name is at its longest in exactly the state
+    /// that produces this — a child that has exited draws
+    /// `cmd.exe · exited (ExitStatus { code: 0, signal: None })`, which is most
+    /// of a 72-column column before anything is appended to it. abeam would
+    /// then type into an agent with nothing on screen having said so, which
+    /// `crate::panes::queue` calls the thing that must be impossible to miss.
+    ///
+    /// Every condition here is the hostile one at once: a real width rather
+    /// than the 300 columns the assembly tests use, the shortest window the
+    /// stack will collapse `agents[0]` in, the cursor on the pane the send is
+    /// *not* going to, and the longest title a pane can have.
+    #[test]
+    fn a_due_send_is_legible_on_the_narrowest_border_the_stack_draws() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        // The long title, and it is the fixture's own child rather than a
+        // contrivance: `exited (…)` is what `TerminalPane::title` appends, and
+        // the countdown outliving the session's agent is the state
+        // [`the_announcement_survives_every_state_the_left_title_can_be_in`]
+        // already pins as reachable.
+        until("the session's agent to go", || {
+            fx.app.reap().expect("try_wait on a child that exists");
+            fx.app.agents[0].pane.has_exited()
+        });
+        fx.app.agents[0].exit = Some((abeam_pty::ExitStatus::with_exit_code(0), Vec::new()));
+
+        fx.app.queue.stub_item("announce me", Mode::Send);
+        fx.app.queue.set_readiness(Readiness::Idle);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(
+            fx.app.queue.due_note().is_some(),
+            "nothing is due, so this test proves nothing"
+        );
+
+        // The cursor on the other pane, so `agents[0]` is the one the stack
+        // collapses — and the send is still going to `agents[0]`.
+        fx.app.set_focus(Focus::Left);
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.at_agent, 1);
+
+        // 120 columns is a 72-column left border, which is the ordinary
+        // terminal this has to work in rather than the wide one the assembly
+        // tests use. The height is the shortest that still gives the focused
+        // pane its floor, so `agents[0]` is one row.
+        let drawn = rows(&mut fx.app, 120, abeam_layout::MIN_AGENT_ROWS + 3);
+        assert_eq!(
+            fx.app.agents[0].outer.height,
+            1,
+            "agents[0] was not collapsed, so the narrow case is untested"
+        );
+        assert!(
+            drawn[0].contains("sending in"),
+            "abeam is three seconds from typing at an agent and the border \
+             does not say so: {:?}",
+            drawn[0]
         );
     }
 
@@ -7009,9 +7202,14 @@ mod tests {
         fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
         polled(&mut fx);
         assert_eq!(
-            fx.app.queue.title_note().as_deref(),
-            Some("queue 1"),
+            fx.app.queue.due_note(),
+            None,
             "Claude's idle record announced an automatic Codex send"
+        );
+        assert_eq!(
+            fx.app.queue.queued_note().as_deref(),
+            Some("queue 1"),
+            "the item is not in the queue, so nothing was ever under test"
         );
         assert_eq!(
             fx.app.queue.take_send_request(),
@@ -7113,7 +7311,7 @@ mod tests {
         // A real bug, found and fixed: the title was an `if`/`else if` chain,
         // so a pending quit or a departed agent took the whole of it and the
         // queue's countdown vanished — leaving abeam three seconds from typing
-        // at the agent with nothing on screen saying so. `title_note`'s
+        // at the agent with nothing on screen saying so. `due_note`'s
         // contract is that it is never silent while a send is due; the pane
         // kept that promise and the shell broke it.
         let mut fx = app();
@@ -7126,15 +7324,17 @@ mod tests {
         assert!(
             fx.app
                 .queue
-                .title_note()
+                .due_note()
                 .is_some_and(|note| note.contains("sending in")),
             "the pane is not announcing a send, so this test proves nothing"
         );
 
         // Rendered wide on purpose. A title clipped at the border is a
-        // different failure with its own rule — `title_note` is appended last
-        // precisely so a 46-column pane loses the count before it loses the
-        // announcement — and what is under test here is the assembly.
+        // different failure with its own rule — the announcement leads the
+        // line precisely so that a narrow one loses everything else first, and
+        // [`a_due_send_is_legible_on_the_narrowest_border_the_stack_draws`] is
+        // where that is under test — and what is under test here is the
+        // assembly.
         let plain = screen(&mut fx, 300, 24);
         assert!(plain.contains("sending in"), "got: {plain}");
 
@@ -7258,9 +7458,14 @@ mod tests {
         fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
         polled(&mut fx);
         assert_eq!(
-            fx.app.queue.title_note().as_deref(),
-            Some("queue 1"),
+            fx.app.queue.due_note(),
+            None,
             "a send was announced at an agent that is not there"
+        );
+        assert_eq!(
+            fx.app.queue.queued_note().as_deref(),
+            Some("queue 1"),
+            "the item is not in the queue, so nothing was ever under test"
         );
         assert!(!fx.app.pump_queue(), "there was nothing to do");
         assert_eq!(keys_sent(&fx), 0);
@@ -7315,9 +7520,14 @@ mod tests {
         fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
         polled(&mut fx);
         assert_eq!(
-            fx.app.queue.title_note().as_deref(),
-            Some("queue 1"),
+            fx.app.queue.due_note(),
+            None,
             "a send was announced at a pty that would submit every line of it"
+        );
+        assert_eq!(
+            fx.app.queue.queued_note().as_deref(),
+            Some("queue 1"),
+            "the item is not in the queue, so nothing was ever under test"
         );
         assert!(!fx.app.pump_queue(), "there was nothing to do");
         assert_eq!(keys_sent(&fx), 0);
