@@ -83,7 +83,7 @@ learns that a second agent exists.
 
 ## What moves out of `App` and into `Agent`
 
-Seven fields on `App` are secretly about the left pane, and finding them is most
+Six fields on `App` are secretly about the left pane, and finding them is most
 of the refactor:
 
 | today | why it is per-agent |
@@ -93,11 +93,28 @@ of the refactor:
 | `draft_open` | a half-written composer belongs to the agent it was typed at |
 | `submit_pending` | the `Enter` owed to one composer |
 | `agent_exit` | one child's status and last screen |
-| `agent: String` | the name; `--bg` availability is decided from it, so hosting `claude` in one pane and `codex` in another is expressible |
 | `left_inner: Rect` | each pty is sized from the rect that drew it |
 
 And one new field: `root: PathBuf`. Which brings up the constraint that decides
 the rest of the design.
+
+**`agent: String` was on that list and has been taken off it, which is a
+decision rather than a correction.** It looked per-agent because it names an
+agent. It is not: it holds `Hosted::agent` — the agent *behind* a preset, so a
+preset called `fleet` hosting Claude answers `claude` — and what it decides is
+whether `--bg` dispatch exists at all and what the per-workspace ask panes host.
+Both are facts about the session, not about a pane. The border title is the
+*other* string, `Hosted::name`, and `TerminalPane` has carried it since before
+any of this, so a pane needs no name field of its own.
+
+The cost of leaving it on `App` is a promise withdrawn: **panes of different
+kinds are not expressible.** Every agent abeam starts is the one it was started
+with, in another directory. Hosting Claude in one pane and Codex in the next is
+a coherent thing to want and this design does not deliver it — `has_claude_state`
+is a session-wide predicate standing in front of a now per-agent probe, and
+making it per-pane is a change to the readiness path that wants its own argument
+rather than a field quietly moved during a refactor. Written down here so the
+next person reaches for it deliberately.
 
 ## An agent pane is pinned to a worktree, permanently
 
@@ -303,6 +320,37 @@ pass.
 Each phase ships something on its own, and phase 1 ships nothing, which is the
 point of it.
 
+## The right pane does not follow, and this is settled
+
+This was the last open question and it has an answer: **cycling agents must not
+move the right pane.** Not to the new agent's worktree, not to a different view,
+not at all.
+
+The case for following was convenience, and it was wrong. Somebody watching an
+agent is *reading* — the document it just wrote, a diff, a shell's output — and
+the reason they reach for the agent cursor in the first place is that they have
+noticed something they want to say to another agent. Making that keystroke throw
+away the place they were reading punishes exactly the gesture the feature exists
+to enable: they went to the keyboard to *add* something, and it cost them what
+they were looking at.
+
+It is also the rule the program already has. `app.rs` opens with it — the panes
+"never switch themselves", and a pane that yanks itself into view while you are
+reading "is delightful twice and infuriating thereafter". The precedent I nearly
+leaned on is `Enter` on a file in the git view, which does switch the reader; the
+difference is that there the switch *is* the request. Here the request is "give
+me that agent's keyboard", and the right pane is not mentioned in it.
+
+So: the agent cursor and the workspace cursor are independent, and neither
+writes to the other. The cost is real and worth naming — you can be typing at an
+agent in one worktree while reading the git status of another, with only the two
+borders to tell you so. That is a labelling problem, and the borders already
+solve it: each agent pane says which root it is standing in, and the right pane
+has said which workspace it is on since the day there was more than one.
+
+A test pins it: cycle the agent cursor, assert `at` and `right_view` are
+untouched.
+
 ## Open questions
 
 - **Closing a pane.** Killing a live agent is the most destructive thing in the
@@ -315,9 +363,3 @@ point of it.
 - **The diag pane** reads `self.left.diagnostics()`. It becomes the current
   agent's, which is almost certainly right and is worth one sentence in its
   border saying which.
-- **Does the right pane follow?** Cycling to an agent in another worktree could
-  point the right pane at that worktree. It is convenient and it violates "the
-  panes never switch themselves" — but this one is a keystroke rather than a
-  watcher event, which is the distinction `App::pump` already draws when it
-  switches the view for `Enter` on a file. My inclination is to make it follow,
-  and to be able to point at that precedent when somebody objects.
