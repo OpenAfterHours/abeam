@@ -24,6 +24,16 @@
 //! is the interception exemption stated once at the top of `crate::keys` for
 //! every pane-local key to point at rather than re-derive.
 //!
+//! What it does **not** get to decide for itself is what `Alt` means. That is
+//! `crate::keys::alt_chord`, and this pane is the reason it is a function: it
+//! used to ask `alt && !ctrl` and so turned over from the left `Alt` key and
+//! not the right one, on every layout where the right one is AltGr — which
+//! Windows spells as Ctrl+Alt. Every global binding worked from both keys the
+//! whole time, because `crate::keys::global` never looked at CONTROL. One
+//! pane's private answer to a question the rest of the program had already
+//! answered is the whole of that bug, and `crate::keys`'s module doc is where
+//! the argument now lives.
+//!
 //! In the **rendering**, bare `t` is an alias for the same toggle. The two
 //! forms differ on purpose rather than by oversight: nothing in the rendering
 //! can be typed, so the plain key is free there, and `t` is the key
@@ -150,7 +160,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -591,14 +601,13 @@ impl PadPane {
     /// of typing, and a pad that routed keys through it would swallow a word
     /// and scroll instead.
     fn edit_key(&mut self, key: KeyEvent) -> Handled {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let alt = crate::keys::alt_chord(&key);
         match key.code {
             // Before the text arm, though the guard on that arm would exclude
             // it anyway: this is the key the whole pane hangs off and it should
             // be the first thing read here.
-            KeyCode::Char('t' | 'T') if alt && !ctrl => self.turn(),
-            KeyCode::Char(c) if !ctrl && !alt => {
+            KeyCode::Char('t' | 'T') if alt => self.turn(),
+            KeyCode::Char(c) if crate::keys::is_text(&key) => {
                 let did = self.text.insert(c);
                 self.typed(did)
             }
@@ -661,12 +670,17 @@ impl PadPane {
         if let Some(handled) = self.scroll.key(key) {
             return handled;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Bare `t` and `Alt+T` both, and the module doc says why the two
-            // forms differ about this. Ctrl is excluded because a Ctrl chord in
-            // a right-hand pane belongs to whatever is hosted, not to abeam.
-            KeyCode::Char('t' | 'T') if !ctrl => self.turn(),
+            // forms differ about this. A bare Ctrl chord is excluded because a
+            // Ctrl chord in a right-hand pane belongs to whatever is hosted,
+            // not to abeam — but Ctrl *with* Alt is AltGr rather than a chord,
+            // which is why this is two questions and not `!ctrl`.
+            KeyCode::Char('t' | 'T')
+                if crate::keys::is_text(&key) || crate::keys::alt_chord(&key) =>
+            {
+                self.turn()
+            }
             // `Esc` and `q` fall through so the shell hands focus back, which
             // is what they do in every other read-only view.
             _ => Handled::No,
@@ -1333,6 +1347,7 @@ impl Pane for PadPane {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+    use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1495,6 +1510,63 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(p.form, Form::Edit);
+    }
+
+    #[test]
+    fn the_chord_turns_the_pad_over_from_either_alt_key() {
+        // Windows reports AltGr as Ctrl+Alt, so a right-hand `Alt+T` arrives
+        // here carrying CONTROL. This pane used to ask `alt && !ctrl` and so
+        // turned over from one half of the keyboard only — while every global
+        // binding worked from both, because `crate::keys::global` never looked
+        // at CONTROL. The bug was the disagreement, and this is its test; the
+        // shared answer is `crate::keys::alt_chord`.
+        let dir = TempDir::new("pad-altgr");
+        let (mut p, _) = pad(&dir);
+        let altgr = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT | KeyModifiers::CONTROL);
+
+        assert_eq!(p.handle_key(altgr('t')).unwrap(), Handled::Yes);
+        assert_eq!(p.form, Form::Rendered);
+        assert_eq!(p.text.text(), "", "the chord typed nothing");
+
+        // And back, which is the arm in the *other* form — it had the same
+        // fault written a different way, as a bare `!ctrl`.
+        assert_eq!(p.handle_key(altgr('t')).unwrap(), Handled::Yes);
+        assert_eq!(p.form, Form::Edit);
+
+        // A plain Ctrl chord is still not the toggle: in a right-hand pane that
+        // belongs to whatever is hosted, and it is only Ctrl *with* Alt that
+        // means AltGr.
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(p.handle_key(ctrl_t).unwrap(), Handled::No);
+        assert_eq!(p.form, Form::Edit);
+        assert_eq!(p.text.text(), "", "and Ctrl+T is not a letter either");
+    }
+
+    #[test]
+    fn a_character_behind_altgr_is_typed_rather_than_dropped() {
+        // `€` is AltGr+4 on a UK layout and AltGr+E on a German one, and
+        // crossterm reports it as `Char('€')` with ALT and CONTROL both set —
+        // the character, not the key under it. The text arm used to demand
+        // `!ctrl && !alt` and dropped every one of them silently.
+        let dir = TempDir::new("pad-altgr-text");
+        let (mut p, _) = pad(&dir);
+        for c in ['€', '@', '\\', '~'] {
+            let ev = KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT | KeyModifiers::CONTROL);
+            assert_eq!(p.handle_key(ev).unwrap(), Handled::Yes, "AltGr {c}");
+        }
+        assert_eq!(p.text.text(), "€@\\~");
+
+        // The chords either side of it are still chords, so this bought the
+        // characters back without spending `Ctrl+A` or `Alt+B` on them.
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                p.handle_key(KeyEvent::new(KeyCode::Char('a'), mods))
+                    .unwrap(),
+                Handled::No,
+                "{mods:?}"
+            );
+        }
+        assert_eq!(p.text.text(), "€@\\~");
     }
 
     #[test]

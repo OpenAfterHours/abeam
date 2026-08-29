@@ -236,7 +236,9 @@ the arrows, `Home` and `End` move the caret, and `Alt+T` shows you the rendering
 instead, which is read-only and where a bare `t` brings the source back. What
 you type is saved a couple of seconds after you stop, in your own profile
 directory rather than in the repository, so it is still there next week and it
-never appears in `git status`. One thing to know about `Alt+T`: it needs the pad
+never appears in `git status`. `Alt+T` here is the pad's own key rather than a
+global, and it works from either `Alt` key like every other one. One thing to
+know about it: it needs the pad
 to have your keys. Hand them back with a second `F9` and the pad is still on
 screen but no longer listening, so `Alt+T` goes to the agent instead and the
 page does not turn over. `F9` again, or a click, and it does. `F7`, a drag and
@@ -305,6 +307,13 @@ to send it to Codex untouched.
 | `Alt+Q` | quit (twice while a child is live) |
 | `F1` | key help overlay |
 | `Ctrl+\` or `F12` | send the *next* key to the agent verbatim |
+
+**Either `Alt` key works.** Windows reports AltGr as Ctrl+Alt, so on a UK, Irish
+or continental layout the right-hand `Alt` key arrives carrying an extra
+modifier; abeam counts both, for every row above and for the pad's `Alt+T`. The
+one place that is deliberately *not* true is `Ctrl+\`: on the layouts that put
+`\` behind AltGr, `AltGr+\` is a backslash you were trying to type, so
+literal-next declines it and `F12` is the alias to reach for there.
 
 A view key leaves focus where it found it. `Alt+G`, `Alt+E`, `F8` and `F2`
 change what the right pane is showing without moving your keys: if you were

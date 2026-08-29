@@ -70,7 +70,8 @@ this document. The Windows test suite, and `clippy --all-targets` clean on both.
 
 The seventh view is the **scratch pad** on `F9`: a markdown pad per workspace
 that opens on its source with a caret in it, turns over to the rendering on
-`Alt+T`, and writes itself to `%APPDATA%\abeam\scratch\` on Windows and
+`Alt+T` — from either `Alt` key — and writes itself to
+`%APPDATA%\abeam\scratch\` on Windows and
 `$XDG_DATA_HOME/abeam/scratch/` — falling back to `~/.local/share` — on Linux,
 keyed by the workspace root. It is the first file abeam has ever written, and it
 is written through a temporary file and a rename so that a crash mid-save leaves
@@ -93,6 +94,29 @@ above.
 
 Two of those changed Windows behaviour on the way past, and both are worth
 seeing before you upgrade rather than after.
+
+**AltGr is Ctrl+Alt, and abeam now says so in one place instead of four.**
+On a UK, Irish or continental layout the right-hand `Alt` key is AltGr, and
+Windows reports it by setting the control bit as well — so half the keyboard
+delivered every `Alt` binding with CONTROL set. `keys::global` had always
+ignored that bit and three other places had not, which is why `Alt+S` reached
+the shell from either key while `Alt+T` turned the scratch pad over from the
+left one alone. `keys::alt_chord` is the single answer now, and `altgr_is_alt`
+walks the whole table to keep it single.
+
+Two more fell out of the same fact. The pad, the ask and the queue all guarded
+typing with `!ctrl && !alt`, which is a guard against AltGr and so against every
+character behind it — `€` on a UK layout, `@` and `€` on a German one — typed
+and silently dropped; `keys::is_text` is their shared answer. And literal-next
+matched `Ctrl+\` on the control bit alone, so on the layouts that put `\` behind
+AltGr, typing a backslash armed it and sent the *next* keystroke to the agent
+raw. It reads `ctrl && !alt` now, and `F12` is still the alias on those layouts.
+
+None of that reaches a terminal that takes `Alt`+letter for its own menus before
+abeam sees it, or one that reports `Alt` as an `Esc` prefix. `cargo run -p abeam
+--example keyprobe` tells the three cases apart, names which `Alt` key arrived,
+and names the binding each event resolves to; it covers all twenty globals and
+the pad's `Alt+T`.
 
 **An earlier `PATH` entry holding something abeam cannot start no longer hides
 the program behind it.** A `claude.ps1` with no `.cmd` beside it, or the

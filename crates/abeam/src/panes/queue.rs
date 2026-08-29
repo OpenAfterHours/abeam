@@ -751,7 +751,12 @@ impl QueuePane {
                 // key early turns a typo into a lost item.
                 draft.pop().is_some().into()
             }
-            KeyCode::Char(c) if !ctrl && !alt => {
+            // `crate::keys::is_text` and not `!ctrl && !alt`: Ctrl *and* Alt
+            // together is how Windows reports AltGr, so the spelt-out pair
+            // dropped every character that lives behind it. The `Enter` arm
+            // above reads the two modifiers separately on purpose and is not
+            // the same question.
+            KeyCode::Char(c) if crate::keys::is_text(&key) => {
                 if let Some(draft) = self.composing.as_mut() {
                     draft.push(c);
                 }
@@ -1984,6 +1989,26 @@ mod tests {
         assert_eq!(p.handle_key(key(KeyCode::Esc)).unwrap(), Handled::Yes);
         assert!(p.composing.is_none(), "esc closed the composer");
         assert!(p.items.is_empty(), "and threw the draft away");
+    }
+
+    #[test]
+    fn a_character_behind_altgr_is_text_in_the_composer() {
+        // The third of the three boxes that spelt this guard `!ctrl && !alt`,
+        // which on Windows is a guard against AltGr — `€`, `@`, `#`, `~`, `|`
+        // and `\` all live behind it on one layout or another.
+        // `crate::keys::is_text` is the shared answer.
+        let mut p = pane();
+        assert_eq!(p.handle_key(key(KeyCode::Char('i'))).unwrap(), Handled::Yes);
+        let altgr = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT | KeyModifiers::CONTROL);
+        for c in ['€', '@'] {
+            assert_eq!(p.handle_key(altgr(c)).unwrap(), Handled::Yes, "AltGr {c}");
+        }
+        assert_eq!(p.composing.as_deref(), Some("€@"));
+
+        // And a bare Ctrl chord is still not a letter, so this bought the
+        // characters back without spending `Ctrl+A` on them.
+        assert_eq!(p.handle_key(ctrl(KeyCode::Char('a'))).unwrap(), Handled::No);
+        assert_eq!(p.composing.as_deref(), Some("€@"));
     }
 
     #[test]

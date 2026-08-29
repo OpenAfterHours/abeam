@@ -99,8 +99,77 @@
 //! evidence than the collision itself. `F8` is the least disruptive
 //! replacement for the queue, but a user who remaps Codex to `F8` must use
 //! literal-next or choose a non-colliding Codex binding.
+//!
+//! # What counts as `Alt`
+//!
+//! One question, one answer, in [`alt_chord`] — and it is a function rather
+//! than a line inside [`global`] because the pad reads `Alt+T` for itself and
+//! got a different answer. On Windows **AltGr is Ctrl+Alt**: the OS sets
+//! `LEFT_CTRL_PRESSED` alongside `RIGHT_ALT_PRESSED`, and crossterm reports
+//! the pair as `ALT | CONTROL`. So on every layout whose right-hand Alt key is
+//! AltGr — every UK, Irish and continental European one — a test of the shape
+//! `alt && !ctrl` is a test for *which Alt key you pressed*, and half a
+//! keyboard fails it. `global` had always ignored CONTROL and the pad had
+//! always excluded it, which is why `Alt+S` reached the shell from either key
+//! and `Alt+T` turned the pad over from only one. `altgr_is_alt` and the pad's
+//! own `the_chord_turns_the_pad_over_from_either_alt_key` pin both halves.
+//!
+//! Nothing is lost by ignoring CONTROL, and the reason is crossterm's rather
+//! than this file's: when an AltGr combination *produces a character* the
+//! reported `KeyCode` is that character — `€`, `@` — and not the letter under
+//! the key, because `u_char` is non-zero and the layout fallback never runs.
+//! A binding letter therefore only ever arrives here from a combination that
+//! typed nothing. The mirror of that claim is what lets the panes take AltGr
+//! text; see `crate::panes::pad`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// True for `Alt`+key however the terminal reports it, AltGr included.
+///
+/// The single definition of abeam's namespace, used by [`global`] and by every
+/// pane that reads an `Alt` chord of its own. The module doc has the argument;
+/// the short of it is that `CONTROL` alongside `ALT` is how Windows spells
+/// AltGr, so excluding it excludes a keyboard rather than a key.
+pub fn alt_chord(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// True when a key event is somebody **typing** rather than reaching for a
+/// chord — the question every pane with a box in it has to answer.
+///
+/// The companion to [`alt_chord`], and it exists for the other half of the same
+/// Windows fact. If AltGr is Ctrl+Alt, then a guard of the shape
+/// `!ctrl && !alt` does not only reject chords: it rejects every character that
+/// lives behind AltGr. `€` on a UK layout, `@` and `€` on a German one, `#`,
+/// `~`, `|`, `\` and `}` on several — the characters somebody writing a note
+/// about code reaches for most. All three of abeam's boxes — the pad, the ask
+/// and the queue — dropped them silently.
+///
+/// `Ctrl` and `Alt` **together** are therefore text, and `Ctrl` or `Alt` alone
+/// is not. What that gives up is `Ctrl+Alt`+letter as a chord, which nothing in
+/// abeam binds and nothing hosted can hear: the three panes that ask this
+/// question are abeam's own composers, with no child in them for a chord to be
+/// aimed at. `Shift` is not part of the question at all — it is what made the
+/// letter a capital.
+///
+/// A pane that also reads an `Alt` binding of its own must match it *before*
+/// this, which is what `crate::panes::pad`'s `Alt+T` arm does. That ordering is
+/// safe rather than lucky: crossterm reports an AltGr combination that produces
+/// a character *as that character*, so `Alt+T` and a layout's AltGr text can
+/// never be the same event.
+pub fn is_text(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match (ctrl, alt) {
+        // Bare, or with the Shift that made the letter a capital.
+        (false, false) => true,
+        // AltGr, as Windows spells it.
+        (true, true) => true,
+        // A chord: Ctrl+letter belongs to whatever is hosted, and Alt+letter is
+        // either abeam's or the agent's, but neither is a character.
+        _ => false,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -204,7 +273,7 @@ pub enum Action {
 ///
 /// Release events must already have been filtered out by the caller.
 pub fn global(key: &KeyEvent) -> Option<Action> {
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let alt = alt_chord(key);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // The audit that cleared the F-keys cleared the *bare* F-keys. A modified
     // one is a key abeam knows nothing about, so it belongs to the agent — and
@@ -215,7 +284,16 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
     match key.code {
         // Ctrl+\ is awkward on layouts that put backslash behind AltGr, so F12
         // is an alias. No F-key is bound by Claude, which is also why F1 works.
-        KeyCode::Char('\\') if ctrl => Some(Action::LiteralNext),
+        //
+        // `!alt` is the whole of what makes that sentence true rather than
+        // merely sympathetic. On a German, Spanish or Italian layout `\` *is*
+        // AltGr+key, and AltGr is Ctrl+Alt — so without this, typing a
+        // backslash anywhere in abeam armed literal-next and the next keystroke
+        // went to the agent raw. The key an F-key was aliased for was not
+        // awkward on those layouts, it was unusable, and it took the character
+        // with it. With `!alt` the combination falls through to the pane, where
+        // `is_text` reads it as the backslash it is.
+        KeyCode::Char('\\') if ctrl && !alt => Some(Action::LiteralNext),
         KeyCode::F(12) if bare => Some(Action::LiteralNext),
         KeyCode::F(1) if bare => Some(Action::ToggleHelp),
         // An F-key rather than another Alt letter, and not because Alt is
@@ -320,6 +398,12 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
 
 /// Rendered by the F1 overlay. Kept next to the table so the two cannot drift.
 pub const HELP: &[(&str, &str)] = &[
+    // First, because it is a fact about every row under it rather than a
+    // binding of its own, and because somebody whose `Alt` key "does not work"
+    // opens this overlay before they open an issue. Every `Alt` row below is
+    // reachable from either `Alt` key: Windows spells AltGr as Ctrl+Alt, and
+    // `alt_chord` counts both.
+    ("Alt or AltGr", "either key works for every Alt row below"),
     ("Alt+G", "right pane: git"),
     ("Alt+E", "right pane: files (again for the file list)"),
     ("Alt+S", "right pane: a shell, focused (again to leave)"),
@@ -762,6 +846,99 @@ mod tests {
             global(&k(KeyCode::F(9), KeyModifiers::NONE)),
             Some(Action::ShowPad)
         );
+    }
+
+    #[test]
+    fn altgr_is_alt() {
+        // On Windows AltGr *is* Ctrl+Alt — the OS sets `LEFT_CTRL_PRESSED`
+        // beside `RIGHT_ALT_PRESSED` and crossterm reports the pair — so on
+        // every layout whose right-hand Alt key is AltGr, an `Alt` binding that
+        // looked at CONTROL would work from one half of the keyboard and not
+        // the other.
+        //
+        // Written as "the same answer" rather than as a list of the bindings,
+        // because a list is a thing a new binding can be left out of. Whatever
+        // this table does with `Alt`+key it must do with `Ctrl+Alt`+key, and
+        // that includes declining: the keys the agents own are still theirs
+        // from the right-hand Alt key too.
+        let mut resolved = 0;
+        let alt = KeyModifiers::ALT;
+        let altgr = KeyModifiers::ALT | KeyModifiers::CONTROL;
+        for c in 'a'..='z' {
+            let want = global(&k(KeyCode::Char(c), alt));
+            resolved += usize::from(want.is_some());
+            assert_eq!(
+                global(&k(KeyCode::Char(c), altgr)),
+                want,
+                "AltGr+{c} must mean what Alt+{c} means"
+            );
+        }
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+        ] {
+            let want = global(&k(code, alt));
+            resolved += usize::from(want.is_some());
+            assert_eq!(global(&k(code, altgr)), want, "AltGr+{code:?}");
+        }
+        // A loop that compared nothing to nothing would pass just as happily,
+        // so the count is the part that keeps this test honest: seven letters
+        // (`g e s q z j k`) and the two page keys.
+        assert_eq!(resolved, 9, "the Alt bindings this test actually walked");
+
+        // And the one key where AltGr must *not* mean Alt, which is the same
+        // fact read the other way: on the layouts that put `\` behind AltGr the
+        // character arrives as Ctrl+Alt+backslash, and literal-next has to
+        // decline it or nobody on those layouts can type a backslash at all.
+        // `F12` is the alias that is reachable everywhere.
+        assert_eq!(
+            global(&k(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
+            Some(Action::LiteralNext)
+        );
+        assert_eq!(
+            global(&k(KeyCode::Char('\\'), altgr)),
+            None,
+            "AltGr+backslash is a backslash, not literal-next"
+        );
+    }
+
+    #[test]
+    fn typing_and_chords_are_told_apart_the_same_way_everywhere() {
+        // `is_text` is the pad's, the ask's and the queue's shared answer, and
+        // the AltGr row is the one it exists for: all three used to spell it
+        // `!ctrl && !alt`, which drops `€`, `@` and every other character that
+        // lives behind that key.
+        for mods in [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+            KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert!(is_text(&k(KeyCode::Char('a'), mods)), "{mods:?}");
+        }
+        for mods in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ] {
+            assert!(!is_text(&k(KeyCode::Char('a'), mods)), "{mods:?}");
+        }
+        // And the two questions are deliberately both true for AltGr, which is
+        // what makes the order of a pane's arms load-bearing: `crate::panes::pad`
+        // matches its `Alt+T` before its text arm, so `AltGr+T` turns the page
+        // over rather than typing a `t`. Safe because crossterm reports an
+        // AltGr combination that *produces* a character as that character —
+        // `€`, not the `e` under the key — so the two can never collide.
+        let altgr_t = k(
+            KeyCode::Char('t'),
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        );
+        assert!(alt_chord(&altgr_t) && is_text(&altgr_t));
     }
 
     #[test]
