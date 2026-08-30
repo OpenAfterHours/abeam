@@ -915,10 +915,31 @@ pub struct Hosted {
     ///
     /// The same as [`name`](Self::name) for a built-in and for a program named
     /// outright; the host's name for a preset. Read by the parts of abeam whose
-    /// question is *what agent is this* rather than *what do I call it* —
-    /// `crate::dispatch` is the whole list today, and its question is whether
-    /// `--bg` is a flag the hosted agent has.
+    /// question is *what agent is this* rather than *what do I call it*, and
+    /// `crate::app` is where the copies are made: `App::agent` for the two that
+    /// ask about the session — whether `--bg` is a flag the hosted agent has,
+    /// and what a workspace's ask pane is a second copy of — and `Agent::kind`
+    /// for the one that asks about a pane, which is whether Claude's own
+    /// session records describe the child in it.
     pub agent: String,
+    /// What the table row put in front of the command line, and nothing that
+    /// was typed.
+    ///
+    /// Empty for a built-in and for a program named outright; `["agent"]` for
+    /// a `[preset.fleet]` whose `args` say so. It is [`Agent::args`] carried
+    /// out of the resolution rather than looked up again by name, and it has
+    /// exactly one reader: `crate::app::Recipe`, which re-resolves this
+    /// program for every pane opened on a keystroke and would otherwise start
+    /// `claude` where the session started `claude agent` — one border word and
+    /// two different programs.
+    ///
+    /// **The row's arguments and never the whole line**, which is the same
+    /// distinction `Recipe`'s own documentation is written around: `abeam
+    /// +fleet -p "fix the tests"` resolves `claude agent -p "fix the tests"`,
+    /// and a later pane may inherit the first two words and must not inherit
+    /// the last two. `line` below is where the two halves are joined; this is
+    /// the half abeam's own table contributed.
+    pub args: Vec<String>,
     pub launch: Launch,
 }
 
@@ -929,10 +950,15 @@ impl Hosted {
     /// agent abeam knows anything about, and answering `crate::dispatch` with
     /// the same word it was given is how it comes to say "abeam is hosting
     /// `pwsh`" rather than guessing on the user's behalf.
+    ///
+    /// No arguments either, and that is the same sentence about a third thing:
+    /// a program with no row in the table has nothing abeam added to its
+    /// command line, so its whole recipe is the file it resolved to.
     pub fn plain(name: &str, launch: Launch) -> Self {
         Self {
             name: name.to_string(),
             agent: name.to_string(),
+            args: Vec::new(),
             launch,
         }
     }
@@ -973,6 +999,10 @@ pub fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result
                 return Ok(Hosted {
                     name: agent.name.to_string(),
                     agent: agent.hosts.to_string(),
+                    // The row's own, not the line above: `args` there is what
+                    // the table added *and* what was typed, and only the first
+                    // half may be given to a pane opened an hour later.
+                    args: agent.args.iter().map(|arg| (*arg).to_string()).collect(),
                     launch,
                 });
             }
@@ -2201,11 +2231,39 @@ mod tests {
         assert_eq!(hosted.name, "abeam-test-fleet");
         assert_eq!(hosted.agent, "abeam-test-direct");
 
+        // **And the row's own words kept apart from the line, which is the
+        // field a pane opened an hour later is started from.** `launch.args`
+        // above is the preset's *and* what was typed, joined;
+        // [`Hosted::args`] is the first half alone, and `crate::app::Recipe`
+        // carries exactly it — `App::new` copies it across and
+        // `Recipe::launch` resolves the program again from it.
+        //
+        // Asserted here because every other assertion in this file reads the
+        // joined line, so nothing anywhere was reading this field: replacing it
+        // with `Vec::new()` left the whole crate green, and the `+fleet` pane
+        // that `a` opens would have gone quietly back to being a bare `claude`
+        // under a border still reading `fleet`.
+        assert_eq!(hosted.args, args(&["agent", "--fleet"]));
+        // The typed half is the half that must *not* be in it. `--resume` was
+        // on the line above and belongs to the session that was started rather
+        // than to a pane somebody opens later — so resolving the same row with
+        // nothing typed has to answer the same words.
+        assert_eq!(
+            resolve_within(&PRESET[0], &[], PRESET).unwrap().args,
+            hosted.args,
+            "what was typed reached the field a later pane is started from"
+        );
+
         // A built-in adds nothing and answers both questions with one word,
         // which is the promise `crate::agentstate` reads this file for.
         let plain = resolve_within(&DIRECT, &args(&["--resume"]), PRESENT).expect(EVERY_MACHINE);
         assert_eq!(plain.launch.args, args(&["--resume"]));
         assert_eq!(plain.name, plain.agent);
+        assert!(
+            plain.args.is_empty(),
+            "a built-in put an argument of abeam's own in front of somebody's \
+             agent"
+        );
     }
 
     #[test]

@@ -425,6 +425,29 @@ looking at. `a` on a row of that worktree list starts one **there**. Both are
 the whole gesture: no path to type, no confirmation, and the row's own count
 goes up on the frame you pressed it.
 
+`A` is the same key with a question in front of it, and the question is only
+ever *which one*. It opens a list over whichever of the two you pressed it in —
+the names `+` already takes, which is `claude`, `copilot`, `codex` and any
+`[preset.*]` blocks of your own, in that order, with the cursor on the agent
+this session was started with. So `A` `Enter` is another of what you already
+have, and `A` `j` `j` `Enter` is a Codex pane beside your Claude one.
+
+**With one exception, and it is the one case where `A` `Enter` is not another
+of what you have.** `abeam +pwsh` hosts a program named outright, and the list
+is the table — so there is no row for it to start the cursor on. Nothing is
+marked `session`, the cursor starts at the top, and `A` `Enter` would start
+whatever is first rather than another `pwsh`. The list on screen says so before
+you press anything. `a` is the key for another of the same, and it works there
+exactly as it does everywhere else.
+
+A preset
+says what it hosts — `fleet → claude` — because that is what decides whether the
+queue can type at the pane. The border names the checkout the pane will start
+in, and `Esc` puts back the list you came from. Choosing something that is not
+on the machine opens no pane and writes the sentence `abeam +codex` would have
+given at startup onto the left border, naming what was looked for and how to
+install it.
+
 The first of those two is the one most sessions want, because Claude Code makes
 its own worktrees: open a second agent where you already are, tell it to branch
 off, and it runs `git worktree add` and moves into the result. abeam does not
@@ -443,6 +466,18 @@ is what stops one pane being told another session's state. Following an agent
 also waits on `git worktree list`, which runs every ten seconds — so expect the
 border and the count to catch up a few seconds after the agent moves, not at
 once.
+
+**And a pane that is not Claude does not follow its agent at all.** Following is
+built on the agent writing its own working directory into a session record abeam
+can read and check the identity of, and Claude is the only one that writes such
+a record — abeam knows of none for Codex or Copilot, and it will not guess one
+out of `git worktree list`, which would name directories nothing is standing in.
+So a Codex pane that makes itself a worktree and moves in keeps the border and
+the occupancy count of the checkout it was *started* in, for as long as it runs.
+The row is still there and `x` `x` on it still ends the pane. The same
+difference is why the queue can never type at such a pane: its item says
+`cannot receive` on its own row rather than waiting for a state that will not
+arrive.
 
 `F4` gives your keys to the left column, and pressed again it moves along the
 agents. The border of the pane that has them is highlighted and reads

@@ -177,12 +177,34 @@ because the two then had to be described as one request and were not.
 
 `Alt` is refused as well, and that half is not symmetry: **`Alt+A` is Codex's
 own key** by the inventory at the foot of this document, in a program that hosts
-Codex, and a reader whose hand knows that chord must not discover that it starts
-an abeam agent. The cost is `Alt+R` and `Alt+W`, which meant refresh and the
+Codex — which after `docs/mixed-agents.md` is an agent any session can be
+hosting, in a pane of its own — and a reader whose hand knows that chord must
+not discover that it starts an abeam agent. The cost is `Alt+R` and `Alt+W`, which meant refresh and the
 worktree list by accident and were never anybody's spelling of either. `Ctrl+D`
 and `Ctrl+U` are unaffected — they are the shared half-page scroll, and the rule
 is a hand-off to that vocabulary rather than a bare refusal, so this list is not
 made the one exception to something the `F1` overlay promises.
+
+**`A` is a fifth letter claimed in that pane, on the same exemption, and it is
+`a` with a question in front of it.** It opens a list of the agents abeam can
+name — the table a `+` token is read against — and starts the one chosen. It is
+claimed in both lists, because `a` is in both. Against `crate::scroll`'s shared
+vocabulary — `j k g G b`, space, `Ctrl+d`, `Ctrl+u` — uppercase is *not* free in
+general, because `G` is End there; `A` simply is not in that list, which was
+checked rather than assumed.
+
+**Two independent arms and not one three-way match, and the `SHIFT` half is what
+this document has to record.** `Char('A')` is matched without consulting the
+`SHIFT` bit at all, exactly as `keys.rs`'s `global` matches `Char('g') |
+Char('G')`: crossterm's ANSI parser has no modifier bits to recover from a bare
+`A` byte, so on Unix Shift+A arrives as `Char('A')` with `KeyModifiers::NONE`,
+and a rule *requiring* `SHIFT` would ship a key that does nothing on most
+terminals abeam runs in. The two `a` arms then refuse `SHIFT` themselves, which
+is the hazard the `?` arm's note about shifted keys implies and never spelled
+out: on a terminal that *does* set the bit for an uppercase letter, an unguarded
+`a` would start the session's agent without asking, in the exact place the
+reader was trying to ask. `SHIFT` is tolerated and never required — the
+blanket chord check above is unchanged, so `Alt+A` stays Codex's.
 
 That second spelling exists because the workflow it serves is not about
 worktrees at all. Claude Code makes its own — it runs `git worktree add` and

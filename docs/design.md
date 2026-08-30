@@ -122,11 +122,30 @@ and reject it on a build server.
 Codex is a first-class **interactive host**, not a claim that Claude-specific
 side channels generalise. `abeam +codex [args]` forwards the line unchanged to
 the Codex TUI in the left pty. Ask is unavailable. The readiness probe reads
-Claude's session records, so under Codex it deliberately reports `Unknown`:
-queue send items cannot drain automatically **or** through `Enter`, and must be
-typed in the left pane instead. Background dispatch and its roster are
-Claude-only and stay unavailable. This fails closed rather than treating a
-neighbouring Claude record in the same repository as Codex's state.
+Claude's session records, so a Codex *pane* deliberately reports `Unknown`:
+queue send items aimed at it can never drain automatically **or** through
+`Enter`, and have to be typed at that pane by hand. This fails closed rather
+than treating a neighbouring Claude record in the same repository as Codex's
+state — a pane that is not Claude never searches for a record at all — and the
+queue says which refusal it is rather than leaving the key silent: `not sent ·
+codex cannot receive` when `Enter` asks anyway, `cannot receive` on the status
+line where `state unknown` would have been, and the same two words on a pending
+item's own row once there is more than one pane to name.
+
+**Which of those are facts about a pane and which about the session is worth
+being exact about, because `A` in the git pane starts a pane of whichever agent
+you choose and a window can hold two kinds.** Readiness is asked of each pane,
+so a Claude pane opened inside a Codex session drains normally. The
+background-agent roster follows any pane too: a session started `abeam +codex`
+that has opened a Claude pane and asked for the worktree list starts `claude
+agents --json`, which is a `claude` process in a window where nobody typed the
+word. That is deliberate — the occupancy column names background agents working
+in this repository, and they are worth naming whichever program the first pane
+happens to be running — and `docs/mixed-agents.md` argues it under "The roster
+widens from 'the session' to 'any pane'". Ask and background dispatch keep the
+session's answer instead, so `abeam +codex` has neither however many Claude
+panes it opens: the ask pane is one per workspace and the queue's dispatcher is
+decided once, at startup, both out of the agent abeam was started with.
 
 The prerequisite is the official CLI on `PATH` — `npm i -g @openai/codex` —
 and a direct `codex` run signed in with ChatGPT or an API key. abeam neither

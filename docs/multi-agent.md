@@ -194,6 +194,32 @@ making it per-pane is a change to the readiness path that wants its own argument
 rather than a field quietly moved during a refactor. Written down here so the
 next person reaches for it deliberately.
 
+**They did, and half of this paragraph is now history rather than a
+description.** `docs/mixed-agents.md` is the argument it asked for, and its
+phase 1 has landed: `has_claude_state` is gone, `Agent::kind` carries
+`Hosted::agent` per pane, and readiness and the roster both ask
+`Agent::is_claude`. What is *not* built is the half that would make the two
+disagree — there is still no way to open a pane of a second kind, so `agent:
+String` is still what every pane hosts. It stays on `App` for the two readers
+that argue for it there, the ask pane and dispatch, and that field's own doc
+comment names them.
+
+**And that held for one commit.** Phase 3 of the same document built the way in:
+`A` in either git list opens the table of agents abeam can name — the built-ins
+and the reader's own `[preset.*]` blocks — and a pane of the chosen row opens in
+the checkout the keystroke was about. So a pane of a second kind is exactly what
+a keystroke makes now, and the predicates phase 1 made per-pane answer
+differently from each other in a window holding two. The paragraph above is kept
+as written rather than corrected in place, because "the seam exists and nothing
+crosses it yet" is what made phase 1 shippable on its own and is worth being
+able to see. What survives it is its last sentence: `agent: String` stays on
+`App`, and the ask pane and dispatch go on reading the session's answer by
+decision rather than by omission — `docs/mixed-agents.md` argues each, in "The
+ask pane keeps the session's answer, and this is a decision" and "Dispatch keeps
+the session's answer too, for now". What is false is the claim in front of it.
+That string is what the *session* was started with; it is no longer what every
+pane hosts.
+
 ## An agent pane is pinned to a worktree, permanently — and this was wrong
 
 **The section title is kept as it was written, because the claim under it is the
@@ -371,6 +397,21 @@ the user's prompt is in the *environment* — dropping one and keeping the other
 keeps the prompt and loses the agent. What is kept is `Launch::target`, the file
 that does the work, and `crate::launch::resolve` is asked again with no
 arguments at all. `crate::app::Recipe` is where that lives.
+
+**"No arguments at all" was one word too strong, and the word is "all"** —
+which `docs/mixed-agents.md` found on its way past, in "One thing found on the
+way, which is a gap in today's code". A preset's own arguments are
+not the typed line and dropping them made one session run two programs: with
+`[preset.fleet] host = "claude", args = ["agent"]`, `abeam +fleet` gave a first
+pane running `claude agent` and every pane opened with `a` running plain
+`claude`, under one border word and on both platforms. `Recipe` carries the
+row's `args` now, and `launch` is `resolve_at(&self.target, &self.args)`. The
+paragraph above still holds everywhere it is about the command line — that is
+the half the field's own doc is written to keep, and it says why it is `args`
+and emphatically not a whole `Launch` or an `env` beside a blanked argv. What
+was wrong is treating *nothing that was typed* and *nothing at all* as one rule.
+The fix landed with phase 3, under a test named after the disagreement:
+`a_preset_pane_opened_later_runs_the_program_the_session_did`.
 
 It is a small move and a safe one, and the safety is not incidental.
 `crate::launch`'s guarantee is that nothing leaves that module which is not an
