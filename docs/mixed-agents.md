@@ -235,6 +235,13 @@ declined for two reasons:
   session. That is a fact about a keystroke ordering, which is not something a
   reader can predict or repeat.
 
+**Two call sites, not one**, and phase 3's checklist has to say so:
+`Space::new` is called by `App::new` for the first workspace and again by
+`sync_workspaces` for every worktree discovered afterwards. Both pass the
+session's agent, which is the same decision applied consistently — but anyone
+revisiting open question 1 who edits one and not the other gets a window where a
+workspace's ask flavour depends on whether that worktree existed at startup.
+
 So the ask pane goes on being the session's agent, and the sentence
 `crate::panes::ask::elsewhere` already writes — "abeam is hosting `X`, and this
 pane is a second copy of the agent you are already talking to" — becomes very
@@ -310,16 +317,51 @@ reach.
 agent` and every pane opened with `a` runs plain `claude`. Two panes, one border
 word, two different programs.
 
-That is not this feature, and this feature makes it visible: a chooser routed
-through `resolve_within` *would* keep a preset's args, so `A` → `fleet` and `a`
-in a `+fleet` session would disagree.
+**Verified, including on Windows**, where it might have been expected not to
+hold: the `.cmd` shim puts the command line in `ABEAM_LAUNCH` rather than in
+argv, but `Recipe` never carried `Launch::env` either, so `through_cmd` simply
+rebuilds the variable from the empty argument list. Both platforms drop the
+preset's args by the same route.
 
-The fix is to make `Recipe` carry the table row when there is one — the session
-was started from a name, `find_within` finds it, and `None` is kept for the case
-that has no row and never will: a program named outright, `abeam +pwsh` or
-`abeam +C:\tools\claude.exe`. Then `a` and `A → the same name` are one program
-by construction rather than by coincidence. It is small, it belongs in phase 2,
-and it wants a test named after the disagreement.
+**An earlier draft proposed fixing this by routing `Recipe::launch` through
+`resolve_within`. That is wrong and would have been a regression.**
+`resolve_within` searches by bare *name*, so it re-walks `PATH`, while
+`Recipe::launch` uses `resolve_at` against an absolute path precisely so that a
+keystroke-opened pane starts *the same file* the session did. A `PATH` that
+changed since startup, or a nearer entry that appeared, would silently start a
+different binary under the same border word — the asymmetry `Recipe`'s own doc
+says it exists to remove.
+
+The fix is one field, and it keeps `resolve_at`:
+
+```rust
+struct Recipe {
+    target: PathBuf,
+    name: String,
+    kind: String,        // Hosted::agent
+    args: Vec<String>,   // the row's own args, empty for a built-in
+}
+
+fn launch(&self) -> Result<Launch, String> {
+    crate::launch::resolve_at(&self.target, &self.args)
+}
+```
+
+**`args` and emphatically not `env`.** `Launch::env` is not an input to
+resolution — it is *derived from* `(script, args)` on every resolve, by
+`through_cmd`, which quotes the arguments back into `ABEAM_LAUNCH` itself. So
+resolving the shim with `["agent"]` runs `claude agent` on Windows and puts the
+same word in argv on Unix: one field, one code path, both platforms. Carrying a
+stale `env` beside a blanked argv is the exact failure `Recipe`'s doc already
+warns about — for `abeam -p "fix the tests"` the prompt lives in that variable,
+so the result is a bare `cmd.exe` under a border reading `claude`.
+
+`args` is the right thing to carry because it is the input the resolver
+re-derives everything else from, and `crate::agent::Agent::args` is precisely
+the preset's contribution with the typed command line excluded. A program named
+outright still has no row and needs none: its `args` are empty and its `target`
+is the whole recipe. It belongs in phase 2, and it wants a test named after the
+disagreement.
 
 ## The keys
 
@@ -339,7 +381,7 @@ argument and would make the common case two keystrokes; the status-view arm of
 judged too long. `A` next to `a` is the smallest possible spelling of "the same
 thing, but ask me first", and it is claimed in **both** lists, because `a` is.
 
-### `Shift` has to become part of the gesture, and today it is not
+### `Shift` may be tolerated and must never be required
 
 `crates/abeam/src/panes/git.rs` has a test named
 `a_chord_never_starts_or_kills_an_agent_in_either_list`, and its comment records
@@ -348,19 +390,53 @@ in the worktree list while the status list declined it, three lines under a
 comment saying the opposite. It refuses `CONTROL` and `ALT`. It does not refuse
 `SHIFT`, because nothing needed it to.
 
-Crossterm reports Shift+A as `KeyCode::Char('A')`, which falls through both arms
-today and is why `A` is free. But a terminal that reports `Char('a')` with
-`SHIFT` set — and the modifier reporting in this program has already had one
-platform surprise, `crate::keys`' AltGr paragraph — would land on the `a` arm
-and start the session's agent without asking, in the exact place a reader had
-just tried to ask.
+**An earlier draft of this section said the chooser should be `a`-or-`A` *with
+`SHIFT` set*. That is exactly backwards, and it would have shipped a key that
+does nothing on most Unix terminals.** Crossterm's ANSI parser has no modifier
+bits to recover from a bare `A` byte, so on Unix Shift+A arrives as
+`KeyCode::Char('A')` with `KeyModifiers::NONE`. A rule that *requires* `SHIFT`
+refuses it.
 
-So the arms become one gesture with three cases, and the existing test grows a
-`SHIFT` row: `a` with no modifiers starts; `a`-or-`A` with `SHIFT` chooses;
-anything with `CONTROL` or `ALT` is `Handled::No`. `Alt+A` in particular stays
-refused, and that half is not symmetry — `crate::keys` records that abeam
-yielded `Alt+A` to Codex, which after this change is an agent any session can be
-hosting.
+The repository has already settled this twice, in the opposite direction:
+
+- `crate::keys::global` matches `Char('g') | Char('G')`, `Char('q') | Char('Q')`
+  and `Char('k') | Char('K')`, and **never consults the `SHIFT` bit at all**.
+- The `?` arm in `crate::panes::git` excludes `CONTROL` and `ALT` **by name**
+  rather than by `modifiers.is_empty()`, and says why: `?` is a shifted key on
+  most layouts, so `SHIFT` arrives with it and must not disqualify it. The
+  right-hand fallthrough in `crate::app` carries the same note about `q`, and
+  the words there are "*some* terminals report SHIFT for an uppercase letter".
+
+*Some* is the whole point. `SHIFT`-on-uppercase is a variable, so it can be
+tolerated and never required.
+
+So this is **two independent edits, not one three-way match**:
+
+```
+Char('A')                                => choose   // Ctrl/Alt still refused by name
+Char('a') if !modifiers.contains(SHIFT)  => start
+```
+
+The first claims the letter the way `keys::global` claims letters. The second is
+the real hazard the paragraph above was reaching for: on a terminal that *does*
+set `SHIFT` for an uppercase letter, an unguarded `a` arm would start the
+session's agent without asking, in the exact place the reader was trying to ask.
+
+The existing test grows two rows, and the second is the one that matters: a
+`SHIFT` row for `a`, **and a row asserting `Char('A')` with
+`KeyModifiers::NONE` opens the chooser**. Without that second row the Unix bug
+ships green. `Alt+A` stays refused, and that half is not symmetry —
+`crate::keys` records that abeam yielded `Alt+A` to Codex, which after this
+change is an agent any session can be hosting.
+
+**And `A` is genuinely free in both lists, which was checked rather than
+assumed.** `crate::scroll::key` claims `Ctrl+d`, `Ctrl+u`, `j`/`Down`, `k`/`Up`,
+space/`PageDown`, `b`/`PageUp`, `g`/`Home` and — the one that matters —
+**`G`/`End`**. So uppercase is *not* free in general; `A` simply is not in that
+list. One asymmetry for whoever writes the two arms: in `Mode::Status` `scroll`
+sees the key *before* the pane's match, and in `Mode::Worktrees` the pane's
+match runs *before* `wt_scroll`. It does not change the answer for `A`, but the
+two arms sit at different depths.
 
 ## The chooser, in code
 
@@ -412,8 +488,51 @@ reach it**, and that difference is the one genuinely new thing here. A standing
 `kill` changes nothing about routing — every other key simply cancels it,
 through the `take` at the top of `worktree_key`. A standing `choosing` has to
 *swallow* `j` and `k`, or the reader scrolls the worktree list while looking at
-a list of agents. So `handle_key` grows one early branch, ahead of either
-list's match, and that branch is the whole of the chooser's key handling.
+a list of agents. So `handle_key` grows one early branch, above the line that
+dispatches to `worktree_key` — which is its second — and that one branch covers
+both lists.
+
+**Two requirements on that branch that an earlier draft did not state, and both
+are load-bearing.**
+
+**It must return `Handled::Yes` for every key, not only the four it acts on.**
+The shell treats a `Handled::No` on a bare `Esc` *or* `q` as "the reader is done
+with this pane" and moves focus to the left column. A branch that handles
+`j`, `k`, `Enter` and `Esc` and falls through on the rest means a bare `q` hands
+the keyboard to the agent with `choosing` still `Some` — an invisible standing
+question over a `root` captured some time ago and still ageing. Coming back to
+the pane later, the next `Enter` starts an agent in a checkout the reader has
+forgotten they named. The `esc→list` hint is only an honest promise if the
+branch consumes `Esc` itself.
+
+**The two `A` arms stay inside each list's own match and must not be hoisted
+into that branch.** `worktree_key` takes the standing `kill` before it matches
+anything, which is what the `x` arm's own comment relies on: *any* other key in
+that list is the answer "no". An `A` hoisted above that `take` skips it, and
+`x`, `A`, `Esc`, `x` becomes a kill of a live agent with **one** visible
+warning, dismissed in between by an unrelated full-pane list. That is the most
+destructive action in the program losing half its guard. As written — the branch
+fires only when `choosing.is_some()`, and `A` is matched by each list — the
+sequence is safe, because the `A` press itself has already taken the kill. It is
+safe by ordering rather than by construction, so it is worth a test: `x`, `A`,
+`Esc`, `x` must close nothing.
+
+**And the same early return is owed to `handle_mouse`.** Without it the wheel
+scrolls a list nobody can see and a click moves the selection underneath the
+chooser. Not a correctness bug — `Choice` carries its own `root`, so the
+captured checkout cannot change under it — but "one branch is the whole of the
+chooser's key handling" is true of keys and there is a second input path.
+
+**Four other sites read the mode and each needs an answer while the question
+stands:** `render` (branch before the status list is measured), `title` (this is
+where `git · start an agent in main` comes from, and the checkout name must come
+from `Choice::root` — never from `self.root` or the selection, or the title
+disagrees with what `Enter` will do), `exit_hint` (a pre-check returning
+`esc→list`; it answers `&'static str`, so a third answer is free), and
+`set_worktree_rows`, whose "a frame is owed" return may optionally be suppressed
+while a chooser is up, since nothing the chooser draws can change. Nothing
+matches `Mode` exhaustively, so none of this needs a third variant — which would
+additionally have had to encode which list to return to.
 
 ### The rows say what a preset hosts
 
@@ -450,38 +569,80 @@ intercepting before a focused pane is offered anything, which is the one thing
 
 ## What goes wrong, and what it costs
 
-### A queued prompt aimed at a non-Claude pane never sends, and nothing says why
+### A queued prompt aimed at a pane that cannot receive never sends, and nothing says why
 
-This is the largest hazard in the proposal and it is a disclosure problem rather
-than a mechanism one.
+This is the largest hazard in the proposal, it is a disclosure problem rather
+than a mechanism one, and **it is not a hazard this feature creates** — see the
+end of this section, which is the reason phase 3 now ships first.
 
 `QueuePane::gate` is `readiness.is_idle() && !draft_open`, and `next_send` will
 not name an item whose gate is not `Some(true)`. `Readiness::Unknown` is not
-idle. `Enter` does not bypass it — a `Due::Asked` still has to survive
-`next_send` — and that is deliberate: `retime`'s comment says a by-hand ask is
-attended, not exempt.
+idle. So a pane that reports `Unknown` can never be typed at by the queue, ever,
+by design. That mechanism is right and nothing in it should be relaxed.
 
-So a non-Claude pane can never be typed at by the queue, ever, by design.
+**`Enter` does not bypass it, and the refusal is completely silent.** A by-hand
+ask only grants a due, which still has to survive `next_send`; and before it
+gets that far, `QueuePane::now` refuses outright when the gate is not
+`Some(true)` — no send, no redraw, no message. The comment beside that refusal
+says "the status line already says which of the two it was", meaning *busy* or
+*you are typing*. For a pane that can never receive it is neither, so **that
+comment becomes false and the key becomes a dead one with a lie next to it.**
+Phase 3 must give that path a sentence.
 
-Today that is a whole-session fact: `has_claude_state` is false, every pane is
-`Unknown`, and the queue says so once. After this change it is one row in a
-stack — and `App::start_agent` moves the queue's aim to the pane it just
-started, deliberately, because "somebody who presses `a` and then goes to write
-a prompt means it for the pane they have just started". Press `A`, choose Codex,
-write a prompt: it is aimed at a pane that will never take it, and
-`QueuePane::gate_state` will draw the pane's label and `Unknown`, which is a
-word about abeam's ignorance rather than about the pane's kind.
+**And the status line describes exactly one pane, which may not be the one that
+is stuck.** `gate_state` picks its subject through `gate_target`: the pane about
+to be typed at, else the pane the first pending `Send` is waiting on, else the
+aim. `index_of(Mode::Send)` returns the first pending item *regardless of
+target*. So: two panes, the Claude one busy, a Claude-aimed item ahead of a
+Codex-aimed one — the footer reads `claude · busy`, and the item that can never
+go is named nowhere on screen. A fix confined to the footer does not reach its
+own case.
 
-**The fix is in `Target`.** It carries `id`, `label`, `readiness` and
-`draft_open`; it gains the kind, and the status line distinguishes "abeam cannot
-say" from "this pane is not one the queue can type at". Those are two different
-sentences and only one of them is worth waiting for. That is phase 3, and phase
-2 should not ship without it — a queue that silently holds a prompt for ever is
-the failure shape `crate::agentstate` exists to refuse.
+**An earlier draft over-claimed the harm and the correction is worth keeping.**
+It said a queue silently holding a prompt for ever is "the failure shape
+`crate::agentstate` exists to refuse". It is not: `next_send` deliberately
+*walks past* a blocked item rather than stopping at it, and its own doc says so
+— so a Codex-aimed item at the head of the list blocks nothing behind it, and
+every other pane's prompts keep flowing. The real harm is one item silently
+never going with nothing on screen saying so, which is enough of an argument on
+its own.
 
-The aim still moves. Refusing to move it would mean a keystroke whose effect
-depends on the kind of thing it started, and the reader who wants the note aimed
-at the new Codex pane — to read later, by hand — is not doing anything wrong.
+**The smallest honest fix is three sites, not one.**
+
+- **`Target` gains `can_receive: bool`** — not the kind string an earlier draft
+  proposed. Two reasons. `Target` derives `PartialEq` and is compared *whole* in
+  `set_targets`, once per pane per readiness poll, so a `String` per pane per
+  quarter second is an allocation with nothing on the other side of it. And the
+  kind is the wrong predicate: `send_readiness` answers `Unknown` for three
+  causes in order — the child has exited, the child has not asked for bracketed
+  paste, the pane is not Claude — and only the first and third are permanent.
+  "Can ever be typed at" is the question the sentence needs, so it is
+  `is_claude() && !pane.has_exited()`, filled in `sync_queue_targets` where the
+  agent is already in hand.
+- **The footer splits its `Unknown` arm** into "cannot receive" and today's
+  "state unknown". Two different facts, and only one of them is worth waiting
+  for.
+- **The item's own row says it too**, which is the half that covers the case
+  above. `aside` already draws the target's label for every `Send` item once
+  there is more than one target — and a mixed session always has more than one
+  by construction — so that arm gains the reason beside the name.
+
+Nothing in `gate`, `next_send`, `retime` or `take_send_request` changes.
+
+**This bug exists today, with no mixed agents anywhere, and that is why phase 3
+goes first.** An **exited but unclosed** Claude pane produces it exactly:
+`send_readiness` returns `Unknown` on `has_exited()` before it asks anything
+else; the pane stays in `App::agents`, because `close_agent` is the only remover
+and it is driven by `x` `x`; so it stays in `targets`, `orphan_lost_targets`
+never fires — that only orphans items whose target has *gone from the list* —
+and its items sit `Pending` for ever under `state unknown`. Phase 3 is therefore
+independently justified and independently testable, and sequencing it ahead of
+phase 2 is a choice rather than a dependency.
+
+The aim still moves to a newly started pane, and that stays right. Refusing to
+move it would make a keystroke's effect depend on the kind of thing it started,
+and a reader who wants a note aimed at the new Codex pane — to read later, by
+hand — is not doing anything wrong.
 
 ### A non-Claude pane does not follow its agent into a worktree
 
@@ -551,18 +712,32 @@ and a function that reads its own field cannot be handed a neighbour's. And
 `Recipe` has no kind until phase 2 gives it one — which is where the preset-args
 disagreement is fixed too, and for the same reason.
 
-**Phase 2 — the feature.** `App` holds the table; `Recipe` carries the row and
-the kind; `start_agent` takes a choice; the `choosing` question and the `A`/`Shift`
-gesture; `AgentRequest`. The preset-args fix and its test go here, because this
-is the phase that would otherwise make the disagreement worse.
+**Phase 2 — the disclosure, and it now goes second rather than third.** `Target`
+gains `can_receive`; the footer splits its `Unknown` arm; the item's own row
+carries the reason; `QueuePane::now`'s silent refusal gets a sentence and its
+comment stops claiming the status line already explained it.
 
-**Phase 3 — the disclosure.** `Target` carries the kind; the queue's status line
-says "this pane cannot be typed at" rather than `Unknown`; the README says what
-a non-Claude pane does not do. Phase 2 should not ship to anyone without this.
+**It was written as phase 3, behind the feature, and that was wrong.** The bug
+it fixes needs no mixed agents at all — an exited but unclosed Claude pane
+reproduces it exactly, and the section above has the chain. So it is not a
+disclosure owed by phase 3's feature; it is a hole in today's program that
+phase 3 would have widened. Fixing it first also means phase 3 lands into a
+queue that can already say what it is doing, rather than shipping a feature and
+its own caveat together.
+
+**Phase 3 — the feature.** `App` holds the table; `Recipe` carries the kind and
+the row's `args`; `start_agent` takes a choice; the `choosing` question, the two
+`A` arms and the `SHIFT` guard on `a`; `AgentRequest`. The preset-args fix and
+its test go here, because this is the phase that would otherwise make the
+disagreement worse. The README gains the note about what a non-Claude pane does
+not do.
 
 **Phase 4 — dispatch, if it is wanted.** The queue's dispatcher becomes
-something that can arrive after a pane opens. Its own argument, its own
-document if it turns out to want one.
+something that can arrive after a pane opens. Note that there are **two**
+`Dispatcher::new` sites, not one — `QueuePane::new` builds one eagerly and
+`pump_queue` builds another on the thread for each `--bg` run — so this is a
+larger phase than it looks. Its own argument, its own document if it turns out
+to want one.
 
 ## What this is not
 
