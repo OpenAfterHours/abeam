@@ -491,9 +491,15 @@ pub const HELP: &[(&str, &str)] = &[
         "Enter",
         "git: open the file · list: open · queue: do it now",
     ),
-    // The right pane only. The agent's pty cannot be moved to another
-    // directory — a live child's cwd is the child's — so this is the one place
-    // the two halves of the window deliberately disagree about where they are.
+    // The right pane only, and nothing abeam does moves an agent pane: a pty is
+    // opened with a working directory and there is no call that re-roots it.
+    // That is what lets the two halves of the window disagree about where they
+    // are, which is what the border's workspace label exists to say.
+    //
+    // **Not that the agent stays put — the session inside the pty can move,
+    // and the row two below is about the key that follows it there.** Claude
+    // Code makes worktrees and moves into them; what cannot be moved is the
+    // pane, not the conversation in it.
     ("Enter (worktrees)", "point the right pane at that worktree"),
     // Beside `Enter` because they are the two keys on one row and the pair is
     // the whole of what a reader has to hold: one moves the right pane, the
@@ -517,9 +523,14 @@ pub const HELP: &[(&str, &str)] = &[
         "a (git)",
         "start another agent here, in the checkout on screen",
     ),
-    // The other half of that pair, and the only row in this block that is about
-    // the *left* column — which the key column says, as it does for every other
-    // conditional row here. It is in the table for the reason `a` is: a key
+    // The other half of the pair the two `a` rows above make — they start a
+    // pane and this closes one — and the only row in this block that is about
+    // the *left* column, which the key column says as it does for every other
+    // conditional row here. ("That pair" used to mean `Enter (worktrees)` and
+    // the `a` beside it, and the second `a` row is what made the phrase
+    // ambiguous enough to be worth spelling out.)
+    //
+    // It is in the table for the reason `a` is: a key
     // whose condition is a state you have to arrive at is one nobody discovers
     // by pressing things, and the state this one needs is a pane you are
     // already looking at wondering how to get rid of.

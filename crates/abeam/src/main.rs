@@ -11,6 +11,38 @@
 //!         abeam +help               (abeam's own; `--help` is the agent's)
 //!
 //! Alt+Q quits, F1 lists the keys, F2 shows what the pty is doing.
+//!
+//! ## Waiving `dead_code`: `#[expect]` unless a `cfg` is what makes it dead
+//!
+//! **The rule is here because it is the one convention in this crate that a
+//! reader cannot infer from the code in front of them**, and because it stopped
+//! being kept. Phase 1 of the multi-agent work chose `#[expect]` deliberately —
+//! it warns the day the lint stops firing, so a waiver cannot outlive its own
+//! argument — and three waivers were later found stale at once: two on
+//! `crate::panes::pad::buffer::Buffer::truncated`, whose consumer had arrived
+//! in the very commit that wrote them, and one on
+//! `crate::agentstate::Session::session_id`, which by then had three production
+//! readers. All three were `#[allow]`, so nothing said a word. There are now no
+//! `#[expect]` left in the crate, which is why this is written down rather than
+//! remembered.
+//!
+//! - **A waiver awaiting a consumer is `#[expect]`.** The item is dead in every
+//!   configuration this crate is built in, so the expectation is fulfilled in
+//!   all of them — and the first build after something reads it fails the lint
+//!   that was waived, which is the whole point.
+//! - **A waiver whose condition is a `cfg` is `#[allow]`**, because in the
+//!   configuration where the item *is* used an `#[expect]` is *unfulfilled*,
+//!   and `unfulfilled_lint_expectations` is a warning in its own right. Both
+//!   kinds are here: `crate::config::from_appdata` and
+//!   `crate::panes::pad::store::from_appdata` are live on one platform and dead
+//!   on the other, and `crate::agentstate::Session::pid` is read only by tests
+//!   — so it is dead under `cargo build` and alive under
+//!   `cargo clippy --all-targets`. `cfg(test)` is a `cfg` like any other, and
+//!   that one is the case worth naming because it does not look like one.
+//!
+//! Both forms carry a `reason`, and the reason is a claim with an expiry date
+//! rather than a label: "tested ahead of a consumer" is checkable, "unused" is
+//! not.
 
 mod agent;
 mod agentstate;

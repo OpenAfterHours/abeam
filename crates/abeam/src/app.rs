@@ -516,8 +516,11 @@ struct Agent {
     /// `has_moved` is gated on starts comparing a record against a directory
     /// that record chose. This one is written from a record the probe has
     /// *already* accepted, and nothing outside display and row-routing may read
-    /// it — [`standing`](Self::standing) is the only reader, and
-    /// [`follow_record`](Self::follow_record) the only writer.
+    /// it — [`standing`](Self::standing) is the only reader that answers a
+    /// question about the agent, and [`follow_record`](Self::follow_record) is
+    /// the only writer. That function reads it too, to compare the old answer
+    /// with the new one; the distinction is worth keeping straight, because
+    /// "one reader" is the sort of claim that stops being true quietly.
     ///
     /// `None` rather than a copy of the root, so that "has this agent left?" is
     /// a question the type answers rather than a `same_dir` somebody has to
@@ -845,6 +848,12 @@ impl Agent {
         let moved = match (self.moved_to.as_deref(), now) {
             (None, None) => false,
             (Some(was), Some(now)) => !paths::same_dir(was, now),
+            // Both mixed cases, and the second is not symmetry for its own
+            // sake: `Some` → `None` is a session coming *home* to the checkout
+            // its pane was spawned in, which is `is_here` rather than the
+            // widening and is what `git worktree remove` after a merge looks
+            // like from here. It was untestable-by-accident for a while — every
+            // other case moves away — so it has a test named after it.
             _ => true,
         };
         if moved {
@@ -1834,8 +1843,11 @@ impl App {
     /// What one agent is called where there is no border to read it off.
     ///
     /// The worktree it is **working in** — [`Agent::standing`], which is the
-    /// pane's own root until its record says the session has moved into a
-    /// worktree it made for itself. [`agent_tag`](Self::agent_tag) draws the
+    /// pane's own root until its record says the session has moved into some
+    /// other worktree of this repository. Usually one it made for itself, and
+    /// deliberately not only that: what the probe accepts is any root
+    /// `git worktree list` named, matched exactly and tied to the `sessionId`
+    /// that was ours. [`agent_tag`](Self::agent_tag) draws the
     /// same string on the pane's own border, suppressed there when it is the
     /// session's root because a border has no columns to spend on the default —
     /// this one is not suppressed, because a queue row naming three of four
@@ -5727,11 +5739,15 @@ impl App {
     /// does. A border built from the spawn directory then named a checkout the
     /// agent had left, permanently and with nothing on screen disagreeing.
     ///
-    /// So it is maintained after all, off [`Agent::standing`], and it costs one
-    /// comparison per poll rather than a field anybody has to remember to
-    /// write. What it must not be built from is the pane's own root — see
-    /// [`Agent::root`], which is what the readiness probe compares records
-    /// against and is the one thing here that may not follow the agent.
+    /// So it is maintained after all, off [`Agent::standing`] — and it is worth
+    /// being plain that this costs a field, [`Agent::moved_to`], written once
+    /// per readiness poll. What it does *not* cost is a field anybody has to
+    /// remember to write: [`Agent::follow_record`] is the only writer and it is
+    /// called from the loop that was already re-reading the record, so there is
+    /// no site that could forget. What it must not be built from is the pane's
+    /// own root — see [`Agent::root`], which is what the readiness probe
+    /// compares records against and is the one thing here that may not follow
+    /// the agent.
     ///
     /// **Suppressed at the session's own root**, exactly as
     /// [`right_title`](Self::right_title) suppresses the workspace label at
@@ -9623,6 +9639,55 @@ mod tests {
         );
     }
 
+    /// An agent that comes back to the checkout it started in is followed home.
+    ///
+    /// **The arm of [`Agent::follow_record`] nothing else reaches**, and it was
+    /// vacuous until this test: every other case moves *away* from the spawn
+    /// root, so `moved_to` goes `None` → `Some`, and the `Some` → `None`
+    /// direction could be broken without a single assertion noticing. It is
+    /// ordinary rather than exotic — `git worktree remove` after a merge,
+    /// or an agent told to finish where it started — and the failure it would
+    /// cause is the one this whole change is about, pointing the other way: a
+    /// border, a count and an `x` all naming a worktree the agent has left.
+    #[test]
+    fn an_agent_that_returns_to_the_checkout_it_started_in_is_followed_home() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        let (records, moved) = moves_to_a_worktree(&mut fx, 1, true);
+        polled(&mut fx);
+        assert!(
+            paths::same_dir(fx.app.agents[1].standing(), &moved),
+            "the move this test undoes did not happen"
+        );
+
+        // Home again: same file, same `sessionId`, the spawn root back in the
+        // `cwd`. That is `is_here` rather than the widening, which is the other
+        // half of what makes this a different path from the one above.
+        say(&records, fx.dir.path(), "idle");
+        assert!(polled(&mut fx), "coming home is worth a frame");
+        assert!(
+            paths::same_dir(fx.app.agents[1].standing(), fx.dir.path()),
+            "the pane is still reported in the worktree it left: {}",
+            fx.app.agents[1].standing().display()
+        );
+        assert_eq!(
+            fx.app.agent_in(&moved),
+            Err(format!(
+                "no agent here. `a` starts one in {}.",
+                workspace::dir_label(&moved)
+            )),
+            "the worktree it left still answers for it"
+        );
+
+        // And the count came back with it, which is the half a reader sees.
+        fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
+        let after = screen(&mut fx.app, 120, 40);
+        assert!(
+            after.contains("2 agents"),
+            "the checkout it returned to does not count it: {after}"
+        );
+    }
+
     /// An agent that branches off *before* git has been asked is found when it
     /// is, rather than lost for the session.
     ///
@@ -12020,8 +12085,13 @@ mod tests {
     //
     // The left pane is never in any of this, and that is the feature rather
     // than an omission: there is no call that moves a running process to
-    // another directory, so the agent stays where it was started. Every test
+    // another directory, so nothing here re-roots an agent pane. Every test
     // below is about the *right* half of the window.
+    //
+    // Which is not the same as the agent staying put, and this comment used to
+    // say it was. The pane cannot be moved; the session in it can make a
+    // worktree and move into one, and the tests for what the window does about
+    // that are up with the readiness poll that notices it.
 
     /// A real directory beside the fixture's root, and a `Space` over it.
     ///

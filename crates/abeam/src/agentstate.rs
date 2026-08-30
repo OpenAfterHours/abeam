@@ -210,9 +210,16 @@ pub struct Session {
     /// `the_record_claude_writes_for_a_live_session_parses_field_for_field`, so
     /// they are covered even while they are unconsumed â€” which is the whole of
     /// what `dead_code` is objecting to here.
+    ///
+    /// **`#[allow]` and not `#[expect]`, and this is the case the crate root's
+    /// rule is written around.** It looks like a waiver awaiting a consumer,
+    /// which would be an `#[expect]`; it is really a waiver whose condition is
+    /// a `cfg`. The tests above read it, so under
+    /// `cargo clippy --all-targets` the lint does not fire and an `#[expect]`
+    /// is *unfulfilled* — a warning of its own. See `crate`'s module docs.
     #[allow(
         dead_code,
-        reason = "a faithful record, parsed and tested ahead of a consumer"
+        reason = "read by this module's tests; dead only in a build without them"
     )]
     pub pid: Option<u32>,
     /// The short id `claude agents` uses; absent on interactive sessions.
@@ -510,11 +517,21 @@ pub struct Probe {
     /// different fact from [`root`](Self::root) and must stay one.
     ///
     /// `root` is the anchor: the directory the pane was spawned in, compared
-    /// against by [`Probe::is_here`], never assigned to after
-    /// [`Probe::new`]. This is what the accepted record said about itself,
-    /// which is the same directory in almost every session and is a worktree
-    /// the session made for itself in the one this exists for. Read
-    /// [`standing_in`](Self::standing_in) before using either.
+    /// against by [`Probe::is_here`], never assigned to after [`Probe::new`].
+    /// This is what the accepted record said about itself, which is the same
+    /// directory in almost every session.
+    ///
+    /// **When it differs it is a worktree `git worktree list` named, and that
+    /// is wider than the case this was built for.** The case is a session that
+    /// made itself a worktree and moved in; what
+    /// [`has_moved`](Self::has_moved) actually accepts is any root git printed,
+    /// matched exactly — one somebody else added, one that has been there for
+    /// months, a neighbour's. That is deliberate and it is safe for a reason
+    /// that has nothing to do with how the directory came to exist: the record
+    /// has to carry the `sessionId` that was ours. Describing the field by its
+    /// motivating case would invite a later edit to narrow the check to
+    /// directories abeam watched appear, which is a fact abeam does not have.
+    /// Read [`standing_in`](Self::standing_in) before using either field.
     ///
     /// **Written only where a record has already been vouched for**, on both
     /// paths through [`Probe::session`], and every accepted record carries a
@@ -522,13 +539,22 @@ pub struct Probe {
     /// refuse a record without one, so there is no acceptance this can be
     /// assigned `None` by.
     ///
-    /// **Never cleared, which is the one decision in it.** A record that goes
-    /// missing or unreadable does not mean the session went back where it came
-    /// from; it means abeam cannot see it this poll. Clearing would make a
-    /// border flap between two names on a transient, and the last
-    /// identity-checked answer is the best one there is. `None` therefore means
-    /// exactly one thing: this probe has never accepted a record at all, which
-    /// is a pane whose child writes none.
+    /// **Never cleared, and the reason is a pane with no way out rather than a
+    /// flickering border.** A record that goes missing or unreadable does not
+    /// mean the session went back where it came from; it means abeam cannot see
+    /// it this poll. Clearing would send `crate::app::Agent::standing` back to
+    /// the directory the pane was *spawned* in — and that answer is what
+    /// `workspace::rows` guarantees a row for and what
+    /// `crate::app::App::agent_in` resolves `x` `x` against. So the row
+    /// synthesised for the worktree the agent is working in would disappear,
+    /// and the only gesture that can end that agent would start answering about
+    /// a checkout it is not in. That is phase 4's "a pane whose root has no row
+    /// is a pane with no way out", arriving through the very accessor built to
+    /// keep the row where the work is. A border flapping between two names is
+    /// the cosmetic half of the same thing and not the argument.
+    ///
+    /// `None` therefore means exactly one thing: this probe has never accepted
+    /// a record at all, which is a pane whose child writes none.
     standing: Option<PathBuf>,
 }
 

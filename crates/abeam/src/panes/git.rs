@@ -786,10 +786,18 @@ impl GitPane {
         // list has any business in — a chord is aimed past abeam at whatever is
         // hosted, and nothing here is reachable any other way.
         //
-        // `SHIFT` is deliberately not in the set, for the reason the `?` arm in
-        // the status list states: some terminals report it for an uppercase
-        // letter, and a rule that excluded it would be a rule about keyboards.
-        // `Char('A')` is a different code from `Char('a')` in any case.
+        // Both modifiers named rather than `modifiers.is_empty()`, and `SHIFT`
+        // deliberately left out of the set: the `?` arm in the status list
+        // already makes that argument and it is not re-made here — some
+        // terminals report `SHIFT` for an uppercase letter, so a rule that
+        // excluded it would be a rule about keyboards. `Char('A')` is a
+        // different code from `Char('a')` in any case.
+        //
+        // **A blanket check rather than a guard on the `a` arm alone**, which
+        // is the narrower fix and would have left `Ctrl+X` and `Alt+X` arming
+        // a kill — the destructive half, and the reason this arm exists at all.
+        // One rule for the list is also what makes `docs/keymap.md`'s claim
+        // that the two `a`s are one gesture a true one.
         // Handed to the shared scroll vocabulary and to nothing else, because
         // `Ctrl+D` and `Ctrl+U` are half-page scrolls in every right-hand pane
         // and this list is not an exception to that. Every other chord is
@@ -1107,15 +1115,26 @@ impl Pane for GitPane {
             // agreeing a true one.
             //
             // **`ALT` joined `CONTROL` when `a` landed here**, and the reason is
-            // a key rather than symmetry: `Alt+A` is **Codex's own key** by
-            // `docs/keymap.md`'s inventory, in a program that hosts Codex, and
-            // a reader whose hand knows that chord must not discover it starts
-            // an abeam agent. It costs `Alt+R` and `Alt+W`, which meant refresh
-            // and the worktree list by accident and were never anybody's
-            // spelling of either — the comment on `w` below has said `Alt+W` is
-            // Claude's since it was written. `crate::keys::global` claims every
-            // `Alt` abeam does own before a pane is offered anything, so
-            // nothing reaches here that this should be taking.
+            // a key rather than symmetry: `Alt+A` is **Codex's own key** — it
+            // opens Codex's agent-session overview, which is why abeam yielded
+            // it and moved the queue to `F8`, and `crate::keys`' module docs
+            // say so in those words — in a program that hosts Codex. Delivery
+            // here is safe; that is not
+            // the point. The point is that the one arm in this pane that spawns
+            // a *process* would be answering an event this project has already
+            // assigned to a hosted agent.
+            //
+            // It costs `Alt+R` and `Alt+W`, which meant refresh and the
+            // worktree list by accident and were never anybody's spelling of
+            // either — the comment on `w` below has said `Alt+W` is Claude's
+            // since it was written. `crate::keys::global` claims every `Alt`
+            // abeam does own before a pane is offered anything, so nothing
+            // reaches here that this should be taking.
+            //
+            // Excluding both by name rather than by `modifiers.is_empty()` is
+            // the `?` arm's rule below, and it is cited rather than re-argued:
+            // `SHIFT` arrives with a shifted key on some layouts and must not
+            // disqualify anything.
             KeyCode::Char(_)
                 if key
                     .modifiers
@@ -3346,9 +3365,10 @@ mod tests {
         // the opposite. Writing a second `a` arm is what made it visible,
         // because the two then had to be one gesture and were not.
         //
-        // `Alt` is refused as well, and that half is not symmetry: `Alt+A` is
-        // **Codex's own key** by `docs/keymap.md`'s inventory, in a program
-        // that hosts Codex.
+        // `Alt` is refused as well, and that half is not symmetry: `Alt+A`
+        // opens **Codex's** agent-session overview — `crate::keys`' module docs
+        // record that abeam yielded the key over it — in a program that hosts
+        // Codex.
         for chord in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
             let (mut pane, _asks, _answers) = detached(ONE);
             pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);

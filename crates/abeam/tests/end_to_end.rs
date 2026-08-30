@@ -699,10 +699,16 @@ fn the_right_pane_can_be_pointed_at_a_worktree_and_both_of_its_views_follow() {
     // columns, and that the two right-hand views really do land in the other
     // worktree.
     //
-    // The left pane is deliberately not in any of it: a live child's working
-    // directory belongs to the child, so the agent stays where it started. That
-    // asymmetry is what the border's workspace label exists to say out loud,
-    // and it is the last thing this test checks.
+    // The left pane is deliberately not in any of it: a pty is opened with a
+    // working directory and there is no call that re-roots it, so `Enter` here
+    // moves the right half of the window and nothing else. That asymmetry is
+    // what the border's workspace label exists to say out loud, and it is the
+    // last thing this test checks.
+    //
+    // "The agent stays where it started" is what this used to say, and it is
+    // not the same claim: the *pane* stays, and the session inside it can make
+    // a worktree and move into one — which the window follows, and which
+    // nothing here exercises.
     let dir = Dir::new("worktrees");
 
     // Committed, so there is a HEAD to add a worktree at. `notes.md` is left

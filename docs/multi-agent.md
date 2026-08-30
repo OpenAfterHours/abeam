@@ -34,8 +34,8 @@
 > - **`Row.agents_here` stayed a count and did not become a list of pane ids**,
 >   which is one prediction below that did not come true. What the closing
 >   gesture needed was not ids on a row but a *guaranteed* row: `workspace::rows`
->   now promises one for every agent's root, which the section on the roster
->   revises.
+>   now promises one for every directory an agent is *working* in, which the
+>   section on the roster revises.
 > - **Nothing was built for re-aiming a queued item.** It is written where it
 >   was written and cannot be moved. That is a gap rather than a decision, and
 >   it is named at the foot of the queue section.
@@ -270,17 +270,17 @@ been a second copy of what `crate::app` already knows, kept up to date on a
 ten-second discovery timer, which is exactly the kind of mirror this design has
 been deleting.
 
-**What the list did owe, and now pays, is a row for every agent's root.**
-`workspace::rows` guaranteed a row for the workspace on screen and for the one
-abeam was started in, and for a while it declined a third guarantee on the
-grounds that an agent is started *from* a row so its root has one by
-construction. That was true and too narrow — an agent standing in a worktree
-`git worktree list` has stopped naming had no row at all — and it stopped being
-survivable when the close gesture arrived, because a pane whose root has no row
-is a pane with no way out, in the very list that is meant to be its roster. It
-is a guarantee now, and the cost is the one that argument named: a row for a
-directory git no longer mentions, carrying a directory name because there is no
-branch to carry.
+**What the list did owe, and now pays, is a row for every directory an agent is
+working in.** `workspace::rows` guaranteed a row for the workspace on screen
+and for the one abeam was started in, and for a while it declined a third
+guarantee on the grounds that an agent is started *from* a row so its root has
+one by construction. That was true and too narrow — an agent standing in a
+worktree `git worktree list` has stopped naming had no row at all — and it
+stopped being survivable when the close gesture arrived, because a pane whose
+root has no row is a pane with no way out, in the very list meant to be its
+roster. It is a guarantee now, and the cost is the one that argument named: a
+row for a directory git no longer mentions, carrying a directory name because
+there is no branch to carry.
 
 **And the guarantee follows the agent, which is what the "by construction"
 premise was always missing.** An agent started *from* a row has a row for the
@@ -886,8 +886,9 @@ So: the agent cursor and the workspace cursor are independent, and neither
 writes to the other. The cost is real and worth naming — you can be typing at an
 agent in one worktree while reading the git status of another, with only the two
 borders to tell you so. That is a labelling problem, and the borders already
-solve it: each agent pane says which root it is standing in, and the right pane
-has said which workspace it is on since the day there was more than one.
+solve it: each agent pane says which checkout its session is working in, and the
+right pane has said which workspace it is on since the day there was more than
+one.
 
 A test pins it: cycle the agent cursor, assert `at` and `right_view` are
 untouched.

@@ -239,7 +239,7 @@ not move. The agent abeam was started with is still the session: its exit is
 abeam's exit code, and it cannot be closed. `docs/multi-agent.md` is the design
 and the record of what each phase cost.
 
-What that is built on is **sixty-five tests** — the number of `#[test]`
+What that is built on is **sixty-six tests** — the number of `#[test]`
 attributes this work added, so it can be checked rather than taken — some
 of which spawn real ptys and draw real frames, and a mutation audit that broke
 each new rule on purpose to check something went red. It is a suite for one
@@ -251,7 +251,7 @@ process go, or told an agent to branch off and watched the window follow it.
 Every number in the paragraph below about how it degrades is arithmetic, not a
 measurement.
 
-Six specific things to expect, in the order they are likely to bite.
+Seven specific things to expect, in the order they are likely to bite.
 
 - **The rows are tight, and the arithmetic is unmeasured.** A whole pane is
   `MIN_AGENT_ROWS` — twelve — plus its border, so two agents want 28 rows and
@@ -298,6 +298,18 @@ Six specific things to expect, in the order they are likely to bite.
   leaves inside the second or so before its *first* record is read is never
   identified at all, so it is never followed. That is discovery being strict on
   purpose, and closing it would be a change to the discovery rule.
+- **`git worktree remove` under a live agent leaves that pane readable but
+  never idle again.** The pane's record still names the worktree; the list git
+  prints no longer does; so the probe refuses it on every poll from then on and
+  the pane reads `Unknown` for the rest of the session. Nothing queued for it
+  is ever delivered, and the border and its row go on naming a directory that
+  is not there any more. Two things still work, and they are the ones that
+  matter: the row survives — `workspace::rows` guarantees one for every
+  directory an agent is working in, whatever git says — so `x` `x` on it still
+  ends the agent, and the pane is still typed at by hand. Putting the worktree
+  back recovers it on the next discovery. Nobody has met this, and the honest
+  reading is that it is the same refusal as the ten seconds above with nothing
+  arriving to end it.
 - **Killing a pane throws away every prompt queued for it.** They are not
   retargeted — the whole design refuses that — and they are not lost silently
   either: each row says which pane it was written for and that the pane has

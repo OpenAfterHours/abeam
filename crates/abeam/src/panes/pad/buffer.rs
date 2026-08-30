@@ -243,12 +243,16 @@ impl Buffer {
     /// cleared itself on the first `backspace` would hand the save path
     /// permission to overwrite exactly the document it was there to protect.
     ///
-    /// **The waiver that used to stand here has gone because the wiring pass it
-    /// was waiting for happened.** It said the pane latched
-    /// `store::Loaded::truncated` and not yet this one, and that the two would
-    /// be ORed together when it did; `PadPane::ensure_read` does exactly that. A
-    /// waiver is the shape of thing that outlives its own argument, so it is
-    /// worth one sentence saying which argument this one was.
+    /// **A `dead_code` waiver used to stand here and it was never true**, which
+    /// is worth a sentence because it is a sharper lesson than a waiver going
+    /// stale over time. It said the pane latched `store::Loaded::truncated` and
+    /// "not yet this one", and that the two would be ORed together in a later
+    /// wiring pass — and `PadPane::ensure_read` ORs them in the *same commit*
+    /// that wrote the waiver. The pass it was waiting for had already happened
+    /// when the words were typed. Nothing ever said so, because an `#[allow]`
+    /// says nothing when the lint stops firing; an `#[expect]` would have
+    /// failed the build that introduced it. The crate root has the rule that
+    /// came out of this.
     pub fn truncated(&self) -> bool {
         self.truncated
     }

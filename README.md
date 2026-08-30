@@ -429,11 +429,20 @@ The first of those two is the one most sessions want, because Claude Code makes
 its own worktrees: open a second agent where you already are, tell it to branch
 off, and it runs `git worktree add` and moves into the result. abeam does not
 make worktrees for you and will not — but it follows an agent that makes one, so
-the pane's border, the list's count and the row `x` acts on all name the
-worktree it is actually working in. What does **not** follow is the record abeam
-reads to tell whether that agent is busy: it goes on being matched against the
-directory the pane started in, which is what stops one pane being told another
-session's state.
+the list's count and the row `x` acts on move to the worktree it is actually
+working in, and so does the pane's own border. The border names that worktree
+only when it is *not* the checkout abeam was started in, which is the same rule
+the right pane's label follows and for the same reason: 72 columns is not enough
+to spend three of them on the answer that is true by default. So two agents in
+one checkout read `claude · 1/2` and `claude · 2/2`, and one that has branched
+off reads `claude · 2/2 · branch-name`.
+
+What does **not** follow is the record abeam reads to tell whether that agent is
+busy: it goes on being matched against the directory the pane started in, which
+is what stops one pane being told another session's state. Following an agent
+also waits on `git worktree list`, which runs every ten seconds — so expect the
+border and the count to catch up a few seconds after the agent moves, not at
+once.
 
 `F4` gives your keys to the left column, and pressed again it moves along the
 agents. The border of the pane that has them is highlighted and reads
