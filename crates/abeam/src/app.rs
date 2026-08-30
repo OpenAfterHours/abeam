@@ -10221,6 +10221,24 @@ mod tests {
         // dangerous answer: `Idle` is the only state that lets a send leave.
         let mut fx = app();
         let _records = records(&mut fx, "idle");
+        // The child has to stay, and without this line the test is about
+        // nothing. `send_readiness` refuses an exited pane, and a pane that
+        // never asked for bracketed paste, *before* it looks at the kind, and
+        // [`stays`]' own doc says the fixture's child is both — so the
+        // `Unknown` every assertion below rests on can be either of those
+        // refusals rather than the one under test.
+        //
+        // **Which of the two fires is not a fixed property of the fixture, and
+        // that is the argument for this line rather than the weakness itself.**
+        // `TerminalPane::has_exited` reads what `poll_exit` last saw without
+        // asking the operating system, and nothing on this path calls it. Two
+        // runs of one mutation — `is_claude` hardwired true — disagreed about
+        // whether this test bites at all. A test that sometimes has a subject
+        // is worse than one that never does, because it reads as cover. `stays`
+        // puts a live child with the mode behind the pane, so the kind is the
+        // only refusal left and the answer is a guarantee rather than a
+        // coincidence.
+        stays(&mut fx);
         // The *pane's* kind, which is what the gate reads. It was the
         // session's, and the two were the same string; they still are in any
         // session abeam can start, which is exactly why this has to be written
