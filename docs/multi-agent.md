@@ -440,6 +440,30 @@ first, and leaving it out made loss look like progress — kill a pane with thre
 prompts queued for it and `queue 5` became `queue 2`, which is what a border
 says when work has been *done*.
 
+**Where a queued prompt is delivered is a fact about the borrow checker.** The
+queue hands the shell whatever the shell needs in order to write — and what the
+shell asks for is a `&mut` to the agent itself, not its position. The pane that
+was vetted is therefore the pane that is typed into by construction: the borrow
+is live across the write, so no statement can be inserted between the two that
+pushes to, removes from or reorders the vector. With an index the property was
+true and one line away from false, which is how the whole class of bug this
+design is about got in the first time.
+
+**A record belongs to one pane, and the two ways that went wrong are cousins.**
+A killed child does not tidy up, so its session record can outlive it and be
+adopted by the next agent started in that worktree; and an agent started
+*beside* another in the same root has no record of its own for a second or two,
+during which the newest one in that directory is its neighbour's. Both end with
+a probe reporting somebody else's `status`, and if that somebody is idle the
+answer is `Idle` — the one answer that lets a prompt be typed. Neither becomes
+permanent, because `agentstate` re-asks `started_at >= spawned_at` on every call
+and never memoises an older record. Both are closed the same way and by the one
+party that can: `crate::app` disowns a pane's record as the pane closes, and
+tells a new pane's probe about every record a pane on screen has already
+claimed. Narrowing `Probe::search`'s clock-skew fallback to a *window* would
+help with both and is a change to the discovery rule with its own argument to
+make; the note at that `or_else` says what it would cost.
+
 **Two things this feature did not break and did expose, which is the more
 useful way to record them.** Condition 3 was tested as a *level* rather than an
 edge — `busy && draft_open` clears, whenever both happen to be true — and Claude

@@ -208,8 +208,8 @@ worktree row ends a live one. The agent abeam was started with is still the
 session: its exit is abeam's exit code, and it cannot be closed. `docs/multi-agent.md`
 is the design and the record of what each phase cost.
 
-What that is built on is **forty-eight tests** — the number of `#[test]`
-attributes the four phases added, so it can be checked rather than taken — some
+What that is built on is **fifty-one tests** — the number of `#[test]`
+attributes this work added, so it can be checked rather than taken — some
 of which spawn real ptys and draw real frames, and a mutation audit that broke
 each new rule on purpose to check something went red. It is a suite for one
 feature and it is not "a few hundred", which is what this paragraph said until

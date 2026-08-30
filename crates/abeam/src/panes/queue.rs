@@ -556,7 +556,16 @@ impl QueuePane {
     /// the shell look the agent up twice — once to answer, once to write — with
     /// nothing but reading to say the two lookups found the same pane. Handing
     /// the answer back through here means the pane that was vetted is the pane
-    /// that is typed into, by construction. This module never inspects it.
+    /// that is typed into. This module never inspects it.
+    ///
+    /// **Generic and not `usize`, which is the difference between a fact about
+    /// the types and a fact about two lines being next to each other.** The
+    /// caller hands back a `&mut` to the agent itself, so the borrow is live
+    /// across the write and the compiler refuses any statement inserted between
+    /// them that would push to, remove from or reorder the vector — the exact
+    /// edit that would silently re-point an index and give back the worst
+    /// finding of phase 2. An index would have been correct today and one line
+    /// away from wrong, with nothing in the type system saying so.
     ///
     /// The target is not returned, for the same reason: there is nothing left
     /// for the caller to resolve.

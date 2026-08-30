@@ -976,6 +976,43 @@ impl Probe {
             // over a rounding difference. A record with no `startedAt` at all
             // sorts below every record that has one, so it wins only when it is
             // the only thing in the directory that could be ours.
+            //
+            // ## What this fallback will adopt, asked and answered
+            //
+            // **It is written for milliseconds and it accepts any age**, and
+            // two callers can hand it a record that is minutes old. A pane that
+            // has just been killed leaves its file behind, because a record's
+            // lifetime is Claude's and a killed child does not tidy up. And a
+            // *second* agent started in a root that already has one has no
+            // record of its own for a second or two, during which the newest
+            // candidate in that directory is its sibling's. Either way the
+            // answer is somebody else's `status`, and if that somebody is idle
+            // the answer is `Idle` â€” the one answer that lets
+            // `crate::panes::queue` type.
+            //
+            // **Neither becomes permanent, and `is_still_mine` is why.** It
+            // re-asks `started_at >= spawned_at` on every call, which an older
+            // record fails, so a wrong answer is never memoised: the memory is
+            // dropped and the search runs again. The moment this pane's own
+            // record exists it wins outright â€” by the pid shortcut on a native
+            // install, and by the at-or-after filter on an npm one, where the
+            // pid abeam holds is the interpreter's. So the exposure is a
+            // startup window and not a session.
+            //
+            // **It is closed from outside rather than narrowed here**, and that
+            // is a decision rather than an oversight. `crate::app::App` disowns
+            // a pane's record when the pane is closed, and tells a new pane's
+            // probe about every record already claimed by a pane on screen â€”
+            // both are "this record belongs to somebody else", said by the one
+            // party that knows. Narrowing the fallback to a *window* around
+            // `spawned_at` would help here too, and would be a change to the
+            // discovery rule with its own argument to make: it would leave a
+            // machine whose clocks disagree by more than the window `Unknown`
+            // for the whole run, which is safe and silent, and it would still
+            // not separate two agents started a fraction of a second apart. The
+            // hazard the window would catch and the disowning does not is a
+            // pane whose probe never settled on a record before it was closed
+            // or before its sibling started.
             .or_else(|| {
                 candidates
                     .iter()

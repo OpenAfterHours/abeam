@@ -1956,6 +1956,41 @@ impl App {
         for id in &self.disowned {
             agent.probe.disown(id.clone());
         }
+        // **And every record that already belongs to a pane on screen**, which
+        // is the same sentence as the line above about abeam's own readers, one
+        // relationship along: a record another agent's probe has settled on is
+        // not this one's, and never will be.
+        //
+        // Without it, `a` twice on one row is a live misattribution rather than
+        // a theoretical one. The new pane has no record of its own for the
+        // second or two before its child writes one — the pid shortcut misses,
+        // and `crate::agentstate::Probe::search`'s at-or-after filter excludes
+        // the older sibling on `startedAt` — so the search falls through to its
+        // last resort, *the newest candidate there is*, which in a shared root
+        // is the sibling. The new pane then reports the sibling's `status`, and
+        // if that sibling is idle the answer is `Idle`, which is the one answer
+        // that lets a queued prompt be typed. The aim follows the cursor and
+        // this key moves it, so the prompt somebody writes straight after
+        // pressing `a` is aimed at exactly the pane that is lying.
+        //
+        // **Into this probe and never into [`disowned`](Self::disowned)**,
+        // which is the whole care needed here: that list is handed to *every*
+        // probe, and a sibling's id in it would make the sibling disown its own
+        // record. This is one pane being told what is not its business.
+        //
+        // It refuses through all three of `agentstate`'s paths — the pid
+        // shortcut, the candidate filter and revalidation — because each asks
+        // `is_disowned`, so the new pane answers `Unknown` until it finds its
+        // own. `Unknown` is what that module fails to on purpose.
+        for id in self
+            .agents
+            .iter()
+            .filter_map(|other| other.probe.found_session_id())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        {
+            agent.probe.disown(id);
+        }
         self.agents.push(agent);
 
         // Here rather than at the caller, because the count in the occupancy
@@ -3802,16 +3837,27 @@ impl App {
         // "cannot happen". Without the mode every newline in a block is a
         // submit, so a three-line prompt arrives as three, the second and third
         // typed at an agent already busy with the first.
-        let agents = &self.agents;
+        // **What comes back is the agent itself and not a position, which is
+        // what makes "the pane vetted is the pane typed into" a fact about the
+        // types rather than about these two statements being adjacent.** It was
+        // an index, and an index is only right while nothing moves the vector:
+        // a statement inserted between the lookup and the write would silently
+        // re-point it, which is the failure `Agent::id` was added for in the
+        // first place and the one that cost phase 2 its worst finding. Holding
+        // the `&mut Agent` makes that statement *not compile* — the borrow is
+        // live across the write, so nothing can push to, remove from or reorder
+        // `self.agents` while it is held. `crate::panes::queue::QueuePane::take_send_request`
+        // is generic over what it hands back precisely so this can be a
+        // reference.
+        let agents = &mut self.agents;
         let taken = self.queue.take_send_request(|target| {
-            let ix = agents.iter().position(|agent| agent.id == target)?;
-            let agent = &agents[ix];
+            let agent = agents.iter_mut().find(|agent| agent.id == target)?;
             let deliverable = !owed.contains(&target)
                 && !agent.pane.has_exited()
                 && agent.pane.bracketed_paste();
-            deliverable.then_some(ix)
+            deliverable.then_some(agent)
         });
-        if let Some((ix, text)) = taken {
+        if let Some((agent, text)) = taken {
             // The `Enter` is armed only by a write that actually succeeded. A
             // pty that refused the paste and then got a bare `\r` would submit
             // whatever the user had in the composer, which is a stray keystroke
@@ -3823,8 +3869,8 @@ impl App {
             // so a caller that cannot deliver has to say so, or the row is a
             // receipt for something that never happened. See
             // `QueuePane::note_send_failed`.
-            match self.agents[ix].pane.send_text(&text) {
-                Ok(()) => self.agents[ix].submit_pending = true,
+            match agent.pane.send_text(&text) {
+                Ok(()) => agent.submit_pending = true,
                 Err(why) => self.queue.note_send_failed(format!("{why:#}")),
             }
             redraw = true;
@@ -8972,6 +9018,63 @@ mod tests {
             fx.app.current().id,
             keeping,
             "the cursor was left on whichever pane slid into that slot"
+        );
+    }
+
+    /// A pane opened beside another in the same root cannot adopt its
+    /// neighbour's record.
+    ///
+    /// **The cousin of the test below, and the one `a` twice on a row reaches.**
+    /// A new pane has no record of its own for the second or two before its
+    /// child writes one: the pid shortcut misses, and `Probe::search`'s
+    /// at-or-after filter excludes the older sibling on `startedAt` — so the
+    /// search falls through to its last resort, *the newest candidate there
+    /// is*, which in a shared root is the sibling's. The new pane would then
+    /// report the sibling's `status`, and `Idle` is the one answer that lets a
+    /// queued prompt be typed. The aim follows the cursor and `a` moves it, so
+    /// the prompt written straight afterwards is aimed at exactly that pane.
+    ///
+    /// It is bounded — `is_still_mine` re-asks `started_at >= spawned_at` every
+    /// call, so a wrong answer is never memoised, and the pane's own record
+    /// wins outright the moment it exists — but a startup window is where a
+    /// queued prompt lives, so it is closed rather than documented.
+    #[test]
+    fn a_pane_started_beside_another_cannot_adopt_its_neighbours_record() {
+        let mut fx = app();
+        a_startable_recipe(&mut fx);
+        stays_at(&mut fx, 0);
+        let _records = records_at(&mut fx, 0, "idle");
+        polled(&mut fx);
+        assert_eq!(
+            fx.app.agents[0].readiness,
+            Readiness::Idle,
+            "the first pane's probe never settled, so there is nothing to claim"
+        );
+
+        // A second agent in the same root, which is what `a` on the row you are
+        // already standing in produces.
+        assert!(fx.app.start_agent(fx.dir.path()), "nothing was started");
+        assert_eq!(fx.app.agents.len(), 2);
+        assert!(
+            fx.app.agents[1].probe.is_disowned_for_tests("s"),
+            "the new pane can adopt the record its neighbour is using"
+        );
+        // ...and the neighbour is untouched, which is the care this needs: the
+        // session-wide list is handed to every probe, so a sibling's id in
+        // there would make that sibling disown its own record.
+        assert!(
+            !fx.app.agents[0].probe.is_disowned_for_tests("s"),
+            "the pane that owns the record was told to ignore it"
+        );
+        assert!(
+            !fx.app.disowned.iter().any(|id| id == "s"),
+            "a live pane's record went into the session-wide list"
+        );
+        polled(&mut fx);
+        assert_eq!(
+            fx.app.agents[0].readiness,
+            Readiness::Idle,
+            "the pane that owns the record stopped being able to read it"
         );
     }
 
