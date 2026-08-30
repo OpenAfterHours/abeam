@@ -226,6 +226,32 @@ pub struct Target {
     pub readiness: Readiness,
     /// Condition 3, about this agent.
     pub draft_open: bool,
+    /// Whether this pane can **ever** be typed at, as opposed to not right
+    /// now.
+    ///
+    /// `crate::app::Agent::send_readiness` answers [`Readiness::Unknown`] for
+    /// three causes in order — the child has exited, the child never asked for
+    /// bracketed paste, the pane is not Claude — and the first and third are
+    /// permanent. [`gate`](QueuePane::gate) refuses all three the same way and
+    /// is right to; what the *reader* is owed is the difference, because one of
+    /// the three is worth waiting for and the other two are a prompt that is
+    /// never going anywhere.
+    ///
+    /// **A bool and deliberately not a kind string, for two reasons that point
+    /// the same way.** [`Target`] derives `PartialEq` and is compared *whole*
+    /// in [`set_targets`](QueuePane::set_targets), once per pane per readiness
+    /// poll, so a `String` per pane per quarter second is an allocation with
+    /// nothing on the other side of it. And the kind is the wrong predicate
+    /// anyway: an exited Claude pane is still a Claude pane, so a row saying
+    /// `claude` would be perfectly true and would tell the reader the opposite
+    /// of what has become of their prompt.
+    ///
+    /// Filled in `crate::app::App::sync_queue_targets`, where the agent is
+    /// already in hand, and read by nothing in the gate. This changes what is
+    /// *said*, not what is sent — see [`QueuePane::why_not`], the footer's
+    /// [`Readiness::Unknown`] arm and [`aside`](QueuePane::aside), which are
+    /// its three readers.
+    pub can_receive: bool,
 }
 
 /// What has become of an item.
@@ -370,6 +396,26 @@ enum Confirm {
     Clear,
 }
 
+/// What the status line says about the one agent it describes.
+///
+/// **A struct rather than a fourth element on the tuple this replaced**, and
+/// the reason is the two bools. Side by side in a `(&str, Readiness, bool,
+/// bool)` they are a swap that compiles, and the frame it draws says a pane
+/// nobody can ever type at is one somebody is typing at — which is the exact
+/// confusion this whole change exists to remove.
+struct GateState<'a> {
+    /// What to call it: the label, or the word `agent` while there is only one
+    /// and a name would be a name for the only thing there is.
+    whose: &'a str,
+    /// Condition 2.
+    readiness: Readiness,
+    /// Condition 3.
+    drafting: bool,
+    /// [`Target::can_receive`], which splits [`Readiness::Unknown`] into the
+    /// state abeam is waiting to learn and the one it already knows.
+    can_receive: bool,
+}
+
 /// The pane.
 pub struct QueuePane {
     root: PathBuf,
@@ -379,6 +425,35 @@ pub struct QueuePane {
     composing: Option<String>,
     /// A destructive key waiting to be pressed a second time. See [`Confirm`].
     confirm: Option<Confirm>,
+    /// What the last `Enter` declined to do, and why, until the next key.
+    ///
+    /// **The alternative was silence, and silence was a lie with a comment
+    /// beside it.** [`now`](Self::now) refuses a send whose target fails the
+    /// gate, and used to do it by returning [`Handled::No`] under a note saying
+    /// the status line had already explained which of busy or drafting it was.
+    /// It has not: [`gate_state`](Self::gate_state) describes exactly one
+    /// agent, chosen by [`gate_target`](Self::gate_target), and that is
+    /// routinely a *different* pane from the one the selected item names. So
+    /// the reader pressed the pane's own verb on the row they had chosen and
+    /// nothing at all happened, with a sentence about somebody else underneath.
+    ///
+    /// **The same slot, colour and lifetime as [`Confirm`], and the two cannot
+    /// both stand.** `list_key` takes both before it matches anything, so a `d`
+    /// clears a refusal and an `Enter` clears a question; each is a line about
+    /// the keystroke before this one, and the next keystroke is what ends it.
+    /// [`cancel_confirm`](Self::cancel_confirm) takes it too, for the reason
+    /// that function exists: a statement about a key pressed on a screen the
+    /// reader has since left is a statement about nothing.
+    ///
+    /// **It is a record of a press and not a reading, and for the volatile
+    /// refusals that means it can go stale.** An agent that was busy when
+    /// `Enter` was pressed may be idle a quarter of a second later, with this
+    /// line still saying it was busy — beside a status line that now says
+    /// `idle`. That reads as then-and-now rather than as a contradiction, and
+    /// the alternative is worse: clearing it from
+    /// [`set_targets`](Self::set_targets) would make the answer to a keystroke
+    /// vanish because some unrelated pane changed state.
+    refused: Option<String>,
     /// Whether [`Mode::Send`] items may go on their own. Off is not "paused
     /// work" — dispatching is unaffected, and so is `Enter` — it is "do not
     /// type at the agent unless I am asking for it".
@@ -459,6 +534,7 @@ impl QueuePane {
             selected: 0,
             composing: None,
             confirm: None,
+            refused: None,
             armed: false,
             targets: Vec::new(),
             handed: None,
@@ -855,7 +931,8 @@ impl QueuePane {
         self.items.push(item);
     }
 
-    /// Forget a question this pane was in the middle of asking.
+    /// Forget a question this pane was in the middle of asking, and anything it
+    /// has just said about a key it declined to act on.
     ///
     /// Called by the shell when the pane leaves the screen, and it has to be
     /// the shell that calls it: a pane is not told it has been put away, and
@@ -867,8 +944,13 @@ impl QueuePane {
     ///
     /// This is the whole of the gap between this guard and `Alt+Q`'s, which
     /// `crate::app` clears before it matches any key at all. See [`Confirm`].
+    ///
+    /// [`refused`](Self::refused) goes with it and for the weaker version of
+    /// the same reason: it answers a keystroke, and a reader coming back to
+    /// this pane an hour later did not press that key just now.
     pub fn cancel_confirm(&mut self) {
         self.confirm = None;
+        self.refused = None;
     }
 
     /// Whether the shell has told this pane about a draft at `id`. A test seam
@@ -882,6 +964,20 @@ impl QueuePane {
     #[cfg(test)]
     pub fn is_draft_open(&self, id: u64) -> bool {
         self.target(id).is_some_and(|t| t.draft_open)
+    }
+
+    /// Whether the shell has said `id` can be typed at at all. The sibling seam
+    /// to [`is_draft_open`](Self::is_draft_open), and for the sharper version
+    /// of its reason: [`Target::can_receive`] is a fact only
+    /// `crate::app::App::sync_queue_targets` can work out, the tests in this
+    /// file reach it by writing the field, and without this nothing anywhere
+    /// asserts that the shell fills it in from the pane it describes.
+    ///
+    /// `false` for an agent this pane has never been told about, which is the
+    /// same answer the gate gives it.
+    #[cfg(test)]
+    pub fn can_receive(&self, id: u64) -> bool {
+        self.target(id).is_some_and(|t| t.can_receive)
     }
 
     /// Shorten the countdown, so a test of the *shell* can watch the automatic
@@ -945,23 +1041,85 @@ impl QueuePane {
             .map_or(self.aim, |i| self.items[i].target)
     }
 
-    /// What the status line says about that agent: what to call it, its
-    /// readiness, and whether a draft is sitting at it.
+    /// What a sentence at the bottom of the pane calls one agent.
     ///
-    /// `agent` and `Unknown` for a target this pane has no row for, which is
-    /// the honest pair: "abeam cannot say" is what `Unknown` means everywhere
-    /// on this path, and a name it does not have is not one to invent.
-    fn gate_state(&self) -> (&str, Readiness, bool) {
+    /// The word rather than the label while there is one agent: a name for the
+    /// only thing there is buys a reader nothing and costs the line its
+    /// columns. One function because there are two sentences down there now —
+    /// [`gate_state`](Self::gate_state)'s and [`why_not`](Self::why_not)'s —
+    /// and they can appear on the same row. Two spellings of this rule would
+    /// put `main busy` and `agent busy` side by side, about one pane.
+    fn called<'a>(&self, target: &'a Target) -> &'a str {
+        if self.targets.len() > 1 {
+            target.label.as_str()
+        } else {
+            "agent"
+        }
+    }
+
+    /// What the status line says about that agent: what to call it, its
+    /// readiness, whether a draft is sitting at it, and whether it can be typed
+    /// at at all.
+    ///
+    /// `agent`, `Unknown` and *can* receive for a target this pane has no row
+    /// for, which is the honest triple: "abeam cannot say" is what `Unknown`
+    /// means everywhere on this path, a name it does not have is not one to
+    /// invent, and nothing has told it this agent is unreachable — only that it
+    /// is unknown to the list.
+    fn gate_state(&self) -> GateState<'_> {
         let id = self.gate_target();
         match self.target(id) {
-            // The word rather than the label while there is one agent: a name
-            // for the only thing there is buys a reader nothing and costs the
-            // line its columns.
-            Some(target) if self.targets.len() > 1 => {
-                (target.label.as_str(), target.readiness, target.draft_open)
-            }
-            Some(target) => ("agent", target.readiness, target.draft_open),
-            None => ("agent", Readiness::Unknown, false),
+            Some(target) => GateState {
+                whose: self.called(target),
+                readiness: target.readiness,
+                drafting: target.draft_open,
+                can_receive: target.can_receive,
+            },
+            None => GateState {
+                whose: "agent",
+                readiness: Readiness::Unknown,
+                drafting: false,
+                can_receive: true,
+            },
+        }
+    }
+
+    /// Why a send to this item's target would not go, in the status line's own
+    /// words.
+    ///
+    /// **Asked of the item and not of [`gate_target`](Self::gate_target)**,
+    /// which is the whole reason it exists: the footer describes the pane the
+    /// queue is waiting on, and an item the reader has selected and been
+    /// refused is routinely aimed somewhere else entirely.
+    ///
+    /// Only ever called once [`gate`](Self::gate) has already answered
+    /// something other than `Some(true)`, and the causes below are every way it
+    /// can have done: a target that has gone, one that can never receive, one
+    /// that is not idle, and one that is idle with something unsubmitted in its
+    /// composer. The last of those is why the [`Readiness::Idle`] arm is not
+    /// dead code.
+    fn why_not(&self, item: &Item) -> String {
+        let Some(target) = self.target(item.target) else {
+            // Barely reachable, and left saying something rather than nothing:
+            // `retime` orphans an item whose target has gone before `Enter` can
+            // reach it, so this is the pass on which the pane has been told
+            // about no agents at all. [`whose`](Self::whose) and not
+            // [`called`](Self::called), because there is no live agent here for
+            // the word `agent` to be mistaken for.
+            return format!("{} has gone", self.whose(item));
+        };
+        let whose = self.called(target);
+        if !target.can_receive {
+            return format!("{whose} cannot receive");
+        }
+        match target.readiness {
+            Readiness::Busy => format!("{whose} busy"),
+            Readiness::Waiting => format!("{whose} waiting on you"),
+            Readiness::Unknown => format!("{whose} state unknown"),
+            // Idle and still refused is condition 3: the one refusal on this
+            // list that a person ends by pressing `Enter` at the agent rather
+            // than by waiting.
+            Readiness::Idle => format!("you are typing at {whose}"),
         }
     }
 
@@ -1184,6 +1342,13 @@ impl QueuePane {
         // cancelled would be one a typist walks straight through.
         let cancelled = self.confirm.take();
         let was_asking = cancelled.is_some();
+        // The same take, one line down, for the same reason one line up: a
+        // sentence about the last key is over when there is a next one. It is
+        // taken *before* the match so that [`now`](Self::now) can write a new
+        // one into the same field on the same press, which is what makes `not
+        // sent · claude busy` twice in a row draw twice rather than clearing
+        // itself on the second press.
+        let was_saying = self.refused.take().is_some();
         let handled = self.list_key_after(key, cancelled);
         // A question that was on screen a moment ago and is not now costs a
         // frame even when the key itself did nothing: leaving `d again to
@@ -1200,7 +1365,7 @@ impl QueuePane {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         let leaving = !chord && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
-        if was_asking && !leaving {
+        if (was_asking || was_saying) && !leaving {
             return Handled::Yes;
         }
         handled
@@ -1446,9 +1611,27 @@ impl QueuePane {
                     // `Some(true)` and not a truthiness test — an agent that
                     // has gone answers `None`, and `None` is a refusal.
                     if self.gate(self.items[self.selected].target) != Some(true) {
-                        // Nothing changed, so nothing is redrawn — and the
-                        // status line already says which of the two it was.
-                        return Handled::No;
+                        // **It says which pane and which refusal, and it used
+                        // to say nothing at all.** The line that stood here
+                        // claimed the status line had already said which of
+                        // busy or drafting it was, and that was false twice
+                        // over: there are more than two refusals — a pane that
+                        // can never receive is neither — and the status line
+                        // describes [`gate_target`](Self::gate_target), which
+                        // is routinely some other pane than the one this item
+                        // names. So the pane's own verb, pressed on the row the
+                        // reader chose, did nothing and explained it somewhere
+                        // else about somebody else.
+                        //
+                        // Nothing about the list changes, and the frame is
+                        // claimed anyway: what changed is the sentence at the
+                        // bottom of the pane, and it is the entire answer to
+                        // the keystroke.
+                        self.refused = Some(format!(
+                            "not sent · {}",
+                            self.why_not(&self.items[self.selected])
+                        ));
+                        return Handled::Yes;
                     }
                     self.selected = self.promote(self.selected);
                     // Due at once, and still drained by `take_send_request`:
@@ -1681,7 +1864,30 @@ impl QueuePane {
             // thing that is true by default would push the text a reader is
             // scanning off the end of its own row. It appears exactly when it
             // is news.
-            _ if item.mode == Mode::Send && self.targets.len() > 1 => self.whose(item).to_string(),
+            //
+            // **And beside the name, whether that agent can be typed at at
+            // all, which is the half the status line cannot reach.**
+            // [`gate_state`](Self::gate_state) describes one pane, chosen by
+            // [`gate_target`](Self::gate_target) — so two panes, the Claude one
+            // busy, a Claude-aimed item ahead of a Codex-aimed one, and the
+            // footer reads `claude · busy` while the item that can never go is
+            // named nowhere. This is where it is named. The suppression above
+            // costs nothing here: with one target the footer is necessarily
+            // about that target, and it says the same thing in the same words.
+            //
+            // Only while it is still [`ItemState::Pending`]. An item that was
+            // sent before its pane exited went; a row saying `cannot receive`
+            // over a `✓` would be a reason given for something that did not
+            // happen.
+            _ if item.mode == Mode::Send && self.targets.len() > 1 => {
+                let whose = self.whose(item);
+                match self.target(item.target) {
+                    Some(t) if !t.can_receive && item.state == ItemState::Pending => {
+                        format!("{whose} · cannot receive")
+                    }
+                    _ => whose.to_string(),
+                }
+            }
             _ => String::new(),
         }
     }
@@ -1709,18 +1915,28 @@ impl QueuePane {
         // with their next keystroke is the last thing on it that may be clipped
         // away. Yellow, the colour this program keeps for "abeam is in a state
         // you did not leave it in".
-        if let Some(confirm) = &self.confirm {
-            let said = match confirm {
-                Confirm::Delete(_) => "d again to delete".to_string(),
-                Confirm::Clear => {
-                    let n = self
-                        .items
-                        .iter()
-                        .filter(|i| i.state != ItemState::Pending)
-                        .count();
-                    format!("r again to clear {n} finished")
-                }
-            };
+        //
+        // **Two things share the slot now**, and they share it rather than
+        // sitting side by side because both are about the key that was just
+        // pressed and the next key ends both. [`list_key`](Self::list_key)
+        // takes each of them before it matches anything, so in the program they
+        // cannot stand together at all; the order below is what to draw if that
+        // ever stops being true, and a question somebody has to answer outranks
+        // a report of something that did not happen.
+        let leading = match (&self.confirm, &self.refused) {
+            (Some(Confirm::Delete(_)), _) => Some("d again to delete".to_string()),
+            (Some(Confirm::Clear), _) => {
+                let n = self
+                    .items
+                    .iter()
+                    .filter(|i| i.state != ItemState::Pending)
+                    .count();
+                Some(format!("r again to clear {n} finished"))
+            }
+            (None, Some(said)) => Some(said.clone()),
+            (None, None) => None,
+        };
+        if let Some(said) = leading {
             spans.push(Span::styled(
                 format!("{said} · "),
                 Style::default().fg(Color::Yellow),
@@ -1737,9 +1953,9 @@ impl QueuePane {
         // agent is busy" is a sentence about nobody in particular, and the one
         // a reader needs is about the pane the next send is going to. See
         // [`gate_target`](Self::gate_target).
-        let (whose, readiness, drafting) = self.gate_state();
-        spans.push(Span::styled(format!(" · {whose} "), dim()));
-        spans.push(match readiness {
+        let state = self.gate_state();
+        spans.push(Span::styled(format!(" · {} ", state.whose), dim()));
+        spans.push(match state.readiness {
             Readiness::Idle => Span::styled("idle", Style::default().fg(Color::Green)),
             Readiness::Busy => Span::styled("busy", Style::default().fg(Color::Yellow)),
             // The one refusal a person can end, and the only thing on this
@@ -1748,12 +1964,26 @@ impl QueuePane {
             // spending a third colour on a state that already has a word buys
             // nothing a reader was not already told.
             Readiness::Waiting => Span::styled("waiting on you", Style::default().fg(Color::Yellow)),
+            // **`Unknown` is two facts and only one of them is worth waiting
+            // for**, which is why the arm splits rather than the vocabulary
+            // growing a variant. `crate::app::Agent::send_readiness` answers it
+            // for a child that has exited, for one that never asked for
+            // bracketed paste, and for a pane that is not Claude; the first and
+            // last are permanent, and a reader told `state unknown` about them
+            // is waiting for a sentence that will never change. That is the
+            // whole of what an exited-but-unclosed pane used to say about the
+            // prompts queued at it.
+            //
+            // Dim like the line it replaces, not [`err`]: nothing has gone
+            // wrong, the item is intact, and this pane simply is not one abeam
+            // may type into.
+            Readiness::Unknown if !state.can_receive => Span::styled("cannot receive", dim()),
             // Named rather than hidden. It is not a worse `busy`, it is the
             // state in which abeam does not know, and nothing will be sent
             // until it does.
             Readiness::Unknown => Span::styled("state unknown", dim()),
         });
-        if drafting {
+        if state.drafting {
             spans.push(Span::styled(" · you are typing", dim()));
         }
         if let Some(secs) = self.countdown() {
@@ -1951,8 +2181,10 @@ impl Pane for QueuePane {
         // and cancels, and a wheel that did not would be the same gesture with
         // two meanings. `crate::app` cancels a pending quit on a mouse press
         // for the reason that covers both — the user has moved on to something
-        // else — and this is that line, one pane down.
+        // else — and this is that line, one pane down. A standing refusal goes
+        // with it: it answers a key, and the reader is doing something else.
         self.confirm = None;
+        self.refused = None;
         if let Some(handled) = self.scroll.mouse(ev) {
             return Ok(handled);
         }
@@ -2019,8 +2251,9 @@ impl Pane for QueuePane {
         // it is sharper than an ordinary cancel, because a paste *appends an
         // item and selects it* — so without this, `d`, paste, `d` destroyed the
         // text that had just been pasted while the row the question named
-        // survived.
+        // survived. A standing refusal rides along, as it does on a click.
         self.confirm = None;
+        self.refused = None;
         // A Windows paste arrives with CRLF in it, and this text is on its way
         // to being typed at an agent one character at a time.
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -2136,13 +2369,27 @@ mod tests {
         p
     }
 
+    /// A pane the queue may type at, which is what all but three tests below
+    /// are about. The ones that are not say so by clearing `can_receive`
+    /// themselves, so the fixture stays the ordinary case.
     fn target(id: u64, label: &str, readiness: Readiness) -> Target {
         Target {
             id,
             label: label.to_string(),
             readiness,
             draft_open: false,
+            can_receive: true,
         }
+    }
+
+    /// An agent that is in the list and can never be typed at: an exited but
+    /// unclosed pane, or one hosting something that is not Claude. The shell
+    /// reports both as [`Readiness::Unknown`], which is why the readiness is
+    /// not a parameter here.
+    fn cannot_receive(id: u64, label: &str) -> Target {
+        let mut t = target(id, label, Readiness::Unknown);
+        t.can_receive = false;
+        t
     }
 
     /// Tell the pane what the shell would tell it about its one agent.
@@ -2408,7 +2655,13 @@ mod tests {
 
         // Not even by the explicit key, which skips the countdown and the
         // arming switch and nothing else.
-        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
+        //
+        // **`Handled::Yes` and it used to be `No`, which is a change to what
+        // the key *says* and not to what it does.** The refusal is the same
+        // refusal; what is new is that it writes a sentence at the bottom of
+        // the pane, so a frame is owed. The assertion that matters is the one
+        // below it — nothing left the queue — and it is unchanged.
+        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
         assert_eq!(drain(&mut p), None);
 
         // And it is unsafe in exactly the way `Busy` is: the same lines pass
@@ -2416,7 +2669,7 @@ mod tests {
         says(&mut p, Readiness::Busy);
         p.items[0].due = elapsed();
         assert_eq!(drain(&mut p), None);
-        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
+        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
         assert_eq!(states(&p), [ItemState::Pending]);
 
         // **And so is `Waiting`, which is the assertion that keeps splitting
@@ -2429,8 +2682,141 @@ mod tests {
         says(&mut p, Readiness::Waiting);
         p.items[0].due = elapsed();
         assert_eq!(drain(&mut p), None);
-        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
+        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
         assert_eq!(states(&p), [ItemState::Pending]);
+    }
+
+    /// The row says it, in the one case the status line cannot reach.
+    ///
+    /// **The footer describes exactly one agent** — [`QueuePane::gate_target`]
+    /// picks the pane about to be typed at, else the pane the *first pending
+    /// item* is waiting on whatever that item names, else the aim. So two
+    /// panes, the receiving one busy with an item ahead of the other's, and the
+    /// footer is a true sentence about `main` while the item that can never go
+    /// is aimed at `elsewhere` and named nowhere. A disclosure confined to the
+    /// status line does not reach its own case, which is why there are two
+    /// halves to this change and this is the one that matters.
+    #[test]
+    fn an_item_aimed_at_a_pane_that_cannot_receive_says_so_on_its_own_row() {
+        let mut p = pane();
+        p.stub_item("for the busy one", Mode::Send);
+        p.stub_item("for the other one", Mode::Send);
+        p.items[1].target = OTHER;
+        p.set_targets(
+            vec![
+                target(AGENT, "main", Readiness::Busy),
+                cannot_receive(OTHER, "elsewhere"),
+            ],
+            AGENT,
+        );
+
+        // Row 0 is the dispatch notice, rows 1 and 2 are the items, row 7 is
+        // the status line.
+        let text = screen(&mut p, 60, 8);
+        let foot = row_of(&text, 60, 7);
+        assert!(
+            foot.contains("main busy"),
+            "the footer is about the other pane: {foot}"
+        );
+        assert!(
+            !foot.contains("cannot receive"),
+            "the footer reached this case after all, and the test proves nothing: {foot}"
+        );
+
+        let row = row_of(&text, 60, 2);
+        assert!(row.contains("elsewhere"), "{row}");
+        assert!(
+            row.contains("cannot receive"),
+            "a prompt that can never be delivered is named nowhere on screen: {row}"
+        );
+
+        // The pane that is merely busy is waited for, not written off — that
+        // item is going somewhere, just not yet.
+        let row = row_of(&text, 60, 1);
+        assert!(row.contains("main"), "{row}");
+        assert!(!row.contains("cannot receive"), "{row}");
+    }
+
+    /// `Enter` on such an item answers.
+    ///
+    /// It cannot send, and it must not pretend otherwise; what it may not do is
+    /// what it used to do, which is nothing at all — no send, no frame, no
+    /// message — under a comment claiming the status line had already said
+    /// which of busy or drafting it was. It is neither, and per the test above
+    /// the status line is routinely about another pane.
+    #[test]
+    fn enter_on_an_item_that_can_never_be_sent_says_why_rather_than_nothing() {
+        let mut p = pane();
+        p.stub_item("for the busy one", Mode::Send);
+        p.stub_item("for the other one", Mode::Send);
+        p.items[1].target = OTHER;
+        p.set_targets(
+            vec![
+                target(AGENT, "main", Readiness::Busy),
+                cannot_receive(OTHER, "elsewhere"),
+            ],
+            AGENT,
+        );
+        p.selected = 1;
+
+        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
+        let text = screen(&mut p, 60, 8);
+        let foot = row_of(&text, 60, 7);
+        assert!(foot.contains("not sent"), "{foot}");
+        assert!(
+            foot.contains("elsewhere cannot receive"),
+            "the refusal named the pane the footer was describing, not the one \
+             the item is aimed at: {foot}"
+        );
+        // Nothing moved. A refusal is not a promotion, and the item is still
+        // waiting for a pane that will never take it.
+        assert_eq!(states(&p), [ItemState::Pending, ItemState::Pending]);
+        assert_eq!(texts(&p), ["for the busy one", "for the other one"]);
+        assert_eq!(drain(&mut p), None);
+
+        // And it is over when the next key is pressed, like every other line
+        // that appears in that slot.
+        assert_eq!(p.handle_key(key(KeyCode::Tab)).unwrap(), Handled::Yes);
+        let foot = row_of(&screen(&mut p, 60, 8), 60, 7);
+        assert!(!foot.contains("not sent"), "{foot}");
+    }
+
+    /// The case that needs no second agent, and the reason this went in ahead
+    /// of the feature it was written for.
+    ///
+    /// An **exited but unclosed** pane reproduces the whole bug on its own:
+    /// `Agent::send_readiness` answers `Unknown` on `has_exited()` before it
+    /// asks anything else, the pane stays in `App::agents` because `x` `x` is
+    /// the only remover, so it stays in the roster this pane is handed and
+    /// [`QueuePane::orphan_lost_targets`] never fires — that only orphans items
+    /// whose target has *gone from the list*. The items sat `Pending` for ever
+    /// under a footer reading `state unknown`, which is a promise that abeam
+    /// will know better in a moment.
+    #[test]
+    fn an_exited_pane_says_it_cannot_receive_rather_than_that_its_state_is_unknown() {
+        let mut p = pane();
+        p.stub_item("nobody will ever read this", Mode::Send);
+        p.armed = true;
+        p.set_targets(vec![cannot_receive(AGENT, "main")], AGENT);
+
+        let foot = row_of(&screen(&mut p, 60, 8), 60, 7);
+        assert!(
+            foot.contains("cannot receive"),
+            "an exited pane still promises the queue will know better soon: {foot}"
+        );
+        assert!(!foot.contains("state unknown"), "{foot}");
+
+        // The mechanism is untouched by any of this: the item is still
+        // `Pending`, still not orphaned — its pane is in the list — and still
+        // not sent.
+        assert_eq!(states(&p), [ItemState::Pending]);
+        p.items[0].due = elapsed();
+        assert_eq!(drain(&mut p), None);
+
+        // One agent, so the row spends no columns on a name; the whole of the
+        // disclosure is the footer, which is about that one agent by
+        // construction.
+        assert!(!row_of(&screen(&mut p, 60, 8), 60, 1).contains("cannot receive"));
     }
 
     #[test]
@@ -2787,14 +3173,24 @@ mod tests {
     fn enter_skips_the_countdown_and_still_refuses_while_the_agent_is_busy() {
         let mut p = ready("do it now");
         says(&mut p, Readiness::Busy);
-        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
+        // `Yes` for the sentence it writes, not for a send: the line below is
+        // what says nothing went. Which of the four refusals it was is on
+        // screen, which it was not before — see
+        // `enter_on_an_item_that_can_never_be_sent_says_why_rather_than_nothing`.
+        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
         assert_eq!(drain(&mut p), None);
+        assert!(row_of(&screen(&mut p, 60, 8), 60, 7).contains("not sent · agent busy"));
 
         says(&mut p, Readiness::Idle);
         let was = p.targets[0].readiness;
         says_drafting(&mut p, was, true);
-        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::No);
+        assert_eq!(p.handle_key(key(KeyCode::Enter)).unwrap(), Handled::Yes);
         assert_eq!(drain(&mut p), None);
+        // The one refusal on the list that a person ends themselves, and the
+        // row says which agent to go and press `Enter` at.
+        assert!(
+            row_of(&screen(&mut p, 60, 8), 60, 7).contains("not sent · you are typing at agent")
+        );
 
         // With both of them true it goes at once — no three seconds of warning,
         // because the warning is for a send nobody asked for and this one was

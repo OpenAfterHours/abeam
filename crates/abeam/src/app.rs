@@ -1917,6 +1917,17 @@ impl App {
                 label: self.agent_label(ix),
                 readiness: agent.readiness,
                 draft_open: agent.draft_open,
+                // **"Can this pane ever be typed at", which is a narrower
+                // question than the one [`Agent::send_readiness`] answers and
+                // is asked here because this is where the agent is in hand.**
+                // Two of that function's three downgrades to `Unknown` are for
+                // good — a child that has exited will not come back, and a pane
+                // that is not Claude will not become one — and the third, the
+                // bracketed-paste probe, is a fact the child may still report.
+                // The queue refuses all three identically; only the reader is
+                // owed the difference, so this is read by what the pane *says*
+                // and by nothing in its gate.
+                can_receive: agent.is_claude() && !agent.pane.has_exited(),
             })
             .collect();
         let aim = self.current().id;
@@ -8130,6 +8141,54 @@ mod tests {
         assert!(
             fx.app.agents[0].submit_pending,
             "the automatic send was stalled by a draft in another pane"
+        );
+    }
+
+    /// An exited but unclosed pane is offered to the queue as one that can
+    /// never be typed at.
+    ///
+    /// **The one half of that disclosure only the shell can answer, and the one
+    /// the queue's own tests cannot reach**: they write
+    /// `queue::Target::can_receive` themselves, so the whole of what is under
+    /// test here is that [`App::sync_queue_targets`] asks the pane rather than
+    /// only the kind.
+    ///
+    /// It matters because this is the case that needs no second kind of agent
+    /// at all. `close_agent` is the only thing that removes an agent and `x`
+    /// `x` is the only thing that calls it, so a pane whose child has gone
+    /// stays in [`App::agents`] and therefore stays in the roster the queue is
+    /// handed — which means `orphan_lost_targets` never fires, because that
+    /// orphans items whose target has *gone from the list*. Their prompts sit
+    /// `Pending` for ever, and until this flag existed the pane said `state
+    /// unknown` about them, which is a promise that abeam will know better in a
+    /// moment.
+    #[test]
+    fn an_exited_pane_is_offered_to_the_queue_as_one_that_can_never_receive() {
+        let mut fx = app();
+        let id = fx.app.agents[0].id;
+
+        // Nothing has reaped it yet, so as far as anything can know the child
+        // is alive — and this is the answer the rest of the session gives.
+        fx.app.sync_queue_targets();
+        assert!(
+            fx.app.queue.can_receive(id),
+            "a live Claude pane was written off before anything asked about it"
+        );
+
+        // `try_wait` is the only call that turns a live child into an exited
+        // one, which is why this loops rather than sleeping once.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.app.agents[0].pane.has_exited() && Instant::now() < deadline {
+            fx.app.reap().expect("try_wait on a child that exists");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(fx.app.agents[0].pane.has_exited(), "the child stayed");
+
+        fx.app.sync_queue_targets();
+        assert!(
+            !fx.app.queue.can_receive(id),
+            "a pane whose child has gone is still offered as one the queue may \
+             type into, so its prompts wait under `state unknown` for ever"
         );
     }
 

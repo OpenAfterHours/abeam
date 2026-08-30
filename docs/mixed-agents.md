@@ -1,19 +1,24 @@
 # More than one *kind* of agent in the window
 
-> **This is a proposal, and phase 1 of it is built.** The rest is not, which is
-> the opposite of `docs/multi-agent.md`'s banner and the reason this is a second
-> document rather than a section of that one. Where a paragraph here describes
-> code, it describes code that exists today and says so; where it describes
-> behaviour, that behaviour does not exist yet.
+> **This is a proposal, and phases 1 and 2 of it are built.** The rest is not,
+> which is the opposite of `docs/multi-agent.md`'s banner and the reason this is
+> a second document rather than a section of that one. Where a paragraph here
+> describes code, it describes code that exists today and says so; where it
+> describes behaviour, that behaviour does not exist yet.
 >
-> What landed is the seam and nothing a reader can see: `Agent::kind`,
+> Phase 1 was the seam and nothing a reader can see: `Agent::kind`,
 > `Agent::is_claude`, a `poll_readiness` that asks each pane and a
 > `roster_is_wanted` that asks whether any pane is Claude. `App::has_claude_state`
 > is gone — the two sections below that quote it are describing the code it
 > replaced, and are kept because the argument for the change is the reason it is
-> written that way. There is still no chooser, no `A` key and no way to *get* a
-> pane of a second kind, so every predicate still answers what it answered
-> before.
+> written that way.
+>
+> Phase 2 is the first of it a reader meets, and what it fixes was already
+> broken: the queue says when a prompt is aimed at a pane that can never receive
+> it — on the item's own row and in its status line — and `Enter` on such an item
+> answers instead of doing nothing. There is still no chooser, no `A` key and no
+> way to *get* a pane of a second kind, so every predicate still answers what it
+> answered before.
 >
 > It is the argument `docs/multi-agent.md` said would be wanted and declined to
 > make in passing. That document's "What moves out of `App` and into `Agent`"
@@ -571,9 +576,11 @@ intercepting before a focused pane is offered anything, which is the one thing
 
 ### A queued prompt aimed at a pane that cannot receive never sends, and nothing says why
 
-This is the largest hazard in the proposal, it is a disclosure problem rather
-than a mechanism one, and **it is not a hazard this feature creates** — see the
-end of this section, which is the reason phase 3 now ships first.
+**Phase 2, and built** — what follows is the argument for it, in the present
+tense it was written in. This is the largest hazard in the proposal, it is a
+disclosure problem rather than a mechanism one, and **it is not a hazard this
+feature creates** — see the end of this section, which is the reason it shipped
+ahead of the feature it was written for.
 
 `QueuePane::gate` is `readiness.is_idle() && !draft_open`, and `next_send` will
 not name an item whose gate is not `Some(true)`. `Readiness::Unknown` is not
@@ -587,7 +594,7 @@ gets that far, `QueuePane::now` refuses outright when the gate is not
 says "the status line already says which of the two it was", meaning *busy* or
 *you are typing*. For a pane that can never receive it is neither, so **that
 comment becomes false and the key becomes a dead one with a lie next to it.**
-Phase 3 must give that path a sentence.
+Phase 2 gives that path a sentence.
 
 **And the status line describes exactly one pane, which may not be the one that
 is stuck.** `gate_state` picks its subject through `gate_target`: the pane about
@@ -607,7 +614,7 @@ every other pane's prompts keep flowing. The real harm is one item silently
 never going with nothing on screen saying so, which is enough of an argument on
 its own.
 
-**The smallest honest fix is three sites, not one.**
+**The smallest honest fix is four sites, not one.**
 
 - **`Target` gains `can_receive: bool`** — not the kind string an earlier draft
   proposed. Two reasons. `Target` derives `PartialEq` and is compared *whole* in
@@ -626,18 +633,24 @@ its own.
   above. `aside` already draws the target's label for every `Send` item once
   there is more than one target — and a mixed session always has more than one
   by construction — so that arm gains the reason beside the name.
+- **`QueuePane::now` says which pane and which refusal**, in the slot the `d`
+  and `r` confirmations already use and with their lifetime: the next key ends
+  it. This is the fourth site, and it is the one the paragraph above is about.
 
 Nothing in `gate`, `next_send`, `retime` or `take_send_request` changes.
 
-**This bug exists today, with no mixed agents anywhere, and that is why phase 3
+**This bug exists today, with no mixed agents anywhere, and that is why phase 2
 goes first.** An **exited but unclosed** Claude pane produces it exactly:
 `send_readiness` returns `Unknown` on `has_exited()` before it asks anything
 else; the pane stays in `App::agents`, because `close_agent` is the only remover
 and it is driven by `x` `x`; so it stays in `targets`, `orphan_lost_targets`
 never fires — that only orphans items whose target has *gone from the list* —
-and its items sit `Pending` for ever under `state unknown`. Phase 3 is therefore
-independently justified and independently testable, and sequencing it ahead of
-phase 2 is a choice rather than a dependency.
+and its items sit `Pending` for ever under `state unknown`. This phase is
+therefore independently justified and independently testable, and sequencing it
+ahead of the feature was a choice rather than a dependency. Its test is named
+after that guarantee —
+`an_exited_pane_says_it_cannot_receive_rather_than_that_its_state_is_unknown` —
+and it needs no second agent to make it fail.
 
 The aim still moves to a newly started pane, and that stays right. Refusing to
 move it would make a keystroke's effect depend on the kind of thing it started,
@@ -712,9 +725,9 @@ and a function that reads its own field cannot be handed a neighbour's. And
 `Recipe` has no kind until phase 2 gives it one — which is where the preset-args
 disagreement is fixed too, and for the same reason.
 
-**Phase 2 — the disclosure, and it now goes second rather than third.** `Target`
-gains `can_receive`; the footer splits its `Unknown` arm; the item's own row
-carries the reason; `QueuePane::now`'s silent refusal gets a sentence and its
+**Phase 2 — the disclosure, and it now goes second rather than third. Built.**
+`Target` gains `can_receive`; the footer splits its `Unknown` arm; the item's own
+row carries the reason; `QueuePane::now`'s silent refusal gets a sentence and its
 comment stops claiming the status line already explained it.
 
 **It was written as phase 3, behind the feature, and that was wrong.** The bug
@@ -724,6 +737,35 @@ disclosure owed by phase 3's feature; it is a hole in today's program that
 phase 3 would have widened. Fixing it first also means phase 3 lands into a
 queue that can already say what it is doing, rather than shipping a feature and
 its own caveat together.
+
+Five things landed differently from the sketch above.
+
+- **The refusal covers all four ways the gate can say no, not only "cannot
+  receive".** The second half of the finding — that the status line describes
+  `gate_target` and is routinely about some other pane — is just as true of a
+  *busy* one, so `Enter` on an item aimed at a busy pane was silent for the same
+  reason and had to stop being. It now writes `not sent · claude busy`, and
+  returns `Handled::Yes` where it used to return `No`. Two existing tests
+  changed the `Handled` they expect, and nothing else: what they were really
+  asserting is that nothing was sent, and that is unchanged.
+- **The sentence needed somewhere to live**, which the sketch did not say. It is
+  `QueuePane::refused`, a `String` beside `confirm` that shares its slot on the
+  status line, its colour, and its rule that the next key ends it — including on
+  a click, a paste, and the `cancel_confirm` the shell calls when the pane leaves
+  the screen.
+- **`gate_state` returns a named struct rather than a widened tuple.** Adding
+  `can_receive` to `(&str, Readiness, bool)` would have put two bools side by
+  side, where a swapped pair compiles and draws a pane nobody can type at as one
+  somebody is typing at.
+- **The row's reason is only drawn for a `Pending` item.** An item that was sent
+  before its pane exited *went*; `cannot receive` over a `✓` would be a reason
+  given for something that did not happen.
+- **The shell's half had no coverage at all**, which the sketch's three tests
+  would not have caught: they build a `Target` by hand, so deleting
+  `!pane.has_exited()` from `App::sync_queue_targets` left every test green. That
+  is now an app-level test of its own,
+  `an_exited_pane_is_offered_to_the_queue_as_one_that_can_never_receive`, against
+  a `can_receive` test seam on the pane in the shape of `is_draft_open`.
 
 **Phase 3 — the feature.** `App` holds the table; `Recipe` carries the kind and
 the row's `args`; `start_agent` takes a choice; the `choosing` question, the two
@@ -776,8 +818,8 @@ to want one.
    section assumes it might and pays one test for the assumption. Whether it
    actually happens on any terminal abeam ships to is unmeasured, and the
    measurement is `crates/abeam/examples/keyprobe.rs`.
-5. **What should the border say about a pane the queue cannot type at?** Phase 3
-   answers it in the queue's status line, which is where the countdown already
-   is. Whether the *left* border should say it too — next to the name that is
-   already there — is a question about how much a title row can carry, and this
-   document does not answer it.
+5. **What should the border say about a pane the queue cannot type at?** Phase 2
+   answered it in the queue — in the status line, where the countdown already
+   is, and on the item's own row. Whether the *left* border should say it too —
+   next to the name that is already there — is a question about how much a title
+   row can carry, and this document does not answer it.
