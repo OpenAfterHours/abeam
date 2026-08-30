@@ -1,10 +1,15 @@
 # More than one *kind* of agent in the window
 
-> **This is a proposal, and phases 1 and 2 of it are built.** The rest is not,
-> which is the opposite of `docs/multi-agent.md`'s banner and the reason this is
-> a second document rather than a section of that one. Where a paragraph here
-> describes code, it describes code that exists today and says so; where it
-> describes behaviour, that behaviour does not exist yet.
+> **This was a proposal, and phases 1, 2 and 3 of it are built.** Phase 4 is the
+> only part still describing something that does not exist.
+>
+> **The argument below is kept in the tense it was written in**, which is the
+> convention `docs/multi-agent.md` uses and the reason a sentence like "`Recipe`
+> grows a third field" is left standing over code where it has already grown
+> two. Reasoning is worth more than a changelog, and rewriting it into the past
+> would lose the shape of the question. What is *actually* true now is the phase
+> list at the foot: each entry says what landed and what landed differently, and
+> where the two disagree the phase list is the one to believe.
 >
 > Phase 1 was the seam and nothing a reader can see: `Agent::kind`,
 > `Agent::is_claude`, a `poll_readiness` that asks each pane and a
@@ -16,9 +21,15 @@
 > Phase 2 is the first of it a reader meets, and what it fixes was already
 > broken: the queue says when a prompt is aimed at a pane that can never receive
 > it — on the item's own row and in its status line — and `Enter` on such an item
-> answers instead of doing nothing. There is still no chooser, no `A` key and no
-> way to *get* a pane of a second kind, so every predicate still answers what it
-> answered before.
+> answers instead of doing nothing. It needed no mixed agents to be worth
+> shipping, which is why it went second.
+>
+> Phase 3 is the feature: `A` where you would have pressed `a`, a list of the
+> agents abeam can name, and a pane of whichever one you chose. With it the
+> predicates phase 1 made per-pane start answering differently from each other —
+> a Codex pane really is not Claude — and the sentence the roster section below
+> warns about becomes reachable: a session that never typed the word `claude`
+> can now start `claude agents --json`.
 >
 > It is the argument `docs/multi-agent.md` said would be wanted and declined to
 > make in passing. That document's "What moves out of `App` and into `Agent`"
@@ -365,8 +376,10 @@ so the result is a bare `cmd.exe` under a border reading `claude`.
 re-derives everything else from, and `crate::agent::Agent::args` is precisely
 the preset's contribution with the typed command line excluded. A program named
 outright still has no row and needs none: its `args` are empty and its `target`
-is the whole recipe. It belongs in phase 2, and it wants a test named after the
-disagreement.
+is the whole recipe. It belongs in the phase that gives `Recipe` a kind — which
+is phase 3, after the reordering below — and it wants a test named after the
+disagreement. It got one:
+`a_preset_pane_opened_later_runs_the_program_the_session_did`.
 
 ## The keys
 
@@ -563,8 +576,8 @@ pub struct AgentRequest {
 ```
 
 `&'static str` because the table is `&'static`, so the request borrows nothing
-and outlives nothing. `None` keeps `a` byte-identical, which is what makes phase
-2 shippable without re-testing the gesture that already works.
+and outlives nothing. `None` keeps `a` byte-identical, which is what makes the
+feature shippable without re-testing the gesture that already works.
 
 The pane keeps owning this, rather than the chooser living in `App` as an
 overlay, because the pane already owns `a`, `x`, the close confirmation and the
@@ -726,8 +739,10 @@ Two things landed differently from the sketch above and both are worth naming.
 one, because the parameter's only caller was the loop that hoisted the answer
 and a function that reads its own field cannot be handed a neighbour's. And
 `start_agent` takes the *session's* kind rather than the recipe's, because
-`Recipe` has no kind until phase 2 gives it one — which is where the preset-args
-disagreement is fixed too, and for the same reason.
+`Recipe` had no kind until phase 3 gave it one — which is where the preset-args
+disagreement was fixed too, and for the same reason. (Written as "phase 2" here
+before the two were swapped; the phase that gives `Recipe` a kind is the
+feature's, wherever it sits in the order.)
 
 **Phase 2 — the disclosure, and it now goes second rather than third. Built.**
 `Target` gains `can_receive`; the footer splits its `Unknown` arm; the item's own
@@ -771,12 +786,50 @@ Five things landed differently from the sketch above.
   `an_exited_pane_is_offered_to_the_queue_as_one_that_can_never_receive`, against
   a `can_receive` test seam on the pane in the shape of `is_draft_open`.
 
-**Phase 3 — the feature.** `App` holds the table; `Recipe` carries the kind and
-the row's `args`; `start_agent` takes a choice; the `choosing` question, the two
-`A` arms and the `SHIFT` guard on `a`; `AgentRequest`. The preset-args fix and
-its test go here, because this is the phase that would otherwise make the
-disagreement worse. The README gains the note about what a non-Claude pane does
-not do.
+**Phase 3 — the feature. Built.** `App` holds the table; `Recipe` carries the
+kind and the row's `args`; `start_agent` takes a choice; the `choosing`
+question, the two `A` arms and the `SHIFT` guard on `a`; `AgentRequest`. The
+preset-args fix and its test landed here, because this is the phase that would
+otherwise have made the disagreement worse. The README gained the note about
+what a non-Claude pane does not do, and `docs/keymap.md` gained the paragraph
+about the fifth letter that pane now claims.
+
+Four things landed differently from the sketch above.
+
+- **`Hosted` grew an `args` field, which the sketch did not say it needed.**
+  `Recipe` is filled by `App::new` out of what `main` resolved, and the row's
+  own arguments were nowhere in that: `Hosted` carried a `Launch` whose
+  arguments are the preset's *and* the typed line joined, and only the first
+  half may go to a pane opened an hour later. Re-deriving it in `App::new` by
+  looking `hosted.name` up in the table would have worked and is the thing this
+  whole section argues against — the resolution already knew, so it says so.
+- **`GitPane::new` takes the session's agent as well as the table.** The sketch
+  wrote `GitPane::new(root, table)`, and the cursor cannot start on the
+  session's own row without knowing which row that is. It is the *border's*
+  word rather than the kind, so `abeam +fleet` marks `fleet` and not the
+  `claude` it hosts, and it is looked up once at construction through
+  `find_within` — so a program named outright is `None`, nothing is marked, and
+  the cursor starts at the top.
+- **The chooser has its own two-key movement rather than a `Scroll`.** "Movement
+  is `crate::scroll`'s shared vocabulary" is right about the letters and wrong
+  about the mechanism: a `Scroll` moves an *offset*, and what this list needs
+  moved is a selection. `j`/`k`, the arrows and `Tab` are matched by the pane,
+  wrapping as both lists do, and there is no scrollbar — the table is three rows
+  on a machine with no presets, and a list somebody has to scroll to see is one
+  they would rather not have opened.
+- **The mouse branch answers `Handled::Yes` to everything, which costs one
+  affordance.** `crate::app` turns what a pane declines into a text selection,
+  so while the question stands its rows cannot be dragged over and copied. Named
+  here because it is a real loss rather than a nil one; owning every input for
+  the lifetime of a question that ends on the next keystroke is the simpler
+  rule, and a click that *chose* would be the one gesture in that file spawning
+  a process with no keystroke behind it.
+
+Two things the sketch asked for and did not get a test of their own, because
+existing tests already carry them: `set_worktree_rows` suppressing its "a frame
+is owed" return while choosing is asserted nowhere — it is an optimisation the
+document itself marked optional — and the `render` branch is exercised by every
+chooser test that reads the screen.
 
 **Phase 4 — dispatch, if it is wanted.** The queue's dispatcher becomes
 something that can arrive after a pane opens. Note that there are **two**

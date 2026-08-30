@@ -922,6 +922,24 @@ pub struct Hosted {
     /// for the one that asks about a pane, which is whether Claude's own
     /// session records describe the child in it.
     pub agent: String,
+    /// What the table row put in front of the command line, and nothing that
+    /// was typed.
+    ///
+    /// Empty for a built-in and for a program named outright; `["agent"]` for
+    /// a `[preset.fleet]` whose `args` say so. It is [`Agent::args`] carried
+    /// out of the resolution rather than looked up again by name, and it has
+    /// exactly one reader: `crate::app::Recipe`, which re-resolves this
+    /// program for every pane opened on a keystroke and would otherwise start
+    /// `claude` where the session started `claude agent` — one border word and
+    /// two different programs.
+    ///
+    /// **The row's arguments and never the whole line**, which is the same
+    /// distinction `Recipe`'s own documentation is written around: `abeam
+    /// +fleet -p "fix the tests"` resolves `claude agent -p "fix the tests"`,
+    /// and a later pane may inherit the first two words and must not inherit
+    /// the last two. `line` below is where the two halves are joined; this is
+    /// the half abeam's own table contributed.
+    pub args: Vec<String>,
     pub launch: Launch,
 }
 
@@ -932,10 +950,15 @@ impl Hosted {
     /// agent abeam knows anything about, and answering `crate::dispatch` with
     /// the same word it was given is how it comes to say "abeam is hosting
     /// `pwsh`" rather than guessing on the user's behalf.
+    ///
+    /// No arguments either, and that is the same sentence about a third thing:
+    /// a program with no row in the table has nothing abeam added to its
+    /// command line, so its whole recipe is the file it resolved to.
     pub fn plain(name: &str, launch: Launch) -> Self {
         Self {
             name: name.to_string(),
             agent: name.to_string(),
+            args: Vec::new(),
             launch,
         }
     }
@@ -976,6 +999,10 @@ pub fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result
                 return Ok(Hosted {
                     name: agent.name.to_string(),
                     agent: agent.hosts.to_string(),
+                    // The row's own, not the line above: `args` there is what
+                    // the table added *and* what was typed, and only the first
+                    // half may be given to a pane opened an hour later.
+                    args: agent.args.iter().map(|arg| (*arg).to_string()).collect(),
                     launch,
                 });
             }

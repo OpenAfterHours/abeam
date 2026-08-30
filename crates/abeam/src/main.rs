@@ -267,7 +267,10 @@ fn main() -> Result<()> {
         // it. `crate::app::Recipe` is where the argument lives about what such
         // a pane may inherit from the command line this function read — and the
         // short version is nothing, because `-p` and `--resume` are in there.
-        App::new(left, root, &hosted, opening).run(&mut terminal)
+        // The table goes over with it, because it is `main`'s and because the
+        // chooser and the resolve behind it have to be reading the same one:
+        // `crate::app::App::table`.
+        App::new(left, root, &hosted, table, opening).run(&mut terminal)
     })();
 
     // Every frame ends by emptying the frame buffer, so this should have

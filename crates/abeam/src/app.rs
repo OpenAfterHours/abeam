@@ -1125,7 +1125,17 @@ impl Agent {
 /// Dropping the arguments and keeping the environment there would keep the
 /// prompt and lose the agent — a bare `cmd.exe` under a border reading
 /// `claude`. `crate::launch::resolve` is what knows how to put the pair back
-/// together, so it is asked again with an empty argument list.
+/// together, so it is asked again with [`args`](Self::args) and nothing else.
+///
+/// **"Nothing from the command line" was once spelled "no arguments at all",
+/// and those are two different rules.** A `[preset.fleet]` with `args =
+/// ["agent"]` puts `agent` in front of whatever was typed, so a session started
+/// `abeam +fleet` ran `claude agent` in its first pane and plain `claude` in
+/// every pane opened with `a` — two panes, one border word, two different
+/// programs. The preset's own words are not the command line: they were written
+/// in the reader's config file, they select the *program*, and every pane of
+/// this session is meant to be that program. So they are carried, and the line
+/// that was typed still is not.
 ///
 /// **Resolving late is safe here for the reason resolving early was necessary
 /// there.** `main` finds the program before `term::setup` and before abeam goes
@@ -1151,11 +1161,34 @@ struct Recipe {
     /// given. Not the path it resolves to — an npm install makes that
     /// `cmd.exe`, and only one of the two is worth a border.
     name: String,
+    /// `Hosted::agent`: what this actually is, for [`Agent::kind`].
+    ///
+    /// The border's word and the pane's kind differ exactly when a preset hosts
+    /// a built-in — `fleet` above and `claude` here — and until this field
+    /// existed [`App::start_agent`] read [`App::agent`] instead, which is the
+    /// session's answer to the same question. That was true for as long as
+    /// every pane was spawned from this recipe and stopped being the moment a
+    /// keystroke could choose something else.
+    kind: String,
+    /// What the *table row* puts in front of the command line, and nothing that
+    /// was typed. `crate::agent::Hosted::args`, which is where the distinction
+    /// is argued.
+    ///
+    /// **`args` and emphatically not a whole `Launch`, or a `Launch::env`
+    /// beside a blanked argv.** `env` is not an input to resolution — it is
+    /// derived from `(target, args)` on every resolve, by `crate::launch`'s
+    /// `through_cmd`, which quotes the arguments back into `ABEAM_LAUNCH`
+    /// itself. So resolving the shim with `["agent"]` runs `claude agent` on
+    /// Windows and puts the same word in argv on Unix: one field, one code
+    /// path, both platforms. Carrying a stale `env` beside an emptied argument
+    /// list is the exact failure the paragraphs above are about — for `abeam -p
+    /// "fix the tests"` the prompt lives in that variable.
+    args: Vec<String>,
 }
 
 impl Recipe {
     /// The launch a new pane is spawned from: this program, interactively, with
-    /// nothing on its command line.
+    /// the table row's own arguments and nothing that was typed.
     ///
     /// `resolve_at` and not `resolve`, so the path never becomes a `String` and
     /// back. That module's own doc has the argument; the short version is that
@@ -1166,8 +1199,17 @@ impl Recipe {
     /// `Launch::config` converts again on the way to the pty, so an install
     /// abeam cannot spell is one it cannot start from any pane. What goes is
     /// the asymmetry between the first pane and the rest.
+    ///
+    /// **`resolve_at` and not `crate::agent::resolve_within`**, which is the
+    /// obvious-looking way to reach a preset's arguments and is a regression.
+    /// That function searches by bare *name*, so it re-walks `PATH`: a `PATH`
+    /// that changed since startup, or a nearer entry that appeared, would
+    /// silently start a different binary under the same border word. Starting
+    /// *the same file* the session did is the asymmetry this type exists to
+    /// remove, and the arguments are carried past the search rather than
+    /// fetched by redoing it.
     fn launch(&self) -> Result<crate::launch::Launch, String> {
-        crate::launch::resolve_at(&self.target, &[])
+        crate::launch::resolve_at(&self.target, &self.args)
     }
 }
 
@@ -1215,6 +1257,21 @@ pub struct App {
     /// How to start another one. See [`Recipe`], which is where the argument
     /// about what a later pane may inherit from the command line lives.
     recipe: Recipe,
+    /// Every agent this session can name: `crate::agent::AGENTS` plus the
+    /// reader's `[preset.*]` blocks, exactly as the command line reads them.
+    ///
+    /// **Held rather than rebuilt, and handed down rather than read from a
+    /// global**, which is what `crate::config::Config::table` already makes
+    /// cheap: it leaks its rows once at startup, so this is `&'static` and
+    /// borrows nothing. `main` holds it because `crate::agent::parse` and
+    /// `main::host` both take it, and this is the third reader — the chooser in
+    /// `crate::panes::git`, which draws it, and [`start_agent`](Self::start_agent),
+    /// which resolves the row that was chosen.
+    ///
+    /// The two must be the same table or the list would offer a name the
+    /// resolve then refuses, so it is passed to both from here rather than
+    /// each asking `Config` again.
+    table: &'static [crate::agent::Agent],
     /// Every session id abeam has started for its own use and told the probes
     /// to ignore.
     ///
@@ -1675,6 +1732,11 @@ impl App {
     /// a later pane is started from. See [`Recipe`] for why it is the target
     /// and not the whole `Launch`.
     ///
+    /// `table` is every agent this session can name, which `main` is holding
+    /// for the same reason it is holding `hosted`: it built it once, before
+    /// `term::setup`, and both the chooser and the resolve behind it have to be
+    /// looking at that one. See [`table`](Self::table).
+    ///
     /// `opening` is where the session starts: which right-hand view, which
     /// pane has the keyboard, whether it is zoomed, and which page the reader
     /// is on. Those four were literals on the lines below until there was
@@ -1684,6 +1746,7 @@ impl App {
         left: TerminalPane,
         root: PathBuf,
         hosted: &crate::agent::Hosted,
+        table: &'static [crate::agent::Agent],
         opening: Opening,
     ) -> Self {
         let agent = hosted.agent.as_str();
@@ -1720,10 +1783,18 @@ impl App {
             recipe: Recipe {
                 target: hosted.launch.target.clone(),
                 name: hosted.name.clone(),
+                kind: agent.to_string(),
+                args: hosted.args.clone(),
             },
+            table,
             disowned: Vec::new(),
             agent_refused: None,
-            git: GitPane::new(root.clone()),
+            // The border's word rather than the kind, because what the chooser
+            // marks `session` is a *row* of the table and `fleet` is the row a
+            // `[preset.fleet]` session was started from. A program named
+            // outright has no row, which is the case where nothing is marked
+            // and the cursor starts at the top.
+            git: GitPane::new(root.clone(), &hosted.name, table),
             viewer,
             // The root abeam was started on, and the invariant that it is
             // `spaces[0]` and stays there — `App::root` rather than the
@@ -2130,17 +2201,58 @@ impl App {
     ///   pane opened after somebody has used the ask pane can otherwise adopt
     ///   that reader's record and report its `idle` as its child's.
     ///
+    /// **`choice` is which agent, and `None` is byte-identical to what this
+    /// function did before it had a second parameter.** `a` passes `None` and
+    /// gets the session's [`Recipe`]: the same file, the same border word, the
+    /// same kind, resolved the same way. `A` passes the name of a row the
+    /// reader picked out of [`table`](Self::table), which is resolved the way
+    /// `main` resolves the session's own agent at startup —
+    /// `crate::agent::resolve_within`, whose `Err` is the install sentence and
+    /// lands in [`agent_refused`](Self::agent_refused) exactly as a failure to
+    /// start the session's agent would.
+    ///
+    /// **A chosen row is looked up by name and the session's is not, and that
+    /// asymmetry is the right way round.** `Recipe` keeps an absolute path
+    /// precisely so that a pane opened an hour later starts *the same file*;
+    /// there is no such file for a row nobody has resolved yet, so the search
+    /// happens here and its failure is a sentence rather than a silence. See
+    /// `docs/mixed-agents.md`, "Resolution happens on the keystroke".
+    ///
     /// Returns whether a frame is owed, which is always: either there is a new
     /// pane or there is a sentence saying why there is not.
-    fn start_agent(&mut self, root: &Path) -> bool {
+    fn start_agent(&mut self, root: &Path, choice: Option<&str>) -> bool {
         let root = paths::resolve_root(root);
 
-        let launch = match self.recipe.launch() {
-            Ok(launch) => launch,
-            Err(why) => {
-                self.agent_refused = Some(why);
-                return true;
-            }
+        // Three things, from one of two places, and they travel together
+        // because a pane started from the wrong pair of them is a border word
+        // that disagrees with the program under it. `name` is what the border
+        // says, `kind` is what `Agent::is_claude` will answer, and for a preset
+        // the two are `fleet` and `claude`.
+        let (launch, name, kind) = match choice {
+            None => match self.recipe.launch() {
+                Ok(launch) => (launch, self.recipe.name.clone(), self.recipe.kind.clone()),
+                Err(why) => {
+                    self.agent_refused = Some(why);
+                    return true;
+                }
+            },
+            // Not reachable from the chooser, whose rows *are* this table — but
+            // a sentence costs one arm and the alternative is an `expect` on a
+            // lookup that a later caller could get wrong. It reads like the
+            // rest of the refusals on this border rather than like a panic.
+            Some(want) => match crate::agent::find_within(want, self.table) {
+                Some(row) => match crate::agent::resolve_within(row, &[], self.table) {
+                    Ok(hosted) => (hosted.launch, hosted.name, hosted.agent),
+                    Err(why) => {
+                        self.agent_refused = Some(why);
+                        return true;
+                    }
+                },
+                None => {
+                    self.agent_refused = Some(format!("abeam knows no agent called `{want}`."));
+                    return true;
+                }
+            },
         };
 
         // A first guess at the size, from the window the last frame measured
@@ -2174,7 +2286,7 @@ impl App {
         let started = TerminalPane::spawn_with(
             launch
                 .config()
-                .title(&self.recipe.name)
+                .title(&name)
                 .cwd(&root)
                 .size(inner.height.max(1), inner.width.max(1)),
         );
@@ -2186,14 +2298,12 @@ impl App {
             }
         };
 
-        // The session's kind, because the session's [`Recipe`] is what this
-        // pane was spawned from: one `target`, one program, one answer. So
-        // [`App::agent`] is not being read here out of habit — it is where the
-        // kind of *the thing this recipe starts* is currently written down, and
-        // the recipe itself has no room for one. The day a keystroke can choose
-        // a different program is the day it needs one; that is phase 2 of
-        // `docs/mixed-agents.md`, and this line is what it has to change.
-        let mut agent = Agent::new(pane, root, self.agent.clone());
+        // The kind of the thing that was just spawned, and no longer
+        // [`App::agent`] — which is the session's answer and was only ever the
+        // right one because every pane came from the session's recipe. It comes
+        // from whichever of the two branches above produced the launch, so the
+        // pane's kind cannot disagree with the program in it.
+        let mut agent = Agent::new(pane, root, kind);
         // `None` only before [`App::run`], which no keystroke can be earlier
         // than — the loop that delivers keys is inside it. Said as a condition
         // rather than an `expect` because a test can reach this function
@@ -3552,8 +3662,11 @@ impl App {
         // paragraph above is about. Pressing both keys in one batch starts a
         // child in one worktree and points the right pane at another, which is
         // exactly what was asked for.
-        if let Some(root) = self.git.take_agent_request() {
-            redraw |= self.start_agent(&root);
+        //
+        // The request carries which agent as well as which checkout, and `None`
+        // there is `a` — the session's own. See [`crate::panes::git::AgentRequest`].
+        if let Some(req) = self.git.take_agent_request() {
+            redraw |= self.start_agent(&req.root, req.agent);
         }
 
         // **The first `x` on a worktree row, checked here so that a question
@@ -6568,7 +6681,13 @@ mod tests {
         let (program, args) = EXITS;
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         let left = TerminalPane::spawn(program, &args, 20, 60).expect("spawn a child in a pty");
-        let app = App::new(left, dir.path().to_path_buf(), &hosting(unstarted()), opening);
+        let app = App::new(
+            left,
+            dir.path().to_path_buf(),
+            &hosting(unstarted()),
+            crate::agent::AGENTS,
+            opening,
+        );
         Fixture { app, dir }
     }
 
@@ -6589,6 +6708,10 @@ mod tests {
         crate::agent::Hosted {
             name: "claude".to_string(),
             agent: "claude".to_string(),
+            // A built-in adds nothing to a command line, which is what makes
+            // the preset case worth a fixture of its own — see
+            // [`a_preset_pane_opened_later_runs_the_program_the_session_did`].
+            args: Vec::new(),
             launch,
         }
     }
@@ -7032,6 +7155,15 @@ mod tests {
         fx.app.recipe = Recipe {
             target,
             name: "shim".to_string(),
+            // `claude`, because [`Agent::is_claude`] gates the readiness path
+            // every test in this file wants open — the same reason [`hosting`]
+            // names the session's agent that.
+            kind: "claude".to_string(),
+            // Nothing, because a built-in adds nothing. A preset's own words
+            // are what
+            // [`a_preset_pane_opened_later_runs_the_program_the_session_did`]
+            // is about, and it builds a recipe of its own to say so.
+            args: Vec::new(),
         };
     }
 
@@ -7107,6 +7239,8 @@ mod tests {
         let recipe = Recipe {
             target: startup.target.clone(),
             name: "claude".to_string(),
+            kind: "claude".to_string(),
+            args: Vec::new(),
         };
         let later = recipe.launch().expect("the same program resolves again");
 
@@ -7120,10 +7254,93 @@ mod tests {
         );
 
         // And the wiring that fills it: `main` hands over what it resolved, and
-        // the two things the recipe keeps are the file and the border's word.
+        // what the recipe keeps is the file, the border's word, the kind and
+        // the table row's own arguments.
         let fx = app();
         assert_eq!(fx.app.recipe.target, unstarted().target);
         assert_eq!(fx.app.recipe.name, "claude");
+        assert_eq!(fx.app.recipe.kind, "claude");
+        assert!(
+            fx.app.recipe.args.is_empty(),
+            "a built-in put an argument in front of somebody's agent"
+        );
+    }
+
+    /// A preset's own arguments **do** survive into a pane opened later, which
+    /// is the sentence above with the other half of the distinction in it.
+    ///
+    /// **Named after a disagreement, because that is what it was.** Until
+    /// `Recipe` carried them, a session started `abeam +fleet` — where
+    /// `[preset.fleet] host = "claude", args = ["agent"]` — ran `claude agent`
+    /// in its first pane and plain `claude` in every pane opened with `a`. Two
+    /// panes, one border word, two different programs.
+    ///
+    /// **It looks in the environment as well as the arguments**, for
+    /// [`a_pane_opened_later_carries_nothing_from_the_command_line`]'s reason
+    /// and against the same install shape: on Windows an npm agent is a `.cmd`
+    /// routed through `cmd.exe`, so what reaches the child is quoted into
+    /// `%ABEAM_LAUNCH%` rather than into argv. `crate::launch`'s `through_cmd`
+    /// derives that variable from `(target, args)` on every resolve, which is
+    /// the whole reason the field carried is `args` and not a stale `env`
+    /// beside a blanked argument list.
+    #[test]
+    fn a_preset_pane_opened_later_runs_the_program_the_session_did() {
+        let dir = TempDir::new("preset-recipe");
+        let target = a_pane_that_stays(&dir);
+
+        let carries = |launch: &Launch, word: &str| {
+            launch
+                .args
+                .iter()
+                .chain(launch.env.iter().map(|(_, value)| value))
+                .any(|said| said.contains(word))
+        };
+
+        let recipe = Recipe {
+            target: target.clone(),
+            name: "fleet".to_string(),
+            kind: "claude".to_string(),
+            args: vec!["agent".to_string()],
+        };
+        let later = recipe.launch().expect("the shim resolves");
+        assert!(
+            carries(&later, "agent"),
+            "a pane opened later dropped the preset's own subcommand"
+        );
+
+        // And nothing invents one: the same recipe with an empty list is the
+        // built-in case, and a test that passed either way would prove nothing.
+        let plain = Recipe {
+            args: Vec::new(),
+            ..recipe
+        };
+        assert!(
+            !carries(&plain.launch().expect("the shim resolves"), "agent"),
+            "an argument nobody asked for reached the child"
+        );
+
+        // And the wiring that fills it, which is the half a `Recipe` built by
+        // hand cannot reach: `crate::agent::resolve_within` carries the row's
+        // words out on `Hosted::args`, and `App::new` copies them across.
+        let hosted = crate::agent::Hosted {
+            name: "fleet".to_string(),
+            agent: "claude".to_string(),
+            args: vec!["agent".to_string()],
+            launch: unstarted(),
+        };
+        let (program, args) = EXITS;
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let left = TerminalPane::spawn(program, &args, 20, 60).expect("spawn a child in a pty");
+        let app = App::new(
+            left,
+            dir.path().to_path_buf(),
+            &hosted,
+            crate::agent::AGENTS,
+            Opening::default(),
+        );
+        assert_eq!(app.recipe.args, ["agent"]);
+        assert_eq!(app.recipe.name, "fleet", "the border word is the preset's");
+        assert_eq!(app.recipe.kind, "claude", "and the kind is what it hosts");
     }
 
     /// `a` on a worktree row starts an agent there, shows it, and moves nothing
@@ -7290,6 +7507,157 @@ mod tests {
         assert_eq!(fx.app.at, was_at, "the right pane followed");
         assert_eq!(fx.app.right_view, was_view, "the view followed");
         assert_eq!(fx.app.focus, was_focus, "the keys moved");
+    }
+
+    /// A one-row table naming a program that really starts, under a kind the
+    /// session is not.
+    ///
+    /// Leaked, which is `crate::config::Config::table`'s own answer — it leaks
+    /// its rows once at startup so that the table is `&'static` and nothing has
+    /// to thread a lifetime through six signatures. A `const` cannot be used
+    /// here the way `crate::panes::git`'s tests use one, because the candidate
+    /// is a path in a `TempDir` and is not known until the test runs.
+    fn a_table_hosting(target: &Path, hosts: &'static str) -> &'static [crate::agent::Agent] {
+        let candidate: &'static str =
+            Box::leak(target.to_string_lossy().into_owned().into_boxed_str());
+        let candidates: &'static [&'static str] = Box::leak(Box::new([candidate]));
+        Box::leak(Box::new([crate::agent::Agent {
+            name: "shim",
+            candidates,
+            install: "there is nothing to install; this row is a fixture",
+            args: &[],
+            hosts,
+        }]))
+    }
+
+    /// The fixture, over a table of somebody's own.
+    ///
+    /// The pane is rebuilt rather than poked because it takes the table at
+    /// construction — see `crate::panes::git::GitPane::session`, which is found
+    /// once from the session's own name — and rebuilding is also what keeps the
+    /// two copies of the table the same one.
+    fn app_over_table(table: &'static [crate::agent::Agent]) -> Fixture {
+        let mut fx = app();
+        fx.app.table = table;
+        fx.app.git = GitPane::new(fx.dir.path().to_path_buf(), "claude", table);
+        fx
+    }
+
+    /// `A` `Enter` starts the agent that was chosen, under its own name and its
+    /// own kind.
+    ///
+    /// **The whole wire, because every link in it is new.** The key reaches a
+    /// pane that only sees keys under `Focus::Right`; the chooser captures the
+    /// checkout and the row; `Enter` fills the same request slot `a` fills, now
+    /// carrying a name; [`pump`](App::pump) drains it; and
+    /// [`start_agent`](App::start_agent) resolves that row rather than the
+    /// session's [`Recipe`].
+    ///
+    /// **The kind is what makes this more than a second copy of the `a` test.**
+    /// The row hosts `codex`, the session hosts `claude`, and
+    /// [`Agent::is_claude`] gates the readiness path — so a `kind` still read
+    /// from [`App::agent`], which is what this function used to do, would put a
+    /// Claude probe in front of a pane that is not Claude and go on reporting a
+    /// neighbour's `idle` as its own.
+    #[test]
+    fn choosing_an_agent_starts_that_one_rather_than_the_sessions() {
+        let dir = TempDir::new("chosen");
+        let target = a_pane_that_stays(&dir);
+        let mut fx = app_over_table(a_table_hosting(&target, "codex"));
+
+        // `claude` is not a row of that table, so nothing is marked `session`
+        // and the cursor starts at the top — which is the only row there is.
+        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        let _ = screen(&mut fx.app, 120, 40);
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "the right pane has no keys");
+
+        fx.app.handle_key(key(KeyCode::Char('A'))).unwrap();
+        assert_eq!(
+            fx.app.git.exit_hint(),
+            "esc→list",
+            "`A` did not reach the pane"
+        );
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(fx.app.pump(), "a new agent is worth a frame");
+
+        assert_eq!(fx.app.agents.len(), 2, "nothing was started");
+        assert_eq!(
+            fx.app.agents[1].kind, "codex",
+            "the new pane took the session's kind rather than the chosen row's"
+        );
+        assert!(
+            !fx.app.agents[1].is_claude(),
+            "a pane that is not Claude would be asked for Claude's readiness"
+        );
+        assert!(
+            fx.app.agents[0].is_claude(),
+            "the session's own pane changed kind"
+        );
+        // And it really started, which is `bracketed_paste` and not
+        // `!has_exited` for the reason the two `a` tests above spell out: only
+        // the mode is a fact the child had to produce.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.app.agents[1].pane.bracketed_paste() && Instant::now() < deadline {
+            fx.app.reap().expect("try_wait on a child that exists");
+            if fx.app.agents[1].pane.has_exited() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            fx.app.agents[1].pane.bracketed_paste(),
+            "the child never asked for bracketed paste, so nothing really started"
+        );
+        assert!(
+            fx.app.agent_refused.is_none(),
+            "a start that worked complained: {:?}",
+            fx.app.agent_refused
+        );
+    }
+
+    /// A chosen agent that is not on the machine is a sentence, and it is the
+    /// same sentence `abeam +codex` gives at startup.
+    ///
+    /// **The list is what abeam can *name*, not what is installed**, and
+    /// deliberately: marking the missing rows would mean a `PATH` walk per row
+    /// per frame the list is open, and `crate::agent`'s module docs are
+    /// explicit that abeam's answer to an agent it cannot find is a sentence
+    /// naming the candidates and the install command — which a greyed-out row
+    /// says none of. So the resolve happens on the keystroke and its `Err` has
+    /// somewhere to go.
+    #[test]
+    fn a_chosen_agent_that_is_not_installed_says_what_to_install() {
+        let missing: &'static [crate::agent::Agent] = &[crate::agent::Agent {
+            name: "nowhere",
+            candidates: &["abeam-no-such-agent-exists"],
+            install: "Install it with `npm i -g nothing`.",
+            args: &[],
+            hosts: "nowhere",
+        }];
+        let mut fx = app_over_table(missing);
+        let root = fx.dir.path().to_path_buf();
+
+        assert!(
+            fx.app.start_agent(&root, Some("nowhere")),
+            "a refusal is worth a frame: it is the only thing that will say why"
+        );
+        assert_eq!(fx.app.agents.len(), 1, "a pane was started anyway");
+        let why = fx.app.agent_refused.clone().expect("no answer at all");
+        assert!(
+            why.contains("could not start `nowhere`") && why.contains("npm i -g nothing"),
+            "the refusal does not name what was looked for or how to install it: {why}"
+        );
+        // **Word for word what startup would have said**, which is the claim
+        // worth pinning: the chooser is not a second failure path with a second
+        // quality of message, it is the same resolve reached by a keystroke.
+        // Getting there any other way — a sentence written here, or a row
+        // greyed out in the list — would be a worse answer for more work.
+        let startup = crate::agent::resolve_within(&missing[0], &[], missing)
+            .expect_err("the fixture named a program that exists");
+        assert_eq!(why, startup);
+        // Reaching the border is [`a_pane_that_would_not_start_says_so_until_the_next_key`]'s,
+        // and it is the same field with the same drawing behind it.
     }
 
     /// A pane that did not start says so, and stops saying it on the next key.
@@ -8247,7 +8615,7 @@ mod tests {
         goes_quiet(&rx);
 
         let root = fx.dir.path().to_path_buf();
-        assert!(fx.app.start_agent(&root));
+        assert!(fx.app.start_agent(&root, None));
         assert_eq!(fx.app.agents.len(), 2, "nothing was started");
         assert_eq!(
             fx.app.agents[1].probe.disowned(),
@@ -9555,7 +9923,10 @@ mod tests {
 
         // A second agent in the same root, which is what `a` on the row you are
         // already standing in produces.
-        assert!(fx.app.start_agent(fx.dir.path()), "nothing was started");
+        assert!(
+            fx.app.start_agent(fx.dir.path(), None),
+            "nothing was started"
+        );
         assert_eq!(fx.app.agents.len(), 2);
         assert!(
             fx.app.agents[1].probe.is_disowned_for_tests("s"),
@@ -10366,7 +10737,10 @@ mod tests {
             "the session's own pane disagrees with the session that built it"
         );
 
-        assert!(fx.app.start_agent(fx.dir.path()), "nothing was started");
+        assert!(
+            fx.app.start_agent(fx.dir.path(), None),
+            "nothing was started"
+        );
         assert_eq!(fx.app.agents.len(), 2);
         assert_eq!(
             fx.app.agents[1].kind, fx.app.agent,
@@ -12031,6 +12405,7 @@ mod tests {
             left,
             root,
             &hosting(unstarted()),
+            crate::agent::AGENTS,
             crate::config::Opening::default(),
         );
         Fixture { app, dir }

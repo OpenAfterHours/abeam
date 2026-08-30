@@ -84,8 +84,80 @@ enum Mode {
     Worktrees,
 }
 
+/// The question `A` is asking, and which row of the table is under the cursor
+/// while it asks.
+///
+/// **A standing question beside the mode rather than a third [`Mode`]**, and
+/// the shape is [`GitPane::kill`]'s: a question the pane is asking about a
+/// checkout, held *over* whichever list is up. It is reachable from both lists,
+/// which a mode would have had to encode a way back out of — and nothing
+/// matches `Mode` exhaustively, so a third variant would have bought nothing
+/// but that obligation.
+struct Choice {
+    /// The checkout the agent will start in, captured on the keystroke that
+    /// asked.
+    ///
+    /// **Carried rather than looked up when `Enter` comes**, which is the `x`
+    /// confirmation's rule one gesture along: that one carries the row it asked
+    /// about because `x`, `Tab`, `x` would otherwise warn about one worktree
+    /// and kill in another, and `A`, `Tab`, `Enter` is the same hazard. The
+    /// title draws this rather than `wt_sel`, so what is on screen is what
+    /// `Enter` will do — and while the question stands nothing can move the
+    /// cursor anyway, because [`GitPane::choose_key`] swallows every key.
+    root: PathBuf,
+    /// Which row of the table the cursor is on. A position into
+    /// [`GitPane::table`], which is `&'static` and never changes length — the
+    /// one index in this file that cannot outlive the list it points into. See
+    /// [`GitPane::wt_sel_root`] for the three times that has gone the other
+    /// way.
+    sel: usize,
+}
+
+/// A pane asking for an agent: where, and which one.
+///
+/// `&'static str` because the table is `&'static`, so the request borrows
+/// nothing and outlives nothing — it can sit in a field until the shell drains
+/// it, exactly as the `PathBuf` it travels with does.
+///
+/// **`None` is `a`, and it keeps that key byte-identical.** It means the
+/// session's own agent, resolved from `crate::app::Recipe` — not the name
+/// `claude`, which would send the fast path through a `PATH` search it has
+/// never used. `Some` is a row the reader picked out of the chooser.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentRequest {
+    pub root: PathBuf,
+    pub agent: Option<&'static str>,
+}
+
 pub struct GitPane {
     root: PathBuf,
+    /// Every agent this session can name, for the chooser to draw and for the
+    /// shell to resolve what was chosen. `crate::config::Config::table`'s
+    /// answer, handed down through `crate::app::App::table`.
+    ///
+    /// **A field and not a `set_` call on [`set_worktree_rows`](Self::set_worktree_rows)'
+    /// pattern**, and the difference is what can change underneath: the rows
+    /// are discovered by a worker thread every ten seconds, and the table is
+    /// built once at startup out of leaked strings and cannot change at all.
+    /// It borrows nothing and is never rebuilt.
+    table: &'static [crate::agent::Agent],
+    /// Which row of [`table`](Self::table) the session's own agent is, if it is
+    /// one of them.
+    ///
+    /// Found once, at construction, from the border's word — so `abeam +fleet`
+    /// answers `fleet` and not the `claude` it hosts. `None` for a program
+    /// named outright, which has no row: `abeam +pwsh` can still open more
+    /// `pwsh` panes with `a`, and simply cannot be *chosen* by name, because
+    /// the list is the table.
+    ///
+    /// Two readers and one decision behind both: the cursor starts here, so `A`
+    /// `Enter` is "another of what I already have" and the common case stays
+    /// two keystrokes; and the row is marked `session`, so the reader can see
+    /// which that is. The *order* is the table's and never moves — a list that
+    /// reorders itself by session is one nobody can build muscle memory in.
+    session: Option<&'static str>,
+    /// The agent `A` is asking about, if it is asking. See [`Choice`].
+    choosing: Option<Choice>,
 
     req: Sender<Ask>,
     res: Receiver<Answer>,
@@ -203,7 +275,11 @@ pub struct GitPane {
     /// pressing both in one batch — which is the ordinary way to use them, look
     /// at a worktree and then work in it — a request that silently overwrote
     /// the other.
-    agent: Option<PathBuf>,
+    ///
+    /// **Three keys write it now and they are still one request.** `A` `Enter`
+    /// is the two above with a name attached; see [`AgentRequest`], whose
+    /// `None` is what keeps `a` the key it was.
+    agent: Option<AgentRequest>,
     /// The worktree an `x` has been pressed at **once**, waiting to be meant.
     ///
     /// **The most destructive thing in the program is asked for here and not in
@@ -294,9 +370,11 @@ struct Answer {
 }
 
 impl GitPane {
-    pub fn new(root: PathBuf) -> Self {
+    /// `agent` is the session's own, by the name on its border — the row of
+    /// `table` the chooser starts on and marks. See [`session`](Self::session).
+    pub fn new(root: PathBuf, agent: &str, table: &'static [crate::agent::Agent]) -> Self {
         let (req, res) = spawn_worker(root.clone());
-        Self::over(root, req, res)
+        Self::over(root, agent, table, req, res)
     }
 
     /// [`GitPane::new`], over channels handed in rather than a worker started.
@@ -308,9 +386,25 @@ impl GitPane {
     /// otherwise be a test with a subprocess in it. Handed both ends, a test
     /// can read exactly what was asked for and answer it by hand, which is
     /// stricter than a real worker rather than weaker.
-    fn over(root: PathBuf, req: Sender<Ask>, res: Receiver<Answer>) -> Self {
+    fn over(
+        root: PathBuf,
+        agent: &str,
+        table: &'static [crate::agent::Agent],
+        req: Sender<Ask>,
+        res: Receiver<Answer>,
+    ) -> Self {
         let mut pane = Self {
             root,
+            table,
+            // Once, here, rather than per frame: neither the table nor the
+            // session's agent can change, so a lookup on every draw would be
+            // the same answer bought again. Through `find_within` rather than
+            // by comparing strings, because `abeam +Claude` and `abeam +claude`
+            // are one request and that function is where the folding is
+            // decided — what is kept is the *table's* spelling, which is what
+            // the list draws.
+            session: crate::agent::find_within(agent, table).map(|row| row.name),
+            choosing: None,
             req,
             res,
             generation: 0,
@@ -346,10 +440,14 @@ impl GitPane {
     /// A pane with no worker behind it, and the two ends a worker would have
     /// held. See [`GitPane::over`].
     #[cfg(test)]
-    fn detached(root: PathBuf) -> (Self, Receiver<Ask>, Sender<Answer>) {
+    fn detached(
+        root: PathBuf,
+        agent: &str,
+        table: &'static [crate::agent::Agent],
+    ) -> (Self, Receiver<Ask>, Sender<Answer>) {
         let (req, asks) = mpsc::channel::<Ask>();
         let (answers, res) = mpsc::channel::<Answer>();
-        (Self::over(root, req, res), asks, answers)
+        (Self::over(root, agent, table, req, res), asks, answers)
     }
 
     /// Point this pane at another worktree.
@@ -424,7 +522,11 @@ impl GitPane {
         // a vanished worktree reappearing would snatch the cursor back off
         // whatever the reader had moved to in the meantime.
         self.remember_wt_sel();
-        matches!(self.mode, Mode::Worktrees)
+        // And nothing is owed while the chooser is up, however the rows moved:
+        // it covers this list, and every line it draws comes from a table that
+        // cannot change. The re-find above still happens, so the list
+        // underneath is right the moment `Esc` puts it back.
+        matches!(self.mode, Mode::Worktrees) && self.choosing.is_none()
     }
 
     /// The workspace the user pressed `Enter` on, if any.
@@ -436,12 +538,12 @@ impl GitPane {
         self.workspace.take()
     }
 
-    /// The worktree the user pressed `a` on, if any.
+    /// The worktree the user pressed `a` on, and which agent they asked for.
     ///
     /// Drained the same way and for the same reason as
     /// [`take_workspace_request`](Self::take_workspace_request): a request left
     /// sitting fires late, and this one fires by starting a *process*.
-    pub fn take_agent_request(&mut self) -> Option<PathBuf> {
+    pub fn take_agent_request(&mut self) -> Option<AgentRequest> {
         self.agent.take()
     }
 
@@ -790,8 +892,14 @@ impl GitPane {
         // deliberately left out of the set: the `?` arm in the status list
         // already makes that argument and it is not re-made here — some
         // terminals report `SHIFT` for an uppercase letter, so a rule that
-        // excluded it would be a rule about keyboards. `Char('A')` is a
-        // different code from `Char('a')` in any case.
+        // excluded it here would be a rule about keyboards. `Char('A')` is a
+        // different code from `Char('a')` in any case, and is now a key of its
+        // own.
+        //
+        // **That is a rule about this blanket and not about every arm.** The
+        // `a` arm below refuses `SHIFT` itself, which is the narrow guard the
+        // wide one must not become: `A` and `Alt+A` are two different
+        // decisions, and only one of them is about a modifier abeam owns.
         //
         // **A blanket check rather than a guard on the `a` arm alone**, which
         // is the narrower fix and would have left `Ctrl+X` and `Alt+X` arming
@@ -848,9 +956,37 @@ impl GitPane {
             // gesture that will need a confirmation is the one that *closes* a
             // pane, and `crate::app::App::close_agent` is where that is
             // written down.
-            KeyCode::Char('a') => match self.worktrees.get(self.wt_sel) {
+            //
+            // **`SHIFT` disqualifies it**, for the reason the status list's
+            // own `a` arm sets out and does not need repeating here: some
+            // terminals set the bit for an uppercase letter, and on one of
+            // those an unguarded arm would start an agent without asking in
+            // the exact place the reader was trying to ask.
+            KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                match self.worktrees.get(self.wt_sel) {
+                    Some(row) => {
+                        self.agent = Some(AgentRequest {
+                            root: row.root.clone(),
+                            // The session's own. See [`AgentRequest`].
+                            agent: None,
+                        });
+                        Handled::Yes
+                    }
+                    None => Handled::No,
+                }
+            }
+            // `a` with a question in front of it, asking about the row under
+            // the cursor. The full argument is on the status list's arm; what
+            // is worth saying here is that this one is **inside this match on
+            // purpose**, below the `take` at the top, so that it cancels a
+            // standing `x` exactly as every other key in this list does.
+            //
+            // `SHIFT` is not required, for the reason the other arm gives: on
+            // Unix a bare `A` byte arrives with `KeyModifiers::NONE`. The chord
+            // check above has already refused `Ctrl+A` and `Alt+A`.
+            KeyCode::Char('A') => match self.worktrees.get(self.wt_sel) {
                 Some(row) => {
-                    self.agent = Some(row.root.clone());
+                    self.choose(row.root.clone());
                     Handled::Yes
                 }
                 None => Handled::No,
@@ -927,6 +1063,99 @@ impl GitPane {
         );
         self.wt_scroll.render_bar(f, inner);
     }
+
+    // --- the chooser -------------------------------------------------------
+
+    /// `A`: ask which agent, about this checkout.
+    ///
+    /// One function for the two arms that press it, so the cursor cannot start
+    /// on the session's agent in one list and at the top in the other. The root
+    /// is whatever the arm was asking about — the row under the cursor in the
+    /// worktree list, the checkout on screen in the status view — and it is
+    /// captured here rather than read again at `Enter`. See [`Choice::root`].
+    fn choose(&mut self, root: PathBuf) {
+        let sel = self
+            .session
+            .and_then(|want| self.table.iter().position(|row| row.name == want))
+            .unwrap_or(0);
+        self.choosing = Some(Choice { root, sel });
+    }
+
+    /// The keys the chooser owns, which is **all of them**.
+    ///
+    /// **Every key answers `Handled::Yes`, not only the four this acts on, and
+    /// that is the load-bearing half.** `crate::app` reads a `Handled::No` on a
+    /// bare `Esc` *or* `q` as "the reader is done with this pane" and moves
+    /// focus to the left column. A branch that handled `j`, `k`, `Enter` and
+    /// `Esc` and fell through on the rest would let a bare `q` hand the
+    /// keyboard to the agent with [`choosing`](Self::choosing) still `Some` —
+    /// an invisible standing question over a `root` captured some time ago and
+    /// still ageing, so that the next `Enter`, minutes later, starts an agent
+    /// in a checkout the reader has forgotten they named. The `esc→list` hint
+    /// is only an honest promise if this consumes `Esc` itself.
+    ///
+    /// The keys are the two lists' own — `j`/`k` and the arrows and `Tab` move
+    /// the cursor, wrapping as both of those do — rather than `crate::scroll`'s
+    /// vocabulary handed a `Scroll`. A `Scroll` moves an *offset*, and what
+    /// this list needs moved is a selection; the table is three rows on a
+    /// machine with no presets, so there is nothing to scroll.
+    ///
+    /// **This is where the swallowing lives, and the two `A` arms are
+    /// deliberately not here.** See [`handle_key`](Self::handle_key).
+    fn choose_key(&mut self, key: KeyEvent) -> Handled {
+        let delta: isize = match key.code {
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => 1,
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => -1,
+            KeyCode::Enter => {
+                // Taken, so the question is over whichever way the request
+                // goes, and the row is read out of the table by the index the
+                // cursor holds — which is why the name that travels is
+                // `&'static` and borrows nothing.
+                if let Some(choice) = self.choosing.take()
+                    && let Some(row) = self.table.get(choice.sel)
+                {
+                    self.agent = Some(AgentRequest {
+                        root: choice.root,
+                        agent: Some(row.name),
+                    });
+                }
+                return Handled::Yes;
+            }
+            // Back to the list they pressed `A` in, because they never left it.
+            KeyCode::Esc => {
+                self.choosing = None;
+                return Handled::Yes;
+            }
+            _ => return Handled::Yes,
+        };
+
+        let n = self.table.len() as isize;
+        if let Some(choice) = self.choosing.as_mut()
+            && n > 0
+        {
+            // Wraps, like both lists in this pane: `k` at the top is the last
+            // row rather than a dead key.
+            choice.sel = (((choice.sel as isize + delta) % n + n) % n) as usize;
+        }
+        Handled::Yes
+    }
+
+    fn render_choice(&mut self, f: &mut Frame, inner: Rect) {
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let Some(choice) = &self.choosing else { return };
+        // No scrollbar and no `Scroll`: the table is what a reader wrote down,
+        // and a list somebody has to scroll to see is one they would rather not
+        // have opened. A table long enough to overflow simply loses its tail
+        // here, which is `take` doing what every other list in this file does
+        // to a pane too short for it.
+        let mut lines = agent_lines(self.table, self.session, choice.sel, inner.width);
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("enter starts", dim())));
+        let visible: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
+        f.render_widget(Paragraph::new(visible), inner);
+    }
 }
 
 /// Where the selection lands in a freshly built list.
@@ -980,6 +1209,21 @@ fn report_rows(report: &Report, root: &Path, rows: &mut Vec<Row>, picks: &mut Ve
 
 impl Pane for GitPane {
     fn title(&self) -> String {
+        // The question names the checkout, because that is what it is about.
+        //
+        // **From [`Choice::root`] and never from `self.root` or the row under
+        // the cursor**, which are the two things that are wrong in one list
+        // each: in the worktree list `self.root` is the checkout the *pane* is
+        // showing rather than the one `A` asked about, and a selection is what
+        // this question was captured to stop being read. Either would put a
+        // title on screen that disagreed with what `Enter` is about to do.
+        if let Some(choice) = &self.choosing {
+            return format!(
+                "git · start an agent in {}",
+                workspace::dir_label(&choice.root)
+            );
+        }
+
         // The list says what it is and nothing about the repository: a branch
         // name and a change count belong to one worktree, and the whole subject
         // of this mode is the several of them.
@@ -1020,6 +1264,13 @@ impl Pane for GitPane {
     }
 
     fn render(&mut self, f: &mut Frame, inner: Rect) {
+        // Above the mode, and above the `measure` below: the status list's
+        // scroll is told what the last frame laid out, and a frame that drew
+        // the chooser laid none of it out.
+        if self.choosing.is_some() {
+            self.render_choice(f, inner);
+            return;
+        }
         if matches!(self.mode, Mode::Worktrees) {
             self.render_worktrees(f, inner);
             return;
@@ -1090,6 +1341,29 @@ impl Pane for GitPane {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Handled> {
+        // **The standing question owns every key, and this branch is above the
+        // one that dispatches to the lists because it covers both of them.** A
+        // standing `kill` changes nothing about routing — every other key
+        // simply cancels it, through the `take` at the top of `worktree_key` —
+        // but a chooser has to *swallow* `j` and `k`, or the reader scrolls the
+        // worktree list while looking at a list of agents. See
+        // [`choose_key`](Self::choose_key) for why it answers `Yes` to keys it
+        // does nothing about.
+        //
+        // **The two `A` arms are not hoisted up here, and that is deliberate
+        // rather than tidy.** `worktree_key` takes the standing `kill` before
+        // it matches anything, which is what the `x` arm relies on: any other
+        // key in that list is the answer no. An `A` matched above that `take`
+        // would skip it, and `x`, `A`, `Esc`, `x` would become a kill of a live
+        // agent with **one** visible warning, dismissed in between by an
+        // unrelated full-pane list. As written, the `A` press goes through the
+        // list's own match and takes the kill with it. That is safety by
+        // ordering rather than by construction, so there is a test named after
+        // the sequence.
+        if self.choosing.is_some() {
+            return Ok(self.choose_key(key));
+        }
+
         // The list owns every key while it is up, the scroll ones included:
         // there `Down` moves a selection rather than an offset, and a pane
         // cannot hand one key to two vocabularies and hope.
@@ -1185,7 +1459,43 @@ impl Pane for GitPane {
             // creates, and what replaces a confirmation is that the gesture
             // reports itself on the frame it fired — the new pane appears in
             // the left column and its border says `2/2`.
-            KeyCode::Char('a') => self.agent = Some(self.root.clone()),
+            //
+            // **`SHIFT` disqualifies it, and that guard is the whole of what
+            // makes `A` below safe on a terminal that sets the bit.** Some do,
+            // for an uppercase letter; the `?` arm below and the right-hand
+            // fallthrough in `crate::app` both say so. On one of those an
+            // unguarded arm would start the session's agent without asking, in
+            // the exact place the reader was trying to ask. `CONTROL` and
+            // `ALT` are already refused by the arm at the top of this match.
+            KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.agent = Some(AgentRequest {
+                    root: self.root.clone(),
+                    // The session's own agent, and not the name `claude`: `a`
+                    // is resolved from `crate::app::Recipe`, which starts *the
+                    // same file* this session did rather than searching `PATH`
+                    // again. See [`AgentRequest`].
+                    agent: None,
+                });
+            }
+            // `A` is `a` with a question in front of it, and the question is
+            // only ever "which one". Claimed in both lists, because `a` is.
+            //
+            // **Two independent arms and not one three-way match, and `SHIFT`
+            // is deliberately not required here.** Crossterm's ANSI parser has
+            // no modifier bits to recover from a bare `A` byte, so on Unix
+            // Shift+A arrives as `Char('A')` with `KeyModifiers::NONE`: a rule
+            // requiring `SHIFT` would ship a key that does nothing on most
+            // terminals abeam runs in. This is how `crate::keys::global` claims
+            // letters — it matches `Char('g') | Char('G')` and never consults
+            // the bit — and the arm at the top of this match is what keeps
+            // `Ctrl+A` and `Alt+A` out, by name.
+            //
+            // **Free in both vocabularies, which was checked rather than
+            // assumed.** `crate::scroll::key` claims `Ctrl+d`, `Ctrl+u`,
+            // `j`/`Down`, `k`/`Up`, space/`PageDown`, `b`/`PageUp`, `g`/`Home`
+            // and — the one that matters — `G`/`End`. So uppercase is not free
+            // in general; `A` simply is not in that list.
+            KeyCode::Char('A') => self.choose(self.root.clone()),
             // `w` for worktree. Free in both vocabularies this pane already
             // matches — `crate::scroll` claims `j k b space g G` and Ctrl+D/U,
             // and the arms above claim the rest — and pane-local, so it is
@@ -1228,6 +1538,27 @@ impl Pane for GitPane {
     }
 
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
+        // The same early return the keys get, and owed for the same reason one
+        // input path along: without it the wheel scrolls a list nobody can see
+        // and a click moves a selection underneath the chooser. Not a
+        // correctness bug — [`Choice`] carries its own root, so the captured
+        // checkout cannot change under it — but "one branch is the whole of the
+        // chooser's handling" is only true of keys, and there are two ways into
+        // this pane.
+        //
+        // Nothing here chooses a row: a click that started an agent would be
+        // the one gesture in this file that spawns a process without a
+        // keystroke.
+        //
+        // `Yes` and not `No`, which costs one affordance and is worth saying:
+        // `crate::app` turns what a pane declines into a text selection, so
+        // while the question stands the four rows of it cannot be dragged over
+        // and copied. That is a question that ends on the next keystroke, and
+        // owning every input for its lifetime is the simpler rule.
+        if self.choosing.is_some() {
+            return Ok(Handled::Yes);
+        }
+
         if matches!(self.mode, Mode::Worktrees) {
             if let Some(handled) = self.wt_scroll.mouse(ev) {
                 return Ok(handled);
@@ -1264,7 +1595,16 @@ impl Pane for GitPane {
     /// press short of the agent — so the border must not promise `esc→agent`
     /// there. `crate::pane` argues the three-answer rule this is the third
     /// answer to.
+    ///
+    /// And the chooser is a fourth, reachable from either list: `Esc` there
+    /// puts back whichever list `A` was pressed in, which is neither the git
+    /// view by name nor the agent. This answers `&'static str`, so a third
+    /// string costs nothing — and the promise is only honest because
+    /// [`choose_key`](Self::choose_key) consumes `Esc` itself.
     fn exit_hint(&self) -> &'static str {
+        if self.choosing.is_some() {
+            return "esc→list";
+        }
         match self.mode {
             Mode::Worktrees => "esc→git",
             Mode::Status => "esc→agent",
@@ -1336,6 +1676,104 @@ fn worktree_lines(rows: &[workspace::Row], width: u16, sel: usize) -> Vec<Line<'
             }
         })
         .collect()
+}
+
+/// The chooser, one line per row of the table.
+///
+/// **[`worktree_lines`]'s conventions, deliberately, down to the gutter.** The
+/// two lists are reached by the same key one press apart, and a reader who has
+/// learnt that `▸` is *here* and that a dim right-hand note is what else is
+/// true of the row should not have to learn it twice. So: the session's own
+/// agent takes the gutter and the cyan the worktree list gives to the checkout
+/// you are standing in, the cursor is the row's background, and the note is
+/// laid out first with the name taking what is left.
+///
+/// Built at render for that function's reason: what to drop at 46 columns
+/// cannot be decided before the width is known.
+fn agent_lines(
+    table: &[crate::agent::Agent],
+    session: Option<&str>,
+    sel: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let w = width as usize;
+    if table.is_empty() {
+        // Unreachable through `crate::config::Config::table`, which is the
+        // built-ins plus whatever a file added — but this function takes a
+        // table and a caller with an empty one gets a sentence rather than a
+        // box with nothing in it.
+        return vec![Line::from(Span::styled("no agents to choose from", dim()))];
+    }
+
+    table
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mine = Some(row.name) == session;
+            let gutter = if mine { " ▸ " } else { "   " };
+            let note = agent_note(row, mine);
+            let budget = w.saturating_sub(gutter.width() + note.width());
+            let label = clip(row.name, budget);
+            let pad = budget.saturating_sub(label.width());
+
+            let style = if mine {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let mut spans = vec![
+                Span::styled(gutter, style),
+                Span::styled(label, style),
+                Span::raw(" ".repeat(pad)),
+            ];
+            if !note.is_empty() {
+                spans.push(Span::styled(note, dim()));
+            }
+
+            // Clipped here and nowhere else, for `worktree_lines`' reason: a
+            // pane that overflows its rect corrupts the frame.
+            let mut spans = clip_line(Line::from(spans), w).spans;
+            if i == sel {
+                let used: usize = spans.iter().map(|s| s.content.width()).sum();
+                spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
+                Line::from(spans).style(Style::default().bg(Color::DarkGray))
+            } else {
+                Line::from(spans)
+            }
+        })
+        .collect()
+}
+
+/// Everything about a table row that is not its name, in one string.
+///
+/// [`worktree_note`]'s shape, and two facts rather than one, joined the same
+/// way for the row that is both — a `[preset.fleet]` the session was started
+/// from reads `session · → claude`.
+///
+/// **`→ claude` is the reason the chooser is worth having even for a reader who
+/// only ever picks the session's own agent.** `crate::agent::Agent::hosts` is a
+/// static field, so it costs nothing to draw, and it is the field that decides
+/// whether the pane will have readiness at all: a `fleet` that hosts Claude is
+/// a pane the queue can type at, and a `reviewer` that hosts Codex is not.
+/// **This is the only place in abeam where the kind of a pane is visible before
+/// it exists.**
+///
+/// A built-in says nothing here, because `claude → claude` is a column of noise
+/// on the three rows a machine with no presets has.
+fn agent_note(row: &crate::agent::Agent, mine: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if mine {
+        parts.push("session".to_string());
+    }
+    if row.hosts != row.name {
+        parts.push(format!("→ {}", row.hosts));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(" {}", parts.join(" · "))
 }
 
 /// Everything about a worktree that is not its name, in one string.
@@ -2793,8 +3231,24 @@ mod tests {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
 
+    /// A pane over the built-in table, hosting `claude` — which is what every
+    /// test here that is not about the chooser wants, because it is what an
+    /// ordinary session is.
     fn detached(root: &str) -> (GitPane, Receiver<Ask>, Sender<Answer>) {
-        GitPane::detached(PathBuf::from(root))
+        GitPane::detached(PathBuf::from(root), "claude", crate::agent::AGENTS)
+    }
+
+    /// The same, hosting something else and reading a table of somebody's own.
+    ///
+    /// The table is `&'static` in the program because `crate::config` leaks it
+    /// once at startup; here it is a `const`, which is the same lifetime by a
+    /// cheaper route and keeps the fixture readable as a list of rows.
+    fn detached_hosting(
+        root: &str,
+        agent: &str,
+        table: &'static [crate::agent::Agent],
+    ) -> (GitPane, Receiver<Ask>, Sender<Answer>) {
+        GitPane::detached(PathBuf::from(root), agent, table)
     }
 
     /// A report with a branch name and a change count in it — the two things
@@ -3179,7 +3633,11 @@ mod tests {
             Handled::Yes
         );
         let asked = pane.take_agent_request().expect("an agent was asked for");
-        assert!(crate::paths::same_dir(&asked, Path::new(TWO)));
+        assert!(crate::paths::same_dir(&asked.root, Path::new(TWO)));
+        // **The session's own, said as `None` and not as a name.** `a` is the
+        // fast path and stays one: a name here would send it through a `PATH`
+        // search the session's `Recipe` exists to avoid.
+        assert_eq!(asked.agent, None, "`a` chose an agent by name");
         // Drained, not left to fire late — and this one fires by starting a
         // process.
         assert_eq!(pane.take_agent_request(), None);
@@ -3218,10 +3676,11 @@ mod tests {
         );
         let asked = pane.take_agent_request().expect("an agent was asked for");
         assert!(
-            crate::paths::same_dir(&asked, Path::new(ONE)),
+            crate::paths::same_dir(&asked.root, Path::new(ONE)),
             "the request names something other than the checkout on screen: {}",
-            asked.display()
+            asked.root.display()
         );
+        assert_eq!(asked.agent, None, "`a` chose an agent by name");
         // Drained rather than left to fire late, like the list's own — and
         // this one fires by starting a process.
         assert_eq!(pane.take_agent_request(), None);
@@ -3245,7 +3704,7 @@ mod tests {
         pane.handle_key(key(KeyCode::Tab)).unwrap();
         pane.handle_key(key(KeyCode::Char('a'))).unwrap();
         assert!(crate::paths::same_dir(
-            &pane.take_agent_request().expect("an agent was asked for"),
+            &pane.take_agent_request().expect("an agent was asked for").root,
             Path::new(TWO)
         ));
     }
@@ -3272,7 +3731,7 @@ mod tests {
         pane.handle_key(key(KeyCode::Char('a'))).unwrap();
         assert!(
             crate::paths::same_dir(
-                &pane.take_agent_request().expect("an agent was asked for"),
+                &pane.take_agent_request().expect("an agent was asked for").root,
                 Path::new(TWO)
             ),
             "the cursor did not start where this test needs it to"
@@ -3290,7 +3749,7 @@ mod tests {
         pane.handle_key(key(KeyCode::Char('a'))).unwrap();
         assert!(
             crate::paths::same_dir(
-                &pane.take_agent_request().expect("an agent was asked for"),
+                &pane.take_agent_request().expect("an agent was asked for").root,
                 Path::new(TWO)
             ),
             "the cursor slid onto another checkout with no keystroke behind it"
@@ -3333,7 +3792,7 @@ mod tests {
         pane.handle_key(key(KeyCode::Char('a'))).unwrap();
         assert!(
             crate::paths::same_dir(
-                &pane.take_agent_request().expect("an agent was asked for"),
+                &pane.take_agent_request().expect("an agent was asked for").root,
                 &third
             ),
             "a vanished row did not leave the cursor where it was"
@@ -3348,7 +3807,7 @@ mod tests {
         pane.handle_key(key(KeyCode::Char('a'))).unwrap();
         assert!(
             crate::paths::same_dir(
-                &pane.take_agent_request().expect("an agent was asked for"),
+                &pane.take_agent_request().expect("an agent was asked for").root,
                 &third
             ),
             "the cursor was dragged back to a row the reader had left"
@@ -3405,6 +3864,365 @@ mod tests {
             // The list is still up, so `w` was not taken either.
             assert_eq!(pane.exit_hint(), "esc→git");
         }
+
+        // **`SHIFT` is the third modifier and it is not a third chord**, which
+        // is why it is asserted here rather than added to the loop above. Some
+        // terminals set the bit for an uppercase letter; on one of those an
+        // unguarded `a` arm would start the session's agent without asking, in
+        // the exact place the reader was trying to ask. So `a` refuses it —
+        // and, one line apart, `A` must not *require* it.
+        for open_list in [false, true] {
+            let (mut pane, _asks, _answers) = detached(ONE);
+            pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+            if open_list {
+                pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+            }
+
+            assert_eq!(
+                pane.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT))
+                    .unwrap(),
+                Handled::No,
+                "Shift+a started an agent without asking (list up: {open_list})"
+            );
+            assert_eq!(pane.take_agent_request(), None, "Shift+a started one");
+
+            // **And the row without which the Unix bug ships green.**
+            // Crossterm's ANSI parser has no modifier bits to recover from a
+            // bare `A` byte, so on Unix Shift+A arrives as `Char('A')` with
+            // `KeyModifiers::NONE` — a rule that required `SHIFT` would refuse
+            // it, and the key would do nothing on most terminals abeam runs in.
+            assert_eq!(
+                pane.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE))
+                    .unwrap(),
+                Handled::Yes,
+                "a bare uppercase A did not open the chooser (list up: {open_list})"
+            );
+            assert_eq!(
+                pane.exit_hint(),
+                "esc→list",
+                "A was taken by something other than the chooser (list up: {open_list})"
+            );
+        }
+    }
+
+    // --- the chooser --------------------------------------------------------
+
+    /// A table with a preset in it, which is the only way to reach the `→
+    /// claude` column: every built-in hosts itself.
+    ///
+    /// A `const` rather than `crate::config::Config::table`'s leak, which is
+    /// the same `&'static` by a cheaper route and keeps the fixture readable as
+    /// the list of rows it is. The install sentences are short on purpose —
+    /// nothing here reaches the failure path, which is `crate::app`'s test.
+    const TABLE: &[crate::agent::Agent] = &[
+        crate::agent::Agent {
+            name: "claude",
+            candidates: &["claude"],
+            install: "install claude",
+            args: &[],
+            hosts: "claude",
+        },
+        crate::agent::Agent {
+            name: "copilot",
+            candidates: &["copilot"],
+            install: "install copilot",
+            args: &[],
+            hosts: "copilot",
+        },
+        crate::agent::Agent {
+            name: "codex",
+            candidates: &["codex"],
+            install: "install codex",
+            args: &[],
+            hosts: "codex",
+        },
+        crate::agent::Agent {
+            name: "fleet",
+            candidates: &["claude"],
+            install: "install claude",
+            args: &["agent"],
+            hosts: "claude",
+        },
+    ];
+
+    /// One frame of the pane, as rows, so a test can ask what is on screen
+    /// rather than what the code meant to put there.
+    fn drawn(pane: &mut GitPane, width: u16, height: u16) -> Vec<String> {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, width, height)))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buf.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_chooser_opens_on_the_sessions_own_agent_and_enter_starts_it() {
+        // **`A` `Enter` is "another of what I already have", and that is the
+        // whole reason the cursor does not start at the top.** The order is the
+        // table's and never moves — a list that reorders itself by session is
+        // one nobody can build muscle memory in — so the only thing that
+        // follows the session is where the cursor lands.
+        let (mut pane, _asks, _answers) = detached_hosting(ONE, "codex", TABLE);
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('A'))).unwrap(),
+            Handled::Yes
+        );
+        assert_eq!(
+            pane.exit_hint(),
+            "esc→list",
+            "the border went on promising the way out of a list that is not up"
+        );
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Enter)).unwrap(),
+            Handled::Yes
+        );
+        let asked = pane.take_agent_request().expect("an agent was asked for");
+        assert_eq!(
+            asked.agent,
+            Some("codex"),
+            "the cursor did not start on the session's own agent"
+        );
+        assert!(crate::paths::same_dir(&asked.root, Path::new(ONE)));
+        // The question is over, so the border is the status list's again.
+        assert_eq!(pane.exit_hint(), "esc→agent");
+    }
+
+    #[test]
+    fn the_chooser_moves_by_j_and_k_and_wraps_like_both_lists() {
+        // `j` and `k` move a *selection* here, where in the worktree list they
+        // move the shared scroll's offset — which is why this is the pane's own
+        // match rather than a `Scroll` handed the key.
+        let (mut pane, _asks, _answers) = detached_hosting(ONE, "claude", TABLE);
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request().map(|req| req.agent),
+            Some(Some("codex")),
+            "two js from the first row is the third"
+        );
+
+        // And `k` from the top is the last row rather than a dead key.
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('k'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request().map(|req| req.agent),
+            Some(Some("fleet")),
+            "the list did not wrap"
+        );
+    }
+
+    #[test]
+    fn the_chooser_asks_about_the_checkout_the_key_was_pressed_in() {
+        // **The title comes from `Choice::root`**, which is neither of the two
+        // things in reach: `self.root` is the checkout the *pane* is showing —
+        // `main` here — and the selection is what the capture exists to stop
+        // being read. Either would put a title on screen that disagreed with
+        // what `Enter` is about to do.
+        let (mut pane, _asks, _answers) = detached_hosting(ONE, "claude", TABLE);
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('A'))).unwrap(),
+            Handled::Yes
+        );
+        assert_eq!(
+            pane.title(),
+            "git · start an agent in other",
+            "the border named a checkout the question is not about"
+        );
+
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        let asked = pane.take_agent_request().expect("an agent was asked for");
+        assert!(
+            crate::paths::same_dir(&asked.root, Path::new(TWO)),
+            "the request named {} rather than the row `A` was pressed on",
+            asked.root.display()
+        );
+        // Back to the list it was asked from, and not to the status view.
+        assert_eq!(pane.exit_hint(), "esc→git");
+    }
+
+    #[test]
+    fn every_key_is_swallowed_while_the_chooser_stands() {
+        // **`Handled::No` on a bare `Esc` or `q` is how a pane says the reader
+        // is done with it, and `crate::app` answers by moving focus left.** A
+        // branch that handled only the four keys it acts on would let `q` hand
+        // the keyboard to the agent with the question still standing —
+        // invisible, over a captured root that goes on ageing, so that the next
+        // `Enter` minutes later starts an agent in a checkout the reader has
+        // forgotten they named.
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('x'),
+            KeyCode::Char('w'),
+            KeyCode::Char('a'),
+            KeyCode::Char('r'),
+            KeyCode::Char('?'),
+            KeyCode::Char('G'),
+        ] {
+            let (mut pane, _asks, _answers) = detached_hosting(ONE, "claude", TABLE);
+            pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+            assert_eq!(
+                pane.handle_key(key(code)).unwrap(),
+                Handled::Yes,
+                "{code:?} fell through the chooser"
+            );
+            assert_eq!(
+                pane.exit_hint(),
+                "esc→list",
+                "{code:?} left the question standing invisibly"
+            );
+            assert_eq!(pane.take_agent_request(), None, "{code:?} started an agent");
+            assert_eq!(pane.take_ask_request().map(|r| r.0), None);
+            assert!(pane.closing().is_none(), "{code:?} armed a kill");
+        }
+
+        // And the wheel, which is the second input path and would otherwise
+        // scroll a list nobody can see.
+        let (mut pane, _asks, _answers) = detached_hosting(ONE, "claude", TABLE);
+        pane.set_worktree_rows((0..40).map(|i| a_row(&format!("b-{i}"), ONE, false)).collect());
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        drawn(&mut pane, 40, 10);
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(pane.handle_mouse(&wheel).unwrap(), Handled::Yes);
+        assert_eq!(
+            pane.wt_scroll.offset, 0,
+            "the wheel scrolled the list underneath the chooser"
+        );
+
+        // `Esc` is the one key that ends it, which is what makes the border's
+        // promise an honest one.
+        assert_eq!(pane.handle_key(key(KeyCode::Esc)).unwrap(), Handled::Yes);
+        assert_eq!(pane.exit_hint(), "esc→git");
+        assert_eq!(pane.take_agent_request(), None, "`Esc` started an agent");
+    }
+
+    #[test]
+    fn x_then_a_chooser_then_esc_then_x_closes_nothing() {
+        // **The most destructive gesture in the program keeps both of its
+        // guards, and this is the sequence that would have taken one away.**
+        // `worktree_key` takes the standing `kill` before it matches anything,
+        // which is what the `x` arm relies on: any other key in that list is
+        // the answer no. Hoisting `A` into the early branch — the tidy-looking
+        // move, since that branch is where the chooser's keys live — would skip
+        // that `take`, and this sequence would become a kill of a live agent
+        // with one visible warning, dismissed in between by an unrelated
+        // full-pane list.
+        //
+        // It is safe by *ordering* rather than by construction, which is why it
+        // is worth a test rather than a comment.
+        let (mut pane, _asks, _answers) = detached_hosting(ONE, "claude", TABLE);
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+
+        pane.handle_key(key(KeyCode::Char('x'))).unwrap();
+        assert!(pane.closing().is_some(), "the first `x` armed nothing");
+
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        assert!(
+            pane.closing().is_none(),
+            "`A` left a kill armed behind a full-pane list"
+        );
+        pane.handle_key(key(KeyCode::Esc)).unwrap();
+
+        pane.handle_key(key(KeyCode::Char('x'))).unwrap();
+        assert_eq!(
+            pane.take_close_request(),
+            None,
+            "a chooser in the middle turned two `x`es into a kill"
+        );
+        assert!(
+            pane.closing().is_some(),
+            "the second `x` was the first press again, and armed nothing"
+        );
+    }
+
+    #[test]
+    fn the_rows_name_the_session_and_say_what_a_preset_hosts() {
+        // **The only place in abeam where the kind of a pane is visible before
+        // it exists.** `→ claude` is `crate::agent::Agent::hosts`, a static
+        // field, and it is what decides whether the queue will be able to type
+        // at the pane at all — so a reader choosing `fleet` can see they are
+        // getting a Claude pane, and a reader choosing `codex` can see they are
+        // not.
+        let (mut pane, _asks, _answers) = detached_hosting(ONE, "fleet", TABLE);
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        let rows = drawn(&mut pane, 34, 8);
+
+        assert_eq!(
+            rows.iter()
+                .filter(|line| line.contains("session"))
+                .collect::<Vec<_>>()
+                .len(),
+            1,
+            "the session is marked on more than one row, or on none: {rows:?}"
+        );
+        assert!(
+            rows[3].contains("fleet") && rows[3].contains("session"),
+            "the mark is not on the row the session was started from: {:?}",
+            rows[3]
+        );
+        assert!(
+            rows[3].contains("→ claude"),
+            "a preset did not say what it hosts: {:?}",
+            rows[3]
+        );
+        // The order is the table's, top to bottom, and never the session's.
+        assert!(rows[0].contains("claude"), "{:?}", rows[0]);
+        assert!(rows[1].contains("copilot"), "{:?}", rows[1]);
+        assert!(rows[2].contains("codex"), "{:?}", rows[2]);
+        // A built-in says nothing about what it hosts, because `claude →
+        // claude` is a column of noise on the three rows a machine with no
+        // presets has.
+        assert!(!rows[0].contains('→'), "{:?}", rows[0]);
+        // And the list says what `Enter` will do, in the words the sketch uses.
+        assert!(
+            rows.iter().any(|line| line.contains("enter starts")),
+            "the list did not say what the key does: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_hosting_a_program_with_no_row_marks_nothing_and_starts_at_the_top() {
+        // `abeam +pwsh` has no row in the table — the list is what abeam can
+        // *name* — so there is nothing to mark and nothing to start the cursor
+        // on. `a` still opens more `pwsh` panes through the recipe; this key
+        // simply cannot choose one by name.
+        let (mut pane, _asks, _answers) = detached_hosting(ONE, "pwsh", TABLE);
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        let rows = drawn(&mut pane, 34, 8);
+        assert!(
+            !rows.iter().any(|line| line.contains("session")),
+            "a program with no row was marked as one: {rows:?}"
+        );
+
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request().map(|req| req.agent),
+            Some(Some("claude")),
+            "the cursor did not start at the top of the table"
+        );
     }
 
     #[test]
