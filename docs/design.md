@@ -1098,11 +1098,16 @@ pane is switched, so a workspace with no row on it is a workspace nobody can get
 back to, and neither absence is exotic: `git worktree list` names the repository
 rather than the subdirectory you started abeam in.
 
-**The left pane never moves, and that asymmetry is the design rather than an
-unfinished half of it.** A live child's working directory belongs to the child;
-there is no call that moves a running process to another directory, so the agent
-stays where it was started for as long as it runs. The window therefore
-deliberately disagrees with itself about where it is, and the border is what
+**The left pane is never moved *by abeam*, and that asymmetry is the design
+rather than an unfinished half of it.** A live child's working directory belongs
+to the child; there is no call that moves a running process to another
+directory, so nothing here re-roots an agent pane the way `Enter` re-roots the
+right one. (The session inside the pty is another matter, and the sentence used
+to be written as though it were not: Claude Code makes worktrees and moves into
+them, and the pane's border, the list's count and the row `x` acts on follow it
+there. `docs/multi-agent.md` has the correction and the two facts it rests on.)
+The window therefore deliberately disagrees with itself about where it is, and
+the border is what
 keeps that honest — it names the workspace the *right* pane is on, and **only
 when that is not the agent's own**. That suppression is not tidiness either. The
 pane is 46 columns; a label on every title spends three or four of them saying

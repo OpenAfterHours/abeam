@@ -199,27 +199,33 @@ work, on either platform.
 
 **More than one agent in the window is built, and no human has ever used it.**
 That sentence is the whole entry and the rest of this paragraph is detail. `a`
-on a row of the worktree list (`Alt+G`, `w`) starts another agent in that
-checkout; `F4` pressed again moves along them; they are stacked vertically, one
-title row each for the ones there is no room to draw whole; the queue's `Send`
-items carry the pane they were written for and are typed there and nowhere else;
-`x` twice at a pane whose child has exited closes it, and `x` twice on a
-worktree row ends a live one. The agent abeam was started with is still the
-session: its exit is abeam's exit code, and it cannot be closed. `docs/multi-agent.md`
-is the design and the record of what each phase cost.
+in the git view (`Alt+G`) starts another agent in the checkout on screen, and
+`a` on a row of the worktree list (`Alt+G`, `w`) starts one in that checkout;
+`F4` pressed again moves along them; they are stacked vertically, one title row
+each for the ones there is no room to draw whole; the queue's `Send` items carry
+the pane they were written for and are typed there and nowhere else; `x` twice
+at a pane whose child has exited closes it, and `x` twice on a worktree row ends
+a live one. An agent that goes on to make itself a git worktree and move into it
+is followed — by its own border, by the list's occupancy count, and by the row
+`x` resolves through — while the readiness probe goes on comparing records
+against the directory the pane was spawned in, which is the one thing that must
+not move. The agent abeam was started with is still the session: its exit is
+abeam's exit code, and it cannot be closed. `docs/multi-agent.md` is the design
+and the record of what each phase cost.
 
-What that is built on is **fifty-one tests** — the number of `#[test]`
+What that is built on is **fifty-seven tests** — the number of `#[test]`
 attributes this work added, so it can be checked rather than taken — some
 of which spawn real ptys and draw real frames, and a mutation audit that broke
 each new rule on purpose to check something went red. It is a suite for one
 feature and it is not "a few hundred", which is what this paragraph said until
 somebody counted. What none of it is built on is use. Nobody has pressed `a` in
 a real terminal, watched two agents work at once, queued a prompt for one of
-them and seen it arrive, or ended a running agent with `x` `x` and watched the
-process go. Every number in the paragraph below about how it degrades is
-arithmetic, not a measurement.
+them and seen it arrive, ended a running agent with `x` `x` and watched the
+process go, or told an agent to branch off and watched the window follow it.
+Every number in the paragraph below about how it degrades is arithmetic, not a
+measurement.
 
-Five specific things to expect, in the order they are likely to bite.
+Six specific things to expect, in the order they are likely to bite.
 
 - **The rows are tight, and the arithmetic is unmeasured.** A whole pane is
   `MIN_AGENT_ROWS` — twelve — plus its border, so two agents want 28 rows and
@@ -244,6 +250,15 @@ Five specific things to expect, in the order they are likely to bite.
   label; and `x` on that row refuses rather than guessing, pointing at `F4` —
   which is five keystrokes from there, not one. A pane has no name a person
   chose, which is the missing piece.
+- **An agent that branches off is followed on a poll, and only once its record
+  has been read.** The window learns where a session has gone by re-reading the
+  record that session writes about itself, every 250 ms, and it will only follow
+  a session it identified *before* the move — discovery matches the pane's own
+  directory exactly, on purpose. So a session that leaves inside the first
+  second or so of its life is never followed at all: readiness reads `Unknown`,
+  and the border, the count and `x` go on naming the checkout the pane was
+  spawned in. That is the safe direction and it is not the obvious one, and
+  nobody has seen either case happen.
 - **Killing a pane throws away every prompt queued for it.** They are not
   retargeted — the whole design refuses that — and they are not lost silently
   either: each row says which pane it was written for and that the pane has

@@ -39,6 +39,34 @@
 > - **Nothing was built for re-aiming a queued item.** It is written where it
 >   was written and cannot be moved. That is a gap rather than a decision, and
 >   it is named at the foot of the queue section.
+>
+> **One thing changed after the four phases, and it is the correction with the
+> widest reach.** This document said an agent pane was pinned to a worktree
+> permanently, on the grounds that a live child's working directory belongs to
+> the child. That is true of the **pty** and it is not true of the **session
+> inside it**: Claude Code makes git worktrees and moves into them, which is why
+> `crate::workspace` exists at all, and it rewrites its own session record with
+> the new `cwd` when it does. `crate::agentstate::Probe::has_moved` had already
+> been widened to keep *reading* such a session; nothing on screen followed it.
+> So the border named a checkout the agent had left, the worktree list credited
+> its occupancy to that row while the worktree it was working in read as empty,
+> and `x` `x` on the row where the work was visibly happening answered `no agent
+> here` — which is the phase-4 "a pane with no way out" bug, back for exactly
+> the workflow the feature is for.
+>
+> **Two facts now, and they must not be collapsed into one.** The directory a
+> pane was *spawned* in — `crate::app::Agent::root`, and the copy of it inside
+> the probe — is an identity anchor: `Probe::is_here` compares a record's `cwd`
+> against it, and an anchor that chased the record would let a probe latch onto
+> a record it should have refused. The directory the agent is *working* in —
+> `Agent::moved_to`, read only through `Agent::standing` — is display and
+> row-routing, and it is written from a record the probe has already accepted
+> and identity-checked by `sessionId`. The section on pinning below is rewritten
+> around that pair; the sections on the roster and the keys carry the rest.
+>
+> **And `a` gained a second home**, in the git *status* view, meaning "start an
+> agent in the checkout this pane is showing". No global was spent; see the keys
+> section.
 
 ## What is being asked for
 
@@ -153,24 +181,55 @@ making it per-pane is a change to the readiness path that wants its own argument
 rather than a field quietly moved during a refactor. Written down here so the
 next person reaches for it deliberately.
 
-## An agent pane is pinned to a worktree, permanently
+## An agent pane is pinned to a worktree, permanently — and this was wrong
 
-`Space`'s documentation says it twice already, once for the shell and once for
-the ask: *a live child's working directory belongs to the child.* There is no
-call that moves a running process to another directory. It is the reason the
-left pane is not in `Space` in the first place — that comment opens with "the
-left pane is not in here, and that is the whole shape of the feature".
+**The section title is kept as it was written, because the claim under it is the
+one thing in this document that was false rather than merely superseded.** What
+it said: `Space`'s documentation says it twice already, once for the shell and
+once for the ask — *a live child's working directory belongs to the child*,
+there is no call that moves a running process to another directory, so an agent
+pane is born in a directory and dies in it. That is why the left pane is not
+in `Space` in the first place; that comment opens with "the left pane is not in
+here, and that is the whole shape of the feature".
 
-Nothing about a second agent changes that. So an agent pane is born in a
-directory and dies in it, and the honest thing is to name it in the pane's own
-border rather than to hide the asymmetry. Which repairs something: today the
-worktree list marks the agent's root separately from the one being read, because
-there is one agent and it may be somewhere else. With a pane per agent, every
-pane says where it is standing and the apology becomes a label.
+**Every word of it is true about the pty and none of it is true about the
+session.** `PtySession::spawn` is given a `cwd` and that spawn is over; nothing
+in abeam moves it. But the thing abeam is watching is not the process's own
+`chdir`, it is the `cwd` field of the record Claude writes about itself — and
+Claude Code makes worktrees and moves into them, rewriting that field when it
+does. `crate::workspace`'s module docs open with exactly that sentence, and
+`crate::agentstate::Probe::set_worktrees` was written for it: the probe was
+already widened to keep reading a session that had moved, gated on the
+`sessionId` that was ours and on the directory being one git named, matched
+exactly.
+
+So the honest version is that **an agent pane is born in a directory and may
+find itself working in another**, and the two are separate facts that must stay
+separate:
+
+- **Where it was spawned.** `crate::app::Agent::root`, and the copy the probe
+  holds. It never changes and nothing assigns to it. It is what
+  `Probe::is_here` compares a record's `cwd` against — so it is an *identity
+  anchor*, and letting it follow the record would be the anchor chasing the
+  thing it anchors. `Probe::set_worktrees` lists three ways a loosened identity
+  check has already gone wrong here, each ending in a false `Idle`, which is the
+  one answer that lets a queued prompt be typed into a working agent.
+- **Where it is working.** `Agent::moved_to`, read only through
+  `Agent::standing`, written only from a record the probe has *already*
+  accepted. Four readers and no others: the pane's border, the name a queue row
+  uses, the occupancy count and row guarantee in `workspace::rows`, and the row
+  `x` resolves a pane from. Not one of them can type at anything.
+
+The border therefore names where the agent is working rather than where it
+started, which is a label that has to be maintained after all — one comparison
+per readiness poll, off the same read that produced the readiness, so a pane's
+state and a pane's whereabouts can never come from two different reads of one
+file.
 
 **Where a new one starts: the workspace the right pane is on.** No new concept,
 no path to type, and the gesture is already in the user's hands — `Alt+G`, `w`,
-move to a worktree, and the new agent starts there. `Row.agent_here: bool`
+move to a worktree, and the new agent starts there; or `Alt+G`, `a`, which is
+the same request about the checkout already on screen. `Row.agent_here: bool`
 became `agents_here: usize` — a count and not the list of pane ids this
 paragraph offered as the alternative; the section below says why — and the list
 stopped being able to say "the" agent, which it should never have been able to
@@ -209,6 +268,18 @@ is a pane with no way out, in the very list that is meant to be its roster. It
 is a guarantee now, and the cost is the one that argument named: a row for a
 directory git no longer mentions, carrying a directory name because there is no
 branch to carry.
+
+**And the guarantee follows the agent, which is what the "by construction"
+premise was always missing.** An agent started *from* a row has a row for the
+directory it was started in; it has none for the worktree it goes on to make for
+itself, which exists a moment after the ten-second discovery last ran. So
+`workspace::rows` is handed where each pane is **working** — `Agent::standing` —
+rather than where it was spawned, and the occupancy count, the row guarantee and
+`App::agent_in`'s row-to-pane resolution all read that one answer. They have to
+be one answer: a row that exists and a gesture that resolves against a different
+directory is a row that does nothing when it is pressed. Handing the spawn
+directory instead is the phase-4 bug back again, and *silently*, because the row
+on the checkout the agent left is still there and still says something.
 
 ## What `main` has to hand over
 
@@ -273,6 +344,28 @@ So:
   the closing gesture turned out to need: `x` twice on a row is where a *live*
   agent is ended, and this paragraph is the reason there was somewhere to put
   it.
+- **…and the same letter in the git status view**, added after the four phases
+  and the one correction to this section. Everything above is right about where
+  a key can be *claimed* and wrong about which gesture most sessions want. `a`
+  on a row needs the worktree to already exist, and **Claude Code makes its
+  own** — that is the whole reason `crate::workspace` is a module. So the
+  ordinary way to want a second agent is to open one where you already are and
+  ask it to branch off, and framing that as `Alt+G`, `w`, find the row you are
+  standing on, `a` is four keystrokes through a list of the checkouts you are
+  *not* in. `Alt+G`, `a` is the same request in the same slot, about the
+  checkout on screen, which is the row that list would have drawn as `here`.
+
+  abeam does **not** create the worktree itself, and that is deliberate rather
+  than unfinished. `crate::dispatch` already refuses to pass `--worktree`, on
+  the argument that writing a git worktree into somebody's repository as a side
+  effect of a queued task is "a structural change to their checkout that they
+  did not ask for"; a key that did it as a side effect of starting an agent is
+  the same change with a shorter fuse. The agent makes the worktree, because
+  the agent was asked to, and the pane follows it there.
+
+  It costs no global and could not have had one — this document records the
+  namespace as spent, and the pane-local exemption is about *delivery*, so it
+  covers a key claimed in either of that pane's two lists identically.
 - **Cycling is `F4` pressed again.** `F4` means "give the keys to the left", and
   before this a second press did nothing at all. "Again" meaning "the next one
   down the stack" collides with nothing, costs no audit, and is a no-op in a
@@ -691,6 +784,13 @@ pass.
 Each phase ships something on its own, and phase 1 shipped nothing, which was
 the point of it.
 
+**A fifth change landed after them and is not a phase.** It is the correction
+named at the top of this document: the display half of a session that moves into
+a worktree it made for itself, plus `a` in the git status view. It ships nothing
+architectural — one field on `Agent`, one accessor on `Probe`, four call sites
+moved from one directory to the other — and it exists because the workflow the
+whole feature is for turned out to be the one it served worst.
+
 ## The right pane does not follow, and this is settled
 
 This was the last open question and it has an answer: **cycling agents must not
@@ -770,6 +870,21 @@ untouched.
   thing that must not be used. What would fix it is a name a person chose —
   panes have none, and giving them one is a feature with a keystroke and a
   border in it.
+- **An agent that moves before its probe ever finds it is never followed.**
+  New, and it is the strict half of `Probe::set_worktrees`' split showing
+  through to the display: discovery matches the pane's own root exactly, so a
+  session that had already left before the first record was read is not
+  discovered at all. Readiness is `Unknown` for it — the direction that module
+  fails in on purpose — and the border, the count and `x` all go on naming the
+  directory the pane was spawned in, because that is the last thing anything
+  identity-checked. It needs a session to move inside the second or so before
+  its first record is read, and the fix would be a change to the *discovery*
+  rule rather than to anything this change touched.
+- **The border is a poll behind, by up to `READINESS_EVERY`.** A quarter of a
+  second between a session moving and the window saying so. Nobody can perceive
+  it; it is written down because the same quarter second is the window
+  `Agent::draft_mid_turn` names as its own residual, and a reader meeting one
+  should find the other.
 - **Nobody has watched any of this work.** Not an open question about the
   design, and the most important line in the section all the same. See
   `docs/status.md`, which is the document that keeps tests and use apart.

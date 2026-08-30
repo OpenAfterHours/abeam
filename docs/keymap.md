@@ -160,6 +160,27 @@ and the weaker sentence would not carry `x`. There is no `Shift+F4` for the othe
 direction, deliberately: a modified F-key is a key abeam knows nothing about and
 therefore the agent's, which `keys.rs` says in a comment about `Ctrl+F12`.
 
+**`a` is bound twice in that pane and it is one gesture, which is the exemption
+earning its keep rather than being stretched.** In the worktree list it is the
+row under the cursor; in the git **status** view — the one `Alt+G` opens — it is
+the checkout that pane is showing, which is the row that list would have drawn
+as `here`. So `Alt+G`, `a` is a shortcut through `Alt+G`, `w`, find the row you
+are already on, `a`, and it asks for the same thing in the same request slot.
+
+That second spelling exists because the workflow it serves is not about
+worktrees at all. Claude Code makes its own — it runs `git worktree add` and
+moves into it — so the ordinary way to want a second agent is to open one where
+you already are and tell it to branch off, and framing that gesture around a
+list of *the checkouts you are not in* made the common case the long way round.
+**No global was spent on it and none could be**: this document records `F1`–`F9`
+and `F12` as abeam's, `F10` and `F11` as eaten by terminal emulators before an
+application sees them, and the `Alt` letters as close to spent across three
+agents' shipped defaults — a claim that could only be renewed by repeating the
+whole extraction below. The exemption above carries this arm word for word,
+because it is about *delivery*: `handle_key` offers a pane a key only under
+`Focus::Right`, whichever of the two lists is up. `?` and `w` in that same match
+have stood on it for longer.
+
 **The gesture that *closes* one is `x`, in two places, and neither is in the
 table.** `a` leans on the worktree list's exemption — a key claimed inside a
 view, and *delivered* only while the right pane has focus and that view is up,

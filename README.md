@@ -147,8 +147,8 @@ untracked files with per-file line counts, and recent commits. Every `git` call
 is a read: it stages nothing and commits nothing. It refreshes when the watcher
 sees a write, and on a two-second timer for changes the watcher cannot see, such
 as a commit made in another terminal. `Enter` opens the selected file in the
-reader. `w` lists the repository's other worktrees, which is how the right pane
-is pointed at one.
+reader. `a` starts another agent in this checkout. `w` lists the repository's
+other worktrees, which is how the right pane is pointed at one.
 
 **files** (`Alt+E`) — read-only markdown and source. Markdown is rendered rather
 than shown as source: headings, lists, tables, quotes, GFM alerts, footnotes,
@@ -411,21 +411,29 @@ does. A neighbouring agent's writes do not refresh your git pane or pull its
 scratch markdown into your reader.
 
 `w` in the git view lists every worktree git knows about, with a count of the
-agents of yours standing in each and `▸` where the right pane is standing.
-`Enter` moves the right pane there and puts the status list back. An agent pane
-never moves, and the border names the right pane's workspace whenever it is not
-the session's own root.
+agents of yours working in each and `▸` where the right pane is standing.
+`Enter` moves the right pane there and puts the status list back. The right
+pane's border names its workspace whenever it is not the session's own root.
 
 [Design notes](docs/design.md) has the argument for the routing rule, including
 why the obvious version of it does not work.
 
 ## More than one agent
 
-`a` on a row of that worktree list starts another agent **there**. It is the
-whole gesture: no path to type, no confirmation, and the row's own count goes up
-on the frame you pressed it. A pane is born in a directory and dies in it — a
-running process cannot be moved — so the border says which worktree each one is
-standing in.
+`a` in the git view starts another agent **here**, in the checkout you are
+looking at. `a` on a row of that worktree list starts one **there**. Both are
+the whole gesture: no path to type, no confirmation, and the row's own count
+goes up on the frame you pressed it.
+
+The first of those two is the one most sessions want, because Claude Code makes
+its own worktrees: open a second agent where you already are, tell it to branch
+off, and it runs `git worktree add` and moves into the result. abeam does not
+make worktrees for you and will not — but it follows an agent that makes one, so
+the pane's border, the list's count and the row `x` acts on all name the
+worktree it is actually working in. What does **not** follow is the record abeam
+reads to tell whether that agent is busy: it goes on being matched against the
+directory the pane started in, which is what stops one pane being told another
+session's state.
 
 `F4` gives your keys to the left column, and pressed again it moves along the
 agents. The border of the pane that has them is highlighted and reads

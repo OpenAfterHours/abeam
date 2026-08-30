@@ -128,11 +128,6 @@ pub struct Buffer {
     /// This pad arrived larger than [`MAX_BYTES`] and what is here is the front
     /// of it. Set by [`Buffer::from_text`], never cleared, and read through
     /// [`Buffer::truncated`], which carries the argument.
-    #[allow(
-        dead_code,
-        reason = "the pane latches store::Loaded::truncated and not yet this one; \
-                  the two are ORed in the wiring pass, and this goes with it"
-    )]
     truncated: bool,
 }
 
@@ -247,11 +242,13 @@ impl Buffer {
     /// that makes room does not bring the tail back with it, so a flag that
     /// cleared itself on the first `backspace` would hand the save path
     /// permission to overwrite exactly the document it was there to protect.
-    #[allow(
-        dead_code,
-        reason = "the pane latches store::Loaded::truncated and not yet this one; \
-                  the two are ORed in the wiring pass, and this goes with it"
-    )]
+    ///
+    /// **The waiver that used to stand here has gone because the wiring pass it
+    /// was waiting for happened.** It said the pane latched
+    /// `store::Loaded::truncated` and not yet this one, and that the two would
+    /// be ORed together when it did; `PadPane::ensure_read` does exactly that. A
+    /// waiver is the shape of thing that outlives its own argument, so it is
+    /// worth one sentence saying which argument this one was.
     pub fn truncated(&self) -> bool {
         self.truncated
     }

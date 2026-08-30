@@ -498,12 +498,24 @@ pub const HELP: &[(&str, &str)] = &[
     // Beside `Enter` because they are the two keys on one row and the pair is
     // the whole of what a reader has to hold: one moves the right pane, the
     // other starts a child in the left column and moves neither. "another" is
-    // load-bearing — the session already has one — and "there" is the half that
-    // cannot be undone later, since a live child's working directory belongs to
-    // the child.
+    // load-bearing — the session already has one — and "there" is where the
+    // pane is *opened*, which is the half the row can promise: a pty is spawned
+    // in a directory and cannot be moved, though the session inside it can go
+    // on to make a worktree and move into that. The pane's border follows it
+    // when it does.
     (
         "a (worktrees)",
         "start another agent there (F4 again reaches it)",
+    ),
+    // The same request, reached the short way, and it is in this table because
+    // it is the one most sessions want. Claude Code makes its own worktrees, so
+    // the ordinary second agent is one opened *here* and told to branch off —
+    // and routing that through a list of the checkouts you are not in is the
+    // long way round to the row you are already standing on. "here" against the
+    // row above's "there" is the whole difference between them.
+    (
+        "a (git)",
+        "start another agent here, in the checkout on screen",
     ),
     // The other half of that pair, and the only row in this block that is about
     // the *left* column — which the key column says, as it does for every other

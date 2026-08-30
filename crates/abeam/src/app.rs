@@ -283,11 +283,19 @@ impl Frames {
 ///
 /// **The left pane is not in here, and that is the whole shape of the feature.**
 /// A live child's working directory belongs to the child: there is no call that
-/// moves a running process to another directory, so the agent stays where it was
-/// started for as long as it runs. The asymmetry is real, so it is surfaced
-/// rather than hidden — the border names the workspace the *right* pane is on,
-/// and the worktree list marks the agent's own root separately from the one
-/// being read.
+/// moves a running process to another directory, so nothing abeam does can
+/// re-root an agent pane the way `set_workspace` re-roots this one. The
+/// asymmetry is real, so it is surfaced rather than hidden — the border names
+/// the workspace the *right* pane is on, and the worktree list counts abeam's
+/// own panes separately from the workspace being read.
+///
+/// **What that sentence does not cover is the session inside the pty**, and the
+/// distinction was learned rather than designed. Claude Code makes git worktrees
+/// and moves into them, rewriting the `cwd` in its own session record — so the
+/// pane cannot be moved and the agent in it can go somewhere else. Where it has
+/// got to is [`Agent::standing`], which is what the border and the worktree list
+/// read; the directory a pane was spawned in stays put and is what
+/// `crate::agentstate::Probe` compares records against. See [`Agent::root`].
 struct Space {
     root: PathBuf,
     label: String,
@@ -448,35 +456,74 @@ struct Agent {
     /// `crate::agentstate` — this is the only thing standing between a queued
     /// prompt and a permission dialog.
     probe: Probe,
-    /// Where this child is standing, and it can never be anywhere else.
+    /// The directory this pane was **spawned** in, which is not the same
+    /// question as where its agent is working now.
     ///
-    /// `Space`'s documentation says it twice for its own two children and it is
-    /// no less true here: a live child's working directory belongs to the
-    /// child, and there is no call that moves a running process to another
-    /// directory. So an agent is born in a directory and dies in it.
+    /// **Two facts, and this is the one that never moves.** A pty is opened
+    /// with an explicit `cwd` and that spawn is over; nothing here can be
+    /// re-pointed at another directory, and nothing may assign to this field
+    /// after [`Agent::new`]. It is what `crate::agentstate::Probe` was built
+    /// with, and the probe's own copy of it is what
+    /// `crate::agentstate::Probe::is_here` compares a record's `cwd` against —
+    /// so this is an *identity anchor*, and an anchor that chased the thing it
+    /// anchors would let a probe latch onto a record it should have refused.
     ///
-    /// **Not the same fact as [`App::root`], which is why both exist.** That
-    /// one is the repository on screen — what the worker threads run `git
-    /// worktree list` against, what the watcher watches, and what the right
-    /// pane's workspaces are discovered under. This one is where one child
-    /// happens to be standing. They are equal today because there is one agent
-    /// and abeam started it in the repository it was pointed at. Writing one of
-    /// them in terms of the other would make that coincidence into a rule, and
-    /// the first agent started in a worktree would then re-root the watcher.
+    /// **The session inside the pty is a different matter, and it moves.**
+    /// Claude Code makes git worktrees and moves into them, rewriting its
+    /// record with the new `cwd`; `crate::agentstate::Probe::set_worktrees` is
+    /// the whole argument for why that is allowed and how narrowly. Where it
+    /// has got to is [`moved_to`](Self::moved_to), and
+    /// [`standing`](Self::standing) is the only thing that reads either.
     ///
-    /// The probe reads it, and so does the border — [`App::agent_tag`] names
-    /// it on the pane, which is what turns the asymmetry into a label rather
-    /// than an apology. The reader still missing is the worktree list, which
-    /// wants *every* agent's root and cannot have them until
-    /// `workspace::rows` takes more than one; see
-    /// [`App::refresh_worktree_rows`], which explains why it must not be handed
-    /// this one in place of the repository's in the meantime.
+    /// **Not the same fact as [`App::root`] either, which is why all three
+    /// exist.** That one is the repository on screen — what the worker threads
+    /// run `git worktree list` against, what the watcher watches, and what the
+    /// right pane's workspaces are discovered under. This one is where one
+    /// child was started. They are equal in most sessions because abeam started
+    /// its first agent in the repository it was pointed at. Writing one of them
+    /// in terms of the other would make that coincidence into a rule, and the
+    /// first agent started in a worktree would then re-root the watcher.
     ///
     /// Always the resolved spelling. `App::new` is handed one `main` resolved
     /// and [`App::start_agent`] resolves the row's own, because git prints its
     /// spelling of a path and `crate::agentstate::Probe` compares this string
     /// against what the child wrote into its record.
     root: PathBuf,
+    /// Where this agent's own record says it has gone, or `None` while it is
+    /// still standing in the directory it was born in.
+    ///
+    /// ## What was wrong without it
+    ///
+    /// The readiness half of a session that moves into a worktree has worked
+    /// since `crate::agentstate::Probe::has_moved` landed: the probe goes on
+    /// reading the record, identity-checked by `sessionId`, wherever git says
+    /// the session is entitled to be. Nothing followed it on screen. The
+    /// border went on naming the checkout the pane was spawned in;
+    /// `workspace::rows` credited [`Row::agents_here`](crate::workspace::Row)
+    /// to that same row while the worktree the agent was actually working in
+    /// read as empty; and [`App::agent_in`] resolves a row to a pane by
+    /// directory, so `x` `x` on the row where the work was visibly happening
+    /// answered `no agent here`. That last one is the expensive one — phase 4
+    /// added the row guarantee precisely because a pane with no row is a pane
+    /// with no way out — and it broke for exactly the workflow this is for:
+    /// open an agent in the checkout you are in, and ask it to branch off into
+    /// a worktree it makes itself.
+    ///
+    /// ## Why it is a second field rather than a new value for the first
+    ///
+    /// Because the first one feeds the probe. See [`root`](Self::root): the
+    /// anchor and the answer must not be one field, or the identity check that
+    /// `has_moved` is gated on starts comparing a record against a directory
+    /// that record chose. This one is written from a record the probe has
+    /// *already* accepted, and nothing outside display and row-routing may read
+    /// it — [`standing`](Self::standing) is the only reader, and
+    /// [`follow_record`](Self::follow_record) the only writer.
+    ///
+    /// `None` rather than a copy of the root, so that "has this agent left?" is
+    /// a question the type answers rather than a `same_dir` somebody has to
+    /// remember to write. It is also what keeps a pane whose child publishes no
+    /// record at all — Codex, Copilot — exactly where it has always been.
+    moved_to: Option<PathBuf>,
     /// Whether the user has typed something at this agent that they have not
     /// submitted.
     ///
@@ -694,6 +741,11 @@ impl Agent {
             pane,
             probe,
             root,
+            // Nothing has been read yet, and a pane that has just been spawned
+            // is standing where it was spawned. The probe's first accepted
+            // record says the same thing — see [`Probe::search`], which is
+            // strict — so this stays `None` until a session really has moved.
+            moved_to: None,
             draft_open: false,
             draft_mid_turn: false,
             submit_pending: false,
@@ -726,6 +778,79 @@ impl Agent {
     fn open_draft(&mut self) {
         self.draft_open = true;
         self.draft_mid_turn |= self.readiness != crate::agentstate::Readiness::Idle;
+    }
+
+    /// Where this agent is working, which is the only answer display and
+    /// row-routing may use.
+    ///
+    /// **One function over the two fields, so the fallback cannot be written
+    /// four ways.** [`moved_to`](Self::moved_to) when the session has left the
+    /// directory it was born in, and [`root`](Self::root) otherwise — which
+    /// covers a pane whose probe has never accepted a record, and that is not
+    /// an edge: a hosted Codex or Copilot publishes nothing this could read,
+    /// for the whole session.
+    ///
+    /// The four callers are the border ([`App::agent_tag`]), the name a queue
+    /// row uses ([`App::agent_label`]), the occupancy count and row guarantee
+    /// in `crate::workspace::rows` ([`App::refresh_worktree_rows`]), and the
+    /// row-to-pane resolution behind `x` `x` ([`App::agent_in`]). **The probe
+    /// is deliberately not one of them.** It holds its own anchor and compares
+    /// records against that; handing it this would be the anchor following the
+    /// thing it anchors, which is the failure
+    /// `crate::agentstate::Probe::set_worktrees` spends three worked examples
+    /// on.
+    fn standing(&self) -> &Path {
+        self.moved_to.as_deref().unwrap_or(&self.root)
+    }
+
+    /// Take the working directory from the record the probe has accepted, and
+    /// say whether it changed.
+    ///
+    /// **The one writer of [`moved_to`](Self::moved_to)**, called from
+    /// [`App::poll_readiness`] beside the readiness read that put the answer
+    /// there — one poll, one record, so the border and the row cannot be
+    /// describing two different reads of the same file.
+    ///
+    /// `crate::agentstate::Probe::standing_in` has already had the identity
+    /// argument: what comes back is the `cwd` of a record that passed
+    /// `is_still_mine`, which for a directory other than the anchor means it
+    /// passed `has_moved` — the same `sessionId`, and a directory git named as
+    /// a worktree of this repository, matched exactly. This function adds no
+    /// judgement of its own and must not: it compares against
+    /// [`root`](Self::root) only to keep `None` meaning *here*, and every
+    /// other question was settled before the answer arrived.
+    ///
+    /// Returns whether anything moved, because a move is two things a caller
+    /// owes: a frame, and a rebuild of the worktree list — the occupancy column
+    /// is the only place on screen that counts abeam's own panes, and a count
+    /// that lags is a row saying an agent is somewhere it is not.
+    fn follow_record(&mut self) -> bool {
+        // Borrowed rather than owned until something has actually changed.
+        // This runs per pane per [`READINESS_EVERY`] for the whole session, and
+        // a `PathBuf` allocated four times a second to be compared and dropped
+        // is a cost with nothing on the other side of it.
+        let now = self
+            .probe
+            .standing_in()
+            .filter(|cwd| !paths::same_dir(cwd, &self.root));
+        // **`same_dir` in the filter above is the one that has to be**, and
+        // this one is the same rule rather than a second one. Up there a `cwd`
+        // a child wrote into a JSON record is compared against a path git
+        // printed, and on Windows those spell a directory differently — an
+        // `==` would call every poll a move, which is a redraw and a discovery
+        // rebuild four times a second for ever. Here both sides came out of
+        // records, where `==` would do; one rule for comparing two directories
+        // is what `crate::paths` exists to keep, and a function that compared
+        // paths two ways is where a later edit picks the wrong one.
+        let moved = match (self.moved_to.as_deref(), now) {
+            (None, None) => false,
+            (Some(was), Some(now)) => !paths::same_dir(was, now),
+            _ => true,
+        };
+        if moved {
+            self.moved_to = now.map(Path::to_path_buf);
+        }
+        moved
     }
 
     /// Let this agent's output ring the loop's doorbell.
@@ -1708,13 +1833,20 @@ impl App {
 
     /// What one agent is called where there is no border to read it off.
     ///
-    /// The worktree it is standing in, which is the only thing about an agent
-    /// that a person chose and that cannot change under it: a live child's
-    /// working directory belongs to the child. [`agent_tag`](Self::agent_tag)
-    /// draws the same string on the pane's own border, suppressed there when it
-    /// is the session's root because a border has no columns to spend on the
-    /// default — this one is not suppressed, because a queue row naming three
-    /// of four agents is worse than one naming all four.
+    /// The worktree it is **working in** — [`Agent::standing`], which is the
+    /// pane's own root until its record says the session has moved into a
+    /// worktree it made for itself. [`agent_tag`](Self::agent_tag) draws the
+    /// same string on the pane's own border, suppressed there when it is the
+    /// session's root because a border has no columns to spend on the default —
+    /// this one is not suppressed, because a queue row naming three of four
+    /// agents is worse than one naming all four.
+    ///
+    /// **It follows the agent, and the queue's rows are the reason that is not
+    /// merely tidy.** An item's `target` is a pane id and is stamped at
+    /// enqueue; what a row shows the reader is this word. A prompt queued for
+    /// an agent that has since branched off into a worktree would otherwise be
+    /// listed against the checkout it left, which is the one place a reader
+    /// checks *before* deciding whether the aim is right.
     ///
     /// **Two agents in one checkout are called the same thing**, and there is
     /// no honest fix inside this function. The distinguishing fact would be the
@@ -1723,7 +1855,7 @@ impl App {
     /// declines the same thing for the same reason, and `docs/design.md` has
     /// the general form of it — abeam describes a checkout, not an author.
     fn agent_label(&self, ix: usize) -> String {
-        let root = &self.agents[ix].root;
+        let root = self.agents[ix].standing();
         self.spaces
             .iter()
             .find(|space| paths::same_dir(&space.root, root))
@@ -2196,12 +2328,23 @@ impl App {
     ///
     /// [`cannot_close`](Self::cannot_close) has the last word, so the session's
     /// own agent is refused here exactly as it is at the pane.
+    ///
+    /// **It asks where each agent is *working*, not where it was spawned**, and
+    /// the two differ for exactly the workflow this feature is for: open a pane
+    /// in the checkout you are in, tell it to branch off, and it makes a
+    /// worktree and moves into it. Resolving by the spawn directory answered
+    /// `no agent here` on the row the work was visibly happening in, and
+    /// offered `x` on the row it had left — a gesture aimed by what the reader
+    /// can see is a gesture that has to be resolved by the same thing.
+    /// `workspace::rows` guarantees a row for the same directory this matches
+    /// against, which is what makes the row reachable at all; the two must be
+    /// read off one answer, and [`Agent::standing`] is it.
     fn agent_in(&self, root: &Path) -> Result<u64, String> {
         let here: Vec<usize> = self
             .agents
             .iter()
             .enumerate()
-            .filter(|(_, agent)| paths::same_dir(&agent.root, root))
+            .filter(|(_, agent)| paths::same_dir(agent.standing(), root))
             .map(|(ix, _)| ix)
             .collect();
         // The label is built inside the arms that use it rather than above the
@@ -2573,7 +2716,16 @@ impl App {
         // reason the vector exists at all: a pane can be opened or closed
         // between two of these calls, and a list held anywhere else would be
         // the previous answer.
-        let agents: Vec<&Path> = self.agents.iter().map(|agent| agent.root.as_path()).collect();
+        //
+        // **[`Agent::standing`] and not the directory a pane was spawned in**,
+        // which is the difference between a roster and a record of where
+        // everybody started. An agent that has made itself a worktree and moved
+        // into it is working there: the count belongs to that row, the row
+        // guarantee `workspace::rows` makes has to reach that row, and
+        // [`agent_in`](Self::agent_in) resolves `x` against the same answer. A
+        // list built from the spawn directory left all three pointing at the
+        // checkout the agent had left.
+        let agents: Vec<&Path> = self.agents.iter().map(Agent::standing).collect();
         let rows = workspace::rows(
             &self.worktrees,
             &self.roster,
@@ -2982,6 +3134,7 @@ impl App {
         // proposal about what it would take to make the agent per-pane.
         let claude = self.has_claude_state();
         let mut redraw = false;
+        let mut moved = false;
         for agent in self.agents.iter_mut() {
             let before = agent.readiness;
             agent.readiness = agent.send_readiness(claude);
@@ -2990,6 +3143,13 @@ impl App {
             // on claiming the old answer until some other event happens to
             // spend a frame.
             redraw |= agent.readiness != before;
+            // **Off the same read, which is the whole reason it is here rather
+            // than beside the border that draws it.** The line above is what
+            // makes the probe re-read the record; this takes the directory that
+            // record named, so a pane's readiness and a pane's whereabouts can
+            // never come from two different polls of one file. See
+            // [`Agent::follow_record`].
+            moved |= agent.follow_record();
         }
 
         // The one event that ends a draft, and the only place this flag is ever
@@ -3030,6 +3190,21 @@ impl App {
                 // the latch is about.
                 agent.draft_mid_turn = false;
             }
+        }
+
+        // **An agent that has moved owes the worktree list a rebuild, and the
+        // rule is [`start_agent`](Self::start_agent)'s said about a directory
+        // instead of a pane**: the occupancy column is the only thing on screen
+        // that counts abeam's own panes, so a refresh this site can forget is a
+        // row that goes on saying a worktree is empty while somebody works in
+        // it — and, worse, a row the close gesture cannot resolve, because
+        // [`agent_in`](Self::agent_in) reads the same directory this just
+        // changed. Unconditionally a frame, whatever the list answers: a
+        // border is what names the worktree an agent moved into, and it is
+        // owed one whether or not the list is the view on screen.
+        if moved {
+            self.refresh_worktree_rows();
+            redraw = true;
         }
 
         // One hand-over, after both loops, so the queue is told a state that is
@@ -5524,11 +5699,20 @@ impl App {
     /// otherwise have been "give me the keys back" — and the only thing that
     /// tells the reader a press moved them is this.
     ///
-    /// **An agent pane can say this and never be wrong, which is the one piece
-    /// of chrome this feature gets for free.** A live child's working directory
-    /// belongs to the child: there is no call that moves a running process to
-    /// another directory, so an agent is born in a directory and dies in it.
-    /// The right pane's label has to be maintained; this one is a fact.
+    /// **This was written as chrome that could never be wrong and it was, on
+    /// both counts.** The claim was that a live child's working directory
+    /// belongs to the child, so an agent is born in a directory and dies in it
+    /// — true of the *pty*, and not of the session inside it. Claude Code makes
+    /// git worktrees and moves into them, which is why `crate::workspace`
+    /// exists at all, and it rewrites its own record with the new `cwd` when it
+    /// does. A border built from the spawn directory then named a checkout the
+    /// agent had left, permanently and with nothing on screen disagreeing.
+    ///
+    /// So it is maintained after all, off [`Agent::standing`], and it costs one
+    /// comparison per poll rather than a field anybody has to remember to
+    /// write. What it must not be built from is the pane's own root — see
+    /// [`Agent::root`], which is what the readiness probe compares records
+    /// against and is the one thing here that may not follow the agent.
     ///
     /// **Suppressed at the session's own root**, exactly as
     /// [`right_title`](Self::right_title) suppresses the workspace label at
@@ -5595,7 +5779,23 @@ impl App {
         // and the readiness word off the end. It appears exactly when it is
         // news — [`right_title`](Self::right_title) makes the same judgement
         // about the workspace label, in the same words.
-        if !paths::same_dir(&self.agents[ix].root, &self.root) {
+        //
+        // **Against `App::root` and not against the pane's own spawn
+        // directory**, which is the tempting reading of "suppress what is true
+        // by default" and is the wrong one. A pane started with `a` on another
+        // worktree has been standing somewhere other than the session's root
+        // since the moment it existed, and suppressing its label because it
+        // has not *moved* since would make two panes in two worktrees draw
+        // borders that differ only by a position — which is the failure the
+        // three-condition rule at the top of this doc exists to name. The
+        // question a border answers is "where is this agent", not "has it
+        // moved", and one root is the default because it is the one the whole
+        // window is otherwise about.
+        //
+        // What the move changes is only which directory is being named: no
+        // column is spent on the fact of moving, and an agent that stays put
+        // draws exactly the border it drew before this existed.
+        if !paths::same_dir(self.agents[ix].standing(), &self.root) {
             tag.push_str(&format!(" · {}", self.agent_label(ix)));
         }
         tag
@@ -6305,6 +6505,22 @@ mod tests {
             .collect()
     }
 
+    /// The same frame, with the left column cut off.
+    ///
+    /// **Because a whole row of the window is two panes, and a test about one
+    /// of them must not be answered by the other.** The worktree list names the
+    /// directory an agent is working in and so does that agent's border, so a
+    /// search over [`rows`] finds either — and would go on passing with the
+    /// list's own copy deleted. Sliced at the split the frame actually used
+    /// rather than at a number, so it stays right at any width.
+    fn right_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let all = rows(app, width, height);
+        let left = abeam_layout::split(app.area, app.zoom).left.width as usize;
+        all.into_iter()
+            .map(|line| line.chars().skip(left).collect())
+            .collect()
+    }
+
     // --- the agents, and which of them a question is about ----------------
     //
     // Three tests for a vector that holds one element in every other test in
@@ -6838,6 +7054,80 @@ mod tests {
         assert!(
             screen(&mut fx.app, 120, 24).contains("agent"),
             "the worktree row does not report the agent that was just started"
+        );
+
+        assert_eq!(fx.app.at, was_at, "the right pane followed");
+        assert_eq!(fx.app.right_view, was_view, "the view followed");
+        assert_eq!(fx.app.focus, was_focus, "the keys moved");
+    }
+
+    /// `a` in the git view itself starts an agent in the checkout on screen.
+    ///
+    /// **The shorter road to the same request, and the reason it was worth
+    /// building.** `a` on a row of the worktree list needs the worktree to
+    /// exist, and Claude Code makes its own — that is why `crate::workspace` is
+    /// a module at all. So the natural gesture is to open another agent where
+    /// you already are and ask it to branch off, and reaching that through a
+    /// list of the checkouts you are *not* in was four keystrokes framed around
+    /// the wrong concept.
+    ///
+    /// The end-to-end half is what makes this more than the pane's own test:
+    /// the key has to reach a pane that only sees keys under `Focus::Right`,
+    /// fill the same request slot the list fills, survive the drain in
+    /// [`pump`](App::pump), and arrive at [`start_agent`](App::start_agent) as
+    /// the workspace the reader was looking at.
+    #[test]
+    fn a_in_the_git_view_starts_an_agent_in_the_checkout_on_screen() {
+        let mut fx = app();
+        a_startable_recipe(&mut fx);
+
+        // The keys where the gesture puts them: `Alt+G` is a global and moves
+        // no focus, so `F5` is what hands the right pane the keyboard — and
+        // without it the letter goes to the agent, which is the whole of the
+        // exemption this key stands on.
+        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        // A frame first, because `F5` refuses when there is no right pane to
+        // hand the keys to and "no right pane" is what a window that has never
+        // been drawn looks like.
+        let _ = screen(&mut fx.app, 120, 40);
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "the right pane has no keys");
+        fx.app.handle_key(key(KeyCode::Char('a'))).unwrap();
+
+        let was_at = fx.app.at;
+        let was_view = fx.app.right_view;
+        let was_focus = fx.app.focus;
+        assert!(fx.app.pump(), "a new agent is worth a frame");
+
+        assert_eq!(fx.app.agents.len(), 2, "nothing was started");
+        assert!(
+            paths::same_dir(&fx.app.agents[1].root, fx.dir.path()),
+            "the agent is standing somewhere other than the checkout on screen: {}",
+            fx.app.agents[1].root.display()
+        );
+        // `bracketed_paste` and not `!has_exited`, for the reason the test
+        // above spells out: only the mode is a fact the child had to produce.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !fx.app.agents[1].pane.bracketed_paste() && Instant::now() < deadline {
+            fx.app.reap().expect("try_wait on a child that exists");
+            if fx.app.agents[1].pane.has_exited() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            fx.app.agents[1].pane.bracketed_paste(),
+            "the child never asked for bracketed paste, so nothing really started"
+        );
+        assert_eq!(fx.app.at_agent, 1, "nothing on screen would say it started");
+        // Two panes in the session's own root, so the border spends columns on
+        // the position and none on a label that is true by default. That is the
+        // shortest use of the whole feature and the one a suppression rule
+        // written against the *spawn* directory would make invisible.
+        assert_eq!(
+            fx.app.agent_tag(fx.app.at_agent, false),
+            " · 2/2",
+            "the border does not say which agent this is"
         );
 
         assert_eq!(fx.app.at, was_at, "the right pane followed");
@@ -9132,6 +9422,179 @@ mod tests {
         );
     }
 
+    /// Put a second pane's session in a worktree it made for itself.
+    ///
+    /// **The workflow the whole change is for, and the only one a fixture can
+    /// stage**: an agent is opened in the checkout the reader is in and told to
+    /// branch off, so it runs `git worktree add`, moves into it, and rewrites
+    /// its own record with the new `cwd`. Nothing here can make a real Claude
+    /// do that, so what is staged is the *evidence* it leaves — which is the
+    /// only thing abeam ever sees of it.
+    ///
+    /// Returns the records directory, which has to outlive the probe reading
+    /// it, and the worktree the session moved to.
+    fn moves_to_a_worktree(fx: &mut Fixture, ix: usize) -> (TempDir, PathBuf) {
+        // A child that stays and asks for bracketed paste: `Agent::send_readiness`
+        // refuses to read the probe at all without one, so without this the
+        // probe never settles and every assertion below would be about a pane
+        // that never found its record.
+        stays_at(fx, ix);
+        let records = records_at(fx, ix, "idle");
+
+        let moved = fx
+            .dir
+            .path()
+            .join(".claude")
+            .join("worktrees")
+            .join("branched-off");
+        std::fs::create_dir_all(&moved).expect("a worktree to move into");
+        // What `crate::app` hands every probe once discovery has answered: the
+        // repository and every worktree of it. `Probe::has_moved` is the only
+        // reader, and without this the record below is refused — which is the
+        // pre-widening behaviour and is tested where it lives.
+        fx.app.agents[ix]
+            .probe
+            .set_worktrees(vec![fx.dir.path().to_path_buf(), moved.clone()]);
+
+        polled(fx);
+        assert_eq!(
+            fx.app.agents[ix].readiness,
+            Readiness::Idle,
+            "the probe never settled, so a move could not be noticed either"
+        );
+        assert!(
+            paths::same_dir(fx.app.agents[ix].standing(), fx.dir.path()),
+            "a pane that has not moved is not standing where it was spawned"
+        );
+
+        // The move: same file, same `sessionId`, new `cwd`.
+        say(&records, &moved, "idle");
+        (records, moved)
+    }
+
+    /// An agent that branches off into a worktree is followed by its own
+    /// border, and by nothing that decides whether its record is its own.
+    ///
+    /// **The two facts this change is about, asserted side by side.** The
+    /// border, the worktree list and the close gesture all read where the agent
+    /// is *working*; `crate::agentstate::Probe` goes on comparing records
+    /// against the directory the pane was spawned in. Letting the second follow
+    /// the first would be the anchor chasing the thing it anchors — a probe
+    /// could then latch onto a record it should have refused, which is the
+    /// identity work three phases spent on `has_moved`, `is_here` and the
+    /// disowned list, undone by a field assignment.
+    #[test]
+    fn an_agent_that_branches_off_is_named_by_its_border_where_it_is_working() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        let (_records, moved) = moves_to_a_worktree(&mut fx, 1);
+
+        assert!(polled(&mut fx), "a pane that has moved is worth a frame");
+        assert!(
+            paths::same_dir(fx.app.agents[1].standing(), &moved),
+            "the pane goes on naming the checkout it was started in: {}",
+            fx.app.agents[1].standing().display()
+        );
+
+        // **The anchor, twice: the shell's copy and the probe's own.** Neither
+        // moves, and it is the probe's that decides anything — `is_here` is an
+        // exact comparison against it, and `has_moved` widens only for a
+        // session that has already matched it under a `sessionId` this probe
+        // watched be ours.
+        assert!(
+            paths::same_dir(&fx.app.agents[1].root, fx.dir.path()),
+            "the pane's spawn directory followed its session"
+        );
+        assert!(
+            paths::same_dir(fx.app.agents[1].probe.anchor(), fx.dir.path()),
+            "the readiness probe's anchor followed the record it is anchoring"
+        );
+
+        // The border. `2/2` is the second pane's own line, which is what tells
+        // this assertion apart from the one about `agents[0]` sitting above it.
+        let drawn = rows(&mut fx.app, 120, 40);
+        let border = drawn
+            .iter()
+            .find(|line| line.contains("2/2"))
+            .unwrap_or_else(|| panic!("no second pane on screen: {drawn:#?}"));
+        assert!(
+            border.contains("branched-off"),
+            "the border names the checkout the agent left: {border}"
+        );
+    }
+
+    /// The worktree list counts an agent where it is working, and `x` reaches
+    /// it from that row.
+    ///
+    /// **The row and the routing are one claim and are asserted together on
+    /// purpose.** `workspace::rows` guarantees a row for every agent's
+    /// directory and `App::agent_in` resolves that row's root back to a pane;
+    /// phase 4 added the guarantee because a pane whose directory has no row is
+    /// a pane with no way out. Reading either off the spawn directory puts the
+    /// row and the gesture on the checkout the agent has left — and does it
+    /// *silently*, because that row is still there and still says something.
+    #[test]
+    fn the_worktree_list_counts_an_agent_where_it_is_working_and_x_reaches_it_there() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        // Only the repository is named, so the row for the worktree the agent
+        // makes for itself can only come from the guarantee. That is the real
+        // shape: a worktree created a moment ago is one the ten-second
+        // discovery has not seen.
+        fx.app.worktrees = vec![worktree(fx.dir.path().to_path_buf(), "main")];
+        let (_records, moved) = moves_to_a_worktree(&mut fx, 1);
+        fx.app.refresh_worktree_rows();
+        fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
+
+        // Both panes are in one checkout, which is what `a` where you already
+        // are produces — and it is the configuration in which a count that did
+        // not move would look exactly like a count that did.
+        let before = screen(&mut fx.app, 120, 40);
+        assert!(
+            before.contains("2 agents"),
+            "both panes are not counted, so a fall to one proves nothing: {before}"
+        );
+        assert!(
+            fx.app.agent_in(&moved).is_err(),
+            "a worktree nobody has moved into already answers for a pane"
+        );
+
+        assert!(polled(&mut fx), "a pane that has moved is worth a frame");
+
+        // The count follows. `2 agents` becoming `agent` is the repository's
+        // row losing the pane that left it, and it cannot be produced by
+        // anything else on screen — a border says `2/2`.
+        let after = screen(&mut fx.app, 120, 40);
+        assert!(
+            !after.contains("2 agents"),
+            "the checkout the agent left still claims it: {after}"
+        );
+        // ...and the worktree it went to has a row of its own, in the right
+        // pane's own columns so that the agent's border cannot answer for it.
+        assert!(
+            right_rows(&mut fx.app, 120, 40)
+                .iter()
+                .any(|line| line.contains("branched-off") && line.contains("agent")),
+            "the list has no row for the worktree the agent is working in: {:#?}",
+            right_rows(&mut fx.app, 120, 40)
+        );
+
+        // And the gesture the row exists for. `x` `x` there resolves to that
+        // pane; the checkout it was spawned in no longer answers for it, which
+        // is `agents[0]`'s row and refuses for its own reason.
+        assert_eq!(
+            fx.app.agent_in(&moved),
+            Ok(fx.app.agents[1].id),
+            "the row the work is visibly happening in does not reach the pane"
+        );
+        assert_eq!(
+            fx.app.agent_in(fx.dir.path()),
+            Err("that pane is the session — its exit is abeam's. Alt+Q is the way out."
+                .to_string()),
+            "the checkout the agent left still resolves to it"
+        );
+    }
+
     /// Closing a pane takes it out of the worktree list's count, at once.
     ///
     /// **The mirror of what `a` does, and it was missing.**
@@ -11250,7 +11713,7 @@ mod tests {
             "git's nested worktree is not inside the root abeam is holding"
         );
 
-        let agents: Vec<&Path> = fx.app.agents.iter().map(|a| a.root.as_path()).collect();
+        let agents: Vec<&Path> = fx.app.agents.iter().map(Agent::standing).collect();
         let rows = workspace::rows(
             &fx.app.worktrees,
             &fx.app.roster,
@@ -11336,7 +11799,7 @@ mod tests {
             "git named the subdirectory, so this test is about nothing"
         );
 
-        let agents: Vec<&Path> = fx.app.agents.iter().map(|a| a.root.as_path()).collect();
+        let agents: Vec<&Path> = fx.app.agents.iter().map(Agent::standing).collect();
         let rows = workspace::rows(
             &fx.app.worktrees,
             &fx.app.roster,

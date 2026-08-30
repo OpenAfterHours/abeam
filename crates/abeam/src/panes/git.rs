@@ -151,6 +151,15 @@ pub struct GitPane {
     /// The worktree `a` asked for an agent in, waiting to be drained the same
     /// way.
     ///
+    /// **Two keys write it and they are one request.** In the worktree list it
+    /// is the row under the cursor; in the status list it is
+    /// [`root`](Self::root), the checkout this pane is showing — which is the
+    /// row that list would have drawn as `here`, so the second spelling is a
+    /// shortcut through the first rather than a second meaning. The status
+    /// one exists because the ordinary way to want another agent is not about
+    /// worktrees at all: Claude Code makes its own, so you open a pane where
+    /// you are and ask it to branch off. Both arms carry the argument.
+    ///
     /// A second field rather than a flag beside [`workspace`](Self::workspace),
     /// because the two keys ask for different things about *different* halves
     /// of the window and only one of them moves this pane: `Enter` points the
@@ -995,9 +1004,48 @@ impl Pane for GitPane {
             KeyCode::BackTab => self.select(-1),
             KeyCode::Enter => self.open = self.openable_path().map(str::to_owned),
             KeyCode::Char('r') => self.request_refresh(),
+            // `a` for an agent in the checkout this pane is showing, which is
+            // the same letter and the same request as the one in the worktree
+            // list, aimed at the row that list would have drawn as `here`.
+            //
+            // **It exists because the workflow it serves is not about
+            // worktrees.** Claude Code makes its own — that is why
+            // `crate::workspace` is a module — so the ordinary way to use a
+            // second agent is to open one in the checkout you are already in
+            // and ask it to branch off. Reaching that through the *worktree
+            // list* meant `Alt+G`, `w`, find the row you are already on, `a`,
+            // in a list whose whole subject is the several checkouts you are
+            // not in. Here it is `Alt+G`, `a`.
+            //
+            // **No global was spent and none could be.** `docs/keymap.md`
+            // records `F1`–`F9` and `F12` as abeam's, `F10` and `F11` as eaten
+            // by terminal emulators before an application sees them, and the
+            // `Alt` letters as close to spent across three agents' shipped
+            // defaults — a claim that could only be renewed by repeating that
+            // document's whole binary extraction. This is a pane-local key
+            // standing on the exemption above [`Mode`], which is about
+            // *delivery*: `handle_key` reaches a pane only under `Focus::Right`,
+            // so the letter is never in front of an agent that is listening.
+            // `?` and `w` in this same match have stood on it for longer, and
+            // against `crate::scroll`'s shared vocabulary — `j k g G b`, space,
+            // `Ctrl+d`, `Ctrl+u` — `a` is free here exactly as it is in the
+            // list.
+            //
+            // `self.root` and not [`base`](Self::base): the toplevel is the
+            // repository, and a session started in a subdirectory of one is a
+            // directory git does not name. What the reader is looking at is the
+            // workspace, `crate::app` guarantees *that* a row, and the two keys
+            // have to mean the same checkout or `a` here and `x` `x` in the
+            // list would be about different directories.
+            //
+            // It asks nothing first, for the worktree list's reason: this key
+            // creates, and what replaces a confirmation is that the gesture
+            // reports itself on the frame it fired — the new pane appears in
+            // the left column and its border says `2/2`.
+            KeyCode::Char('a') => self.agent = Some(self.root.clone()),
             // `w` for worktree. Free in both vocabularies this pane already
             // matches — `crate::scroll` claims `j k b space g G` and Ctrl+D/U,
-            // and the four arms above claim the rest — and pane-local, so it is
+            // and the arms above claim the rest — and pane-local, so it is
             // never in front of the agent. `Alt+W` is Claude's and is not what
             // this is.
             KeyCode::Char('w') => self.open_worktrees(),
@@ -3007,6 +3055,55 @@ mod tests {
         pane.handle_key(key(KeyCode::Enter)).unwrap();
         assert!(pane.take_agent_request().is_some());
         assert!(pane.take_workspace_request().is_some());
+    }
+
+    #[test]
+    fn a_in_the_status_list_asks_for_an_agent_in_the_checkout_on_screen() {
+        // **The gesture the worktree list made expensive.** Claude Code makes
+        // its own worktrees, so the ordinary way to want a second agent is to
+        // open one where you already are and tell it to branch off — and
+        // reaching that through a *list of the checkouts you are not in* was
+        // `Alt+G`, `w`, find the row you are on, `a`. Here it is `Alt+G`, `a`,
+        // and it is the same request in the same slot.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        assert_eq!(pane.exit_hint(), "esc→agent", "the status list is not up");
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('a'))).unwrap(),
+            Handled::Yes
+        );
+        let asked = pane.take_agent_request().expect("an agent was asked for");
+        assert!(
+            crate::paths::same_dir(&asked, Path::new(ONE)),
+            "the request names something other than the checkout on screen: {}",
+            asked.display()
+        );
+        // Drained rather than left to fire late, like the list's own — and
+        // this one fires by starting a process.
+        assert_eq!(pane.take_agent_request(), None);
+
+        // It moves nothing. The right pane stays where it is, the list stays
+        // shut, and the selection is where it was: this key is about the left
+        // column and says nothing about what is being read.
+        assert_eq!(pane.take_workspace_request(), None);
+        assert_eq!(pane.take_open_request(), None);
+        assert_eq!(
+            pane.exit_hint(),
+            "esc→agent",
+            "a key about the left column changed what this pane is showing"
+        );
+
+        // And the same key one room along still means the row rather than the
+        // pane's own root, which is what makes the two spellings one gesture
+        // rather than two.
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+        pane.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(crate::paths::same_dir(
+            &pane.take_agent_request().expect("an agent was asked for"),
+            Path::new(TWO)
+        ));
     }
 
     #[test]

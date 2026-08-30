@@ -348,9 +348,15 @@ pub struct Row {
     pub root: PathBuf,
     /// The right pane is on this workspace.
     pub here: bool,
-    /// How many hosted agents are standing in it. Distinct from `here` on
+    /// How many hosted agents are **working** in it. Distinct from `here` on
     /// purpose: the point of the list is to look at a workspace an agent is
     /// *not* in.
+    ///
+    /// Working, rather than started: an agent that has made itself a worktree
+    /// and moved into it is counted where the work is happening, and the
+    /// checkout it left reads empty because it is. See [`rows`] for why the
+    /// count and the row guarantee have to come off the same answer, and
+    /// `crate::app::Agent::standing` for what that answer is.
     ///
     /// **A count and not a `bool`, which is what the key that starts an agent
     /// costs this struct.** While there was one agent it could only be here or
@@ -382,9 +388,14 @@ pub struct Row {
 /// Join what git said, what Claude said, and where abeam is standing.
 ///
 /// Pure and I/O-free, like everything above [`discover`]. `at` is the workspace
-/// the right pane is on, `agents` is where each hosted pane is standing, and
-/// the two really do differ: the right pane can be pointed at a worktree and a
-/// live child's pty can never be moved at all.
+/// the right pane is on, and `agents` is where each hosted pane is **working**
+/// — `crate::app::Agent::standing`, which is the directory that pane's session
+/// last reported, not the one its pty was opened in. The two differ for the
+/// workflow this module is named after: Claude Code makes worktrees and moves
+/// into them, so an agent started in the checkout you are in can be working one
+/// directory down by the time you look for it. A list built from spawn
+/// directories reports where everybody started, which is a different question
+/// and not one anybody opened this list to ask.
 ///
 /// **`session_root` is a third thing again, and conflating it with `agents` is
 /// the mistake this signature is shaped to prevent.** It is the root abeam was
@@ -416,12 +427,13 @@ pub struct Row {
 /// stopped naming because a child is still running in it, which is exactly the
 /// moment the right pane may be pointed at it.
 ///
-/// **Every agent's root is a third guarantee, and it stopped being optional in
-/// phase 4.** It was declined once, on the argument that an agent is started
-/// *from* a row of this list so its root has one by construction, that the only
-/// way to lose it is `git worktree remove` under a live pane, and that a row
-/// synthesised for a worktree git has stopped having would be a row nothing
-/// else on screen agrees exists. Two things were wrong with that.
+/// **Every agent's working directory is a third guarantee, and it stopped
+/// being optional in phase 4.** It was declined once, on the argument that an
+/// agent is started *from* a row of this list so its root has one by
+/// construction, that the only way to lose it is `git worktree remove` under a
+/// live pane, and that a row synthesised for a worktree git has stopped having
+/// would be a row nothing else on screen agrees exists. Two things were wrong
+/// with that.
 ///
 /// The first is that the premise was too narrow: `at` drops off the list
 /// whenever `crate::app::sync_workspaces` retains a workspace git has stopped
@@ -429,9 +441,21 @@ pub struct Row {
 /// position with no guarantee of its own. The second is what the row is now
 /// *for*. `x` twice on a row is how a **live** agent is closed —
 /// `crate::app::App::agent_in` resolves the row's root to a pane — so an agent
-/// whose root has no row is an agent that cannot be closed at all, in the one
-/// list that is meant to be the roster of them. A missing row was a cosmetic
-/// undercount; it is now a pane with no way out.
+/// whose directory has no row is an agent that cannot be closed at all, in the
+/// one list that is meant to be the roster of them. A missing row was a
+/// cosmetic undercount; it is now a pane with no way out.
+///
+/// **And the guarantee follows the agent, which is the whole of what makes it
+/// survive an agent that moves.** The premise above — "started *from* a row, so
+/// its root has one by construction" — was never true of the directory an agent
+/// makes for itself: a fresh worktree exists before this list is next
+/// discovered, and a session in one of Claude Code's own
+/// `.claude/worktrees/…` is standing somewhere no row was ever drawn for.
+/// `agents` therefore carries where each pane is working rather than where it
+/// was spawned, and the guarantee and the routing read that one answer. Handing
+/// this the spawn directories instead reintroduces the phase-4 bug for exactly
+/// the workflow it is meant to enable, and reintroduces it silently: the row is
+/// *there*, on the checkout the agent left, so nothing looks missing.
 ///
 /// What it costs is the thing that argument was right about: a row naming a
 /// directory `git worktree list` no longer does. That is the honest report of
