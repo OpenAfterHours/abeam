@@ -251,6 +251,18 @@ pub struct Target {
     /// *said*, not what is sent — see [`QueuePane::why_not`], the footer's
     /// [`Readiness::Unknown`] arm and [`aside`](QueuePane::aside), which are
     /// its three readers.
+    ///
+    /// **The exit half is a cached answer and not a syscall, which the next
+    /// reader will assume the other way round.** `TerminalPane::has_exited` is
+    /// `poll_exit`'s last answer, and only `App::reap` refreshes it — so a
+    /// child can be gone while this still reads `true`. The honest claim is not
+    /// that it is current but that it is *exactly as current as the readiness
+    /// beside it*: both are the same cache, read on the same pass, and the
+    /// loop's periodic pass reaps a few statements before it polls readiness.
+    /// On the keystroke paths that also sync this pane, to withdraw a countdown
+    /// on the press, it is as old as the last reap and no older. Being wrong
+    /// costs a sentence here and nothing at the gate, which is
+    /// [`readiness`](Self::readiness)'s.
     pub can_receive: bool,
 }
 

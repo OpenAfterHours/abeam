@@ -625,7 +625,11 @@ its own.
   paste, the pane is not Claude — and only the first and third are permanent.
   "Can ever be typed at" is the question the sentence needs, so it is
   `is_claude() && !pane.has_exited()`, filled in `sync_queue_targets` where the
-  agent is already in hand.
+  agent is already in hand. **`has_exited` is a cache and not a syscall** —
+  `poll_exit`'s last answer, refreshed only by `App::reap` — so the honest claim
+  for this field is that it is exactly as fresh as the `readiness` beside it,
+  which is the same cache read on the same pass. Being stale costs a sentence
+  and never a send.
 - **The footer splits its `Unknown` arm** into "cannot receive" and today's
   "state unknown". Two different facts, and only one of them is worth waiting
   for.

@@ -1927,6 +1927,16 @@ impl App {
                 // The queue refuses all three identically; only the reader is
                 // owed the difference, so this is read by what the pane *says*
                 // and by nothing in its gate.
+                //
+                // **`has_exited` is [`TerminalPane::poll_exit`]'s cached answer
+                // rather than a syscall**, and [`App::reap`] is the only thing
+                // that refreshes it — so this is as fresh as `readiness` on the
+                // line above and no fresher, which is the same cache read on
+                // the same pass. The loop reaps a few statements before it
+                // calls `poll_readiness`, which ends here; the keystroke paths
+                // that sync this pane to withdraw a countdown do not, so on
+                // those it is one frame old at worst. That is a sentence out of
+                // date, never a send.
                 can_receive: agent.is_claude() && !agent.pane.has_exited(),
             })
             .collect();
@@ -8167,16 +8177,23 @@ mod tests {
         let mut fx = app();
         let id = fx.app.agents[0].id;
 
-        // Nothing has reaped it yet, so as far as anything can know the child
-        // is alive — and this is the answer the rest of the session gives.
+        // **Deterministic and not a race, because `has_exited` is a cache.**
+        // `TerminalPane::spawn` sets `exited: None` and `App::reap` is the only
+        // thing in the program that fills it, so before the loop below this
+        // pane reads as live whatever the child has actually done — and this
+        // assertion is about what the shell reports, not about the process.
         fx.app.sync_queue_targets();
         assert!(
             fx.app.queue.can_receive(id),
-            "a live Claude pane was written off before anything asked about it"
+            "a pane nothing has reaped was written off before anything asked"
         );
 
-        // `try_wait` is the only call that turns a live child into an exited
-        // one, which is why this loops rather than sleeping once.
+        // **And this is why the exit half has to be driven rather than waited
+        // for.** `try_wait` is the only call that turns a live child into an
+        // exited one, and `has_exited` answers out of the field it fills — so a
+        // test that started a short-lived child and slept would be asserting
+        // against a cache nobody had refreshed, and would pass or fail on
+        // whichever of `send_readiness`'s gates happened to fire.
         let deadline = Instant::now() + Duration::from_secs(20);
         while !fx.app.agents[0].pane.has_exited() && Instant::now() < deadline {
             fx.app.reap().expect("try_wait on a child that exists");
