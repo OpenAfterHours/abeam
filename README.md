@@ -430,7 +430,17 @@ ever *which one*. It opens a list over whichever of the two you pressed it in �
 the names `+` already takes, which is `claude`, `copilot`, `codex` and any
 `[preset.*]` blocks of your own, in that order, with the cursor on the agent
 this session was started with. So `A` `Enter` is another of what you already
-have, and `A` `j` `j` `Enter` is a Codex pane beside your Claude one. A preset
+have, and `A` `j` `j` `Enter` is a Codex pane beside your Claude one.
+
+**With one exception, and it is the one case where `A` `Enter` is not another
+of what you have.** `abeam +pwsh` hosts a program named outright, and the list
+is the table — so there is no row for it to start the cursor on. Nothing is
+marked `session`, the cursor starts at the top, and `A` `Enter` would start
+whatever is first rather than another `pwsh`. The list on screen says so before
+you press anything. `a` is the key for another of the same, and it works there
+exactly as it does everywhere else.
+
+A preset
 says what it hosts — `fleet → claude` — because that is what decides whether the
 queue can type at the pane. The border names the checkout the pane will start
 in, and `Esc` puts back the list you came from. Choosing something that is not

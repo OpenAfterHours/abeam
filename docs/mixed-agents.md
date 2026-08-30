@@ -118,8 +118,14 @@ rest of this document then argues:
   whether the queue will be able to type at the pane at all. `crate::agent::Agent::hosts`
   is a static field, so this costs nothing to draw.
 
-The sketch marks the cursor with `▸`; the real list highlights the row's
-background, as `worktree_lines` does today. While the question stands the
+**The `▸` in the sketch marks the session's own row, not the cursor** — the two
+coincide above only because the cursor starts there, and pressing `j` moves the
+highlight while the `▸` stays put. `agent_lines` borrows the gutter and the cyan
+that `worktree_lines` gives the checkout you are standing in, so a reader learns
+one convention rather than two, and the cursor is the row's background as it is
+in that list. An earlier draft of this paragraph said the opposite, which would
+have told anyone editing `agent_lines` that the session gutter was a stale
+cursor marker to delete. While the question stands the
 border's `exit_hint` reads `esc→list` rather than `esc→git`, because `Esc` here
 puts the reader back in the list they pressed `A` in.
 
@@ -880,3 +886,30 @@ to want one.
    is, and on the item's own row. Whether the *left* border should say it too —
    next to the name that is already there — is a question about how much a title
    row can carry, and this document does not answer it.
+
+6. **Should the chooser offer a row for a program named outright?** A session
+   started `abeam +pwsh` hosts something the table cannot contain, so the list
+   has no row to start the cursor on: nothing is marked `session`, the cursor
+   sits at the top, and `A` `Enter` starts whatever is first rather than another
+   `pwsh`. The README now says so.
+
+   **It was nearly fixed during the review round and the fix was declined, which
+   is worth recording with both arguments.** A synthetic first row for the
+   session's own program, mapping to `AgentRequest { agent: None }` — the
+   `Recipe` path `a` already uses — would make "the cursor starts on the agent
+   this session was started with" true universally, and the `None` variant that
+   would carry it already exists.
+
+   What defeated it is the sentence that explains what the list *is*: the names
+   `+` already takes. A row that is not in the table is a row that sentence does
+   not cover, and the list would then be *mostly* the table plus one thing that
+   is not — which is a second rule to learn, bought for a case that already has
+   a key. `a` is "another of the same" and works there exactly as everywhere
+   else; `A` is "choose", and a session hosting a program abeam knows nothing
+   about has nothing of its own to choose. The gesture is also visible rather
+   than silent — the list is on screen, with no `session` marker anywhere, before
+   `Enter` is pressed.
+
+   It would become worth doing the moment a second thing wants that row — a
+   recently-used list, or a way to start a program by typing its name — because
+   then the synthetic row is not an exception but the first of a class.
