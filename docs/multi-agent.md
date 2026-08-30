@@ -194,6 +194,16 @@ making it per-pane is a change to the readiness path that wants its own argument
 rather than a field quietly moved during a refactor. Written down here so the
 next person reaches for it deliberately.
 
+**They did, and half of this paragraph is now history rather than a
+description.** `docs/mixed-agents.md` is the argument it asked for, and its
+phase 1 has landed: `has_claude_state` is gone, `Agent::kind` carries
+`Hosted::agent` per pane, and readiness and the roster both ask
+`Agent::is_claude`. What is *not* built is the half that would make the two
+disagree — there is still no way to open a pane of a second kind, so `agent:
+String` is still what every pane hosts. It stays on `App` for the two readers
+that argue for it there, the ask pane and dispatch, and that field's own doc
+comment names them.
+
 ## An agent pane is pinned to a worktree, permanently — and this was wrong
 
 **The section title is kept as it was written, because the claim under it is the

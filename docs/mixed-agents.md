@@ -1,10 +1,19 @@
 # More than one *kind* of agent in the window
 
-> **This is a proposal. Nothing below is built**, which is the opposite of
-> `docs/multi-agent.md`'s banner and the reason this is a second document
-> rather than a section of that one. Where a paragraph here describes code, it
-> describes code that exists today and says so; where it describes behaviour,
-> that behaviour does not exist yet.
+> **This is a proposal, and phase 1 of it is built.** The rest is not, which is
+> the opposite of `docs/multi-agent.md`'s banner and the reason this is a second
+> document rather than a section of that one. Where a paragraph here describes
+> code, it describes code that exists today and says so; where it describes
+> behaviour, that behaviour does not exist yet.
+>
+> What landed is the seam and nothing a reader can see: `Agent::kind`,
+> `Agent::is_claude`, a `poll_readiness` that asks each pane and a
+> `roster_is_wanted` that asks whether any pane is Claude. `App::has_claude_state`
+> is gone — the two sections below that quote it are describing the code it
+> replaced, and are kept because the argument for the change is the reason it is
+> written that way. There is still no chooser, no `A` key and no way to *get* a
+> pane of a second kind, so every predicate still answers what it answered
+> before.
 >
 > It is the argument `docs/multi-agent.md` said would be wanted and declined to
 > make in passing. That document's "What moves out of `App` and into `Agent`"
@@ -528,11 +537,19 @@ than discovering it from a border that has gone quietly wrong.
 
 Each phase is shippable and each has something to test.
 
-**Phase 1 — the seam, with no user-visible change.** `Agent::kind`, written in
-`Agent::new` from the `Hosted` that spawned the pane; `Agent::is_claude`;
-`poll_readiness` asks each pane; `roster_is_wanted` asks whether any pane is
-Claude. Every pane's kind is the session's, so every predicate answers today's
-answer. The test is that it still does.
+**Phase 1 — the seam, with no user-visible change. Built.** `Agent::kind`,
+written in `Agent::new` from the `Hosted` that spawned the pane;
+`Agent::is_claude`; `poll_readiness` asks each pane; `roster_is_wanted` asks
+whether any pane is Claude. Every pane's kind is the session's, so every
+predicate answers today's answer. The test is that it still does.
+
+Two things landed differently from the sketch above and both are worth naming.
+`send_readiness` lost its `claude: bool` rather than being handed a per-pane
+one, because the parameter's only caller was the loop that hoisted the answer
+and a function that reads its own field cannot be handed a neighbour's. And
+`start_agent` takes the *session's* kind rather than the recipe's, because
+`Recipe` has no kind until phase 2 gives it one — which is where the preset-args
+disagreement is fixed too, and for the same reason.
 
 **Phase 2 — the feature.** `App` holds the table; `Recipe` carries the row and
 the kind; `start_agent` takes a choice; the `choosing` question and the `A`/`Shift`

@@ -915,9 +915,12 @@ pub struct Hosted {
     ///
     /// The same as [`name`](Self::name) for a built-in and for a program named
     /// outright; the host's name for a preset. Read by the parts of abeam whose
-    /// question is *what agent is this* rather than *what do I call it* —
-    /// `crate::dispatch` is the whole list today, and its question is whether
-    /// `--bg` is a flag the hosted agent has.
+    /// question is *what agent is this* rather than *what do I call it*, and
+    /// `crate::app` is where the copies are made: `App::agent` for the two that
+    /// ask about the session — whether `--bg` is a flag the hosted agent has,
+    /// and what a workspace's ask pane is a second copy of — and `Agent::kind`
+    /// for the one that asks about a pane, which is whether Claude's own
+    /// session records describe the child in it.
     pub agent: String,
     pub launch: Launch,
 }

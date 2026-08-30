@@ -421,13 +421,22 @@ static NEXT_AGENT_ID: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 /// **The name is deliberately not here, and this is the distinction the next
 /// reader will get wrong.** What the border says is [`TerminalPane::title`],
 /// built from `crate::agent::Hosted::name` — the preset's own word, which may
-/// be anything somebody put in a config file. [`App::agent`] is a different
-/// string: `Hosted::agent`, the built-in a preset *resolves to*, which decides
-/// whether `--bg` dispatch exists at all and what a workspace's ask pane hosts.
-/// That is a fact about the session abeam was started for and not about any one
-/// child, so it stays on [`App`] where the queue and the ask can both read it.
-/// Two strings, two questions, and collapsing them would let a preset named
-/// "reviewer" acquire or lose background dispatch on the strength of its label.
+/// be anything somebody put in a config file. [`kind`](Self::kind) is a
+/// different string, `Hosted::agent`, answering a different question: not what
+/// to call this pane but which built-in is behind it. Two strings, two
+/// questions, and collapsing them would let a preset named "reviewer" acquire
+/// or lose Claude's readiness probe on the strength of its label.
+///
+/// **`Hosted::agent` is now here *and* still on [`App`], and that is a split
+/// rather than a duplicate.** This one is what *this child* is, and it is the
+/// whole of what the readiness probe and the background roster are gated on —
+/// both are questions about a pane, and a session-wide answer standing in front
+/// of them was the seam `docs/multi-agent.md` said it was leaving. [`App::agent`]
+/// is what the session was *started* to host, and its two remaining readers ask
+/// about the session on purpose. The two hold the same word in every session
+/// abeam can start today, because every pane is spawned from the session's own
+/// `Recipe`; `docs/mixed-agents.md` is the argument for the day they can
+/// disagree.
 struct Agent {
     /// This agent, named in a way that survives the list it is in changing
     /// length.
@@ -456,6 +465,33 @@ struct Agent {
     /// `crate::agentstate` — this is the only thing standing between a queued
     /// prompt and a permission dialog.
     probe: Probe,
+    /// Which built-in this pane is running, which decides whether the field
+    /// above is reading anything at all.
+    ///
+    /// `crate::agent::Hosted::agent`: the built-in a preset *resolves to*, so a
+    /// `[preset.fleet]` hosting Claude arrives here as `claude` whatever it was
+    /// called in the config file. [`is_claude`](Self::is_claude) is the one
+    /// question anything asks of it.
+    ///
+    /// **Written in [`Agent::new`] and never assigned afterwards**, which is
+    /// the rule [`root`](Self::root) is held to and for a weaker version of the
+    /// same reason. A pty was opened to run one program, that spawn is over,
+    /// and nothing abeam can do swaps the program inside a running child. The
+    /// rule is weaker because nothing *else* holds a copy of this to be
+    /// compared against — where a moving `root` would let a probe latch onto a
+    /// record it should have refused, a moving `kind` would only be a lie. It
+    /// is written down anyway, because "it never changes" is the sort of claim
+    /// that stops being true quietly, and because the field it stands beside
+    /// has the identical rule for a much sharper reason.
+    ///
+    /// **Not the border's word, and this is the pair the next reader will
+    /// collapse.** What is drawn is [`TerminalPane::title`], from
+    /// `Hosted::name` — the preset's own label, which may be anything somebody
+    /// put in a config file. `fleet` on the border and `claude` here is the
+    /// ordinary case rather than the odd one, and it is the whole reason there
+    /// are two strings: a pane must not acquire or lose Claude's readiness
+    /// probe on the strength of what its author chose to call it.
+    kind: String,
     /// The directory this pane was **spawned** in, which is not the same
     /// question as where its agent is working now.
     ///
@@ -730,7 +766,13 @@ impl Agent {
     /// accident; with a pane opened on a keystroke an hour later it would be
     /// wrong by exactly an hour, and the probe would settle on whichever record
     /// happened to be newer than a timestamp from startup.
-    fn new(pane: TerminalPane, root: PathBuf) -> Self {
+    ///
+    /// `kind` is the third of the three facts a spawn settles for ever — what
+    /// was started, where, and when — and it arrives as a parameter for the
+    /// same reason the other two do: there is one moment at which it is known
+    /// and this is it. See [`kind`](Self::kind) for why nothing may assign to
+    /// it afterwards.
+    fn new(pane: TerminalPane, root: PathBuf, kind: String) -> Self {
         let spawned_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -743,6 +785,7 @@ impl Agent {
             id: NEXT_AGENT_ID.fetch_add(1, atomic::Ordering::Relaxed),
             pane,
             probe,
+            kind,
             root,
             // Nothing has been read yet, and a pane that has just been spawned
             // is standing where it was spawned. The probe's first accepted
@@ -965,16 +1008,27 @@ impl Agent {
     ///
     /// **The three downgrades that were in [`App::poll_readiness`], moved here
     /// whole so that there is still one calculation.** They are per-pane facts
-    /// — this child's bracketed paste, this child's exit — and the border and
-    /// the queue must not reach them by two different routes; `poll_readiness`
-    /// now reads what this returns and hands `agents[0]`'s copy to the queue
-    /// unchanged.
+    /// — this child's bracketed paste, this child's exit, this child's kind —
+    /// and the border and the queue must not reach them by two different
+    /// routes; `poll_readiness` now reads what this returns and hands every
+    /// pane's copy to the queue unchanged.
     ///
-    /// `claude` is the session's, not the pane's: it is
-    /// [`App::has_claude_state`], which asks what kind of agent abeam is
-    /// hosting at all. The probe reads Claude's session records, and a record
-    /// in this repository is not evidence about a Codex or a Copilot hosted
-    /// beside it.
+    /// **The third one used to be the session's, and it took a parameter to be
+    /// it.** `claude: bool` was `App::has_claude_state` hoisted out of that
+    /// loop, because there was one answer for the window; it is
+    /// [`is_claude`](Self::is_claude) now, and asking it here rather than
+    /// taking it means no caller can hand one pane's answer to another. The
+    /// probe reads Claude's session records, and a record in this repository is
+    /// not evidence about a Codex or a Copilot hosted beside it — which was
+    /// always the argument, and only now says *beside* literally.
+    ///
+    /// **So a non-Claude pane's probe is never read, and that is safety by
+    /// construction rather than by care.** This returns before reaching it, so
+    /// such a pane cannot report a neighbouring Claude's `idle` as its own —
+    /// not because anything compares them, but because it never asks. The
+    /// sibling-disowning [`App::start_agent`] does stays exactly as necessary
+    /// as it was, and covers the case this cannot: two Claude panes in one
+    /// checkout.
     ///
     /// **The bracketed-paste condition is the one that reads oddly for a
     /// border**, and it is kept anyway. `Unknown` means "abeam cannot establish
@@ -1005,7 +1059,7 @@ impl Agent {
     /// reported `Idle` is a three-line prompt arriving as three submits. If a
     /// border ever wants a looser answer than the gate's, it needs a second
     /// function and its own argument — not a relaxation of this one.
-    fn send_readiness(&mut self, claude: bool) -> crate::agentstate::Readiness {
+    fn send_readiness(&mut self) -> crate::agentstate::Readiness {
         use crate::agentstate::Readiness;
         // A session that has gone cannot be typed at, and its last record can
         // sit at `idle` forever — a dead agent is the most convincingly idle
@@ -1019,10 +1073,32 @@ impl Agent {
         if !self.pane.bracketed_paste() {
             return Readiness::Unknown;
         }
-        if !claude {
+        // The probe searches for a record Claude writes about itself. Nothing
+        // else abeam can host writes one, so for anything else the search would
+        // be a walk that either finds nothing or finds a neighbour's.
+        if !self.is_claude() {
             return Readiness::Unknown;
         }
         self.probe.readiness()
+    }
+
+    /// Whether Claude's private session state describes *this* child.
+    ///
+    /// [`kind`](Self::kind) carries the built-in a preset resolves to, so a
+    /// Claude preset answers `true` here whatever its author called it; a
+    /// program named outright keeps its own spelling and must not acquire
+    /// Claude-only capabilities by resemblance. This one predicate gates both
+    /// consumers of that state: [`send_readiness`](Self::send_readiness), which
+    /// is interactive readiness and therefore the queue's send gate, and
+    /// [`App::roster_is_wanted`], which is the background-agent roster.
+    ///
+    /// It was [`App`]'s until phase 1 of `docs/mixed-agents.md` — the same
+    /// comparison against the same string, one field along. What moved is which
+    /// question it answers: not "is abeam hosting Claude" but "is this pane
+    /// Claude", and while every pane is spawned from the session's own `Recipe`
+    /// those are the same answer.
+    fn is_claude(&self) -> bool {
+        self.kind == "claude"
     }
 }
 
@@ -1424,26 +1500,33 @@ pub struct App {
     /// This is what git is asked about and what the watcher watches; that is
     /// where one child is standing.
     root: PathBuf,
-    /// The hosted agent's *kind*, for the same reason — and not the name on any
-    /// border.
+    /// The kind of agent abeam was *started* to host — and not the name on any
+    /// border, and no longer the kind of any particular pane.
     ///
     /// `crate::agent::Hosted::agent`: the built-in a preset resolves to, so a
     /// Claude preset arrives here as `claude` whatever it was called in the
-    /// config file. [`App::has_claude_state`] is what it decides — whether the
-    /// readiness probe and the background roster mean anything — and it is also
-    /// what each workspace's ask pane is built with. That makes it a fact about
-    /// the session rather than about a child, which is why it did not move into
-    /// [`Agent`] with the six that did. The word that appears in the border is
+    /// config file. The word that appears in the border is
     /// `TerminalPane::title`, from `Hosted::name`, and it is a different string
     /// on purpose.
     ///
-    /// **It is a session-wide answer gating a per-agent question, and that is
-    /// the seam to watch.** The probe `has_claude_state` stands in front of now
-    /// belongs to an [`Agent`]; this string does not. While every pane hosts
-    /// what abeam was started to host the two cannot disagree. A pane hosting a
-    /// *different* preset would need its kind carried beside
-    /// [`Agent::root`] — and every reader of this field re-read to ask whether
-    /// it wants the session's answer or that pane's.
+    /// **Two readers, and both are asking about the session.**
+    /// [`Space::new`] builds each workspace's ask pane with it, and
+    /// `crate::dispatch::Dispatcher::new` is handed it — once at construction,
+    /// through `QueuePane::new`, and again on the thread
+    /// [`pump_queue`](Self::pump_queue) spawns for a `--bg` run.
+    ///
+    /// **The seam this used to name has been taken, and what is left is a
+    /// decision rather than a compromise.** It said: a session-wide answer
+    /// gating a per-agent question. The per-agent questions were readiness and
+    /// the background roster, and both now ask [`Agent::kind`] — a pane at a
+    /// time, through [`Agent::is_claude`]. These two are session-wide because
+    /// each was argued to be, not because nothing had moved yet:
+    /// `docs/mixed-agents.md`'s "The ask pane keeps the session's answer" is
+    /// the first, and turns on the ask pane being per *workspace*, so that a
+    /// workspace holding two kinds of agent has no true answer to "which one is
+    /// this a second copy of"; "Dispatch keeps the session's answer too, for
+    /// now" is the second, and turns on the dispatcher being a capability the
+    /// queue has or has not rather than a predicate it evaluates.
     agent: String,
 }
 
@@ -1614,7 +1697,7 @@ impl App {
         // memoises what it finds, so the wrong answer is stable rather than a
         // flicker: a neighbour's `idle` reported as this agent's, and a queued
         // prompt typed at a busy composer on the strength of it.
-        let agent_pane = Agent::new(left, root.clone());
+        let agent_pane = Agent::new(left, root.clone(), agent.to_string());
         // Bounded and small: at most one roster refresh and one dispatch are
         // ever in flight, so anything deeper would be a queue nobody drains.
         let (work_tx, work_rx) = mpsc::sync_channel::<Work>(8);
@@ -2082,7 +2165,14 @@ impl App {
             }
         };
 
-        let mut agent = Agent::new(pane, root);
+        // The session's kind, because the session's [`Recipe`] is what this
+        // pane was spawned from: one `target`, one program, one answer. So
+        // [`App::agent`] is not being read here out of habit — it is where the
+        // kind of *the thing this recipe starts* is currently written down, and
+        // the recipe itself has no room for one. The day a keystroke can choose
+        // a different program is the day it needs one; that is phase 2 of
+        // `docs/mixed-agents.md`, and this line is what it has to change.
+        let mut agent = Agent::new(pane, root, self.agent.clone());
         // `None` only before [`App::run`], which no keystroke can be earlier
         // than — the loop that delivers keys is inside it. Said as a condition
         // rather than an `expect` because a test can reach this function
@@ -3158,7 +3248,7 @@ impl App {
     ///
     /// [`Agent::send_readiness`]'s three early returns are what keep the rest
     /// off this path — an exited child, a child with no bracketed paste, and a
-    /// session that is not Claude's never reach the probe at all, which is most
+    /// pane that is not Claude's never reach the probe at all, which is most
     /// of the ways a pane could search for ever.
     ///
     /// **The shape that would be bad, so it is recognisable if it appears:** N
@@ -3191,17 +3281,16 @@ impl App {
         }
         self.readiness_at = Instant::now();
 
-        // Asked once, of the session rather than of a pane: it is whether abeam
-        // is hosting Claude at all, which decides whether Claude's session
-        // records are evidence about *any* of these children. See
-        // [`has_claude_state`](Self::has_claude_state), and the note in the
-        // proposal about what it would take to make the agent per-pane.
-        let claude = self.has_claude_state();
         let mut redraw = false;
         let mut moved = false;
         for agent in self.agents.iter_mut() {
             let before = agent.readiness;
-            agent.readiness = agent.send_readiness(claude);
+            // **Whether Claude's records are evidence about *this* child is
+            // asked inside, once per pane.** It was hoisted out of this loop —
+            // one `has_claude_state` for the window — which was the same answer
+            // every time only because every pane hosts what abeam was started
+            // to host. See [`Agent::is_claude`].
+            agent.readiness = agent.send_readiness();
             // A border that has stopped saying `busy` is news, and this
             // function is the only thing that notices. Without it the row goes
             // on claiming the old answer until some other event happens to
@@ -3969,19 +4058,26 @@ impl App {
     /// which never uses a feature never starts it. See
     /// [`worktrees_wanted`](Self::worktrees_wanted) for why there are two
     /// reasons now and why neither replaced the other.
-    fn roster_is_wanted(&self) -> bool {
-        self.has_claude_state() && (self.dispatched_any || self.worktrees_wanted)
-    }
-
-    /// Whether Claude's private session state describes the hosted process.
     ///
-    /// `Hosted::agent` carries the built-in a preset resolves to, so a Claude
-    /// preset arrives here as `claude`; a program named outright keeps its own
-    /// spelling and must not acquire Claude-only capabilities by resemblance.
-    /// This one predicate gates both consumers of that state: interactive
-    /// readiness and the background-agent roster.
-    fn has_claude_state(&self) -> bool {
-        self.agent == "claude"
+    /// **`any` and not the session's own kind, and that is a behaviour change
+    /// rather than a refactor.** It was [`App::agent`] — one string, decided
+    /// before the first frame — so a session started under Codex never started
+    /// `claude agents --json` however many panes it opened. It is every pane
+    /// now, so a Codex session that opens a Claude pane and *then* opens the
+    /// worktree list starts a process that session would not have started
+    /// before, in a window where nobody typed the word `claude`.
+    ///
+    /// That is the right answer and it is worth saying why rather than
+    /// asserting it: the occupancy column names background Claude agents
+    /// working in this repository, and whether they are worth naming does not
+    /// depend on which program `agents[0]` happens to be. What the gate is
+    /// protecting is a session that never uses the feature, and a session
+    /// holding a Claude pane is not that session. The other half of the
+    /// condition is untouched, so the process still waits for somebody to ask
+    /// for a dispatch or open the list.
+    fn roster_is_wanted(&self) -> bool {
+        self.agents.iter().any(Agent::is_claude)
+            && (self.dispatched_any || self.worktrees_wanted)
     }
 
     /// The queue's two wires out, and the results of both coming back.
@@ -6458,9 +6554,12 @@ mod tests {
     /// A `Hosted` around one `Launch`, under the name every test in this file
     /// uses.
     ///
-    /// `claude`, because that is what [`App::has_claude_state`] gates the whole
-    /// readiness path on and the one test that wants a different answer sets
-    /// the field itself. The launch is what a pane opened later would be built
+    /// `claude`, because [`Agent::is_claude`] gates the whole readiness path on
+    /// it and every test here wants that path open. It reaches a pane through
+    /// [`Agent::kind`], which `App::new` writes from this field; the handful of
+    /// tests that want the other answer write that pane's `kind` afterwards,
+    /// exactly as the routing tests write a pane's `root`. The launch is what a
+    /// pane opened later would be built
     /// from, and [`unstarted`] is the default for the same reason it is the
     /// default for the ask panes: nothing here spawns a second agent unless it
     /// says so, and a fixture that resolved a real program would make every
@@ -6573,9 +6672,10 @@ mod tests {
         let (program, args) = EXITS;
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         let pane = TerminalPane::spawn(program, &args, 20, 60).expect("spawn a child in a pty");
+        let kind = fx.app.agent.clone();
         fx.app
             .agents
-            .push(Agent::new(pane, fx.dir.path().to_path_buf()));
+            .push(Agent::new(pane, fx.dir.path().to_path_buf(), kind));
     }
 
     /// The exit of a pane opened later is not abeam's exit, whatever the cursor
@@ -6724,9 +6824,10 @@ mod tests {
         let mut fx = app();
         let staying = asks_and_stays(&fx.dir);
         let pane = TerminalPane::spawn_with(staying).expect("a child in a pty");
+        let kind = fx.app.agent.clone();
         fx.app
             .agents
-            .push(Agent::new(pane, fx.dir.path().to_path_buf()));
+            .push(Agent::new(pane, fx.dir.path().to_path_buf(), kind));
 
         // Both children settled: the first has exited, and the second has said
         // everything it says at startup. Waiting on the mode rather than on a
@@ -10061,7 +10162,11 @@ mod tests {
         // dangerous answer: `Idle` is the only state that lets a send leave.
         let mut fx = app();
         let _records = records(&mut fx, "idle");
-        fx.app.agent = "codex".to_string();
+        // The *pane's* kind, which is what the gate reads. It was the
+        // session's, and the two were the same string; they still are in any
+        // session abeam can start, which is exactly why this has to be written
+        // where the answer is now read from rather than where it used to be.
+        fx.app.agents[0].kind = "codex".to_string();
         assert_eq!(fx.app.agents[0].probe.readiness(), Readiness::Idle);
 
         fx.app.queue.stub_item("never sent to codex", Mode::Send);
@@ -10092,6 +10197,90 @@ mod tests {
             take_send(&mut fx.app),
             None,
             "Codex produced a manually requested send"
+        );
+    }
+
+    /// The refusal above, asked of one pane in a window holding two.
+    ///
+    /// **The test the session-wide gate could not have.** While the answer was
+    /// [`App::agent`] there was nothing to disagree with: every pane in the
+    /// window got the same `Unknown` and the loop was a formality. Two panes,
+    /// two kinds, one repository and *identical evidence* is the arrangement
+    /// phase 1 of `docs/mixed-agents.md` exists to make expressible, and the
+    /// only thing that separates the two answers below is
+    /// [`Agent::kind`].
+    ///
+    /// The last assertion is the one that stops this passing for the wrong
+    /// reason: the Codex pane's probe is holding the same `idle` its neighbour
+    /// acted on, so what refused was the gate and not a search that failed.
+    #[test]
+    fn a_pane_that_is_not_claude_never_reads_a_session_record() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        // Both children alive and both asking for bracketed paste, because
+        // `Agent::send_readiness` refuses the probe without either — so a test
+        // that skipped this would get `Unknown` from the pane it is about and
+        // `Unknown` from the pane it is comparing against, and prove nothing.
+        stays_at(&mut fx, 0);
+        stays_at(&mut fx, 1);
+        // One records directory each, which is how `records_at` gives two
+        // probes one record: what separates two sessions here is the directory
+        // a probe is pointed at, and both are pointed at this root.
+        let _left = records_at(&mut fx, 0, "idle");
+        let _right = records_at(&mut fx, 1, "idle");
+        fx.app.agents[1].kind = "codex".to_string();
+
+        polled(&mut fx);
+
+        assert_eq!(
+            fx.app.agents[0].readiness,
+            Readiness::Idle,
+            "the Claude pane stopped reading the record it owns"
+        );
+        assert_eq!(
+            fx.app.agents[1].readiness,
+            Readiness::Unknown,
+            "a Codex pane reported the idle a Claude beside it wrote"
+        );
+        assert_eq!(
+            fx.app.agents[1].probe.readiness(),
+            Readiness::Idle,
+            "the record was unreadable anyway, so the gate was never what refused"
+        );
+    }
+
+    /// Every pane in every session abeam can start today is the session's kind,
+    /// which is the whole of phase 1's claim to change nothing anybody can see.
+    ///
+    /// **Both constructors, because there are two and only one of them is
+    /// obvious.** `App::new` writes the field from the `Hosted` that resolved
+    /// at startup. [`App::start_agent`] has no `Hosted` — it re-derives a launch
+    /// from [`Recipe`], which keeps a file and a border word and no kind at all
+    /// — so it takes the session's, and the day a keystroke can choose a
+    /// different program is the day that stops being right. Phase 2 of
+    /// `docs/mixed-agents.md` is where the recipe grows one.
+    ///
+    /// The border word is deliberately not `claude` here — `a_startable_recipe`
+    /// names it `shim` — so a kind quietly read off `Recipe::name` would fail
+    /// this rather than pass it by looking similar.
+    #[test]
+    fn a_pane_opened_on_a_keystroke_is_the_kind_the_session_hosts() {
+        let mut fx = app();
+        a_startable_recipe(&mut fx);
+        assert_eq!(
+            fx.app.agents[0].kind, fx.app.agent,
+            "the session's own pane disagrees with the session that built it"
+        );
+
+        assert!(fx.app.start_agent(fx.dir.path()), "nothing was started");
+        assert_eq!(fx.app.agents.len(), 2);
+        assert_eq!(
+            fx.app.agents[1].kind, fx.app.agent,
+            "a pane opened with `a` is a different kind from the one that opened it"
+        );
+        assert!(
+            fx.app.agents.iter().all(Agent::is_claude),
+            "two panes of one session answer the readiness gate differently"
         );
     }
 
@@ -12069,9 +12258,15 @@ mod tests {
         // Both reasons describe Claude-only state. A neighbouring Claude may
         // have records in this repository while another provider is hosted;
         // neither reason may turn those records into that provider's roster.
+        //
+        // Written at the pane rather than at the session, because that is where
+        // the gate reads now. The other half — one Claude pane in a window that
+        // was not started as one — is the half that changed behaviour, and is
+        // `a_claude_pane_makes_the_roster_wanted_whatever_the_session_was_started_as`
+        // below.
         for agent in ["codex", "copilot", "some-program"] {
             let mut fx = app();
-            fx.app.agent = agent.to_string();
+            fx.app.agents[0].kind = agent.to_string();
             fx.app.dispatched_any = true;
             fx.app.worktrees_wanted = true;
             assert!(
@@ -12079,6 +12274,54 @@ mod tests {
                 "Claude's roster was enabled while hosting {agent}"
             );
         }
+    }
+
+    /// The one thing phase 1 changes that a user could observe, pinned so that
+    /// it is a decision rather than a discovery.
+    ///
+    /// **A behaviour change and not a refactor.** The gate was the session's
+    /// kind, so a window started under Codex never started `claude agents
+    /// --json` however many Claude panes it came to hold. It is every pane now:
+    /// open a Claude pane in a Codex session, then open the worktree list, and
+    /// a process starts in a window where nobody typed the word.
+    ///
+    /// That is the right answer — the occupancy column names background Claude
+    /// agents working in this repository, and whether they are worth naming
+    /// does not depend on which program `agents[0]` happens to be — and it is
+    /// still a new invocation, which is why it is written down twice: here and
+    /// in `docs/mixed-agents.md`.
+    ///
+    /// Asserted through the predicate rather than by pumping, for the reason
+    /// the gate's own test gives above: opening it for real starts that
+    /// process, and no test in this crate starts an agent.
+    #[test]
+    fn a_claude_pane_makes_the_roster_wanted_whatever_the_session_was_started_as() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        // Both written rather than one inherited, so this says which pane is
+        // which kind instead of resting on what the fixture happens to host.
+        fx.app.agents[0].kind = "codex".to_string();
+        fx.app.agents[1].kind = "claude".to_string();
+        fx.app.worktrees_wanted = true;
+
+        assert!(
+            fx.app.roster_is_wanted(),
+            "a Claude pane on screen does not count, so the occupancy column \
+             has nothing to fill itself from"
+        );
+
+        // And it really is the pane and not the session: nothing above touched
+        // `App::agent`, which still says what abeam was started to host.
+        assert_eq!(fx.app.agent, "claude");
+
+        // The other reason is untouched. A Claude pane is not on its own enough
+        // — a session that has neither dispatched nor opened the list still
+        // never starts the process.
+        fx.app.worktrees_wanted = false;
+        assert!(
+            !fx.app.roster_is_wanted(),
+            "a Claude pane started the roster with nothing asking for it"
+        );
     }
 
     // --- pointing the right pane somewhere else ----------------------------
