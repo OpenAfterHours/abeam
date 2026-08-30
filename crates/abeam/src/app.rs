@@ -519,6 +519,55 @@ struct Agent {
     /// for `agents[0]` alone would re-arm exactly the failure two paragraphs
     /// up.
     draft_open: bool,
+    /// The draft at this pane was typed while the agent was **not idle**, so
+    /// the next `Busy` reading is not evidence that it was submitted.
+    ///
+    /// ## The bug this exists to close, which is a level test where an edge
+    /// test was meant
+    ///
+    /// [`draft_open`](Self::draft_open) is cleared by *watching the agent go
+    /// busy*, because a message that was really submitted makes the agent work
+    /// and an accepted autocomplete does not. That is an edge, and the code
+    /// tested a level: `readiness == Busy && draft_open` fires whenever both
+    /// happen to be true, not when a turn *starts*. Claude takes typing while
+    /// it is working — you can queue a follow-up in its composer mid-turn — so
+    /// the order that breaks it is ordinary rather than exotic: type into a
+    /// busy agent's composer without submitting, the poll sees both conditions
+    /// inside a quarter second and clears the flag, the agent finishes and goes
+    /// `Idle`, and the queue pastes a prompt on top of a sentence somebody was
+    /// still writing. Condition 3 defeated, by a route none of the
+    /// `Enter`-and-autocomplete reasoning above covers.
+    ///
+    /// This is the missing half of the edge. A draft opened while the agent was
+    /// idle may be cleared by the next `Busy`; a draft opened at any other
+    /// moment latches, and the latch is released only by observing the agent
+    /// *not* busy — the turn it was typed into having ended — after which the
+    /// next `Busy` is a new turn and is evidence again.
+    ///
+    /// **`!= Idle` and not `== Busy`, deliberately.** `Waiting` is a permission
+    /// dialog: answering it makes the agent work, and that `Busy` is the dialog
+    /// being answered rather than a draft being submitted. `Unknown` is abeam
+    /// not knowing, which is never evidence of anything.
+    ///
+    /// ## Which way it fails, which is the whole justification
+    ///
+    /// **No rule survives a turn that begins and ends inside one 250 ms
+    /// window**, because the poll simply does not see it, so the only question
+    /// is which way to be wrong. The level test fails **unsafe** — a prompt
+    /// spliced into a half-written message, silently. The edge test fails
+    /// **safe**: the latch is held over a turn abeam missed, that pane's queue
+    /// stalls, `QueuePane::foot_line` says `· you are typing`, and one submit
+    /// at that agent clears it. Take the stall.
+    ///
+    /// A narrower residual survives and is worth naming rather than leaving to
+    /// be found: this reads the *last polled* readiness, so a keystroke landing
+    /// in the quarter second after a turn started but before abeam noticed sets
+    /// no latch, and the next `Busy` clears the draft. That is the same
+    /// unsafe failure as before, narrowed from "any moment both are true" to
+    /// one 250 ms window at the start of a turn. If it ever proves to matter,
+    /// the honest fixes are a faster poll or a turn counter in the record —
+    /// not a looser clear.
+    draft_mid_turn: bool,
     /// A sent prompt is sitting in this agent's composer, waiting for the
     /// `Enter` that submits it on the next pass. See [`App::pump_queue`].
     ///
@@ -646,6 +695,7 @@ impl Agent {
             probe,
             root,
             draft_open: false,
+            draft_mid_turn: false,
             submit_pending: false,
             exit: None,
             // Nothing has been read yet, and `Unknown` is what "abeam cannot
@@ -657,6 +707,25 @@ impl Agent {
             inner: Rect::ZERO,
             outer: Rect::ZERO,
         }
+    }
+
+    /// Somebody has put text in this agent's composer that they have not
+    /// submitted.
+    ///
+    /// **One function for the three sites that can do it**, so that the latch
+    /// cannot be set at two of them and forgotten at the third — which is
+    /// exactly the shape the guard on those three sites had before phase 4, and
+    /// exactly the shape that made one of them a permanent silent stall. See
+    /// [`draft_mid_turn`](Self::draft_mid_turn) for what the latch is and which
+    /// way it fails.
+    ///
+    /// `|=` rather than `=`, so a second keystroke at an agent that has since
+    /// gone idle cannot release a latch the first one set. The latch is
+    /// released by observing the agent *not busy*, in
+    /// [`App::poll_readiness`], and by nothing else.
+    fn open_draft(&mut self) {
+        self.draft_open = true;
+        self.draft_mid_turn |= self.readiness != crate::agentstate::Readiness::Idle;
     }
 
     /// Let this agent's output ring the loop's doorbell.
@@ -1049,6 +1118,33 @@ pub struct App {
     /// Cleared by the next key, wherever it goes, exactly as `pending_quit` is
     /// — and by a mouse press, for the same reason.
     pending_close: Option<u64>,
+    /// The agent whose kill confirmation the **last frame actually painted**,
+    /// legibly, on that agent's own border.
+    ///
+    /// **A confirmation a fast typist can skip is not a confirmation, and this
+    /// is the only irreversible thing in the program.** Without it two `x`es
+    /// arriving in one input batch end a running agent with the prompt never
+    /// having been on screen: [`drive`](Self::drive) drains every queued event
+    /// before it calls [`pump`](Self::pump), so the arm and the answer are
+    /// consumed with no frame between them. Key repeat, a fast double tap and a
+    /// pasted `xx` all produce it.
+    ///
+    /// So the rule is *drawn*, not *recorded*: [`ui`](Self::ui) writes this
+    /// only where it appends the words, and only when they will be visible —
+    /// the pane has rows, and the prompt fits in front of whatever else leads
+    /// that border. Both halves are reachable. A window with fewer rows than
+    /// agents gives some panes a height of zero and `crate::layout::stack`
+    /// paints nothing into them; and a countdown leads the same slot, so a
+    /// narrow column can spend the line on it. A `pump` that finds no match
+    /// puts the question back rather than refusing outright, which turns the
+    /// skipped press into the first one and is what the reader meant.
+    ///
+    /// **Not the same question as [`pending_close`](Self::pending_close)**,
+    /// which needs none of this: it is armed at the pane by a key that only
+    /// reaches a pane whose child has exited, and the *next* keystroke clears
+    /// it, so two `x`es in one batch there close a frozen screen — which is
+    /// what the reader asked for and is not irreversible in the same way.
+    close_drawn: Option<u64>,
     /// Whichever pane owned the last mouse press keeps drag and motion events
     /// even once the pointer leaves it. Without this, dragging a selection in
     /// the agent and crossing the divider silently retargets mid-gesture.
@@ -1449,6 +1545,7 @@ impl App {
             literal_next: false,
             pending_quit: false,
             pending_close: None,
+            close_drawn: None,
             mouse_owner: None,
             select: None,
             select_took_focus: false,
@@ -1941,11 +2038,29 @@ impl App {
             return Err(why);
         }
 
+        // **What this pane's probe settled on, taken before the pane goes,
+        // because after it there is nothing left to ask.** A record's lifetime
+        // is Claude's rather than abeam's — a killed child does not tidy up —
+        // so the file can outlive the pane with `status` frozen at whatever it
+        // was, and the *next* agent started in that worktree adopts it through
+        // `Probe::search`'s clock-skew fallback and is told a dead session's
+        // `idle`. `Idle` is the one answer that lets a queued prompt be typed.
+        // `crate::agentstate::Probe::found_session_id` carries the walked
+        // argument and the gap it leaves.
+        let orphaned_record = self.agents[ix].probe.found_session_id().map(str::to_string);
+
         // Remembered before the removal and looked up again after it, for the
         // reason in this function's own doc: an index does not survive the list
         // it points into changing length.
         let keeping = self.current().id;
         self.agents.remove(ix);
+        // After the removal, so the pane being destroyed is not among the
+        // probes told — it has no more questions to answer — and so that
+        // `disowned` carries it for every pane opened later, which is the half
+        // [`disown`](Self::disown) exists to keep.
+        if let Some(id) = orphaned_record {
+            self.disown(id);
+        }
         let to = self
             .agents
             .iter()
@@ -2012,9 +2127,11 @@ impl App {
         // abeam's status code, and `sync_workspaces` refuses the analogous
         // `spaces[0]` for the analogous reason — there would be nothing to fall
         // back to.
+        // The action last, for [`App::ui`]'s elision: what survives a narrow
+        // border is `Alt+Q is the way out`, which is the half a reader can
+        // press.
         (ix == 0).then(|| {
-            "the agent abeam was started with is the session, and closing it is \
-             leaving: its exit is what abeam exits with. Alt+Q is the way out."
+            "that pane is the session — its exit is abeam's. Alt+Q is the way out."
                 .to_string()
         })
     }
@@ -2055,26 +2172,36 @@ impl App {
         // The label is built inside the arms that use it rather than above the
         // match: this runs on every frame while a question stands, and the
         // answer it usually gives has no sentence in it.
-        let ix = match here.as_slice() {
-            [] => {
-                let label = workspace::dir_label(root);
-                return Err(format!(
-                    "no agent of abeam's is standing in {label}. `a` starts one there."
-                ));
+        match here.as_slice() {
+            [] => Err(format!(
+                "no agent here. `a` starts one in {}.",
+                workspace::dir_label(root)
+            )),
+            // **`cannot_close` is asked before the ambiguity, and the order was
+            // the other way round and wrong.** With the session's own agent and
+            // one other in the same checkout — which is what pressing `a` on
+            // the row you started in produces — a cursor sitting on `agents[0]`
+            // resolved the ambiguity to `agents[0]` and then refused with "the
+            // agent abeam was started with is the session". True, and not the
+            // reader's problem: they have two panes there and needed to be told
+            // to point at the other one. Asking the refusal first answers about
+            // the pane that was named; asking it last answers about the pane
+            // the tie-break happened to pick.
+            [only] => match self.cannot_close(*only) {
+                Some(why) => Err(why),
+                None => Ok(self.agents[*only].id),
+            },
+            several if several.contains(&self.at_agent) => {
+                match self.cannot_close(self.at_agent) {
+                    // Not the session's refusal, which would be an answer about
+                    // the wrong half of the problem: the cursor is on a pane
+                    // that cannot be closed *and* there is another one standing
+                    // there, so what the reader needs is the second sentence.
+                    Some(_) => Err(ambiguous(several.len(), root)),
+                    None => Ok(self.agents[self.at_agent].id),
+                }
             }
-            [only] => *only,
-            several if several.contains(&self.at_agent) => self.at_agent,
-            several => {
-                let (n, label) = (several.len(), workspace::dir_label(root));
-                return Err(format!(
-                    "{n} agents are standing in {label} and this list cannot tell them \
-                     apart. F4 to the one you mean, then press x here."
-                ));
-            }
-        };
-        match self.cannot_close(ix) {
-            Some(why) => Err(why),
-            None => Ok(self.agents[ix].id),
+            several => Err(ambiguous(several.len(), root)),
         }
     }
 
@@ -2846,9 +2973,27 @@ impl App {
         // silently and for the rest of the session. The rule that field states
         // is met here and nowhere else: whatever polls a pane's record is what
         // may clear that pane's draft, and this loop polls all of them.
+        //
+        // **The condition is an edge and not a level, which is the whole of
+        // what [`Agent::draft_mid_turn`] buys.** `Busy && draft_open` fires
+        // whenever both happen to be true, and Claude takes typing while it is
+        // working — so a follow-up typed into a mid-turn composer was cleared
+        // by the first poll that saw it, and the queue then pasted on top of a
+        // sentence somebody was still writing. What clears a draft is *this
+        // turn started after you typed*, which is the latch, and the latch is
+        // released by seeing the agent stop.
         for agent in &mut self.agents {
-            if agent.readiness == crate::agentstate::Readiness::Busy && agent.draft_open {
-                agent.draft_open = false;
+            if agent.readiness == crate::agentstate::Readiness::Busy {
+                if !agent.draft_mid_turn {
+                    agent.draft_open = false;
+                }
+            } else {
+                // The turn the draft was typed into has ended, so the next
+                // `Busy` is a new one and is evidence again. Released whatever
+                // the non-busy answer is: `Idle`, `Waiting` and `Unknown` are
+                // all "not the turn that was running", which is the only thing
+                // the latch is about.
+                agent.draft_mid_turn = false;
             }
         }
 
@@ -2863,10 +3008,17 @@ impl App {
     ///
     /// This only ever *sets* the flag. Clearing it is
     /// [`poll_readiness`](Self::poll_readiness)'s job and happens on one event:
-    /// the agent being observed **busy**. That asymmetry is the whole design,
-    /// and it replaced a version that tried to infer a submit from the keystroke
-    /// — which cannot be done, because the keystroke that submits and the
-    /// keystroke that does not are the same key.
+    /// the agent being observed to **start working after you typed**. That
+    /// asymmetry is the whole design, and it replaced a version that tried to
+    /// infer a submit from the keystroke — which cannot be done, because the
+    /// keystroke that submits and the keystroke that does not are the same key.
+    ///
+    /// **"After you typed" is load-bearing and was missing.** For a while the
+    /// condition was simply *the agent is busy*, which is true of a turn that
+    /// was already running when the keystroke landed — and Claude takes typing
+    /// mid-turn, so that cleared a live draft within a quarter second of it
+    /// being started. [`Agent::draft_mid_turn`] is the latch that makes this an
+    /// edge, and [`Agent::open_draft`] is why all three sites set it.
     ///
     /// `Enter` is the case that proves it. A bare `Enter` submits, *except* when
     /// Claude's inline autocomplete has a completion open, where it accepts the
@@ -2878,7 +3030,7 @@ impl App {
     /// same bug. Modifiers do not separate them: `Shift+Enter` inserts a
     /// newline here and `Alt+Enter` is Copilot's only newline.
     ///
-    /// Waiting to see the agent *busy* asks a question that has one answer. A
+    /// Waiting to see the agent *start* asks a question that has one answer. A
     /// message that was really submitted makes the agent work; an accepted
     /// completion does not.
     ///
@@ -2905,7 +3057,7 @@ impl App {
                 | KeyCode::Down
         );
         if typing {
-            self.current_mut().draft_open = true;
+            self.current_mut().open_draft();
             // **Told whichever pane the key went to, which is the change phase
             // 4 made here.** It used to tell the queue only about `agents[0]`,
             // because that was the only composer a send could be spliced into;
@@ -3047,8 +3199,21 @@ impl App {
         // what a request left sitting fires late is the end of a running
         // session.
         if let Some(root) = self.git.take_close_request() {
-            match self.agent_in(&root).and_then(|id| self.close_agent(id)) {
-                Ok(()) => {}
+            match self.agent_in(&root) {
+                // **The answer arrived before the question was on screen**, so
+                // it is not an answer. See [`close_drawn`](Self::close_drawn):
+                // two `x`es in one input batch reach here with no frame drawn
+                // between them, and a confirmation a fast typist can skip is
+                // not one. The press becomes the first press rather than
+                // nothing, so the next frame carries the words and the next `x`
+                // is answered in front of them — which is what the reader
+                // meant, one press later.
+                Ok(id) if self.close_drawn != Some(id) => self.git.ask_close(root),
+                Ok(id) => {
+                    if let Err(why) = self.close_agent(id) {
+                        self.agent_refused = Some(why);
+                    }
+                }
                 // Reachable between the two presses — the cursor moved, or the
                 // pane went — and the sentence is the same one the first press
                 // would have refused with.
@@ -3621,6 +3786,15 @@ impl App {
         // refusal that arrives afterwards is a queue reading `✓` over a prompt
         // no pty received.
         //
+        // **`has_exited` is the one of the three that is reachable**, and it is
+        // reachable through the gate rather than around it. `poll_readiness`
+        // runs four times a second; a child that leaves inside the quarter
+        // second before a due elapses is still `Idle` to the queue, and
+        // `bracketed_paste` reads the *parser*, which keeps whatever the child
+        // last set — so a dead pty answers `true` to both of the other two
+        // questions here. Without this the write goes to a closed pty, fails,
+        // and the row reads `✓ sent` over a prompt that is simply gone.
+        //
         // The bracketed-paste half is unreachable in practice —
         // `Agent::send_readiness` downgrades a pane without the mode to
         // `Unknown`, and `Unknown` never passes the gate — and is kept because
@@ -3632,15 +3806,27 @@ impl App {
         let taken = self.queue.take_send_request(|target| {
             let ix = agents.iter().position(|agent| agent.id == target)?;
             let agent = &agents[ix];
-            (!owed.contains(&target) && agent.pane.bracketed_paste()).then_some(ix)
+            let deliverable = !owed.contains(&target)
+                && !agent.pane.has_exited()
+                && agent.pane.bracketed_paste();
+            deliverable.then_some(ix)
         });
         if let Some((ix, text)) = taken {
             // The `Enter` is armed only by a write that actually succeeded. A
             // pty that refused the paste and then got a bare `\r` would submit
             // whatever the user had in the composer, which is a stray keystroke
             // abeam invented out of its own failure.
-            let sent = self.agents[ix].pane.send_text(&text).is_ok();
-            self.agents[ix].submit_pending = sent;
+            //
+            // **And the failure goes back to the pane**, which is the half this
+            // used to throw away with an `is_ok()`. The item is marked `Sent`
+            // on the way out — that is what stops it being handed over twice —
+            // so a caller that cannot deliver has to say so, or the row is a
+            // receipt for something that never happened. See
+            // `QueuePane::note_send_failed`.
+            match self.agents[ix].pane.send_text(&text) {
+                Ok(()) => self.agents[ix].submit_pending = true,
+                Err(why) => self.queue.note_send_failed(format!("{why:#}")),
+            }
             redraw = true;
         }
 
@@ -3836,7 +4022,7 @@ impl App {
                         // and reaches the queue's gate the same way — see
                         // [`note_left_key`](Self::note_left_key), where the
                         // argument is written.
-                        self.current_mut().draft_open = true;
+                        self.current_mut().open_draft();
                         self.sync_queue_targets();
                         self.current_mut().pane.handle_paste(&text)?
                     }
@@ -3846,14 +4032,19 @@ impl App {
                 // concerned: "any other key cancels it" has to include the ones
                 // that do not arrive as keys, or Alt+Q, paste, Alt+Q quits.
                 //
-                // **Both confirmations, which is what the line above was
+                // **All three confirmations, which is what the line above was
                 // missing.** `pending_close` is the same mechanism one pane
                 // down and it is the more expensive one to leave armed: `x`,
                 // paste, `x` would close a pane across a gesture that had
                 // nothing to do with it, and unlike the quit there is no second
-                // chance afterwards.
+                // chance afterwards. The worktree list's is the same argument
+                // again and one step worse, because the pane it would destroy
+                // can still be running — a paste is not a small keystroke
+                // either, and a reader who has just pasted is a reader doing
+                // something else.
                 self.pending_quit = false;
                 self.pending_close = None;
+                self.git.cancel_close();
                 Ok(Flow::Continue {
                     redraw: handled.is_yes(),
                 })
@@ -4440,7 +4631,7 @@ impl App {
                 // draft, so a flag set here is a flag something will clear: the
                 // condition the guard was standing in for is met by the code
                 // rather than by the call site.
-                self.current_mut().draft_open = true;
+                self.current_mut().open_draft();
                 self.sync_queue_targets();
                 self.select = None;
                 self.set_focus(Focus::Left);
@@ -4634,6 +4825,9 @@ impl App {
             // something else, and a confirmation that survives it is one they
             // are no longer looking at.
             self.pending_close = None;
+            // ...and the worktree list's, which is the same rule again about
+            // the one question that can end a running agent.
+            self.git.cancel_close();
         }
 
         match target {
@@ -4789,20 +4983,23 @@ impl App {
         // still be clipped off the end of it by a long pane name. See where
         // `due` is built.
         //
-        // **Which facts belong on which border, and now there are several.**
-        // Four things below are the *session's* and not any pane's: the pending
-        // quit, a spawn that refused, why abeam is still up after the session's
-        // agent left, and the queue's countdown — which is literally about
-        // `agents[0]`, since that is the pane the queue types into. They go on
-        // `agents[0]`'s border and nowhere else. What is the pane's — its name,
-        // its position in the list, whether it is working, the root it is
-        // standing in — is built per pane in the loop below.
+        // **Which facts belong on which border, and there are three kinds.**
+        // The *session's* go on `agents[0]`'s and nowhere else: the pending
+        // quit, a spawn or a close that refused, and why abeam is still up
+        // after the session's agent left. The *pane's* — its name, its position
+        // in the list, whether it is working, the root it is standing in — are
+        // built per pane in the loop below. And the queue's countdown is a
+        // third thing: it belongs to whichever pane the item names, which is
+        // neither of the other two rules.
         //
-        // That is what repays the cost phase 2 booked: with one border drawn,
-        // the countdown was attached to whichever pane the cursor happened to
-        // be on rather than to the pane the send was going to. Drawing
-        // `agents[0]`'s border alongside everybody else's is the whole of the
-        // fix, and it is the reason the stack is where that debt was owed. See
+        // **That third kind is phase 4's correction to this paragraph**, which
+        // used to count the countdown among the session's four "since
+        // `agents[0]` is the pane the queue types into". That was true of phase
+        // 2's aiming and is false twenty lines below, where `due_at` looks the
+        // target up. What phase 3 fixed and this keeps is the *cost* phase 2
+        // booked — with one border drawn, the announcement was attached to
+        // whichever pane the cursor happened to be on — and drawing every
+        // border at once is what made a per-item answer expressible at all. See
         // [`App::pump_queue`].
         let state = if self.pending_quit {
             Some("Alt+Q again to quit".to_string())
@@ -4974,30 +5171,50 @@ impl App {
             // This part's own separator, and the space the title closes with.
             let budget = width.saturating_sub(spent + SEPARATOR + 1);
             // **Elided from the left, which is the opposite of everything else
-            // in this border and is the right way round for this one string.**
-            // `crate::launch`'s answer is `` `<absolute path>` was not found on
-            // PATH. `` — the path is the long half and the verdict is the half
-            // worth the columns, so clipping from the right would leave a
-            // truncated path and no sentence. That shape is the only one that
-            // can arrive here: everything else `crate::launch` refuses — a
-            // `.ps1`, an extension it will not route, a command line past
-            // `cmd`'s limit — was decided about this same file at startup and
-            // succeeded, and none of those answers changes while abeam runs.
-            // What changes mid-session is that the file has gone.
+            // in this border, and every writer is now shaped for it.** The
+            // first one was `crate::launch`'s `` `<absolute path>` was not
+            // found on PATH. `` — the path is the long half and the verdict is
+            // the half worth the columns, so clipping from the right would
+            // leave a truncated path and no sentence.
+            //
+            // **Phase 4 gave this slot four more writers, and that is what the
+            // paragraph here used to get wrong.** It said the launch shape was
+            // "the only one that can arrive here", which was true when
+            // `App::start_agent` was the only path that could refuse; `x` in
+            // the worktree list added `App::agent_in`'s three answers and
+            // `App::close_agent`'s. So the rule is stated as a rule rather than
+            // an observation: **whatever is written into `agent_refused` puts
+            // the part a reader can act on at the end**, because that is the
+            // half a narrow window keeps. `agent_in` and `cannot_close` are
+            // written that way on purpose — `` `a` starts one ``, `` then x ``,
+            // `` Alt+Q is the way out ``.
             //
             // Below the floor the sentence is *replaced* rather than shortened
             // further, because an elision that has run out of room says less
             // than nothing — a `…` and four characters of a path is a border
-            // that has failed twice. What is left then is the only thing that
-            // still fits and is still true.
+            // that has failed twice.
+            //
+            // **What replaces it says only what is true of every writer**, and
+            // the string it replaces did not: `no agent started` described one
+            // of the five, so pressing `x` on the session's own row at eighty
+            // columns printed it on the border of a visibly running agent.
+            // Nothing survives at this width except that abeam declined and
+            // will not say why here; the word is first because *this* string is
+            // clipped from the right by the border, and `refused` is what has
+            // to survive.
             if budget >= REFUSAL_FLOOR {
                 crate::text::elide_left(why, budget)
             } else {
-                "no agent started".to_string()
+                "refused · widen to see why".to_string()
             }
         });
 
         let session = [state, refusal, door, queued];
+        // Cleared before the loop and written only where the words go, so this
+        // describes the frame about to go out rather than any frame. See
+        // [`close_drawn`](Self::close_drawn): the second `x` is answered
+        // against what a reader could actually have seen.
+        self.close_drawn = None;
         for (ix, outer) in rects.into_iter().enumerate() {
             let mut title = String::new();
             // **In front of everything, the pane's own name included.** See
@@ -5069,11 +5286,24 @@ impl App {
             // `x` in a list is two presses on a key with no memory of what it
             // destroyed.
             if closing == Some(ix) {
-                title.push_str(if self.agents[ix].pane.has_exited() {
+                let prompt = if self.agents[ix].pane.has_exited() {
                     " x again to close this pane ·"
                 } else {
                     " x again to kill this running agent ·"
-                });
+                };
+                // **Measured against the border that will draw it, and this is
+                // the whole of S3 and S4.** A rect with no rows paints nothing,
+                // and a title longer than its border is clipped from the right
+                // — where a countdown leading the same slot is what takes the
+                // columns. Either way the words are not on screen, and a second
+                // `x` answered against a prompt nobody saw is a kill with no
+                // confirmation in front of it. `title` at this point holds
+                // exactly what precedes the prompt.
+                let room = abeam_layout::inner(outer).width as usize;
+                if outer.height > 0 && title.width() + prompt.width() <= room {
+                    self.close_drawn = Some(self.agents[ix].id);
+                }
+                title.push_str(prompt);
             } else if self.pending_close == Some(self.agents[ix].id) {
                 title.push_str(" x again to close ·");
             }
@@ -5649,6 +5879,30 @@ fn plural(n: u16) -> &'static str {
 /// [`App::agent_tag`] follows throughout: say the thing that is news, and spend
 /// no columns on the absence of it. An exited pane is the case that proves it,
 /// because `TerminalPane::title` has already said `exited` in the same row.
+/// What `x` on a worktree row says when more than one agent is standing there.
+///
+/// **A free function because two arms of [`App::agent_in`] give it**, and one
+/// wording that drifts into two is the shape of thing a border cannot be
+/// audited for.
+///
+/// **It names the whole path, which is five keystrokes and not one.** The first
+/// version said "F4 to the one you mean, then press x here", which reads as one
+/// key and is not: the keys are in the right pane, so `F4` gives them to the
+/// left column, a *second* `F4` moves the agent cursor, `F5` brings them back,
+/// and then `x` twice. A message that undercounts the path by four presses is a
+/// message that gets pressed once and abandoned. The test that covered this
+/// never noticed, because it calls `set_focus` and `git.handle_key` directly
+/// and so never walks the path a hand walks.
+///
+/// **The action is last, because the border elides this from the left.** See
+/// [`App::ui`], where the elision is chosen for `crate::launch`'s shape; a
+/// sentence that keeps its verb at the end survives a narrow window with the
+/// half a reader can act on.
+fn ambiguous(n: usize, root: &Path) -> String {
+    let label = workspace::dir_label(root);
+    format!("{n} agents in {label}; F4 F4 to pick one, F5 back, then x")
+}
+
 fn readiness_word(readiness: crate::agentstate::Readiness) -> Option<&'static str> {
     match readiness {
         crate::agentstate::Readiness::Idle => Some("idle"),
@@ -6840,6 +7094,63 @@ mod tests {
         assert!(!fx.app.agents[0].submit_pending);
     }
 
+    /// A draft typed into a mid-turn composer survives the turn it was typed
+    /// into.
+    ///
+    /// **The failing order the level test never met.** `Busy && draft_open`
+    /// is true of a turn that was already running when the keystroke landed,
+    /// and Claude takes typing while it works — so the poll cleared a live
+    /// draft within a quarter second of it being started, the agent finished,
+    /// and the queue pasted on top of a sentence somebody was still writing.
+    /// Condition 3 defeated by an ordinary sequence.
+    ///
+    /// Every existing test of this flag types at an **idle** agent, which is
+    /// the order that works; this is the other one. The last third is the
+    /// control, and it is what stops this passing against a clear that has
+    /// simply been deleted.
+    #[test]
+    fn a_draft_typed_into_a_working_agent_outlives_the_turn_it_was_typed_into() {
+        let mut fx = app();
+        let records = records(&mut fx, "busy");
+        stays(&mut fx);
+        polled(&mut fx);
+        assert_eq!(fx.app.agents[0].readiness, Readiness::Busy);
+
+        // Typed mid-turn, which Claude allows and which nothing here may read
+        // as a submit.
+        fx.app.note_left_key(&key(KeyCode::Char('h')));
+        assert!(fx.app.agents[0].draft_open);
+        polled(&mut fx);
+        assert!(
+            fx.app.agents[0].draft_open,
+            "the turn that was already running was read as this draft's submit"
+        );
+
+        // The turn ends. The draft is still in the composer — nothing was
+        // submitted — and the latch is released, so the *next* turn is evidence
+        // again.
+        say(&records, fx.dir.path(), "idle");
+        polled(&mut fx);
+        assert!(
+            fx.app.agents[0].draft_open,
+            "an idle agent ended a draft nobody submitted"
+        );
+        assert!(
+            fx.app.queue.is_draft_open(fx.app.agents[0].id),
+            "the gate does not know about the draft that is still there"
+        );
+
+        // The control: the user submits, the agent starts again, and that turn
+        // *is* the evidence.
+        say(&records, fx.dir.path(), "busy");
+        polled(&mut fx);
+        assert!(
+            !fx.app.agents[0].draft_open,
+            "a turn that started after the draft did not end it, so the flag \
+             can never be cleared at all"
+        );
+    }
+
     /// A prompt written before the first readiness poll is still aimed at the
     /// session's agent.
     ///
@@ -6874,6 +7185,133 @@ mod tests {
             vec![crate::panes::queue::ItemState::Pending],
             "the queue could not name the session's own agent, so a prompt \
              written before the first poll disarmed itself"
+        );
+    }
+
+    /// A send to a pane whose child has gone is not reported as sent.
+    ///
+    /// **The narrow window that reaches it, and it is a real one.**
+    /// `poll_readiness` runs four times a second, so a child that leaves inside
+    /// the quarter second before a due elapses is still `Idle` to the gate; and
+    /// `bracketed_paste` reads the *parser*, which keeps whatever the child
+    /// last set, so a dead pty answers `true` to that too. Without the
+    /// `has_exited` veto the write goes to a closed pty and fails — and the row
+    /// said `✓ sent` over a prompt that is simply gone, because
+    /// `take_send_request` marks the item on the way out and the shell threw
+    /// the write's answer away.
+    ///
+    /// Both halves are asserted: the item does not go, and it does not read as
+    /// having gone.
+    #[test]
+    fn a_send_to_a_pane_that_has_just_died_is_neither_typed_nor_reported_sent() {
+        let mut fx = app();
+        let _records = records(&mut fx, "idle");
+        stays(&mut fx);
+        polled(&mut fx);
+        assert_eq!(fx.app.agents[0].readiness, Readiness::Idle);
+        assert!(fx.app.agents[0].pane.bracketed_paste());
+
+        fx.app.queue.stub_item("written-for-a-dying-pane", Mode::Send);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
+
+        // The child goes, and nothing has polled since — which is the state a
+        // real session is in for up to a quarter second after any exit.
+        fx.app.agents[0].pane = TerminalPane::spawn_with(asks_and_goes(&fx.dir))
+            .expect("a child in a pty");
+        until("the replacement child to leave", || {
+            fx.app.reap().expect("try_wait on a child that exists");
+            fx.app.agents[0].pane.has_exited()
+        });
+        assert_eq!(
+            fx.app.agents[0].readiness,
+            Readiness::Idle,
+            "the poll has already noticed, so the window under test is closed"
+        );
+
+        fx.app.pump_queue();
+        assert!(
+            !fx.app.agents[0].submit_pending,
+            "an `Enter` is owed to a pty that has gone"
+        );
+        assert_eq!(
+            fx.app.queue.states(),
+            vec![crate::panes::queue::ItemState::Pending],
+            "the queue reported a prompt sent into a closed pty"
+        );
+    }
+
+    /// One agent stuck on a permission dialog does not hold up another agent's
+    /// prompts.
+    ///
+    /// **Head-of-line blocking across targets, which is the shape a per-item
+    /// target introduces and nothing else in this file would have caught.**
+    /// The queue took the first pending `Send` whatever it named, so a pane
+    /// sitting on an unanswered dialog — `Readiness::Waiting`, which never
+    /// passes the gate — parked itself at the head and every prompt written
+    /// afterwards waited behind it, for as long as nobody went and answered it.
+    ///
+    /// The second half is the property the skip must not cost: order *within* a
+    /// conversation. Two items for the surviving pane go in the order they were
+    /// written, not the order the walk happened to reach them.
+    #[test]
+    fn an_agent_waiting_on_a_dialog_does_not_hold_up_another_agents_prompts() {
+        let mut fx = app();
+        let at_zero = records_at(&mut fx, 0, "idle");
+        stays_at(&mut fx, 0);
+        second_agent(&mut fx);
+        let _at_one = records_at(&mut fx, 1, "idle");
+        stays_at(&mut fx, 1);
+        polled(&mut fx);
+
+        // One for the session's pane, written first, and two for the second
+        // pane behind it.
+        fx.app.queue.stub_item("blocked-at-the-head", Mode::Send);
+        fx.app.set_focus(Focus::Left);
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        fx.app.queue.stub_item("neighbour-first", Mode::Send);
+        fx.app.queue.stub_item("neighbour-second", Mode::Send);
+
+        // And the session's pane stops on a permission dialog.
+        say(&at_zero, fx.dir.path(), "waiting");
+        polled(&mut fx);
+        assert_eq!(fx.app.agents[0].readiness, Readiness::Waiting);
+
+        // **The automatic sender and not `Enter`**, which is load-bearing:
+        // `Enter` promotes the item it acts on to the head of the list, and a
+        // head is exactly what a test about not stopping at the head must not
+        // have. The countdown is shortened rather than waited out.
+        fx.app.queue.set_arm_delay(Duration::ZERO);
+        fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(fx.app.pump_queue(), "a send is worth a frame");
+        assert!(
+            fx.app.agents[1].submit_pending,
+            "an agent waiting on a dialog held up a prompt for another pane"
+        );
+        assert!(!fx.app.agents[0].submit_pending, "the dialog was typed at");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let screen = fx.app.agents[1].pane.last_screen().join("\n");
+            if screen.contains("neighbour-first") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "nothing reached agent 1:\n{screen}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // In order: the second item for that pane goes after the first, not
+        // before it. Two passes — the `Enter` is owed on the next one and
+        // nothing new is taken while it is.
+        fx.app.pump_queue();
+        fx.app.pump_queue();
+        assert_eq!(
+            fx.app.queue.states(),
+            vec![
+                crate::panes::queue::ItemState::Pending,
+                crate::panes::queue::ItemState::Sent,
+                crate::panes::queue::ItemState::Sent,
+            ],
+            "the walk past a blocked item did not keep one conversation in order"
         );
     }
 
@@ -7966,11 +8404,27 @@ mod tests {
 
         fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
         assert!(fx.app.git.closing().is_some(), "nothing was asked");
+        // **Drawn, which is what makes the withdrawal below load-bearing.**
+        // `App::close_drawn` remembers the pane whose confirmation the last
+        // frame painted, and it is what a second `x` is answered against — so a
+        // question withdrawn *after* a frame has to be withdrawn by this pane
+        // as well, or the next `x` finds a `close_drawn` that still matches and
+        // kills on one press.
+        rows(&mut fx.app, 160, 40);
         fx.app.git.handle_key(key(KeyCode::Char('j'))).unwrap();
         assert!(
             fx.app.git.closing().is_none(),
             "the question outlived a keystroke in the same list"
         );
+        fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+        fx.app.pump();
+        assert_eq!(
+            fx.app.agents.len(),
+            2,
+            "a single press killed a pane, against a confirmation drawn for a \
+             question that had been withdrawn"
+        );
+        fx.app.git.handle_key(key(KeyCode::Char('j'))).unwrap();
         // ...so the next `x` is a first press again rather than a second one,
         // which is the whole of what withdrawing means.
         fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
@@ -8009,6 +8463,55 @@ mod tests {
         assert_eq!(fx.app.agents.len(), 2);
     }
 
+    /// A paste and a mouse press withdraw every question about a pane.
+    ///
+    /// **`pending_close` was cleared by both and the worktree list's question
+    /// was not**, which is the same argument arriving at only two of three
+    /// places. A paste is not a small keystroke and a press is a reader doing
+    /// something else; a confirmation that survives either is one nobody is
+    /// looking at any more — and the one it left armed is the one that can end
+    /// a running agent.
+    #[test]
+    fn a_paste_or_a_click_withdraws_every_question_about_a_pane() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        stays_at(&mut fx, 1);
+        let other = fx.dir.path().join("other");
+        std::fs::create_dir_all(&other).expect("a second worktree");
+        fx.app.agents[1].root = other.clone();
+        fx.app.git.set_worktree_rows(vec![
+            wt_row(fx.dir.path(), "main", true),
+            wt_row(&other, "other", false),
+        ]);
+        fx.app.set_right_view(RightView::Git);
+        fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
+        fx.app.git.handle_key(key(KeyCode::Tab)).unwrap();
+
+        for withdraw in [0u8, 1] {
+            fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+            fx.app.pump();
+            assert!(fx.app.git.closing().is_some(), "nothing was asked");
+            match withdraw {
+                0 => {
+                    fx.app
+                        .handle_event(Event::Paste("some text".to_string()))
+                        .unwrap();
+                }
+                _ => {
+                    // A press is hit-tested against what the last frame drew,
+                    // so there has to have been one.
+                    rows(&mut fx.app, 160, 40);
+                    clicks_at(&mut fx.app, 1, 1);
+                }
+            }
+            assert!(
+                fx.app.git.closing().is_none(),
+                "the question survived a paste or a press: {withdraw}"
+            );
+        }
+        assert_eq!(fx.app.agents.len(), 2, "something was closed on the way");
+    }
+
     /// Two agents in one checkout are refused, and `F4` is the way through.
     ///
     /// **The ambiguity the list cannot resolve on its own**, and the reason
@@ -8031,20 +8534,38 @@ mod tests {
         fx.app.set_right_view(RightView::Git);
         fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
 
-        // The cursor is on `agents[0]`, which is among the three and may not be
-        // closed — so this is the session's refusal, not the ambiguity one.
+        // **The cursor is on `agents[0]`, which is among the three and may not
+        // be closed — and the answer is the *ambiguity*, not the session's.**
+        // This is the arm the reviewers found: resolving the tie-break first
+        // and then refusing told the reader "that pane is the session", which
+        // is true and not their problem. They have three panes on that row and
+        // needed to be pointed at one of the other two.
         assert_eq!(fx.app.at_agent, 0);
+        fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+        fx.app.pump();
+        let why = fx.app.agent_refused.clone().expect("no answer at all");
+        assert!(
+            why.contains("3 agents") && why.contains("F4"),
+            "the cursor's tie-break answered about the wrong half: {why}"
+        );
+
+        // The session's own refusal is what a row with *one* agent on it gives,
+        // and that one agent being `agents[0]` is the ordinary case: it is the
+        // first row of the list.
+        let elsewhere = fx.dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("a directory to stand in");
+        fx.app.agents[1].root = elsewhere.clone();
+        fx.app.agents[2].root = elsewhere;
         fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
         fx.app.pump();
         let why = fx.app.agent_refused.clone().expect("no answer at all");
         assert!(why.contains("Alt+Q"), "got: {why}");
 
-        // The cursor on a pane that is not among the candidates cannot pick
-        // one either — there is no such pane here, so the ambiguity is reached
-        // by taking `agents[0]`'s root somewhere else.
-        let elsewhere = fx.dir.path().join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).expect("a directory to stand in");
-        fx.app.agents[0].root = elsewhere;
+        // ...and two of somebody else's on one row is the ambiguity again,
+        // reached with `agents[0]` nowhere near it.
+        fx.app
+            .git
+            .set_worktree_rows(vec![wt_row(&fx.dir.path().join("elsewhere"), "other", false)]);
         fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
         fx.app.pump();
         let why = fx.app.agent_refused.clone().expect("no answer at all");
@@ -8057,7 +8578,12 @@ mod tests {
             "a question was left standing that the program would refuse"
         );
 
-        // The control: `F4` to one of the two, and the same two presses go.
+        // The control: `F4` to one of the two, and the same two presses go —
+        // **with a frame between them**, which is not decoration. A second `x`
+        // arriving before the confirmation has been painted is refused and
+        // re-armed; see [`App::close_drawn`]. Every other line of this test
+        // reaches a refusal, so without the control it would pass against a
+        // key that never works at all.
         fx.app.set_focus(Focus::Left);
         fx.app.handle_key(key(KeyCode::F(4))).unwrap();
         assert_eq!(fx.app.at_agent, 1);
@@ -8068,9 +8594,110 @@ mod tests {
             "the cursor did not resolve the ambiguity: {:?}",
             fx.app.agent_refused
         );
+        rows(&mut fx.app, 160, 40);
         fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
         fx.app.pump();
         assert_eq!(fx.app.agents.len(), 2, "the chosen pane did not go");
+    }
+
+    /// Two `x`es in one input batch do not kill: the second becomes the first.
+    ///
+    /// **A confirmation a fast typist can skip is not a confirmation, and this
+    /// is the only irreversible thing in the program.** `App::drive` drains
+    /// every queued event before it calls `pump`, so key repeat, a fast double
+    /// tap or a pasted `xx` reach the shell with no frame between them — the
+    /// question armed and answered without the words ever being on a border.
+    /// [`App::close_drawn`] is the rule that closes it, and the shape of the
+    /// answer matters as much as the refusal: the press becomes the first one,
+    /// so the reader who meant it gets what they meant one press later rather
+    /// than a key that silently did nothing.
+    #[test]
+    fn a_kill_answered_before_it_was_drawn_becomes_the_question_instead() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        stays_at(&mut fx, 1);
+        let other = fx.dir.path().join("other");
+        std::fs::create_dir_all(&other).expect("a second worktree");
+        fx.app.agents[1].root = other.clone();
+        fx.app.git.set_worktree_rows(vec![
+            wt_row(fx.dir.path(), "main", true),
+            wt_row(&other, "other", false),
+        ]);
+        fx.app.set_right_view(RightView::Git);
+        fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
+        fx.app.git.handle_key(key(KeyCode::Tab)).unwrap();
+
+        // Both presses, no frame between them — which is what one input batch
+        // looks like from here.
+        fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+        fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+        fx.app.pump();
+        assert_eq!(fx.app.agents.len(), 2, "a kill went through undrawn");
+        assert!(
+            fx.app.git.closing().is_some(),
+            "the skipped press left no question standing, so it did nothing at all"
+        );
+
+        // Now a frame, and the words are on the pane's own border...
+        let drawn = rows(&mut fx.app, 160, 40);
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.contains("2/2") && row.contains("x again to kill")),
+            "the question is standing and not on screen"
+        );
+
+        // ...and the next press is answered in front of them.
+        fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+        fx.app.pump();
+        assert_eq!(fx.app.agents.len(), 1, "a drawn confirmation was not enough");
+    }
+
+    /// A pane the frame gave no rows to cannot carry its own confirmation, so
+    /// the kill does not go through either.
+    ///
+    /// **The window with fewer rows than agents is the one `layout::stack`
+    /// paints nothing into**, and the countdown has a documented fallback for
+    /// it while this did not: the words rendered into a rect of height zero and
+    /// the second `x` still killed. Same rule as the batched double tap, from
+    /// the other direction — what is not on screen was not confirmed.
+    #[test]
+    fn a_kill_is_refused_while_its_pane_has_no_rows_to_say_so_in() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        second_agent(&mut fx);
+        stays_at(&mut fx, 2);
+        let other = fx.dir.path().join("other");
+        std::fs::create_dir_all(&other).expect("a second worktree");
+        fx.app.agents[2].root = other.clone();
+        fx.app
+            .git
+            .set_worktree_rows(vec![wt_row(&other, "other", false)]);
+        fx.app.set_right_view(RightView::Git);
+        fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
+        fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+        fx.app.pump();
+        assert!(fx.app.git.closing().is_some(), "nothing was asked");
+
+        // Two rows and three agents: `stack` keeps a row for the pane with the
+        // keys and one from the top of the list, and the third gets nothing.
+        // The cursor is on `agents[0]`, so `agents[2]` is the one that goes
+        // unpainted — and `agents[2]` is the one the question is about.
+        assert_eq!(fx.app.at_agent, 0);
+        rows(&mut fx.app, 160, 2);
+        fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+        fx.app.pump();
+        assert_eq!(
+            fx.app.agents.len(),
+            3,
+            "a pane was killed under a confirmation drawn into no rows"
+        );
+
+        // The control: a window that can draw it, and the same press goes.
+        rows(&mut fx.app, 160, 40);
+        fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
+        fx.app.pump();
+        assert_eq!(fx.app.agents.len(), 2, "the drawn confirmation was refused");
     }
 
     /// A live agent hears `x`, and the key that closes panes was never there.
@@ -8345,6 +8972,60 @@ mod tests {
             fx.app.current().id,
             keeping,
             "the cursor was left on whichever pane slid into that slot"
+        );
+    }
+
+    /// A closed pane's session record is disowned, so the next pane opened
+    /// there cannot adopt it.
+    ///
+    /// **The hazard `disown` exists for, arriving from the other end.** A
+    /// record's lifetime is Claude's: a killed child does not tidy up, so its
+    /// file sits there with `status` frozen at whatever it was. The next agent
+    /// started in that worktree has no record of its own for a second or two —
+    /// the pid shortcut misses, and the at-or-after filter excludes the dead
+    /// one on `startedAt` — and `Probe::search` then falls through to its last
+    /// resort, *the newest candidate there is*, which is the dead session. That
+    /// fallback is for a few milliseconds of clock skew and this is not clock
+    /// skew. `Idle` is the one answer that lets a queued prompt be typed.
+    ///
+    /// The assertion is on the disowned list rather than on a second probe,
+    /// because what is under test is the shell remembering — `Probe`'s own
+    /// tests own the question of what a disowned id does to a search, and
+    /// `start_agent` already has a test that a new pane is told the list.
+    #[test]
+    fn a_closed_panes_session_record_is_disowned_for_every_pane_opened_after_it() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        // A child that stays and asks for bracketed paste, because
+        // `Agent::send_readiness` refuses to read the probe at all without one
+        // — so without this the probe never settles and the test would pass by
+        // proving nothing.
+        stays_at(&mut fx, 1);
+        let records = records_at(&mut fx, 1, "idle");
+        // Read once, so the probe has settled on the record and can name it.
+        // Nothing is disownable before that, which is the gap the accessor's
+        // own doc names.
+        polled(&mut fx);
+        assert_eq!(
+            fx.app.agents[1].readiness,
+            Readiness::Idle,
+            "the probe never found a record, so there is nothing to disown"
+        );
+        let _keep = records;
+
+        let doomed = fx.app.agents[1].id;
+        fx.app.close_agent(doomed).expect("a closable pane");
+
+        assert!(
+            fx.app.disowned.iter().any(|id| id == "s"),
+            "the dead pane's record was left adoptable: {:?}",
+            fx.app.disowned
+        );
+        // And every probe that exists now has been told, which is the half
+        // `disown` pairs with the list. `agents[0]` is the only one left.
+        assert!(
+            fx.app.agents[0].probe.is_disowned_for_tests("s"),
+            "a surviving pane can still adopt the dead one's record"
         );
     }
 
@@ -9457,8 +10138,16 @@ mod tests {
         // counter and loses its alarm, which is what makes the last assertion
         // below true on both platforms for opposite reasons: on Windows because
         // the query was answered, on Linux because there is no alarm to draw.
+        // **Twenty seconds and not five, which is this file's own number for a
+        // wait on a real child** — [`stays_at`] and [`reaches_the_agent`] both
+        // use it. Five was enough for a suite with a handful of ptys in it and
+        // became a flake as the multi-agent tests added more: the wait is for a
+        // handshake between two threads, `cargo test` runs the file's tests in
+        // parallel, and a ConPTY starting under a dozen siblings is slower than
+        // one starting alone. It costs nothing when the reply is prompt, which
+        // is every healthy run.
         if cfg!(windows) {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
             while app.agents[0].pane.diagnostics().dsr_replies == 0
                 && std::time::Instant::now() < deadline
             {

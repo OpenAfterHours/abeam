@@ -198,13 +198,20 @@ pub struct GitPane {
     /// survives `F4` to an agent and back, for as long as the list is the view
     /// on screen — which is deliberate, because `F4` is exactly how a reader
     /// says *which* pane they mean when two share a checkout, and a guard that
-    /// withdrew on focus would make that path impossible. What keeps a
-    /// long-lived question honest is that it is not a memory: the border of the
-    /// pane it would destroy carries the words for the whole time it stands, so
-    /// a second press an hour later is made in front of the same sentence the
-    /// first one was. That is a stronger disclosure than either `Alt+Q`'s or
-    /// the queue's `d`, which say what they are about in a title the reader may
-    /// have looked away from.
+    /// withdrew on focus would make that path impossible.
+    ///
+    /// What keeps a long-lived question honest is that it is not a memory: the
+    /// border of the pane it would destroy carries the words, so a second press
+    /// an hour later is made in front of the same sentence the first one was.
+    /// **That was written as "for the whole time it stands" and it is not
+    /// unconditional**, which is worth the correction because the claim is the
+    /// guard. The border can fail to carry it two ways — a window with fewer
+    /// rows than agents paints nothing into some panes, and a countdown leads
+    /// the same slot and can take the columns. So the rule is the other way
+    /// round and stronger: `crate::app::App::close_drawn` refuses the *kill*
+    /// whenever the words were not on screen. A question that is standing and
+    /// invisible is one that cannot be answered, rather than one that can be
+    /// answered blind.
     ///
     /// It holds the *root* rather than an agent, because a root is all this
     /// pane knows. Which agent that names, and whether it may be closed at all,
@@ -389,6 +396,24 @@ impl GitPane {
     /// order to display it.
     pub fn closing(&self) -> Option<&Path> {
         self.kill.as_deref()
+    }
+
+    /// Ask the question again, because the answer arrived before the question
+    /// was on screen.
+    ///
+    /// **The shell's, and it is the only way a confirmation can be *re-armed*
+    /// rather than merely made.** `crate::app::App::drive` drains every queued
+    /// event before it draws, so two `x`es in one input batch — key repeat, a
+    /// fast double tap, a pasted `xx` — consume the arm and the answer with no
+    /// frame between them. The shell refuses that and calls this, which turns
+    /// the skipped press into the first one: the border then carries the words,
+    /// and the next `x` is answered in front of them. See
+    /// `crate::app::App::close_drawn`.
+    ///
+    /// Not reachable from this pane, deliberately. Whether a confirmation was
+    /// legible is a fact about a frame, and this pane draws no part of it.
+    pub fn ask_close(&mut self, root: PathBuf) {
+        self.kill = Some(root);
     }
 
     /// Forget the question, because the shell has found it unanswerable — no

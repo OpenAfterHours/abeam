@@ -685,6 +685,46 @@ impl Probe {
         }
     }
 
+    /// The `sessionId` this probe settled on, if it has settled on one.
+    ///
+    /// **For the moment a pane is destroyed, and it is the same hazard
+    /// [`disown`](Self::disown) exists for arriving from the other end.** A
+    /// record's lifetime belongs to Claude, not to abeam: a child that is
+    /// killed does not tidy up after itself, so its `<pid>.json` can sit in the
+    /// directory with `status` frozen at whatever it was. Start another agent
+    /// in that worktree afterwards and the new probe finds no record of its own
+    /// for a second or two — the pid shortcut misses, the at-or-after filter
+    /// excludes the dead one on `startedAt` — and then falls through to
+    /// [`Probe::search`]'s last resort, *the newest candidate there is*, which
+    /// is the dead session. That fallback is there for a few milliseconds of
+    /// clock skew and this is not clock skew; it hands the new pane a frozen
+    /// `idle`, and `Idle` is the one answer that lets a queued prompt be typed.
+    ///
+    /// So `crate::app::App::close_agent` reads this as the pane goes and
+    /// disowns what it finds, which **widens what the disowned list means**:
+    /// it held ids abeam minted for its own readers, and it now also holds ids
+    /// abeam has watched a child of its own stop carrying. Both are "records of
+    /// something abeam is finished with", which is the sentence `is_disowned`
+    /// was already written around.
+    ///
+    /// `None` when this probe never found a record — a pane closed in the first
+    /// second of its life, or one whose agent was not Claude. There is then
+    /// nothing to name, and the hazard survives for the case where the child
+    /// wrote a record abeam never got as far as reading. That is a real gap and
+    /// a small one: it needs a pane killed inside the window between its child
+    /// writing its first record and the next quarter-second poll.
+    pub fn found_session_id(&self) -> Option<&str> {
+        self.found.as_ref()?.session_id.as_deref()
+    }
+
+    /// Whether this probe has been told to ignore `id`. A seam for
+    /// `crate::app`, whose half of the promise is that every probe that exists
+    /// is told and every probe made later is told out of a list.
+    #[cfg(test)]
+    pub fn is_disowned_for_tests(&self, id: &str) -> bool {
+        self.disowned.iter().any(|mine| mine == id)
+    }
+
     /// Whether this record belongs to something abeam started for itself.
     ///
     /// A record carrying no `sessionId` is not ours by this test, and that is

@@ -171,8 +171,10 @@ pane says where it is standing and the apology becomes a label.
 **Where a new one starts: the workspace the right pane is on.** No new concept,
 no path to type, and the gesture is already in the user's hands — `Alt+G`, `w`,
 move to a worktree, and the new agent starts there. `Row.agent_here: bool`
-becomes a count or a list of pane ids, and the list stops being able to say
-"the" agent, which it should never have been able to say.
+became `agents_here: usize` — a count and not the list of pane ids this
+paragraph offered as the alternative; the section below says why — and the list
+stopped being able to say "the" agent, which it should never have been able to
+say.
 
 **That count is not a phase-4 nicety, and phase 2 pulled it forward on being
 told so.** It is the load-bearing half of the argument for putting the key in
@@ -268,12 +270,13 @@ So:
   the list already shows who is working in which checkout, via the roster's
   occupancy column, so "there is nobody in that worktree" is already on screen
   next to the gesture that fixes it. It also gets a confirmation surface, which
-  the closing gesture is going to need.
-- **Cycling is `F4` pressed again.** `F4` means "give the keys to the left" and
-  today a second press does nothing at all. "Again" meaning "the next one down
-  the stack" collides with nothing, costs no audit, and is a no-op in a session
-  with one agent — which is every session that exists now. `F5` keeps its
-  meaning untouched.
+  the closing gesture turned out to need: `x` twice on a row is where a *live*
+  agent is ended, and this paragraph is the reason there was somewhere to put
+  it.
+- **Cycling is `F4` pressed again.** `F4` means "give the keys to the left", and
+  before this a second press did nothing at all. "Again" meaning "the next one
+  down the stack" collides with nothing, costs no audit, and is a no-op in a
+  session with one agent. `F5` keeps its meaning untouched.
 
 That is one repurposed key and one pane-local letter, for a feature that looked
 like it needed three globals. If cycling in one direction turns out not to be
@@ -406,6 +409,16 @@ building.**
   behind a prompt that is never going anywhere — the automatic sender off for
   the rest of the session with `armed` still on the status line, which is the
   silent-stall shape `crate::agentstate` refuses by name.
+- **A blocked item is walked past, not stopped at.** The queue took the first
+  pending `Send` whatever it named, which is right for one destination and a
+  permanent stall for several: an agent sitting on an unanswered permission
+  dialog parked itself at the head and held every *other* agent's prompts behind
+  it. The search asks each item's own target, so it yields the first one that
+  could actually go. Three properties survive the skip and each was checked
+  rather than assumed — at most one item due at a time, at most one send in
+  flight per agent, and order preserved *within* a conversation, which holds
+  because eligibility is a fact about the target and two items naming one agent
+  are always eligible together.
 - **The announcement moved with the send.** Phase 3 put the countdown at the
   *front* of `agents[0]`'s border, because appended it was clipped off the end
   by the pane's own name; phase 4 has to choose a border as well as a position,
@@ -415,6 +428,31 @@ building.**
   some panes no rows at all; it is borrowed onto a neighbour's border there and
   the shell adds the target's name, because which border a note ended up on is a
   fact about the layout and belongs to whatever chose the layout.
+
+**What an orphan actually looks like, because "disarms with a note" is three
+surfaces and not one.** The row's marker changes to `⊘` and its aside says
+`<pane> closed`, naming the pane off the label snapshotted when the item was
+written — which is the only thing left to say about an agent that no longer
+exists. The pane's status line stops counting it as work still coming. And the
+agent border's low-ranked note counts it separately from the failures:
+`queue 2 · 3 undeliverable`. That third one is the one that was missing at
+first, and leaving it out made loss look like progress — kill a pane with three
+prompts queued for it and `queue 5` became `queue 2`, which is what a border
+says when work has been *done*.
+
+**Two things this feature did not break and did expose, which is the more
+useful way to record them.** Condition 3 was tested as a *level* rather than an
+edge — `busy && draft_open` clears, whenever both happen to be true — and Claude
+takes typing while it is working, so a follow-up typed into a mid-turn composer
+was cleared within a quarter second and the queue pasted on top of it. That was
+already wrong with one agent; what phase 4 changed is that it is now wrong at
+every pane rather than one. `Agent::draft_mid_turn` makes it an edge, and the
+direction of failure is stated where it lives: no rule survives a turn that
+begins and ends inside one poll interval, so the choice is between a splice and
+a stall, and it takes the stall. And a `Send` was marked sent before the write,
+with the write's answer discarded — so a pty that refused one left `✓` over a
+prompt that was simply gone. The item goes `Failed` now, and the pane a child
+has just left is refused before the write is attempted.
 
 **What is not built: there is no way to re-aim an item once it is written.** The
 target is decided at enqueue and nothing moves it, which is the property the
@@ -531,7 +569,33 @@ no memory of what it destroyed.
 
 Two panes in one checkout are one row, and abeam refuses rather than guessing —
 the answer counts them and says `F4` to the one you mean, which makes the
-gesture two-factor exactly where it is ambiguous.
+gesture two-factor exactly where it is ambiguous. **What that costs is five
+keystrokes and the message says so**, because the first version said "F4 to the
+one you mean" and that reads as one: the keys are in the right pane, so `F4`
+gives them to the left column, a second `F4` moves the agent cursor, `F5` brings
+them back, and then `x` twice. A refusal that undercounts its own remedy by four
+presses is a refusal nobody follows.
+
+**And a confirmation nobody saw does not count.** abeam drains every queued
+input event before it draws, so two `x`es in one batch — key repeat, a fast
+double tap, a pasted `xx` — would arm and answer the question with the words
+never on a border. The kill is refused unless the last frame actually painted
+them, which also covers the two ways a border can fail to: a window with fewer
+rows than agents paints nothing into some panes, and a countdown leads the same
+slot and can take the columns. The refused press becomes the *first* press
+rather than nothing, so the reader who meant it gets what they meant one press
+later.
+
+**How a refusal reaches the reader at all** is `agents[0]`'s border, which is
+where every answer about the roster of panes goes — a pane that failed to start,
+a pane that must not be closed, a row abeam cannot resolve. It is elided from
+the left, so every one of those sentences is written with the half a reader can
+act on at the *end*: `` `a` starts one ``, `` then x ``, `` Alt+Q is the way
+out ``. Below thirty columns of spare border there is no room for a sentence at
+all and it is replaced by `refused · widen to see why`, which is the only thing
+true of all five writers — the string it replaced said `no agent started`, which
+described one of them and was printed on the border of a visibly running agent
+the first time somebody pressed `x` on the session's own row.
 
 ## What it costs, said out loud
 
@@ -546,9 +610,13 @@ gesture two-factor exactly where it is ambiguous.
 - **Frames.** Every pane rings the output doorbell, and `MIN_FRAME`'s coalescing
   is exactly the mechanism that makes several of them survivable — a burst
   becomes one frame either way. The trap is not throughput: `wake_on_output` is
-  registered once, on `self.left`, inside `App::run`. Every pane spawned later
-  needs the same sender, and a pane whose waker was forgotten does not look
-  slow, it looks frozen.
+  registered once, on `self.left`, inside `App::run` — which was the warning,
+  and it is answered: `Agent::arm_waker` is the one call that arms one,
+  `App::arm_wakers` makes it over every agent that exists, and `App::wake_tx`
+  keeps the sender for the panes that do not exist yet. It is recorded rather
+  than deleted because the failure it names is invisible — a pane whose waker
+  was forgotten does not look slow, it looks frozen, and only under output that
+  nothing else coincides with.
 - **Rows.** `App::right_title` calls them the scarcest resource in a two-pane
   TUI, and the stack is what makes that a three-pane one. Each agent's border is
   a row gone.

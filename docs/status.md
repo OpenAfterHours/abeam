@@ -208,15 +208,18 @@ worktree row ends a live one. The agent abeam was started with is still the
 session: its exit is abeam's exit code, and it cannot be closed. `docs/multi-agent.md`
 is the design and the record of what each phase cost.
 
-What that is built on is tests — a few hundred of them, spawning real ptys and
-drawing real frames, including a mutation audit that broke each new rule on
-purpose to check something went red. What it is not built on is use. Nobody has
-pressed `a` in a real terminal, watched two agents work at once, queued a prompt
-for one of them and seen it arrive, or ended a running agent with `x` `x` and
-watched the process go. Every number in the paragraph below about how it
-degrades is arithmetic, not a measurement.
+What that is built on is **forty-eight tests** — the number of `#[test]`
+attributes the four phases added, so it can be checked rather than taken — some
+of which spawn real ptys and draw real frames, and a mutation audit that broke
+each new rule on purpose to check something went red. It is a suite for one
+feature and it is not "a few hundred", which is what this paragraph said until
+somebody counted. What none of it is built on is use. Nobody has pressed `a` in
+a real terminal, watched two agents work at once, queued a prompt for one of
+them and seen it arrive, or ended a running agent with `x` `x` and watched the
+process go. Every number in the paragraph below about how it degrades is
+arithmetic, not a measurement.
 
-Four specific things to expect, in the order they are likely to bite.
+Five specific things to expect, in the order they are likely to bite.
 
 - **The rows are tight, and the arithmetic is unmeasured.** A whole pane is
   `MIN_AGENT_ROWS` — twelve — plus its border, so two agents want 28 rows and
@@ -238,8 +241,16 @@ Four specific things to expect, in the order they are likely to bite.
   misdeliver one — and it is the gap most likely to be the first complaint.
 - **Two agents in one checkout are indistinguishable.** The worktree list counts
   them and cannot name them; the queue's rows call both by the same worktree
-  label; and `x` on that row refuses rather than guessing, pointing at `F4`.
-  A pane has no name a person chose, which is the missing piece.
+  label; and `x` on that row refuses rather than guessing, pointing at `F4` —
+  which is five keystrokes from there, not one. A pane has no name a person
+  chose, which is the missing piece.
+- **Killing a pane throws away every prompt queued for it.** They are not
+  retargeted — the whole design refuses that — and they are not lost silently
+  either: each row says which pane it was written for and that the pane has
+  closed, and the border counts them (`queue 2 · 3 undeliverable`). But there is
+  no way to re-aim them and no way to get them back, so `x` `x` on a row with
+  work queued behind it costs that work. Nobody has met this in a real session;
+  expect it to be the first thing that feels harsh.
 
 Two costs are worth knowing before starting a fourth agent. Each pane is a whole
 agent — its memory and its quota are the agent's, not abeam's — and each holds a
@@ -263,10 +274,10 @@ opinion, and nobody has made one.
   `Alt+G`, `w`, find the row, `x`, `x`. That is deliberate — `x` at the pane
   itself is that child's letter, and abeam may not take a key a live agent might
   bind — but it means the gesture is not discoverable from the pane a reader is
-  looking at while wondering how to get rid of it. The `F1` overlay and
-  `docs/keymap.md` are the only signposts, and neither is where the question is
-  asked. If that turns out to be the common complaint, the honest fix is a
-  sentence in the agent pane's own border rather than a key.
+  looking at while wondering how to get rid of it. The signposts are the `F1`
+  overlay, `docs/keymap.md` and the README's own section, and not one of them is
+  where the question is asked. If that turns out to be the common complaint, the
+  honest fix is a sentence in the agent pane's own border rather than a key.
 - **Nobody has typed into the scratch pad by hand, on either platform.** That is
   the sentence to read before trusting it with anything you would mind losing,
   and it is the same sentence "Platforms" says about Linux, said about a feature

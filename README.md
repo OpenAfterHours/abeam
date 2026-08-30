@@ -2,8 +2,9 @@
 
 One window for an AI coding session.
 
-Your agent runs in the left pane — hosted in a pty, parsed and drawn by abeam,
-not passed through to your terminal. The right pane shows the state of the git
+Your agent runs in the left column — hosted in a pty, parsed and drawn by
+abeam, not passed through to your terminal — and you can start more than one
+there. The right pane shows the state of the git
 worktree, the document the agent just wrote, a shell to run things in, work
 lined up for the agent, a pad to write your own notes in, or, where that
 provider is supported, a second copy you
@@ -127,10 +128,11 @@ line that does not lead with a `+`, so one exported in a dotfile years ago will
 quietly redirect `abeam -p "commit my changes"` as well as bare `abeam`. The
 left border always says which agent is taking your typing.
 
-The directory you start in is the agent's working directory and the root that
-the git pane, the watcher and the shell use. The right pane can later be pointed
-at another worktree of the same repository; the left one cannot, ever, because a
-running process cannot be moved.
+The directory you start in is the first agent's working directory and the root
+that the git pane, the watcher and the shell use. The right pane can later be
+pointed at another worktree of the same repository; an agent pane cannot, ever,
+because a running process cannot be moved — starting a second agent somewhere
+else is what you do instead.
 
 ## The panes
 
@@ -448,7 +450,13 @@ the pane you meant.
 
 **Closing.** `x` twice at an agent whose child has exited closes that pane; `x`
 twice on its row in the worktree list ends it even if it is still running, and
-the pane's own border asks first, in those words. The agent abeam started with
+the pane's own border asks first, in those words — the second press is refused
+if those words were not actually on screen, so a fast double tap becomes the
+question rather than the answer. Two agents in one checkout are one row, and
+abeam refuses to guess between them: it says so and points at `F4`, which from
+the list is `F4` `F4` `F5` and then `x` `x`. Prompts queued for a pane you close
+are not sent anywhere else — each says which pane it was for, and the border
+counts them. The agent abeam started with
 is the session and never closes — its exit is what abeam exits with, so leaving
 it is `Alt+Q`. While any agent or shell is still live, `Alt+Q` asks twice and
 the title says which of them is holding the door.

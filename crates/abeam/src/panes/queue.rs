@@ -45,9 +45,6 @@
 //!   (`crate::dispatch`), with none of that context, running beside you. These
 //!   are parallel, and there can be many. It carries a target like everything
 //!   else and reads it nowhere: it never types at anybody.
-//! - [`Mode::Dispatch`] — started as its own background agent
-//!   (`crate::dispatch`), with none of that context, running beside you. These
-//!   are parallel, and there can be many.
 //!
 //! They are the same list because they are the same thought — "do this next" —
 //! and differ only in whether the work needs the conversation you have already
@@ -192,13 +189,30 @@ pub enum Mode {
 /// lesson of the two-copies bug phase 2 removed: `crate::app::App` maintained a
 /// per-agent draft flag and this pane maintained a second one, they were kept
 /// in step by hand, and the syncing was itself the mechanism of a
-/// misdelivery. There is one authority — `crate::app::Agent` — and
-/// [`QueuePane::set_targets`] is a projection of it. Nothing in this file
-/// writes a field of a `Target`.
+/// misdelivery. There is one authority for what an agent is *doing* —
+/// `crate::app::Agent` — and [`QueuePane::set_targets`] is a projection of it.
+/// Nothing in this file writes a field of a `Target`.
+///
+/// **That is a claim about live state and not about everything here**, and the
+/// two exceptions are deliberate rather than overlooked. [`Item::target`] and
+/// [`Item::whose`] are *snapshots*: what the shell said at the moment an item
+/// was written, kept precisely because they must not follow anything
+/// afterwards. [`QueuePane::aim`] is a copy of the cursor and is a quarter
+/// second stale at worst. None of the three is a second opinion about an agent
+/// — they are records of a moment — which is what keeps them out of the class
+/// of bug this paragraph is about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
-    /// `crate::app::Agent::id`. Opaque here, and deliberately: this pane must
-    /// not be able to derive a pty, a position or a path from it.
+    /// `crate::app::Agent::id`, treated as a name and never as a number.
+    ///
+    /// **A rule this file keeps rather than a guarantee the type makes**, and
+    /// the difference is worth being exact about: it is a `u64`, so nothing
+    /// stops it being indexed with or compared for order. What holds is that
+    /// nothing here does — it is read in one place,
+    /// [`QueuePane::target`](QueuePane::target), which searches for it — so a
+    /// pty, a position and a path are all things this pane can only get by
+    /// asking the shell. If it ever needs to be a guarantee, the answer is a
+    /// newtype with no arithmetic on it.
     pub id: u64,
     /// What a row calls this agent — the worktree it is standing in.
     ///
@@ -382,6 +396,14 @@ pub struct QueuePane {
     /// items are not orphaned by a pane that has merely never been told
     /// anything.
     targets: Vec<Target>,
+    /// Which item [`take_send_request`](Self::take_send_request) last marked
+    /// [`ItemState::Sent`], so that
+    /// [`note_send_failed`](Self::note_send_failed) can take the claim back.
+    ///
+    /// Live only for the two consecutive statements in
+    /// `crate::app::App::pump_queue` that drain and report; taken by the
+    /// report, and overwritten rather than accumulated by the next drain.
+    handed: Option<usize>,
     /// The [`Target::id`] a new item is aimed at: the agent with the left
     /// column's cursor, as of the last [`set_targets`](Self::set_targets).
     ///
@@ -439,6 +461,7 @@ impl QueuePane {
             confirm: None,
             armed: false,
             targets: Vec::new(),
+            handed: None,
             aim: 0,
             arm_delay: ARM_DELAY,
             shown: None,
@@ -468,14 +491,21 @@ impl QueuePane {
     /// and again on the keystroke that opens a draft so the countdown is
     /// withdrawn on the press rather than up to a quarter second later.
     ///
-    /// Returns whether a frame is owed. **It compares the whole list, which
-    /// over-claims by exactly one case**: a draft ending at an agent that was
-    /// already busy is not drawn anywhere in this pane, and it will cost a
-    /// frame. The alternative is a second description of what this pane draws
-    /// from a target — the gate's readiness, the gate's draft, every targeted
-    /// item's label, and which targets still exist — kept beside the code that
-    /// draws them, which is the kind of pair that goes quietly out of step. One
-    /// frame on a keystroke made at a busy agent is the cheaper of the two.
+    /// Returns whether a frame is owed, and **it compares the whole list, which
+    /// over-claims.** What this pane draws from a target is narrow — the gate's
+    /// readiness and draft, the label on every row that names it, and which
+    /// targets exist at all — so any change at an agent this pane is currently
+    /// saying nothing about costs a frame it did not need. With one agent that
+    /// is nothing; the cost grows with the number of panes, and a frame
+    /// re-renders every agent's screen rather than this one.
+    ///
+    /// It is still the cheaper of the two. The alternative is a second, narrower
+    /// description of what this pane draws, kept beside the code that draws it
+    /// — the kind of pair that goes quietly out of step, in the one place where
+    /// being out of step means a countdown on screen that is not the countdown
+    /// the gate is running. If the frames ever show up in a measurement, the
+    /// honest fix is for the *shell* to compare, since it is already walking
+    /// the agents to build this.
     pub fn set_targets(&mut self, targets: Vec<Target>, aim: u64) -> bool {
         let changed = self.targets != targets || self.aim != aim;
         self.targets = targets;
@@ -548,6 +578,14 @@ impl QueuePane {
         &mut self,
         deliverable: impl FnOnce(u64) -> Option<To>,
     ) -> Option<(To, String)> {
+        // **First, so that [`handed`](Self::handed) cannot outlive the pass it
+        // was set on.** Its doc claims it is live for two consecutive
+        // statements in the shell; without this the claim is a convention, and
+        // a `note_send_failed` arriving on some later pass would demote an item
+        // that had been delivered perfectly well. Cleared on the way in rather
+        // than on the way out because a call that hands nothing over is exactly
+        // the case that must not leave the last one's index lying there.
+        self.handed = None;
         self.retime();
         let i = self.next_send()?;
         let elapsed = match self.items[i].due? {
@@ -568,7 +606,52 @@ impl QueuePane {
         // by the next `retime` for exactly that reason, rather than by a second
         // line here that no test could ever fail without.
         self.items[i].state = ItemState::Sent;
+        self.handed = Some(i);
         Some((to, self.items[i].text.clone()))
+    }
+
+    /// The write the caller made with the last handed-out item did not happen.
+    ///
+    /// **`Sent` is marked before the text leaves this pane, and that is right
+    /// — it is what makes it impossible to hand the same item out twice — but
+    /// it means the row is a claim the caller has to be able to withdraw.**
+    /// Without this, a pty that refused the paste left `✓ sent` over a prompt
+    /// that is simply gone: the one lie this whole path is built to prevent,
+    /// arriving from the one direction nobody was watching. The reachable route
+    /// is narrow and real — a child that exits inside the quarter second before
+    /// a due elapses is still `Idle` to the gate and still reports bracketed
+    /// paste, because the parser keeps what the child last set — and
+    /// `crate::app::App::pump_queue` refuses that case as well, so this is the
+    /// second of two rather than the only one.
+    ///
+    /// [`ItemState::Failed`] rather than back to `Pending`, so that nothing
+    /// re-sends it on its own: what went wrong is a fact about a pty and may
+    /// still be true on the next pass. `Enter` re-queues it, because
+    /// [`Item::started`] is a dispatcher's flag and no dispatcher was involved
+    /// — a send that never reached a pty can be asked for again.
+    ///
+    /// **The index is remembered rather than passed back**, and it is sound
+    /// because it cannot outlive the hand-out it describes. Two lines make that
+    /// true rather than conventional, and they are the whole of the bookkeeping
+    /// here: [`take_send_request`](Self::take_send_request) clears it on the
+    /// way *in*, so a pass that hands nothing over leaves no index behind; and
+    /// this takes it, so one hand-out can be reported on at most once. Between
+    /// them the index can only ever name the item this pass marked
+    /// [`ItemState::Sent`] — `pump_queue` drains and reports in consecutive
+    /// statements on one thread, so no key, no paste and no worker result gets
+    /// in between.
+    ///
+    /// **There was a third check on the item's state and it has gone**, which
+    /// is worth recording because it looks like the safe thing to keep. It was
+    /// unreachable given the two above — a mutation audit could delete it and
+    /// nothing went red — and a guard that cannot fail is a guard the next
+    /// reader mistakes for a reason the other two are not needed. `get_mut` is
+    /// kept: a bounds check is not a claim about anything, and a shell may not
+    /// panic.
+    pub fn note_send_failed(&mut self, why: String) {
+        let Some(i) = self.handed.take() else { return };
+        let Some(item) = self.items.get_mut(i) else { return };
+        item.state = ItemState::Failed(clip(&why, 200));
     }
 
     /// The next item to start as a background agent. Independent of readiness
@@ -700,18 +783,45 @@ impl QueuePane {
     /// border drawing both parts unconditionally would otherwise say `queue 2`
     /// twice. A caller that has to remember not to ask is a caller that will
     /// forget.
+    /// **Orphans are counted here, and leaving them out made loss look like
+    /// progress.** This used to report pending and failed; kill a pane with
+    /// three queued prompts and `queue 5` became `queue 2`, which is what a
+    /// border says when work has been *done*. `Failed` is user-caused and
+    /// retryable and gets a number; `Orphaned` is neither, and got nothing —
+    /// so the one state a reader cannot undo was the one the border did not
+    /// mention. It is last of the three because it is the least urgent, and it
+    /// is the first thing a narrow border drops.
     pub fn queued_note(&self) -> Option<String> {
         if self.countdown().is_some() {
             return None;
         }
-        let pending = self.pending();
-        let failed = self.failed();
-        match (pending, failed) {
-            (0, 0) => None,
-            (0, f) => Some(format!("queue · {f} failed")),
-            (p, 0) => Some(format!("queue {p}")),
-            (p, f) => Some(format!("queue {p} · {f} failed")),
+        let (pending, orphaned, failed) = (self.pending(), self.orphaned(), self.failed());
+        if pending + orphaned + failed == 0 {
+            return None;
         }
+        // Built as parts rather than as an arm per combination, because three
+        // counts is eight arms and the eight would differ from each other by a
+        // word. The bare `queue` when nothing is pending is what the two-count
+        // version said, kept: a number would read as a number of things still
+        // coming.
+        let mut parts = vec![match pending {
+            0 => "queue".to_string(),
+            p => format!("queue {p}"),
+        }];
+        if orphaned > 0 {
+            parts.push(format!("{orphaned} undeliverable"));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
+        }
+        Some(parts.join(" · "))
+    }
+
+    fn orphaned(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| i.state == ItemState::Orphaned)
+            .count()
     }
 
     fn pending(&self) -> usize {
@@ -765,6 +875,21 @@ impl QueuePane {
         self.target(id).is_some_and(|t| t.draft_open)
     }
 
+    /// Shorten the countdown, so a test of the *shell* can watch the automatic
+    /// sender work without sitting through [`ARM_DELAY`].
+    ///
+    /// The field already exists for this reason one level down — see its own
+    /// doc — and this is the same seam offered outwards. It matters that a
+    /// shell test can reach the automatic path at all: `Enter` gets there by
+    /// promoting the item it acts on, which moves it to the head of the list,
+    /// and a head is exactly what a test about *not* stopping at the head must
+    /// not have.
+    #[cfg(test)]
+    pub fn set_arm_delay(&mut self, delay: Duration) {
+        self.arm_delay = delay;
+        self.retime();
+    }
+
     /// What has become of each item, in list order. A test seam for the shell,
     /// which can otherwise only see what a row *drew* and so cannot tell an
     /// item that is waiting from one that has disarmed.
@@ -794,18 +919,20 @@ impl QueuePane {
             .map(|target| target.readiness.is_idle() && !target.draft_open)
     }
 
-    /// The agent the status line is describing: the next send's target, or —
-    /// with nothing queued — the one a new item would be aimed at.
+    /// The agent the status line is describing.
     ///
-    /// **Two answers because the line answers two questions and a reader asks
-    /// whichever is live.** With something waiting, "why has this not gone
-    /// yet" is about the agent it is waiting on. With nothing waiting, the same
-    /// row is a standing report of the pane you are about to write for, which
-    /// is [`aim`](Self::aim) — and it is the only reading that keeps the line
-    /// meaningful in an empty queue, where the alternative is a state word
-    /// about no agent at all.
+    /// **Three answers, in the order a reader's question changes.** The pane
+    /// about to be typed at, if one is — that is what the countdown beside this
+    /// word is counting down to. Failing that, the pane the item at the head of
+    /// the list is *waiting on*, because "why has nothing gone" is a question
+    /// about the agent that is holding it up, and after
+    /// [`next_send`](Self::next_send) learned to walk past a blocked item there
+    /// is no longer any guarantee that the two are the same pane. And failing
+    /// both, the pane a new item would be aimed at, which is the only reading
+    /// that keeps the line meaningful in an empty queue.
     fn gate_target(&self) -> u64 {
         self.next_send()
+            .or_else(|| self.index_of(Mode::Send))
             .map_or(self.aim, |i| self.items[i].target)
     }
 
@@ -917,25 +1044,21 @@ impl QueuePane {
     fn retime(&mut self) -> bool {
         let mut changed = self.orphan_lost_targets();
 
-        // Conditions 2 and 3, asked of the item that is next in line and of no
-        // other agent. They govern both kinds of due: a by-hand ask is
-        // attended, not exempt, and an agent can go busy between the keystroke
-        // that asked for it and the pass that would deliver it.
-        //
-        // **Only `next`'s target is consulted, and that is exact rather than an
-        // approximation.** At most one item is ever due and it is always the
-        // one next in line — the invariant three paragraphs up — so the loop
-        // below can only ever *keep* a due on `next`, and `safe` is only ever
-        // read for it. An item further down the list whose own agent is busy is
-        // not being announced, so there is nothing to withdraw.
+        // **Conditions 2 and 3 are inside `next_send` and are not asked again
+        // here.** They used to be a separate `safe` beside it, which was two
+        // spellings of one question and made the answer look like a property of
+        // the *pane* — it is a property of the item's target, and putting it in
+        // the search is what lets a blocked item be walked past rather than
+        // stopped at. They govern both kinds of due: a by-hand ask is attended,
+        // not exempt, and an agent can go busy between the keystroke that asked
+        // for it and the pass that would deliver it, at which point `next_send`
+        // stops naming that item and the loop below takes its due away.
         let next = self.next_send();
-        let safe = next.is_some_and(|i| self.gate(self.items[i].target) == Some(true));
         let armed = self.armed;
 
         for (i, item) in self.items.iter_mut().enumerate() {
             let Some(due) = item.due else { continue };
             let keep = Some(i) == next
-                && safe
                 // Condition 1, and the only place `armed` is consulted: it
                 // governs the sender that runs unattended, so it withdraws an
                 // announcement and leaves an ask alone.
@@ -949,8 +1072,7 @@ impl QueuePane {
             }
         }
 
-        if safe
-            && armed
+        if armed
             && let Some(i) = next
             && self.items[i].due.is_none()
         {
@@ -974,8 +1096,38 @@ impl QueuePane {
         }
     }
 
+    /// The next `Send` that could actually go: the first pending one whose
+    /// **own target** passes conditions 2 and 3.
+    ///
+    /// **It walks past a blocked item rather than stopping at it, and stopping
+    /// was a stall with no end to it.** [`index_of`](Self::index_of) takes the
+    /// first pending item of the mode whatever it names, which is right for one
+    /// destination and wrong for several: one agent sitting on an unanswered
+    /// permission dialog held every *other* agent's prompts behind it, for as
+    /// long as nobody went and answered it. The module doc already concedes
+    /// that what survives several agents is "one conversation takes one turn at
+    /// a time" — per target. This is what makes that sentence true rather than
+    /// aspirational.
+    ///
+    /// **Three properties survive the skip, and each is worth checking rather
+    /// than assuming.** At most one item is ever due, because this still yields
+    /// one index and [`retime`](Self::retime) still keeps a due only on it. At
+    /// most one send is in flight per agent, because the shell's own veto is
+    /// keyed by agent id and a pane mid-turn fails its own gate anyway. And
+    /// order *within* a conversation is untouched: eligibility is a fact about
+    /// the target, so of two items naming one agent the earlier is eligible
+    /// whenever the later is, and is found first.
+    ///
+    /// [`promote`](Self::promote) deliberately does **not** use this. Moving an
+    /// item to the head of its mode is about the order somebody asked for
+    /// things, which has nothing to do with whether an agent is busy this
+    /// second.
     fn next_send(&self) -> Option<usize> {
-        self.index_of(Mode::Send)
+        self.items.iter().position(|item| {
+            item.mode == Mode::Send
+                && item.state == ItemState::Pending
+                && self.gate(item.target) == Some(true)
+        })
     }
 
     fn next_dispatch(&self) -> Option<usize> {
@@ -1600,9 +1752,16 @@ impl QueuePane {
                 format!(" · sending in {secs}s"),
                 Style::default().fg(Color::Yellow),
             ));
-        } else if !self.armed && self.next_send().is_some() {
+        } else if !self.armed && self.index_of(Mode::Send).is_some() {
             // The one key that is otherwise undiscoverable from in here: the
             // list looks identical whether or not anything will ever leave it.
+            //
+            // **`index_of` and not [`next_send`](Self::next_send), which is the
+            // distinction that walk introduced.** This row is about a *key*
+            // being worth knowing, and it is worth knowing whenever there is a
+            // `Send` in the list — whether or not the agent it names happens to
+            // be idle this second. Asking `next_send` would make the hint
+            // flicker with somebody else's turn.
             spans.push(Span::styled(" · a arms", dim()));
         }
         // Last, so that the volatile half of the line leads — but present
@@ -2342,6 +2501,116 @@ mod tests {
         assert_eq!(empty.due_note(), None);
         assert_eq!(empty.queued_note(), None);
         assert!(!empty.tick());
+    }
+
+    /// A send the shell could not deliver stops reading as sent.
+    ///
+    /// **`Sent` is marked before the text leaves this pane** — that is what
+    /// makes it impossible to hand one item out twice — so the row is a claim
+    /// the caller has to be able to withdraw. Without the withdrawal a pty that
+    /// refused the paste left `✓ sent` over a prompt that is simply gone, which
+    /// is the one lie this whole path exists to prevent.
+    ///
+    /// Tested here rather than through the shell, and the reason is worth
+    /// stating: `crate::app::App::pump_queue` refuses to hand out a pane whose
+    /// child has gone, which is the only reachable way to make the write fail,
+    /// so the call site cannot be provoked from a test without breaking the
+    /// veto that is there to stop it. What is testable is what the withdrawal
+    /// *does*, which is where the decisions are.
+    #[test]
+    fn a_send_the_shell_could_not_deliver_stops_reading_as_sent() {
+        let mut p = ready("this one never lands");
+        p.items[0].due = elapsed();
+        assert_eq!(sent(&mut p).as_deref(), Some("this one never lands"));
+        assert_eq!(states(&p), [ItemState::Sent]);
+
+        p.note_send_failed("the pty is gone".to_string());
+        assert_eq!(
+            states(&p),
+            [ItemState::Failed("the pty is gone".to_string())],
+            "a prompt no pty received is still reported sent"
+        );
+        // The reason is on the row, where a reader will meet it.
+        assert!(screen(&mut p, 60, 8).contains("the pty is gone"));
+
+        // **`Failed` and not `Pending`**, so nothing re-sends it on its own —
+        // what went wrong is a fact about a pty and may still be true next
+        // pass. `Enter` puts it back, because no dispatcher was involved and a
+        // send that never reached one can be asked for again.
+        assert_eq!(drain(&mut p), None, "it went again without being asked");
+        p.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(states(&p), [ItemState::Pending]);
+
+        // And a second withdrawal has nothing to withdraw: the claim was
+        // already taken back, and taking it back twice would demote whatever
+        // the *next* drain hands out.
+        p.items[0].due = elapsed();
+        assert!(sent(&mut p).is_some());
+        p.note_send_failed("once".to_string());
+        p.note_send_failed("twice".to_string());
+        assert_eq!(states(&p), [ItemState::Failed("once".to_string())]);
+
+        // **And a withdrawal on a later pass has nothing either**, which is the
+        // other fence and the one the doc's "two consecutive statements" claim
+        // rests on. A drain that hands nothing over must not leave the last
+        // one's index lying there for a spurious report to land on: this is a
+        // successful send, followed by a pass with nothing to give, followed by
+        // a failure that belongs to nobody.
+        p.handle_key(key(KeyCode::Enter)).unwrap();
+        p.items[0].due = elapsed();
+        assert!(sent(&mut p).is_some());
+        assert_eq!(drain(&mut p), None, "there was something left to send");
+        p.note_send_failed("belongs to nobody".to_string());
+        assert_eq!(
+            states(&p),
+            [ItemState::Sent],
+            "a report from a later pass demoted a prompt that was delivered"
+        );
+    }
+
+    /// The low-ranked note counts what has been lost as well as what is coming.
+    ///
+    /// **Leaving orphans out made loss look like progress.** The border counted
+    /// pending and failed, so killing a pane with three queued prompts took
+    /// `queue 5` to `queue 2` — which is what a border says when work has been
+    /// *done*. `Failed` is user-caused and retryable and had a number;
+    /// `Orphaned` is neither, and is the one state a reader cannot undo.
+    ///
+    /// The existing spellings are asserted alongside, because this rewrote the
+    /// function they came out of and a border that quietly starts saying
+    /// something else is the failure this file is most exposed to.
+    #[test]
+    fn the_queued_note_counts_what_will_never_be_sent_as_well_as_what_is_waiting() {
+        let mut p = pane();
+        p.stub_item("still coming", Mode::Send);
+        p.stub_item("also coming", Mode::Send);
+        assert_eq!(p.queued_note().as_deref(), Some("queue 2"));
+
+        // The pane one item names has gone. The count drops by one and the
+        // border says where it went, rather than reading as one fewer thing to
+        // do.
+        p.items[1].target = OTHER;
+        p.retime();
+        assert_eq!(states(&p), [ItemState::Pending, ItemState::Orphaned]);
+        assert_eq!(
+            p.queued_note().as_deref(),
+            Some("queue 1 · 1 undeliverable"),
+            "an item that will never be sent left the border silently"
+        );
+
+        // All three at once, in rank order, and the bare `queue` when nothing
+        // is still coming — which is what the two-count version said and is
+        // kept: a number there would read as a number of things on their way.
+        p.items[0].state = ItemState::Failed("no".to_string());
+        assert_eq!(
+            p.queued_note().as_deref(),
+            Some("queue · 1 undeliverable · 1 failed")
+        );
+        p.stub_item("one more", Mode::Send);
+        assert_eq!(
+            p.queued_note().as_deref(),
+            Some("queue 1 · 1 undeliverable · 1 failed")
+        );
     }
 
     #[test]

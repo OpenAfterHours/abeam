@@ -148,18 +148,34 @@ it.** A press while the keys are already on the left used to do nothing at all,
 so "again" is a meaning added to a dead press rather than a key taken from any
 agent — the table above is one row longer in words and no rows longer in keys.
 The gesture that *starts* another agent is `a` on a row of the worktree list,
-which is not in this table either: it is a pane-local key, claimed inside a list
-that is only up while the right pane has focus, and the exemption is
+which is not in this table either: it is a pane-local key, and the exemption is
 `crates/abeam/src/panes/git.rs`'s, stated above `enum Mode` and standing since
-`w` and `Enter` were claimed there. There is no `Shift+F4` for the other
+`w` and `Enter` were claimed there. **That exemption is about delivery and not
+about what is on screen**, which is the precise claim and the only one that
+holds: the key is *only ever delivered* while the right pane has focus and this
+view is up, so it never reaches a pane while anything is being typed at an
+agent. Paraphrasing it as "a view that is only up while the right pane has
+focus" says something weaker and untrue — the list stays up when focus moves —
+and the weaker sentence would not carry `x`. There is no `Shift+F4` for the other
 direction, deliberately: a modified F-key is a key abeam knows nothing about and
 therefore the agent's, which `keys.rs` says in a comment about `Ctrl+F12`.
 
 **The gesture that *closes* one is `x`, in two places, and neither is in the
 table.** `a` leans on the worktree list's exemption — a key claimed inside a
-view that is only up while the right pane has focus, so it is never delivered
-while anything is being typed at an agent. The two `x`es split along exactly
-that line, and the split is not tidiness: it is what the letter costs.
+view, and *delivered* only while the right pane has focus and that view is up,
+so it never reaches a pane while anything is being typed at an agent. The two
+`x`es split along exactly that line, and the split is not tidiness: it is what
+the letter costs.
+
+**What that buys, and it is the answer phase 3 owed the `q` comparison below.**
+Refusing `q` cost a shared vocabulary — one letter for "leave this pane" and
+another for "destroy it" — and the objection then was that abeam had gained a
+verb without a habit behind it. It has one now: `x` means *close that agent
+pane* in both places it appears, and the difference between them is where the
+key is legal rather than what it does. A reader who learns it at a dead pane has
+learned the gesture in the list, and vice versa. `q` could never have carried
+that, because it is already the way *out* of the right pane and would have had
+to mean two things.
 
 **At an agent pane, `x` closes one whose child has exited.** That is claimed in
 the **left** column, which is where typing at an agent happens, and it is
@@ -207,10 +223,18 @@ failure `App::cannot_close` is shaped around.
 
 The question survives `F4` and back — it has to, or the sentence above about
 choosing between two panes would be impossible to act on — and it is withdrawn
-by any other key in the list and by leaving the git view. What keeps a
-long-lived one honest is that it is not a memory: the border of the pane it
-would destroy carries the words for as long as it stands, so a second press an
+by any other key in the list, by a paste, by a mouse press and by leaving the
+git view. What keeps a long-lived one honest is that it is not a memory: the
+border of the pane it would destroy carries the words, so a second press an
 hour later is made in front of the same sentence the first one was.
+
+And where the border *cannot* carry them — a window with fewer rows than agents
+paints nothing into some panes, and a countdown leads the same slot and can take
+the columns — the second press is refused rather than honoured, and becomes the
+first press instead. The same rule catches two `x`es arriving in one input
+batch, which is what key repeat and a pasted `xx` produce: abeam drains every
+queued event before it draws, so a confirmation a fast typist could skip would
+be no confirmation at all.
 
 **`x` and not `q`, which was the first choice and was wrong.** `q` looked like
 the program's own word for "I am done with this pane", on the strength of the
