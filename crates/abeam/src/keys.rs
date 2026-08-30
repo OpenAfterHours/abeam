@@ -318,6 +318,30 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
         // declares that pair as word-motion in Copilot CLI's command reference,
         // so it is the agent's key and not abeam's; the module doc has the
         // argument, and `the_agents_alt_bindings_are_left_alone` pins it.
+        //
+        // **`F4` has since acquired a second meaning, and it is the exception
+        // the paragraph above has to admit rather than a counter-example
+        // somebody will find later.** Pressed while the keys are already on the
+        // left it moves along the hosted agents — see `crate::app`'s
+        // `Action::FocusLeft` arm — which is a *cycle*, on a key whose whole
+        // defence was that it is not one.
+        //
+        // What keeps the defence standing is that the two meanings are not the
+        // same question. The first press answers "give me the keys", is a
+        // direct key still, and is the only meaning in a session with one
+        // agent — which is most of them. The second answers "the next one", and
+        // by then the reader is not glancing: they have the keyboard, they are
+        // looking at the pane it belongs to, and its border says `2/3`.
+        //
+        // The state to know before pressing is therefore on screen, which is
+        // the condition the paragraph above actually imposes — and it is on
+        // screen *because* of this key rather than as a coincidence, which is
+        // why `crate::app::App::agent_tag` is not optional chrome. The case
+        // that pays for it is zoom: with the right pane hidden `App::ui` holds
+        // focus on the left, so every press cycles, including the one somebody
+        // pressed meaning "back to the agent". Without the position in the
+        // border that press would silently hand their next sentence to another
+        // session.
         KeyCode::F(4) if bare => Some(Action::FocusLeft),
         KeyCode::F(5) if bare => Some(Action::FocusRight),
         // F6 for the ask, and an F-key rather than an `Alt` letter for a
@@ -412,7 +436,13 @@ pub const HELP: &[(&str, &str)] = &[
         "F9",
         "right pane: the scratch pad, focused (again to leave)",
     ),
-    ("F4 / F5", "move focus left / right"),
+    // The parenthetical is the whole of what a second agent costs this table.
+    // `F4` has always meant "give the keys to the left" and a second press did
+    // nothing at all, so "again" is a meaning added to a dead press rather than
+    // a key taken from anybody — which is why there is no new row here and no
+    // new audit under docs/keymap.md. One direction, because a modified F-key
+    // is deliberately not abeam's; see `global` above on `Ctrl+F12`.
+    ("F4 / F5", "move focus left / right (F4 again: next agent)"),
     ("Alt+J / Alt+K", "scroll right pane, without focusing it"),
     (
         "Alt+PgDn / Alt+PgUp",
@@ -461,10 +491,81 @@ pub const HELP: &[(&str, &str)] = &[
         "Enter",
         "git: open the file · list: open · queue: do it now",
     ),
-    // The right pane only. The agent's pty cannot be moved to another
-    // directory — a live child's cwd is the child's — so this is the one place
-    // the two halves of the window deliberately disagree about where they are.
+    // The right pane only, and nothing abeam does moves an agent pane: a pty is
+    // opened with a working directory and there is no call that re-roots it.
+    // That is what lets the two halves of the window disagree about where they
+    // are, which is what the border's workspace label exists to say.
+    //
+    // **Not that the agent stays put — the session inside the pty can move,
+    // and the row two below is about the key that follows it there.** Claude
+    // Code makes worktrees and moves into them; what cannot be moved is the
+    // pane, not the conversation in it.
     ("Enter (worktrees)", "point the right pane at that worktree"),
+    // Beside `Enter` because they are the two keys on one row and the pair is
+    // the whole of what a reader has to hold: one moves the right pane, the
+    // other starts a child in the left column and moves neither. "another" is
+    // load-bearing — the session already has one — and "there" is where the
+    // pane is *opened*, which is the half the row can promise: a pty is spawned
+    // in a directory and cannot be moved, though the session inside it can go
+    // on to make a worktree and move into that. The pane's border follows it
+    // when it does.
+    (
+        "a (worktrees)",
+        "start another agent there (F4 again reaches it)",
+    ),
+    // The same request, reached the short way, and it is in this table because
+    // it is the one most sessions want. Claude Code makes its own worktrees, so
+    // the ordinary second agent is one opened *here* and told to branch off —
+    // and routing that through a list of the checkouts you are not in is the
+    // long way round to the row you are already standing on. "here" against the
+    // row above's "there" is the whole difference between them.
+    (
+        "a (git)",
+        "start another agent here, in the checkout on screen",
+    ),
+    // The other half of the pair the two `a` rows above make — they start a
+    // pane and this closes one — and the only row in this block that is about
+    // the *left* column, which the key column says as it does for every other
+    // conditional row here. ("That pair" used to mean `Enter (worktrees)` and
+    // the `a` beside it, and the second `a` row is what made the phrase
+    // ambiguous enough to be worth spelling out.)
+    //
+    // It is in the table for the reason `a` is: a key
+    // whose condition is a state you have to arrive at is one nobody discovers
+    // by pressing things, and the state this one needs is a pane you are
+    // already looking at wondering how to get rid of.
+    //
+    // "that has exited" is load-bearing twice over. It is the whole of what
+    // makes a bare letter legal here — the child that would have received it
+    // has gone, so no hosted agent can ever be shadowed — and it is the answer
+    // to the question the row otherwise invites, which is whether this kills
+    // anything. It does not, and the pane it will not close is named because
+    // pressing twice at the wrong one is how a reader finds out.
+    //
+    // `x` rather than `q` deliberately: `q` is documented three rows down as
+    // the way *out* of the right pane, and a table that taught one letter for
+    // "leave this" and the same letter for "destroy this" would be teaching a
+    // mistake. `docs/keymap.md` has the argument.
+    (
+        "x (exited agent)",
+        "close that pane, twice over — never the session's own agent",
+    ),
+    // The third of the trio, and the row that has to say where it is pressed
+    // *and* what it costs. It is in this table for `a`'s reason — a key whose
+    // condition is a state you have to arrive at is one nobody discovers by
+    // pressing things — and it is worded harder than the row above because
+    // what it destroys is different: not a frozen screen but a turn somebody
+    // is paying for.
+    //
+    // "worktrees" in the key column and not "agent", which is the whole of why
+    // this is not the row above with a wider condition. `x` at a live agent is
+    // that child's letter and abeam never takes it; the only place the key can
+    // be claimed is a list that is up while the right pane has focus. The
+    // detour is also the guard, and `docs/keymap.md` carries the argument.
+    (
+        "x (worktrees)",
+        "kill the agent standing there, twice over — the pane's border says which",
+    ),
     // Not "rendered markdown", which is what this said and what it stopped
     // meaning: a `.py` or a `.rs` with documentation in it is rendered too, and
     // a reader looking for the key that put their `"""` back was reading a row

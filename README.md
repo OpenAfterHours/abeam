@@ -2,13 +2,20 @@
 
 One window for an AI coding session.
 
-Your agent runs in the left pane — hosted in a pty, parsed and drawn by abeam,
-not passed through to your terminal. The right pane shows the state of the git
+Your agent runs in the left column — hosted in a pty, parsed and drawn by
+abeam, not passed through to your terminal — and you can start more than one
+there. The right pane shows the state of the git
 worktree, the document the agent just wrote, a shell to run things in, work
 lined up for the agent, a pad to write your own notes in, or, where that
 provider is supported, a second copy you
 can ask about the file in front of you. A file watcher drives the first two, so
 neither has to be asked.
+
+The left column holds **more than one agent** when you want it to: start another
+in a second worktree and they stack, whole where there are rows for them and a
+title row each where there are not. See [More than one
+agent](#more-than-one-agent) below — and read `docs/status.md` first, because
+nobody has yet driven that part by hand.
 
 It replaces a three-window setup: the agent in one terminal, git in another, and
 an editor open purely to read the markdown it produced. The difference from
@@ -121,25 +128,27 @@ line that does not lead with a `+`, so one exported in a dotfile years ago will
 quietly redirect `abeam -p "commit my changes"` as well as bare `abeam`. The
 left border always says which agent is taking your typing.
 
-The directory you start in is the agent's working directory and the root that
-the git pane, the watcher and the shell use. The right pane can later be pointed
-at another worktree of the same repository; the left one cannot, ever, because a
-running process cannot be moved.
+The directory you start in is the first agent's working directory and the root
+that the git pane, the watcher and the shell use. The right pane can later be
+pointed at another worktree of the same repository; an agent pane cannot, ever,
+because a running process cannot be moved — starting a second agent somewhere
+else is what you do instead.
 
 ## The panes
 
-The left pane is your agent. The right pane is one of seven views, and switching
-between them or scrolling them costs you nothing — you only need to move focus
-to pick something out of a list, to type, or to copy with the keyboard rather
-than the mouse.
+The left column is your agent — or your agents, if you have started more than
+one; see [More than one agent](#more-than-one-agent). The right pane is one of
+seven views, and switching between them or scrolling them costs you nothing —
+you only need to move focus to pick something out of a list, to type, or to copy
+with the keyboard rather than the mouse.
 
 **git** (`Alt+G`) — read-only. Branch, ahead/behind, staged / unstaged /
 untracked files with per-file line counts, and recent commits. Every `git` call
 is a read: it stages nothing and commits nothing. It refreshes when the watcher
 sees a write, and on a two-second timer for changes the watcher cannot see, such
 as a commit made in another terminal. `Enter` opens the selected file in the
-reader. `w` lists the repository's other worktrees, which is how the right pane
-is pointed at one.
+reader. `a` starts another agent in this checkout. `w` lists the repository's
+other worktrees, which is how the right pane is pointed at one.
 
 **files** (`Alt+E`) — read-only markdown and source. Markdown is rendered rather
 than shown as source: headings, lists, tables, quotes, GFM alerts, footnotes,
@@ -213,7 +222,7 @@ pane](#copying-out-of-the-right-pane).
 
 **queue** (`F8`) — work lined up for the agent, for the gap between having a
 thought and being able to act on it. Items go one of two ways: **send**, typed
-into the left pane's session the moment it goes idle, continuing the
+into one agent's session the moment *that* agent goes idle, continuing its
 conversation; or **dispatch**, started as its own background agent with none of
 that context, running beside you. `i` writes an item, `m` switches it between
 the two, `a` arms unattended sending, `Enter` does the selected one now, `d`
@@ -300,7 +309,7 @@ to send it to Codex untouched.
 | `F3` | file reader → light / dark page |
 | `F7` | select rows of the right pane by keyboard, **and focus it** (a drag copies on its own) |
 | `F9` | right pane → the scratch pad, **and focus it** (again to hand focus back) |
-| `F4` / `F5` | move focus left / right |
+| `F4` / `F5` | move focus left / right; `F4` again moves along the agents |
 | `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
 | `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
 | `Alt+Z` | zoom: hide / show the right pane |
@@ -401,14 +410,76 @@ that owns it, which is the innermost one containing it, exactly as `git status`
 does. A neighbouring agent's writes do not refresh your git pane or pull its
 scratch markdown into your reader.
 
-`w` in the git view lists every worktree git knows about, with `agent` against
-the one your agent is running in and `▸` where the right pane is standing.
-`Enter` moves the right pane there and puts the status list back. The left pane
-never moves, and the border names the right pane's workspace whenever it is not
-the agent's own.
+`w` in the git view lists every worktree git knows about, with a count of the
+agents of yours working in each and `▸` where the right pane is standing.
+`Enter` moves the right pane there and puts the status list back. The right
+pane's border names its workspace whenever it is not the session's own root.
 
 [Design notes](docs/design.md) has the argument for the routing rule, including
 why the obvious version of it does not work.
+
+## More than one agent
+
+`a` in the git view starts another agent **here**, in the checkout you are
+looking at. `a` on a row of that worktree list starts one **there**. Both are
+the whole gesture: no path to type, no confirmation, and the row's own count
+goes up on the frame you pressed it.
+
+The first of those two is the one most sessions want, because Claude Code makes
+its own worktrees: open a second agent where you already are, tell it to branch
+off, and it runs `git worktree add` and moves into the result. abeam does not
+make worktrees for you and will not — but it follows an agent that makes one, so
+the list's count and the row `x` acts on move to the worktree it is actually
+working in, and so does the pane's own border. The border names that worktree
+only when it is *not* the checkout abeam was started in, which is the same rule
+the right pane's label follows and for the same reason: 72 columns is not enough
+to spend three of them on the answer that is true by default. So two agents in
+one checkout read `claude · 1/2` and `claude · 2/2`, and one that has branched
+off reads `claude · 2/2 · branch-name`.
+
+What does **not** follow is the record abeam reads to tell whether that agent is
+busy: it goes on being matched against the directory the pane started in, which
+is what stops one pane being told another session's state. Following an agent
+also waits on `git worktree list`, which runs every ten seconds — so expect the
+border and the count to catch up a few seconds after the agent moves, not at
+once.
+
+`F4` gives your keys to the left column, and pressed again it moves along the
+agents. The border of the pane that has them is highlighted and reads
+`claude · 2/3`, which is the only thing on screen that says which session your
+next sentence is going to.
+
+They **stack**, top to bottom in the order you started them. A pane that will
+not fit whole shrinks to its title row rather than disappearing, so the roster
+and the busy / idle / waiting-on-you word stay on screen for every agent. A
+whole pane wants twelve rows and a border, so two agents want about 28 rows of
+terminal and three want 42; below that you get one pane and title rows. The
+right pane does **not** follow the agent cursor: moving between agents never
+costs you the thing you were reading.
+
+The **queue** (`F8`) aims each item at the agent that had your keys when you
+wrote it, and it stays aimed there — moving the cursor afterwards does not move
+the prompt. The row says which pane it is for once there is more than one, the
+three-second countdown appears on that pane's border, and if you close the pane
+before the item goes, the item disarms and says so rather than being sent
+somewhere else. There is no way to re-aim an item: press `F4` and write it at
+the pane you meant.
+
+**Closing.** `x` twice at an agent whose child has exited closes that pane; `x`
+twice on its row in the worktree list ends it even if it is still running, and
+the pane's own border asks first, in those words — the second press is refused
+if those words were not actually on screen, so a fast double tap becomes the
+question rather than the answer. Two agents in one checkout are one row, and
+abeam refuses to guess between them: it says so and points at `F4`, which from
+the list is `F4` `F4` `F5` and then `x` `x`. Prompts queued for a pane you close
+are not sent anywhere else — each says which pane it was for, and the border
+counts them. The agent abeam started with
+is the session and never closes — its exit is what abeam exits with, so leaving
+it is `Alt+Q`. While any agent or shell is still live, `Alt+Q` asks twice and
+the title says which of them is holding the door.
+
+**Read `docs/status.md` before relying on any of this.** It works in the tests
+and nobody has yet watched it work.
 
 ## Configuration
 
@@ -482,6 +553,11 @@ before you install it.
 - **Nobody has typed a question into the ask pane**, and the Copilot half of it
   has never been run by any process at all. What comes back from it is a model's
   answer, which can be fluent, specific and wrong about the file it read.
+- **Nobody has run more than one agent in a real window.** The whole of [More
+  than one agent](#more-than-one-agent) — starting, cycling, stacking, aiming
+  the queue, closing a live pane — is built and tested and has never been used.
+  Expect the row arithmetic to be the first thing that disappoints: three agents
+  want a 42-row terminal before all three are drawn whole.
 - **Nobody has typed into the scratch pad by hand either**, on either platform.
   It has tests and it has never had a user. It also has no undo and no
   selection, it holds 64 KiB, and it saves two seconds after you stop typing —

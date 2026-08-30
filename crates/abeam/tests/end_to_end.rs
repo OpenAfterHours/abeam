@@ -546,11 +546,23 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
 
     // Both children are live — the one in the left pane and the shell in the
     // right — so the first Alt+Q asks and the second answers.
+    //
+    // **`wait_for` and not a bare `screen`, which is what this was and which
+    // made it the one flaky assertion in this file.** [`send`] ends in a fixed
+    // 250 ms sleep, and that pause is written for what it says it is — keeping
+    // two bursts of keystrokes in order — not for standing in front of an
+    // assertion. Between the write and the words appearing there is a whole
+    // round trip: bytes into abeam's pty, abeam's loop draining them, `Alt+Q`
+    // decoded, `pending_quit` set, a frame drawn, and the frame's bytes back
+    // out through the pty into this parser. Under a loaded machine — several
+    // suites at once, which is exactly when it was caught — that is more than
+    // 250 ms, and the failure reads as abeam not asking rather than as a test
+    // that looked too early.
+    //
+    // Every other assertion here already waits. This one asserted on a
+    // snapshot, so it was the only one that could lose the race.
     send(&session, &alt('q'));
-    assert!(
-        screen(&session).contains("again to quit"),
-        "quitting a live session asks first"
-    );
+    wait_for(&session, "again to quit");
     send(&session, &alt('q'));
     drop(session);
 }
@@ -699,10 +711,16 @@ fn the_right_pane_can_be_pointed_at_a_worktree_and_both_of_its_views_follow() {
     // columns, and that the two right-hand views really do land in the other
     // worktree.
     //
-    // The left pane is deliberately not in any of it: a live child's working
-    // directory belongs to the child, so the agent stays where it started. That
-    // asymmetry is what the border's workspace label exists to say out loud,
-    // and it is the last thing this test checks.
+    // The left pane is deliberately not in any of it: a pty is opened with a
+    // working directory and there is no call that re-roots it, so `Enter` here
+    // moves the right half of the window and nothing else. That asymmetry is
+    // what the border's workspace label exists to say out loud, and it is the
+    // last thing this test checks.
+    //
+    // "The agent stays where it started" is what this used to say, and it is
+    // not the same claim: the *pane* stays, and the session inside it can make
+    // a worktree and move into one — which the window follows, and which
+    // nothing here exercises.
     let dir = Dir::new("worktrees");
 
     // Committed, so there is a HEAD to add a worktree at. `notes.md` is left
@@ -847,6 +865,16 @@ fn rows_of_the_shell_view_are_selected_and_copied_and_the_child_never_sees_the_k
 
     // Now the part that matters. `jjj` moves the caret three rows; at a prompt
     // it is three characters somebody would then have to notice and delete.
+    //
+    // **A bare `screen` here and no `wait_for`, which is right, and is said out
+    // loud so that it is not "corrected" into the shape above.** The claim is
+    // an *absence*, and an absence has nothing to wait for: a frame that has
+    // not arrived yet also has no `jjj` in it. So this cannot lose the race the
+    // `Alt+Q` assertion could — it fails the other way, by passing while
+    // proving nothing, if [`send`]'s pause is ever too short. There is no
+    // positive marker to wait on instead: `jjj` inside a selection moves a
+    // caret and changes no word on any border, and adding one for a test to
+    // watch would be the product growing a feature to be observed by.
     send(&session, b"jjj");
     let quiet = screen(&session);
     assert!(

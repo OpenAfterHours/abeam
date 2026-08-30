@@ -142,12 +142,132 @@ pub struct GitPane {
     /// this pane's to start.
     worktrees: Vec<workspace::Row>,
     wt_sel: usize,
+    /// The root [`wt_sel`](Self::wt_sel) is a position of, so the cursor can be
+    /// re-found when the list changes length underneath it.
+    ///
+    /// **The fourth time an index has outlived the list it pointed into**, and
+    /// the other three are already written down: `crate::app::Agent::id` exists
+    /// because a pane's position moves when a neighbour closes,
+    /// `crate::app::Aim::Agent(u64)` for the same reason one level up, and
+    /// phase 4's queue targeting refuses an index outright because a `Send`
+    /// aimed at a *slot* starts naming whichever pane slides into it.
+    /// `crate::app::App::sync_workspaces` has the worked argument and this is
+    /// its shape one list along.
+    ///
+    /// ## Why clamping was enough until it was not
+    ///
+    /// [`set_worktree_rows`](Self::set_worktree_rows) only ever kept `wt_sel`
+    /// inside the list, which is exactly right against a list that shrinks at
+    /// the end and wrong against one that grows at the *front* — and
+    /// `workspace::rows` adds its guaranteed rows in front of git's, so a row
+    /// appearing shifts every other row down under a stationary index.
+    ///
+    /// Rows could already appear mid-session, and this was survivable for a
+    /// reason that has just stopped being true: it took either a keystroke the
+    /// reader had made or the ten-second discovery, so the cursor moved at a
+    /// moment they were not acting on it. An agent that makes itself a worktree
+    /// is a *third* trigger, and it fires from a hosted agent's action with no
+    /// keystroke at all — at exactly the moment this list is most likely to be
+    /// open, since watching where the agents are is what it is for. Open `w`,
+    /// tab to a row, let an agent branch off, and the next `a` starts a child
+    /// in a checkout you were not pointing at while the next `x` asks about it.
+    ///
+    /// `None` before anything has been selected, and after a list that came
+    /// back empty. Held as the root rather than the label, because a label
+    /// changes when a branch does and a root is what every other lookup in this
+    /// program compares.
+    wt_sel_root: Option<PathBuf>,
     /// The list's own scroll, not the status list's. Sharing one would make
     /// `w` and `Esc` a round trip that loses the reader's place in whichever
     /// list they were not looking at.
     wt_scroll: Scroll,
     /// The workspace `Enter` asked for, waiting to be drained by the shell.
     workspace: Option<PathBuf>,
+    /// The worktree `a` asked for an agent in, waiting to be drained the same
+    /// way.
+    ///
+    /// **Two keys write it and they are one request.** In the worktree list it
+    /// is the row under the cursor; in the status list it is
+    /// [`root`](Self::root), the checkout this pane is showing — which is the
+    /// row that list would have drawn as `here`, so the second spelling is a
+    /// shortcut through the first rather than a second meaning. The status
+    /// one exists because the ordinary way to want another agent is not about
+    /// worktrees at all: Claude Code makes its own, so you open a pane where
+    /// you are and ask it to branch off. Both arms carry the argument.
+    ///
+    /// A second field rather than a flag beside [`workspace`](Self::workspace),
+    /// because the two keys ask for different things about *different* halves
+    /// of the window and only one of them moves this pane: `Enter` points the
+    /// right pane somewhere else, and `a` starts a child in the left column and
+    /// leaves the list exactly where it was. Sharing one slot would make
+    /// pressing both in one batch — which is the ordinary way to use them, look
+    /// at a worktree and then work in it — a request that silently overwrote
+    /// the other.
+    agent: Option<PathBuf>,
+    /// The worktree an `x` has been pressed at **once**, waiting to be meant.
+    ///
+    /// **The most destructive thing in the program is asked for here and not in
+    /// the left column, and the reason is a key rather than a preference.**
+    /// `crate::app::App::close_key` claims `x` at an agent pane whose child has
+    /// **exited**, and the whole of what makes a bare letter legal there is
+    /// that the child which would have received it has gone. A *live* agent is
+    /// listening: intercepting `x` in front of one would eat the letter out of
+    /// every word somebody types at it, and forwarding it and arming a
+    /// confirmation anyway would make `box` — or any second `x` in a sentence —
+    /// kill a running session. Neither is a program anybody can type at. There
+    /// is no global left to spend either; `docs/keymap.md` records the `Alt`
+    /// namespace as close to spent and a new letter would need an audit of
+    /// three agents' shipped defaults, which is a claim nobody can make on an
+    /// afternoon.
+    ///
+    /// This list is where the key can be claimed, and it is also where it
+    /// belongs: `a` on a row starts an agent there, the occupancy column says
+    /// how many are standing there, and `x` is the same gesture undone. The
+    /// comment above [`Mode`] states the exemption once — a key claimed inside
+    /// a view that is only up while the right pane has focus is never delivered
+    /// while anything is being typed at an agent — and `w`, `Enter`, `Esc` and
+    /// `a` have stood on it since this list existed.
+    ///
+    /// **Pane-local like the queue's `d`, and not
+    /// `crate::app::App::pending_close`.** That one is cleared by the next key
+    /// wherever it goes, which is a stronger guard and an unavailable one:
+    /// `handle_key` takes it before any pane is offered the keystroke, so it is
+    /// already gone by the time the shell drains this pane's request. What is
+    /// kept instead is the same shape one level down — the question is taken at
+    /// the top of [`worktree_key`](Self::worktree_key), so any other key in
+    /// this list is the answer no, and the shell cancels it when the view
+    /// leaves the screen.
+    ///
+    /// **The gap that leaves, and what stands in it.** A question armed here
+    /// survives `F4` to an agent and back, for as long as the list is the view
+    /// on screen — which is deliberate, because `F4` is exactly how a reader
+    /// says *which* pane they mean when two share a checkout, and a guard that
+    /// withdrew on focus would make that path impossible.
+    ///
+    /// What keeps a long-lived question honest is that it is not a memory: the
+    /// border of the pane it would destroy carries the words, so a second press
+    /// an hour later is made in front of the same sentence the first one was.
+    /// **That was written as "for the whole time it stands" and it is not
+    /// unconditional**, which is worth the correction because the claim is the
+    /// guard. The border can fail to carry it two ways — a window with fewer
+    /// rows than agents paints nothing into some panes, and a countdown leads
+    /// the same slot and can take the columns. So the rule is the other way
+    /// round and stronger: `crate::app::App::close_drawn` refuses the *kill*
+    /// whenever the words were not on screen. A question that is standing and
+    /// invisible is one that cannot be answered, rather than one that can be
+    /// answered blind.
+    ///
+    /// It holds the *root* rather than an agent, because a root is all this
+    /// pane knows. Which agent that names, and whether it may be closed at all,
+    /// is `crate::app::App::agent_in`'s answer and is re-asked on the second
+    /// press rather than remembered from the first.
+    kill: Option<PathBuf>,
+    /// The worktree `x` asked about twice, waiting to be drained by the shell.
+    ///
+    /// A third request slot for [`agent`](Self::agent)'s reason, one key along:
+    /// the two act on opposite halves of the same list and neither may
+    /// overwrite the other.
+    close: Option<PathBuf>,
     /// The list has been opened at least once. Sticky, and read by the shell:
     /// occupancy comes from `claude agents --json`, which is a *process*, and
     /// the rule `crate::app` keeps is that a session which never uses a feature
@@ -210,8 +330,12 @@ impl GitPane {
             mode: Mode::Status,
             worktrees: Vec::new(),
             wt_sel: 0,
+            wt_sel_root: None,
             wt_scroll: Scroll::default(),
             workspace: None,
+            agent: None,
+            kill: None,
+            close: None,
             worktrees_wanted: false,
         };
         pane.rebuild();
@@ -272,12 +396,34 @@ impl GitPane {
     /// screen only while it is the mode showing. Discovery runs every ten
     /// seconds for the whole session, so a bare "it changed" here would be a
     /// full re-render of the agent's screen for a list nobody has opened.
+    /// **The cursor is re-found by root and not merely clamped**, which is the
+    /// correction [`wt_sel_root`](Self::wt_sel_root) argues for: rows are added
+    /// in front of git's, so an insert shifts every row down under a stationary
+    /// index, and the reader's `a` or `x` then lands on a checkout they were
+    /// not pointing at. Clamping is kept as the fallback for the row that has
+    /// genuinely gone — there is nothing better to do than stay where it was —
+    /// and it is also what covers the very first call, before anything has been
+    /// selected.
     pub fn set_worktree_rows(&mut self, rows: Vec<workspace::Row>) -> bool {
         if self.worktrees == rows {
             return false;
         }
         self.worktrees = rows;
-        self.wt_sel = self.wt_sel.min(self.worktrees.len().saturating_sub(1));
+        self.wt_sel = self
+            .wt_sel_root
+            .as_deref()
+            .and_then(|want| {
+                self.worktrees
+                    .iter()
+                    .position(|row| crate::paths::same_dir(&row.root, want))
+            })
+            .unwrap_or(self.wt_sel)
+            .min(self.worktrees.len().saturating_sub(1));
+        // Re-stamped rather than left alone, so the remembered root is the row
+        // the index now names even when the one it named has gone. Without this
+        // a vanished worktree reappearing would snatch the cursor back off
+        // whatever the reader had moved to in the meantime.
+        self.remember_wt_sel();
         matches!(self.mode, Mode::Worktrees)
     }
 
@@ -288,6 +434,67 @@ impl GitPane {
     /// left sitting fires late, at whatever unrelated moment next reads it.
     pub fn take_workspace_request(&mut self) -> Option<PathBuf> {
         self.workspace.take()
+    }
+
+    /// The worktree the user pressed `a` on, if any.
+    ///
+    /// Drained the same way and for the same reason as
+    /// [`take_workspace_request`](Self::take_workspace_request): a request left
+    /// sitting fires late, and this one fires by starting a *process*.
+    pub fn take_agent_request(&mut self) -> Option<PathBuf> {
+        self.agent.take()
+    }
+
+    /// The worktree the user pressed `x` on **twice**, if any.
+    ///
+    /// Drained like the two above and with more riding on it than either: what
+    /// a request left sitting fires late is the killing of a running agent.
+    pub fn take_close_request(&mut self) -> Option<PathBuf> {
+        self.close.take()
+    }
+
+    /// The worktree an `x` has been pressed at once and is waiting to be meant.
+    ///
+    /// **Peeked rather than drained, which is the opposite of the three above
+    /// and is right for this one.** A question is not a request: it belongs to
+    /// this pane until it is answered or cancelled, and the shell reads it to
+    /// draw the confirmation on the border of the pane that is about to be
+    /// destroyed. Draining it would be the shell taking the question away in
+    /// order to display it.
+    pub fn closing(&self) -> Option<&Path> {
+        self.kill.as_deref()
+    }
+
+    /// Ask the question again, because the answer arrived before the question
+    /// was on screen.
+    ///
+    /// **The shell's, and it is the only way a confirmation can be *re-armed*
+    /// rather than merely made.** `crate::app::App::drive` drains every queued
+    /// event before it draws, so two `x`es in one input batch — key repeat, a
+    /// fast double tap, a pasted `xx` — consume the arm and the answer with no
+    /// frame between them. The shell refuses that and calls this, which turns
+    /// the skipped press into the first one: the border then carries the words,
+    /// and the next `x` is answered in front of them. See
+    /// `crate::app::App::close_drawn`.
+    ///
+    /// Not reachable from this pane, deliberately. Whether a confirmation was
+    /// legible is a fact about a frame, and this pane draws no part of it.
+    pub fn ask_close(&mut self, root: PathBuf) {
+        self.kill = Some(root);
+    }
+
+    /// Forget the question, because the shell has found it unanswerable — no
+    /// agent stands there, or several do and this list cannot tell them apart —
+    /// or because the view has left the screen.
+    ///
+    /// **The shell has to be able to say so, and that is the whole reason this
+    /// is public.** This pane knows which worktree a row is and knows nothing
+    /// about panes; whether there is an agent to close is `crate::app`'s
+    /// question. A confirmation offered for something the program will then
+    /// refuse is a border promising what it will not do, which is the failure
+    /// `App::cannot_close` is shaped around.
+    pub fn cancel_close(&mut self) {
+        self.kill = None;
     }
 
     /// Whether anything has asked to see the worktree list yet.
@@ -498,6 +705,19 @@ impl GitPane {
         self.worktrees_wanted = true;
     }
 
+    /// Stamp [`wt_sel_root`](Self::wt_sel_root) from wherever the cursor is
+    /// now.
+    ///
+    /// One function for the three sites that move it — the keyboard, the mouse
+    /// and the rebuild — so the pair cannot be updated at two of them and
+    /// forgotten at the third, which is the shape `crate::app::Agent::open_draft`
+    /// was made for one file along. A cursor whose remembered root is stale is
+    /// worse than no memory at all: the next rebuild would drag the selection
+    /// back to a row the reader had deliberately left.
+    fn remember_wt_sel(&mut self) {
+        self.wt_sel_root = self.worktrees.get(self.wt_sel).map(|row| row.root.clone());
+    }
+
     fn wt_select(&mut self, delta: isize) -> Handled {
         if self.worktrees.is_empty() {
             return Handled::No;
@@ -506,6 +726,7 @@ impl GitPane {
         // Wraps, like the status list's own selection: Tab from the last row
         // back to the first is what a reader means, not a dead key.
         self.wt_sel = (((self.wt_sel as isize + delta) % n + n) % n) as usize;
+        self.remember_wt_sel();
 
         // Bring it into view without recentring, for `reveal`'s reason.
         let page = self.wt_scroll.viewport().max(1);
@@ -527,10 +748,142 @@ impl GitPane {
     /// Everything else falls through to the shared scroll vocabulary and then
     /// to `No`, including `q` — it means what it has always meant here, which is
     /// back to the agent.
+    ///
+    /// **`a` needed no `docs/keymap.md` audit and that is not an oversight.**
+    /// The invariant that document states is about *global* bindings — what
+    /// `crate::keys::global` claims before any pane is offered a key — and this
+    /// letter is claimed here, inside a list that is only up because somebody
+    /// pressed `w`, only reached while the right pane has focus, and therefore
+    /// only ever delivered when nothing is being typed at the agent. The
+    /// comment above [`Mode`] states the exemption once; `w`, `Enter` and `Esc`
+    /// have stood on it since this list existed. What the letter *is* checked
+    /// against is `crate::scroll`, which is the vocabulary every right-hand
+    /// pane shares and the one thing a bare letter here can really collide
+    /// with: `j k g G b` and space are spoken for there, `d` and `u` under
+    /// `Ctrl`, and `a` is none of them.
+    ///
+    /// **`x` needed no audit either, and it needs the exemption more than `a`
+    /// does.** See [`kill`](Self::kill): it is the gesture that ends a running
+    /// agent, it cannot live in the left column because a live child is
+    /// listening there, and there is no global left to give it. Against
+    /// `crate::scroll`'s shared vocabulary — `j k g G b`, space, `Ctrl+d`,
+    /// `Ctrl+u` — `x` is free, as `a` was.
     fn worktree_key(&mut self, key: KeyEvent) -> Handled {
+        // **A chord is not one of this list's letters, and this arm is the
+        // second half of a fix the status list's `a` made visible.** That match
+        // has declined `Ctrl`+letter since it was written, on the ground that
+        // `Ctrl` plus a letter is the agent's everywhere in this program; this
+        // one matched on `key.code` alone, so `Ctrl+A` started an agent and
+        // `Ctrl+X` killed one — the more destructive half, three lines under a
+        // comment saying the opposite. It took writing a second `a` arm to
+        // notice, because the two then had to be described as one request and
+        // were not.
+        //
+        // `ALT` as well as `CONTROL`, and that half is not symmetry. `Alt+A` is
+        // **Codex's own key** by `docs/keymap.md`'s inventory, in a program
+        // that hosts Codex; a reader whose hand knows that chord should not
+        // discover it starts an abeam agent. Neither modifier is a key this
+        // list has any business in — a chord is aimed past abeam at whatever is
+        // hosted, and nothing here is reachable any other way.
+        //
+        // Both modifiers named rather than `modifiers.is_empty()`, and `SHIFT`
+        // deliberately left out of the set: the `?` arm in the status list
+        // already makes that argument and it is not re-made here — some
+        // terminals report `SHIFT` for an uppercase letter, so a rule that
+        // excluded it would be a rule about keyboards. `Char('A')` is a
+        // different code from `Char('a')` in any case.
+        //
+        // **A blanket check rather than a guard on the `a` arm alone**, which
+        // is the narrower fix and would have left `Ctrl+X` and `Alt+X` arming
+        // a kill — the destructive half, and the reason this arm exists at all.
+        // One rule for the list is also what makes `docs/keymap.md`'s claim
+        // that the two `a`s are one gesture a true one.
+        // Handed to the shared scroll vocabulary and to nothing else, because
+        // `Ctrl+D` and `Ctrl+U` are half-page scrolls in every right-hand pane
+        // and this list is not an exception to that. Every other chord is
+        // declined, which is what `crate::scroll::key` already answers for
+        // `Ctrl`+anything-else and what the status list's own arm says in
+        // words.
+        //
+        // Taken *after* the question above, so a chord cancels a standing `x`
+        // exactly as any other key does — the safe direction, and today's
+        // behaviour unchanged.
+        let chord = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        // Taken before a single key is matched, so that *any* other key in this
+        // list is the answer no. The same shape the queue's `d` has and the
+        // same shape `Alt+Q`'s double press has one level up; only the `x` arm
+        // below puts it back.
+        let asked = self.kill.take();
+        if chord {
+            return self.wt_scroll.key(key).unwrap_or(Handled::No);
+        }
         match key.code {
             KeyCode::Tab | KeyCode::Down => self.wt_select(1),
             KeyCode::BackTab | KeyCode::Up => self.wt_select(-1),
+            // The list stays up, where `Enter` below closes it, and the
+            // difference is the whole distinction between the two keys. A
+            // switch is *for* looking at the other worktree's git, so the list
+            // has done its job and gets out of the way. Starting an agent
+            // leaves this pane on the same worktree — only the row's own count
+            // changes — and the ordinary next thing to do is start another one
+            // somewhere else.
+            //
+            // **It asks nothing first, where `Alt+Q` asks twice and the
+            // queue's `d` and `r` ask once, and the difference is what the
+            // key does rather than what it costs.** Those three destroy: a
+            // session, a queued item, a whole queue, and none of them can be
+            // got back by pressing anything. This one creates. A mistaken `a`
+            // leaves a process you can see and stop; a mistaken `Alt+Q` leaves
+            // nothing, and a confirmation that fires where nothing is at stake
+            // is a confirmation nobody reads where something is.
+            //
+            // What replaces the confirmation is that the gesture reports
+            // itself, immediately and where the reader is already looking: the
+            // row under the cursor gains an agent in its own occupancy column
+            // on the frame the key was pressed, and the pane in the left column
+            // says `2/3`. So a second press is an informed one rather than a
+            // blind one, which is the whole of what asking twice buys. The
+            // gesture that will need a confirmation is the one that *closes* a
+            // pane, and `crate::app::App::close_agent` is where that is
+            // written down.
+            KeyCode::Char('a') => match self.worktrees.get(self.wt_sel) {
+                Some(row) => {
+                    self.agent = Some(row.root.clone());
+                    Handled::Yes
+                }
+                None => Handled::No,
+            },
+            // The inverse of `a`, and the one key in this list that destroys
+            // something. Two presses, because it is what ends a running agent —
+            // a turn somebody is paying for, and a conversation nothing in
+            // abeam can get back.
+            //
+            // **The question is asked about the row, and answered about the
+            // row.** Carried rather than trusted to `wt_sel`, exactly as the
+            // queue's `Confirm::Delete` carries the text it asked about: `x`,
+            // `Tab`, `x` would otherwise be one warning shown about one
+            // worktree and a kill performed in another. `Tab` cancels it
+            // anyway, by the `take` at the top — this is the second fence, and
+            // the cheaper of the two guarantees should not be the only one in
+            // front of the only unrecoverable action in the program.
+            //
+            // What is *on screen* while the question stands is not here: the
+            // shell draws it on the border of the pane that is about to be
+            // destroyed, which is the one thing this pane cannot name. See
+            // [`closing`](Self::closing).
+            KeyCode::Char('x') => match self.worktrees.get(self.wt_sel) {
+                Some(row) => {
+                    if asked.is_some_and(|root| root == row.root) {
+                        self.close = Some(row.root.clone());
+                    } else {
+                        self.kill = Some(row.root.clone());
+                    }
+                    Handled::Yes
+                }
+                None => Handled::No,
+            },
             KeyCode::Enter => match self.worktrees.get(self.wt_sel) {
                 Some(row) => {
                     self.workspace = Some(row.root.clone());
@@ -760,7 +1113,33 @@ impl Pane for GitPane {
             // chords aimed at the agent. The viewer's document view has the same
             // arm, which is what makes the claim below about the two panes
             // agreeing a true one.
-            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            //
+            // **`ALT` joined `CONTROL` when `a` landed here**, and the reason is
+            // a key rather than symmetry: `Alt+A` is **Codex's own key** — it
+            // opens Codex's agent-session overview, which is why abeam yielded
+            // it and moved the queue to `F8`, and `crate::keys`' module docs
+            // say so in those words — in a program that hosts Codex. Delivery
+            // here is safe; that is not
+            // the point. The point is that the one arm in this pane that spawns
+            // a *process* would be answering an event this project has already
+            // assigned to a hosted agent.
+            //
+            // It costs `Alt+R` and `Alt+W`, which meant refresh and the
+            // worktree list by accident and were never anybody's spelling of
+            // either — the comment on `w` below has said `Alt+W` is Claude's
+            // since it was written. `crate::keys::global` claims every `Alt`
+            // abeam does own before a pane is offered anything, so nothing
+            // reaches here that this should be taking.
+            //
+            // Excluding both by name rather than by `modifiers.is_empty()` is
+            // the `?` arm's rule below, and it is cited rather than re-argued:
+            // `SHIFT` arrives with a shifted key on some layouts and must not
+            // disqualify anything.
+            KeyCode::Char(_)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 return Ok(Handled::No);
             }
 
@@ -768,9 +1147,48 @@ impl Pane for GitPane {
             KeyCode::BackTab => self.select(-1),
             KeyCode::Enter => self.open = self.openable_path().map(str::to_owned),
             KeyCode::Char('r') => self.request_refresh(),
+            // `a` for an agent in the checkout this pane is showing, which is
+            // the same letter and the same request as the one in the worktree
+            // list, aimed at the row that list would have drawn as `here`.
+            //
+            // **It exists because the workflow it serves is not about
+            // worktrees.** Claude Code makes its own — that is why
+            // `crate::workspace` is a module — so the ordinary way to use a
+            // second agent is to open one in the checkout you are already in
+            // and ask it to branch off. Reaching that through the *worktree
+            // list* meant `Alt+G`, `w`, find the row you are already on, `a`,
+            // in a list whose whole subject is the several checkouts you are
+            // not in. Here it is `Alt+G`, `a`.
+            //
+            // **No global was spent and none could be.** `docs/keymap.md`
+            // records `F1`–`F9` and `F12` as abeam's, `F10` and `F11` as eaten
+            // by terminal emulators before an application sees them, and the
+            // `Alt` letters as close to spent across three agents' shipped
+            // defaults — a claim that could only be renewed by repeating that
+            // document's whole binary extraction. This is a pane-local key
+            // standing on the exemption above [`Mode`], which is about
+            // *delivery*: `handle_key` reaches a pane only under `Focus::Right`,
+            // so the letter is never in front of an agent that is listening.
+            // `?` and `w` in this same match have stood on it for longer, and
+            // against `crate::scroll`'s shared vocabulary — `j k g G b`, space,
+            // `Ctrl+d`, `Ctrl+u` — `a` is free here exactly as it is in the
+            // list.
+            //
+            // `self.root` and not [`base`](Self::base): the toplevel is the
+            // repository, and a session started in a subdirectory of one is a
+            // directory git does not name. What the reader is looking at is the
+            // workspace, `crate::app` guarantees *that* a row, and the two keys
+            // have to mean the same checkout or `a` here and `x` `x` in the
+            // list would be about different directories.
+            //
+            // It asks nothing first, for the worktree list's reason: this key
+            // creates, and what replaces a confirmation is that the gesture
+            // reports itself on the frame it fired — the new pane appears in
+            // the left column and its border says `2/2`.
+            KeyCode::Char('a') => self.agent = Some(self.root.clone()),
             // `w` for worktree. Free in both vocabularies this pane already
             // matches — `crate::scroll` claims `j k b space g G` and Ctrl+D/U,
-            // and the four arms above claim the rest — and pane-local, so it is
+            // and the arms above claim the rest — and pane-local, so it is
             // never in front of the agent. `Alt+W` is Claude's and is not what
             // this is.
             KeyCode::Char('w') => self.open_worktrees(),
@@ -818,6 +1236,7 @@ impl Pane for GitPane {
                 let row = self.wt_scroll.offset + ev.row as usize;
                 if row < self.worktrees.len() {
                     self.wt_sel = row;
+                    self.remember_wt_sel();
                     return Ok(Handled::Yes);
                 }
             }
@@ -926,9 +1345,20 @@ fn worktree_lines(rows: &[workspace::Row], width: u16, sel: usize) -> Vec<Line<'
 /// pane's own two-second timer instead — and a pane that is merely slow looks
 /// exactly like a pane that is broken unless something admits which it is.
 fn worktree_note(row: &workspace::Row) -> String {
+    // One agent keeps the word it has always had and says nothing about a
+    // count, because in a session with one agent there is no count to read and
+    // the row should look exactly as it always did. Two is where the number
+    // starts earning its columns — it is the answer to "did that `a` do
+    // anything", asked by pressing `a` again.
+    let agents = match row.agents_here {
+        0 => String::new(),
+        1 => "agent".to_string(),
+        n => format!("{n} agents"),
+    };
+
     let mut parts: Vec<&str> = Vec::new();
-    if row.agent_here {
-        parts.push("agent");
+    if !agents.is_empty() {
+        parts.push(&agents);
     }
     if let Some(who) = &row.occupant {
         parts.push(who);
@@ -2386,7 +2816,7 @@ mod tests {
             label: label.to_string(),
             root: PathBuf::from(root),
             here,
-            agent_here: false,
+            agents_here: 0,
             occupant: None,
             watched: true,
         }
@@ -2734,6 +3164,282 @@ mod tests {
     }
 
     #[test]
+    fn a_on_a_row_asks_for_an_agent_there_and_leaves_the_list_up() {
+        // The two keys on a row ask about the two halves of the window, and
+        // the difference shows up here: `Enter` closes the list because what a
+        // switch is for is the other worktree's git, and `a` leaves it up
+        // because the child it starts does not appear in this pane at all.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('a'))).unwrap(),
+            Handled::Yes
+        );
+        let asked = pane.take_agent_request().expect("an agent was asked for");
+        assert!(crate::paths::same_dir(&asked, Path::new(TWO)));
+        // Drained, not left to fire late — and this one fires by starting a
+        // process.
+        assert_eq!(pane.take_agent_request(), None);
+        // Nothing about the right pane was asked for, which is the half the
+        // whole feature rests on.
+        assert_eq!(pane.take_workspace_request(), None);
+        assert_eq!(
+            pane.exit_hint(),
+            "esc→git",
+            "the list closed itself over a key that does not move it"
+        );
+
+        // ...and the two requests can be made in one batch without either
+        // overwriting the other, which is the ordinary way to use them: look
+        // at a worktree, then work in it.
+        pane.handle_key(key(KeyCode::Char('a'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(pane.take_agent_request().is_some());
+        assert!(pane.take_workspace_request().is_some());
+    }
+
+    #[test]
+    fn a_in_the_status_list_asks_for_an_agent_in_the_checkout_on_screen() {
+        // **The gesture the worktree list made expensive.** Claude Code makes
+        // its own worktrees, so the ordinary way to want a second agent is to
+        // open one where you already are and tell it to branch off — and
+        // reaching that through a *list of the checkouts you are not in* was
+        // `Alt+G`, `w`, find the row you are on, `a`. Here it is `Alt+G`, `a`,
+        // and it is the same request in the same slot.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        assert_eq!(pane.exit_hint(), "esc→agent", "the status list is not up");
+
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('a'))).unwrap(),
+            Handled::Yes
+        );
+        let asked = pane.take_agent_request().expect("an agent was asked for");
+        assert!(
+            crate::paths::same_dir(&asked, Path::new(ONE)),
+            "the request names something other than the checkout on screen: {}",
+            asked.display()
+        );
+        // Drained rather than left to fire late, like the list's own — and
+        // this one fires by starting a process.
+        assert_eq!(pane.take_agent_request(), None);
+
+        // It moves nothing. The right pane stays where it is, the list stays
+        // shut, and the selection is where it was: this key is about the left
+        // column and says nothing about what is being read.
+        assert_eq!(pane.take_workspace_request(), None);
+        assert_eq!(pane.take_open_request(), None);
+        assert_eq!(
+            pane.exit_hint(),
+            "esc→agent",
+            "a key about the left column changed what this pane is showing"
+        );
+
+        // And the same key one room along still means the row rather than the
+        // pane's own root, which is what makes the two spellings one gesture
+        // rather than two.
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+        pane.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(crate::paths::same_dir(
+            &pane.take_agent_request().expect("an agent was asked for"),
+            Path::new(TWO)
+        ));
+    }
+
+    #[test]
+    fn the_worktree_cursor_stays_on_its_row_when_one_is_inserted_in_front() {
+        // **The fourth time an index has outlived the list it pointed into**,
+        // and the first where the list can change with no keystroke behind it.
+        // `workspace::rows` adds its guaranteed rows in *front* of git's, so an
+        // insert shifts every row down under a stationary `wt_sel`; clamping
+        // keeps the index inside the list and does not keep it on the row.
+        //
+        // Rows could already appear mid-session, and it was survivable because
+        // it took a keystroke the reader had made or the ten-second discovery.
+        // An agent branching off into a worktree of its own is a third trigger
+        // and it fires from a *hosted agent's* action, at the moment this list
+        // is most likely to be open — so the row under the cursor moves while
+        // the reader is looking at it, and the next `a` or `x` is about a
+        // checkout they were not pointing at.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+        pane.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(
+            crate::paths::same_dir(
+                &pane.take_agent_request().expect("an agent was asked for"),
+                Path::new(TWO)
+            ),
+            "the cursor did not start where this test needs it to"
+        );
+
+        // An agent makes itself a worktree, `workspace::rows` guarantees it a
+        // row, and the row goes in front. Nothing was pressed.
+        let third = Path::new(TWO).join("deeper");
+        pane.set_worktree_rows(vec![
+            a_row("branched-off", &third.to_string_lossy(), false),
+            a_row("main", ONE, true),
+            a_row("other", TWO, false),
+        ]);
+
+        pane.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(
+            crate::paths::same_dir(
+                &pane.take_agent_request().expect("an agent was asked for"),
+                Path::new(TWO)
+            ),
+            "the cursor slid onto another checkout with no keystroke behind it"
+        );
+        // And `x` is asked about the same row, which is the half that destroys.
+        pane.handle_key(key(KeyCode::Char('x'))).unwrap();
+        assert!(
+            pane.closing()
+                .is_some_and(|root| crate::paths::same_dir(root, Path::new(TWO))),
+            "the kill was armed on a row the reader was not pointing at: {:?}",
+            pane.closing()
+        );
+    }
+
+    #[test]
+    fn a_worktree_cursor_whose_row_has_gone_holds_its_place() {
+        // The fallback, and the reason clamping is kept rather than replaced.
+        // A row that has genuinely gone — `git worktree remove`, or a workspace
+        // dropped by `sync_workspaces` — leaves nothing to re-find, and staying
+        // where the reader was is the least surprising answer there is. What
+        // must *not* happen is the cursor being dragged back later: the
+        // remembered root is re-stamped from wherever the index landed, so a
+        // worktree that comes back does not snatch the selection off whatever
+        // they have moved to since.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        let third = Path::new(TWO).join("deeper");
+        pane.set_worktree_rows(vec![
+            a_row("main", ONE, true),
+            a_row("other", TWO, false),
+            a_row("deeper", &third.to_string_lossy(), false),
+        ]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+
+        // The row the cursor is on goes.
+        pane.set_worktree_rows(vec![
+            a_row("main", ONE, true),
+            a_row("deeper", &third.to_string_lossy(), false),
+        ]);
+        pane.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(
+            crate::paths::same_dir(
+                &pane.take_agent_request().expect("an agent was asked for"),
+                &third
+            ),
+            "a vanished row did not leave the cursor where it was"
+        );
+
+        // ...and it coming back does not pull the cursor off where it landed.
+        pane.set_worktree_rows(vec![
+            a_row("main", ONE, true),
+            a_row("other", TWO, false),
+            a_row("deeper", &third.to_string_lossy(), false),
+        ]);
+        pane.handle_key(key(KeyCode::Char('a'))).unwrap();
+        assert!(
+            crate::paths::same_dir(
+                &pane.take_agent_request().expect("an agent was asked for"),
+                &third
+            ),
+            "the cursor was dragged back to a row the reader had left"
+        );
+    }
+
+    #[test]
+    fn a_chord_never_starts_or_kills_an_agent_in_either_list() {
+        // **One request means one set of modifiers, and it was two.** The
+        // status list has declined `Ctrl`+letter since it was written — `Ctrl`
+        // plus a letter is the agent's everywhere in this program — while the
+        // worktree list matched on the key code alone, so `Ctrl+A` started an
+        // agent and `Ctrl+X` armed a kill, three lines under a comment saying
+        // the opposite. Writing a second `a` arm is what made it visible,
+        // because the two then had to be one gesture and were not.
+        //
+        // `Alt` is refused as well, and that half is not symmetry: `Alt+A`
+        // opens **Codex's** agent-session overview — `crate::keys`' module docs
+        // record that abeam yielded the key over it — in a program that hosts
+        // Codex.
+        for chord in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            let (mut pane, _asks, _answers) = detached(ONE);
+            pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+
+            // The status list, where `a` is new.
+            assert_eq!(
+                pane.handle_key(KeyEvent::new(KeyCode::Char('a'), chord))
+                    .unwrap(),
+                Handled::No,
+                "{chord:?}+A was taken by the status list"
+            );
+            assert_eq!(pane.take_agent_request(), None, "{chord:?}+A started one");
+
+            // ...and the worktree list, where `a` and `x` are older and where
+            // the destructive one is.
+            pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+            assert_eq!(
+                pane.handle_key(KeyEvent::new(KeyCode::Char('a'), chord))
+                    .unwrap(),
+                Handled::No,
+                "{chord:?}+A was taken by the worktree list"
+            );
+            assert_eq!(pane.take_agent_request(), None, "{chord:?}+A started one");
+            assert_eq!(
+                pane.handle_key(KeyEvent::new(KeyCode::Char('x'), chord))
+                    .unwrap(),
+                Handled::No,
+                "{chord:?}+X was taken by the worktree list"
+            );
+            assert!(
+                pane.closing().is_none(),
+                "{chord:?}+X armed a kill on a running agent"
+            );
+            // The list is still up, so `w` was not taken either.
+            assert_eq!(pane.exit_hint(), "esc→git");
+        }
+    }
+
+    #[test]
+    fn the_worktree_lists_half_page_scroll_survives_the_chord_rule() {
+        // The one pair of chords this list does own, and the reason the rule
+        // above is a hand-off to `crate::scroll` rather than a bare refusal:
+        // `Ctrl+D` and `Ctrl+U` are half-page scrolls in every right-hand pane,
+        // and a guard that declined every chord would have made this list the
+        // one exception to a vocabulary the F1 overlay promises.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        let rows: Vec<workspace::Row> = (0..40)
+            .map(|i| a_row(&format!("branch-{i}"), ONE, false))
+            .collect();
+        pane.set_worktree_rows(rows);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        // Measured by a render, because a scroll that has never been told how
+        // tall the viewport is has nothing to move by.
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| pane.render(f, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+
+        assert_eq!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+                .unwrap(),
+            Handled::Yes,
+            "Ctrl+D stopped scrolling the worktree list"
+        );
+        assert!(
+            pane.wt_scroll.offset > 0,
+            "Ctrl+D was accepted and moved nothing"
+        );
+    }
+
+    #[test]
     fn a_worktree_list_nobody_has_opened_never_costs_a_frame() {
         // Discovery runs every ten seconds for the whole session, and a frame
         // re-renders the agent's entire screen. `QueuePane::set_roster`'s
@@ -2758,7 +3464,7 @@ mod tests {
     fn every_row_of_the_worktree_list_fits_the_pane_it_is_drawn_in() {
         let rows = vec![
             workspace::Row {
-                agent_here: true,
+                agents_here: 1,
                 ..a_row("hand-the-command-line-to-the-agent", ONE, true)
             },
             workspace::Row {

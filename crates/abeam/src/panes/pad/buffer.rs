@@ -128,11 +128,6 @@ pub struct Buffer {
     /// This pad arrived larger than [`MAX_BYTES`] and what is here is the front
     /// of it. Set by [`Buffer::from_text`], never cleared, and read through
     /// [`Buffer::truncated`], which carries the argument.
-    #[allow(
-        dead_code,
-        reason = "the pane latches store::Loaded::truncated and not yet this one; \
-                  the two are ORed in the wiring pass, and this goes with it"
-    )]
     truncated: bool,
 }
 
@@ -247,11 +242,17 @@ impl Buffer {
     /// that makes room does not bring the tail back with it, so a flag that
     /// cleared itself on the first `backspace` would hand the save path
     /// permission to overwrite exactly the document it was there to protect.
-    #[allow(
-        dead_code,
-        reason = "the pane latches store::Loaded::truncated and not yet this one; \
-                  the two are ORed in the wiring pass, and this goes with it"
-    )]
+    ///
+    /// **A `dead_code` waiver used to stand here and it was never true**, which
+    /// is worth a sentence because it is a sharper lesson than a waiver going
+    /// stale over time. It said the pane latched `store::Loaded::truncated` and
+    /// "not yet this one", and that the two would be ORed together in a later
+    /// wiring pass — and `PadPane::ensure_read` ORs them in the *same commit*
+    /// that wrote the waiver. The pass it was waiting for had already happened
+    /// when the words were typed. Nothing ever said so, because an `#[allow]`
+    /// says nothing when the lint stops firing; an `#[expect]` would have
+    /// failed the build that introduced it. The crate root has the rule that
+    /// came out of this.
     pub fn truncated(&self) -> bool {
         self.truncated
     }

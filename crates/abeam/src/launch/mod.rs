@@ -106,6 +106,35 @@ pub fn resolve(program: &str, args: &[String]) -> Result<Launch, String> {
     resolve_preferring(program, args, None)
 }
 
+/// [`resolve`], for a program abeam is already holding as a path.
+///
+/// **The same resolution with one conversion removed, and the conversion is
+/// the point.** Every caller of [`resolve`] is holding a name somebody typed —
+/// a command line, an environment variable, an entry in a candidate list — and
+/// a `&str` is what those are. `crate::app::Recipe` is not: it holds a
+/// [`Launch::target`] this module itself produced, and routing that back
+/// through `to_string_lossy` to hand it in here would be a lossy conversion of
+/// a path that is about to be compared against the filesystem. `crate::paths`
+/// spends a module on what two spellings of one directory cost, and a path with
+/// no faithful `String` — an unpaired surrogate on Windows, a non-UTF-8 byte on
+/// Unix — comes back through `Path::new` as a *different* path, so the probe
+/// below would fail to find a file that is sitting right there. A pane opened
+/// on a keystroke would refuse where the session's own agent started fine, on a
+/// machine where nothing else about abeam is unusual.
+///
+/// **What this removes is the asymmetry and not the limitation, and the
+/// difference is worth being exact about.** [`Launch::config`] still spells the
+/// program with `to_string_lossy` on the way to the pty, so an install path
+/// that has no faithful `String` is one abeam cannot start *at all* — at
+/// startup as much as on a keystroke. That is pre-existing, it is the same
+/// answer for every pane, and it is a fix somewhere else entirely: it belongs
+/// in `PtyConfig`, which takes a `String` where it wants an `OsString`. What
+/// this stops is a later pane failing where the first one succeeded, which is
+/// the shape nobody would think to look for.
+pub fn resolve_at(program: &Path, args: &[String]) -> Result<Launch, String> {
+    into_launch(find_at(program, None)?, args)
+}
+
 /// [`resolve`], with one path to try before the `PATH` walk.
 ///
 /// The hint stays out of this module because it is not knowledge about
@@ -124,7 +153,19 @@ pub fn resolve_preferring(
 
 /// Where the file is, without yet asking whether it can be started.
 fn find(program: &str, home: Option<PathBuf>) -> Result<PathBuf, String> {
-    let named = Path::new(program);
+    find_at(Path::new(program), home)
+}
+
+/// The same, over a path rather than a name.
+///
+/// **This is where the work always happened** — `find` began by calling
+/// `Path::new` on its argument and never used the `&str` again except to write
+/// it into a message, and `Path::display` writes the same characters back. So
+/// this is a rename rather than a second implementation, and [`resolve_at`] is
+/// what it exists for: a caller already holding a path does not have to spell
+/// it as a `String` on the way in.
+fn find_at(named: &Path, home: Option<PathBuf>) -> Result<PathBuf, String> {
+    let program = named.display();
 
     let found = if named.is_absolute() {
         // Probed rather than trusted: a path to something that has since been
@@ -159,8 +200,16 @@ fn find(program: &str, home: Option<PathBuf>) -> Result<PathBuf, String> {
         // it is the *same variable*, so a broken `SystemRoot` takes out both
         // defences at once and this is the one of the two that can still say
         // no.
+        // `to_str` rather than a lossy conversion, and the `None` is honest
+        // rather than lazy: `PATH` is walked by *name*, and a name with no
+        // faithful `String` is one no entry on `PATH` was ever going to match
+        // under a substituted spelling. Every caller that reaches this branch
+        // arrived holding a `&str` anyway — a bare name is what a command line,
+        // an environment variable and a candidate list all are — so this is
+        // unreachable in practice and says so by declining rather than by
+        // guessing.
         home.filter(|home| home.is_absolute() && home.is_file())
-            .or_else(|| walk_path(program))
+            .or_else(|| named.to_str().and_then(walk_path))
     };
 
     found.ok_or_else(|| format!("`{program}` was not found on PATH."))

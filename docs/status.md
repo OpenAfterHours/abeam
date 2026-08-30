@@ -197,8 +197,153 @@ not been re-run against `abeam` itself since the panes landed — and have never
 been run on Linux at all, against anything. Do that before trusting it with real
 work, on either platform.
 
+> **Observed, because the whole of "the window follows an agent into a worktree"
+> rests on it.** The claim is that a *running* session rewrites the `cwd` in its
+> own `~/.claude/sessions/<pid>.json` when it moves into a git worktree. Every
+> worktree record on this machine could have been *launched* in the worktree it
+> names, so none of them settled it; this one does, and it is recorded here in
+> `docs/keymap.md`'s register — what was seen, when, and out of which record —
+> because it was awkward to obtain and will rot silently.
+>
+> Record `33644.json`, session `2aab7d20-4158-4913-a695-062b2b9ba929`, Claude
+> Code **2.1.251**, read on 2026-08-30. Its `startedAt` is `1788023044756` —
+> 2026-08-29 18:04:04 — and its `cwd` is
+> `…\forge\.claude\worktrees\multi-agent-proposal`. That directory's creation
+> time is **2026-08-29 18:08:59**, four minutes and fifty-five seconds *after*
+> the session started, so the path in the record cannot be the one written at
+> startup. The session rewrote it.
+>
+> **Two residuals, and they are the reason this is a note rather than a
+> proof.** The rewrite was inferred from two timestamps rather than watched, and
+> more seriously the record says `"kind":"bg"` while
+> `crate::agentstate::Probe::is_still_mine` will only accept `"interactive"`.
+> So what is observed is a *background* session moving. That the same
+> record-writer serves both kinds — one `peerProtocol`, one file layout, one
+> `cwd` field — is inference from the shape of the record and not evidence. An
+> interactive session observed doing the same thing would close it, and nobody
+> has captured one.
+
+**More than one agent in the window is built, and no human has ever used it.**
+That sentence is the whole entry and the rest of this paragraph is detail. `a`
+in the git view (`Alt+G`) starts another agent in the checkout on screen, and
+`a` on a row of the worktree list (`Alt+G`, `w`) starts one in that checkout;
+`F4` pressed again moves along them; they are stacked vertically, one title row
+each for the ones there is no room to draw whole; the queue's `Send` items carry
+the pane they were written for and are typed there and nowhere else; `x` twice
+at a pane whose child has exited closes it, and `x` twice on a worktree row ends
+a live one. An agent that goes on to make itself a git worktree and move into it
+is followed — by its own border, by the list's occupancy count, and by the row
+`x` resolves through — while the readiness probe goes on comparing records
+against the directory the pane was spawned in, which is the one thing that must
+not move. The agent abeam was started with is still the session: its exit is
+abeam's exit code, and it cannot be closed. `docs/multi-agent.md` is the design
+and the record of what each phase cost.
+
+What that is built on is **sixty-six tests** — the number of `#[test]`
+attributes this work added, so it can be checked rather than taken — some
+of which spawn real ptys and draw real frames, and a mutation audit that broke
+each new rule on purpose to check something went red. It is a suite for one
+feature and it is not "a few hundred", which is what this paragraph said until
+somebody counted. What none of it is built on is use. Nobody has pressed `a` in
+a real terminal, watched two agents work at once, queued a prompt for one of
+them and seen it arrive, ended a running agent with `x` `x` and watched the
+process go, or told an agent to branch off and watched the window follow it.
+Every number in the paragraph below about how it degrades is arithmetic, not a
+measurement.
+
+Seven specific things to expect, in the order they are likely to bite.
+
+- **The rows are tight, and the arithmetic is unmeasured.** A whole pane is
+  `MIN_AGENT_ROWS` — twelve — plus its border, so two agents want 28 rows and
+  three want 42. A 24-row terminal draws one agent and a title row whatever you
+  do. Twelve is an argument (five rows of permanent furniture, seven of
+  transcript, which is what a permission prompt needs to be on screen at all)
+  rather than a number anybody has watched an agent use, and it is the first
+  thing to change if a real session says otherwise.
+- **A collapsed pane is not resized, on purpose, and the consequence is
+  visible.** Resizing a live agent to one row would reflow its whole transcript
+  and, on some agents, truncate the scrollback that reflow lands in — so a
+  collapsed pane goes on believing it has the size it last had, and the first
+  frame that draws it whole again is drawn at a size its child has not caught up
+  with. That is one odd-looking frame per pane per return, by design, and it has
+  never been seen by a person.
+- **The queue's target is decided when you write the item and cannot be
+  changed.** Write three prompts for the wrong pane and you write them again.
+  This is deliberate — a key that re-points a prompt is a key that can
+  misdeliver one — and it is the gap most likely to be the first complaint.
+- **Two agents in one checkout are indistinguishable.** The worktree list counts
+  them and cannot name them; the queue's rows call both by the same worktree
+  label; and `x` on that row refuses rather than guessing, pointing at `F4` —
+  which is five keystrokes from there, not one. A pane has no name a person
+  chose, which is the missing piece.
+- **An agent that branches off is followed up to ten seconds later, not at
+  once.** Where a session has gone is read from the record it writes about
+  itself, every 250 ms — but abeam will only believe a directory `git worktree
+  list` has named, and that list is refreshed every ten seconds. A worktree an
+  agent has just made for itself is newer than the last refresh by
+  construction, so the poll straight after a move refuses it. Until the next
+  discovery the pane reads `Unknown`: its border still names the checkout it
+  started in, the count is still on that row, and a queued prompt aimed at it
+  waits. Then git is asked, and the window catches up in one poll.
+
+  **That refusal was permanent until the review found it**, which is worth
+  knowing because it is the shape to watch for: the probe threw away the record
+  it had identified, and nothing could re-adopt it — so the session was
+  `Unknown` and undeliverable for the rest of the run, with nothing on screen
+  saying why. It now keeps the record and re-checks it, and the regression test
+  is named after the sequence. Nobody has watched either the failure or the
+  fix in a real terminal.
+
+  A narrower case is still open and fails the same safe way: a session that
+  leaves inside the second or so before its *first* record is read is never
+  identified at all, so it is never followed. That is discovery being strict on
+  purpose, and closing it would be a change to the discovery rule.
+- **`git worktree remove` under a live agent leaves that pane readable but
+  never idle again.** The pane's record still names the worktree; the list git
+  prints no longer does; so the probe refuses it on every poll from then on and
+  the pane reads `Unknown` for the rest of the session. Nothing queued for it
+  is ever delivered, and the border and its row go on naming a directory that
+  is not there any more. Two things still work, and they are the ones that
+  matter: the row survives — `workspace::rows` guarantees one for every
+  directory an agent is working in, whatever git says — so `x` `x` on it still
+  ends the agent, and the pane is still typed at by hand. Putting the worktree
+  back recovers it on the next discovery. Nobody has met this, and the honest
+  reading is that it is the same refusal as the ten seconds above with nothing
+  arriving to end it.
+- **Killing a pane throws away every prompt queued for it.** They are not
+  retargeted — the whole design refuses that — and they are not lost silently
+  either: each row says which pane it was written for and that the pane has
+  closed, and the border counts them (`queue 2 · 3 undeliverable`). But there is
+  no way to re-aim them and no way to get them back, so `x` `x` on a row with
+  work queued behind it costs that work. Nobody has met this in a real session;
+  expect it to be the first thing that feels harsh.
+
+Two costs are worth knowing before starting a fourth agent. Each pane is a whole
+agent — its memory and its quota are the agent's, not abeam's — and each holds a
+reader thread and a `vt100::Parser` with 5,000 lines of scrollback. Whether a
+collapsed pane should keep 5,000 is a question for a measurement rather than an
+opinion, and nobody has made one.
+
 **Not done, and known.**
 
+- **Two agents that are neither the session's can never be read together.** The
+  stack hands out rects in list order and panes never swap places, so with three
+  agents and room for two, the two you get are `agents[0]` and whichever has the
+  keys — moving the cursor to the third collapses the second on the way past.
+  Comparing two panes neither of which is the session's would need a second
+  cursor or a pinned pane, and either is a feature rather than a fix. There is
+  also no "show me only this agent": `Alt+Z` hides the *right* pane, which buys
+  the left column columns and not one extra row, and a second zoom was declined
+  because its whole effect would be to delete the roster of collapsed title rows
+  that the feature exists to keep.
+- **Ending a live agent is only reachable through the worktree list**, which is
+  `Alt+G`, `w`, find the row, `x`, `x`. That is deliberate — `x` at the pane
+  itself is that child's letter, and abeam may not take a key a live agent might
+  bind — but it means the gesture is not discoverable from the pane a reader is
+  looking at while wondering how to get rid of it. The signposts are the `F1`
+  overlay, `docs/keymap.md` and the README's own section, and not one of them is
+  where the question is asked. If that turns out to be the common complaint, the
+  honest fix is a sentence in the agent pane's own border rather than a key.
 - **Nobody has typed into the scratch pad by hand, on either platform.** That is
   the sentence to read before trusting it with anything you would mind losing,
   and it is the same sentence "Platforms" says about Linux, said about a feature

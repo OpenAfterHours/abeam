@@ -109,20 +109,76 @@ use crate::text::clip;
 pub const PEER_PROTOCOL: u64 = 1;
 
 /// Whether the hosted agent is mid-turn.
+///
+/// **Four variants, and the fourth is the one [`Session::readiness`] predicted
+/// would be worth having "on the day anything wants to explain itself".** That
+/// day is the stacked left column: a pane the window has no room for collapses
+/// to its title row, and that row is all a reader gets about the agent inside
+/// it. `Unknown` on such a row draws nothing at all — abeam cannot say — which
+/// left the agent *stopped on a permission dialog* as the one agent a reader
+/// must go and look at and the one the row stayed silent about.
+///
+/// **Splitting a refusal is not widening an acceptance, and that distinction is
+/// the whole safety argument.** Every gate in this program tests for `Idle` and
+/// nothing else — `crate::panes::queue` compares against it and calls
+/// [`is_idle`](Self::is_idle) — so a state that was `Unknown` and is now
+/// `Waiting` is refused by exactly the same comparison it was refused by
+/// before. What a border wanted was never a *looser* answer, which would need
+/// its own function and its own argument; it was a **more specific** one, and
+/// specificity cannot let a prompt through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Readiness {
     /// The agent is at its prompt. A queued item may be sent.
     Idle,
     /// The agent is working, or waiting on something that is not us.
     Busy,
-    /// No record, an unreadable one, or one from a protocol this does not
-    /// know. **Never treated as `Idle`.**
+    /// The agent has **stopped and is waiting for a person**: Claude's
+    /// `waiting` status, which is the permission dialog, or the `blocked`
+    /// state, which is a background agent that has gone quiet on a question.
+    ///
+    /// A refusal exactly as `Unknown` is — nothing may be typed at it — and a
+    /// different sentence about why. It is the one refusal the reader can *do*
+    /// something about, which is why it is worth a word on a border where
+    /// `Unknown` gets none: an agent stopped on a dialog stays stopped until
+    /// somebody answers it, and a stack exists to show several agents at once
+    /// precisely so that the one that has stopped can be noticed.
+    Waiting,
+    /// No record, an unreadable one, one from a protocol this does not know, or
+    /// a session abeam cannot type at for a reason of its own — a shell over
+    /// the agent, a child with no bracketed paste, a child that has gone.
+    /// **Never treated as `Idle`.**
     Unknown,
 }
 
 impl Readiness {
+    /// Whether this is a permission to type at the agent.
+    ///
+    /// **The one gate, and an exhaustive `match` rather than `self == Idle`,
+    /// which is the whole of what makes it a mechanism.** Adding a variant to
+    /// this enum is a change to what abeam might type into; written as an
+    /// equality the new state would be silently refused — correct today, and
+    /// correct only by luck, because nothing would have made anybody *decide*.
+    /// Written as a `match` with no wildcard, `rustc` refuses the file until
+    /// somebody has said, in the one place the answer matters, whether the new
+    /// state lets a queued prompt through.
+    ///
+    /// [`Readiness::Waiting`] is the variant that proved the point. It split
+    /// out of `Unknown` so that a border could name a stopped agent, and a
+    /// reviewer had to enumerate every read of this enum by hand to establish
+    /// that it was still refused everywhere. The next split should not need
+    /// that: this is where it is answered.
+    ///
+    /// `crate::panes::queue` asks through here and nowhere else — both of its
+    /// gates, which were two spellings of the same comparison until this
+    /// existed to be the one.
     pub fn is_idle(self) -> bool {
-        self == Readiness::Idle
+        match self {
+            Readiness::Idle => true,
+            // Spelled out rather than left to a `_`, for the reason the arms in
+            // [`Session::readiness`] are: a wildcard here would let a fifth
+            // variant compile, which is exactly what this function is for.
+            Readiness::Busy | Readiness::Waiting | Readiness::Unknown => false,
+        }
     }
 }
 
@@ -154,19 +210,30 @@ pub struct Session {
     /// `the_record_claude_writes_for_a_live_session_parses_field_for_field`, so
     /// they are covered even while they are unconsumed â€” which is the whole of
     /// what `dead_code` is objecting to here.
+    ///
+    /// **`#[allow]` and not `#[expect]`, and this is the case the crate root's
+    /// rule is written around.** It looks like a waiver awaiting a consumer,
+    /// which would be an `#[expect]`; it is really a waiver whose condition is
+    /// a `cfg`. The tests above read it, so under
+    /// `cargo clippy --all-targets` the lint does not fire and an `#[expect]`
+    /// is *unfulfilled* — a warning of its own. See `crate`'s module docs.
     #[allow(
         dead_code,
-        reason = "a faithful record, parsed and tested ahead of a consumer"
+        reason = "read by this module's tests; dead only in a build without them"
     )]
     pub pid: Option<u32>,
     /// The short id `claude agents` uses; absent on interactive sessions.
     pub id: Option<String>,
-    /// The full session id â€” what `claude --resume` would want, on the day
-    /// anything offers to reopen a dispatched task.
-    #[allow(
-        dead_code,
-        reason = "a faithful record, parsed and tested ahead of a consumer"
-    )]
+    /// The full session id, and the only field in this record that separates
+    /// one session from another.
+    ///
+    /// **It was kept ahead of a consumer and has three now**, which is worth
+    /// recording because a waiver is the shape of thing that outlives its
+    /// argument. [`Probe::is_disowned`] matches it against the ids abeam
+    /// minted for its own readers and the ids of panes it has closed;
+    /// [`Found`] remembers it; and [`Probe::has_moved`] refuses to let a
+    /// record have moved unless it carries the one that was ours. A pid could
+    /// do none of that — the operating system hands those out again.
     pub session_id: Option<String>,
     pub cwd: Option<PathBuf>,
     pub kind: Kind,
@@ -248,21 +315,34 @@ impl Session {
         match self.status.as_deref() {
             Some(word) if word.eq_ignore_ascii_case("idle") => Readiness::Idle,
             Some(word) if word.eq_ignore_ascii_case("busy") => Readiness::Busy,
-            // Both spelled out rather than left to the catch-all below, even
-            // though all three answers are the same word. What the catch-all
-            // says is "abeam has never heard of this"; what these two say is
-            // "abeam knows exactly what this is, and it is still not a
-            // permission to type" â€” and only one of those survives Claude
+            // Both spelled out rather than left to the catch-all below. What
+            // the catch-all says is "abeam has never heard of this"; what these
+            // two say is "abeam knows exactly what this is, and it is still not
+            // a permission to type" — and only one of those survives Claude
             // adding a fifth status.
-            Some(word) if word.eq_ignore_ascii_case("waiting") => Readiness::Unknown,
+            //
+            // **They stopped being the same answer when [`Readiness::Waiting`]
+            // arrived, and the split is between what a person can act on and
+            // what they cannot.** `waiting` is a dialog with somebody's name on
+            // it: it will sit there until a human answers, and a border that
+            // says so is a border that gets it answered. `shell` is the agent
+            // being fine and abeam's own keystroke being aimed at `bash`
+            // instead — nothing is stuck, nobody is being waited for, and the
+            // reader has nothing to do about it. Refused identically; reported
+            // differently.
+            Some(word) if word.eq_ignore_ascii_case("waiting") => Readiness::Waiting,
             Some(word) if word.eq_ignore_ascii_case("shell") => Readiness::Unknown,
             // A status this version has never seen is not one it may guess at:
             // the guess that costs something is the one that guesses `Idle`.
             Some(_) => Readiness::Unknown,
             None => match self.state.as_deref() {
                 Some(word) if word.eq_ignore_ascii_case("working") => Readiness::Busy,
-                // `blocked` and `failed` arrive here with everything else, and
-                // that is the whole of the paragraph above.
+                // `blocked` is the same shape of stop as `waiting` and gets the
+                // same word: an agent that has gone quiet on a question, which
+                // a person can end and nothing else can. `failed` arrives here
+                // with everything else, because a failed background task is not
+                // waiting for anybody.
+                Some(word) if word.eq_ignore_ascii_case("blocked") => Readiness::Waiting,
                 _ => Readiness::Unknown,
             },
         }
@@ -433,6 +513,49 @@ pub struct Probe {
     /// rather than pids because a pid is reused and a `sessionId` abeam chose
     /// is not.
     disowned: Vec<String>,
+    /// The `cwd` of the last record this probe *accepted*, which is a
+    /// different fact from [`root`](Self::root) and must stay one.
+    ///
+    /// `root` is the anchor: the directory the pane was spawned in, compared
+    /// against by [`Probe::is_here`], never assigned to after [`Probe::new`].
+    /// This is what the accepted record said about itself, which is the same
+    /// directory in almost every session.
+    ///
+    /// **When it differs it is a worktree `git worktree list` named, and that
+    /// is wider than the case this was built for.** The case is a session that
+    /// made itself a worktree and moved in; what
+    /// [`has_moved`](Self::has_moved) actually accepts is any root git printed,
+    /// matched exactly — one somebody else added, one that has been there for
+    /// months, a neighbour's. That is deliberate and it is safe for a reason
+    /// that has nothing to do with how the directory came to exist: the record
+    /// has to carry the `sessionId` that was ours. Describing the field by its
+    /// motivating case would invite a later edit to narrow the check to
+    /// directories abeam watched appear, which is a fact abeam does not have.
+    /// Read [`standing_in`](Self::standing_in) before using either field.
+    ///
+    /// **Written only where a record has already been vouched for**, on both
+    /// paths through [`Probe::session`], and every accepted record carries a
+    /// `cwd` by construction — `is_here`, `is_mine` and `has_moved` each
+    /// refuse a record without one, so there is no acceptance this can be
+    /// assigned `None` by.
+    ///
+    /// **Never cleared, and the reason is a pane with no way out rather than a
+    /// flickering border.** A record that goes missing or unreadable does not
+    /// mean the session went back where it came from; it means abeam cannot see
+    /// it this poll. Clearing would send `crate::app::Agent::standing` back to
+    /// the directory the pane was *spawned* in — and that answer is what
+    /// `workspace::rows` guarantees a row for and what
+    /// `crate::app::App::agent_in` resolves `x` `x` against. So the row
+    /// synthesised for the worktree the agent is working in would disappear,
+    /// and the only gesture that can end that agent would start answering about
+    /// a checkout it is not in. That is phase 4's "a pane whose root has no row
+    /// is a pane with no way out", arriving through the very accessor built to
+    /// keep the row where the work is. A border flapping between two names is
+    /// the cosmetic half of the same thing and not the argument.
+    ///
+    /// `None` therefore means exactly one thing: this probe has never accepted
+    /// a record at all, which is a pane whose child writes none.
+    standing: Option<PathBuf>,
 }
 
 /// A record that was positively the session abeam hosts, and which session it
@@ -475,6 +598,7 @@ impl Probe {
             found: None,
             worktrees: Vec::new(),
             disowned: Vec::new(),
+            standing: None,
         }
     }
 
@@ -616,6 +740,71 @@ impl Probe {
         }
     }
 
+    /// The `sessionId` this probe settled on, if it has settled on one.
+    ///
+    /// **For the moment a pane is destroyed, and it is the same hazard
+    /// [`disown`](Self::disown) exists for arriving from the other end.** A
+    /// record's lifetime belongs to Claude, not to abeam: a child that is
+    /// killed does not tidy up after itself, so its `<pid>.json` can sit in the
+    /// directory with `status` frozen at whatever it was. Start another agent
+    /// in that worktree afterwards and the new probe finds no record of its own
+    /// for a second or two — the pid shortcut misses, the at-or-after filter
+    /// excludes the dead one on `startedAt` — and then falls through to
+    /// [`Probe::search`]'s last resort, *the newest candidate there is*, which
+    /// is the dead session. That fallback is there for a few milliseconds of
+    /// clock skew and this is not clock skew; it hands the new pane a frozen
+    /// `idle`, and `Idle` is the one answer that lets a queued prompt be typed.
+    ///
+    /// So `crate::app::App::close_agent` reads this as the pane goes and
+    /// disowns what it finds, which **widens what the disowned list means**:
+    /// it held ids abeam minted for its own readers, and it now also holds ids
+    /// abeam has watched a child of its own stop carrying. Both are "records of
+    /// something abeam is finished with", which is the sentence `is_disowned`
+    /// was already written around.
+    ///
+    /// `None` when this probe never found a record — a pane closed in the first
+    /// second of its life, or one whose agent was not Claude. There is then
+    /// nothing to name, and the hazard survives for the case where the child
+    /// wrote a record abeam never got as far as reading. That is a real gap and
+    /// a small one: it needs a pane killed inside the window between its child
+    /// writing its first record and the next quarter-second poll.
+    pub fn found_session_id(&self) -> Option<&str> {
+        self.found.as_ref()?.session_id.as_deref()
+    }
+
+    /// Where the record this probe has accepted says its session is standing.
+    ///
+    /// **It answers *where*, and it must never be asked *whether*.** Every
+    /// question about whether a record is this pane's is settled before this is
+    /// written: [`is_mine`](Self::is_mine) on discovery,
+    /// [`is_still_mine`](Self::is_still_mine) on every read after it, and
+    /// [`has_moved`](Self::has_moved) — gated on the `sessionId` that was ours
+    /// — for the one widening in this module. What comes back is a fact about
+    /// an identity check that has already passed, and a caller that used it to
+    /// decide identity would be asking the answer to vouch for the question.
+    ///
+    /// It is therefore for **display and routing only**, and
+    /// `crate::app::Agent::standing` is the whole of what reads it: a border
+    /// that names the worktree an agent moved into, the occupancy count in the
+    /// worktree list, and the row an `x` resolves a pane from. Not one of those
+    /// can type at anything.
+    ///
+    /// **Not the directory the pane was spawned in**, which is
+    /// [`root`](Self::root) and never changes — see [`standing`](Self::standing)
+    /// for why the two cannot be collapsed, and why this is never cleared once
+    /// it has an answer.
+    pub fn standing_in(&self) -> Option<&Path> {
+        self.standing.as_deref()
+    }
+
+    /// Whether this probe has been told to ignore `id`. A seam for
+    /// `crate::app`, whose half of the promise is that every probe that exists
+    /// is told and every probe made later is told out of a list.
+    #[cfg(test)]
+    pub fn is_disowned_for_tests(&self, id: &str) -> bool {
+        self.disowned.iter().any(|mine| mine == id)
+    }
+
     /// Whether this record belongs to something abeam started for itself.
     ///
     /// A record carrying no `sessionId` is not ours by this test, and that is
@@ -648,7 +837,59 @@ impl Probe {
             found: None,
             worktrees: Vec::new(),
             disowned: Vec::new(),
+            standing: None,
         }
+    }
+
+    /// The directory the pane this probe belongs to was spawned in — the
+    /// [`root`](Self::root) field, under the name the arguments use for it.
+    ///
+    /// **A test seam for the one property that has no behaviour to observe:
+    /// that this never moves.** [`standing_in`](Self::standing_in) follows the
+    /// session and the anchor does not, and the whole safety of that pair is
+    /// that only one of them feeds [`is_here`](Self::is_here). Nothing in this
+    /// module assigns to the field, so the property holds by there being no
+    /// writer — which is exactly the kind of property a later edit can take away
+    /// without any test going red. This is the test that would.
+    ///
+    /// Not called `root`, which is the field's name and would be the obvious
+    /// one: the two facts this module keeps apart are a directory that moves
+    /// and a directory that does not, and a reader who meets `probe.root()`
+    /// beside `probe.standing_in()` has to be told which is which. `anchor` is
+    /// the word every argument here already uses.
+    ///
+    /// `#[cfg(test)]` and `pub` for [`disowned`](Self::disowned)'s reason:
+    /// reachable from any test in the crate, and not part of what abeam ships.
+    #[cfg(test)]
+    pub fn anchor(&self) -> &Path {
+        &self.root
+    }
+
+    /// What this probe has been told, for the one question a behavioural test
+    /// cannot ask.
+    ///
+    /// **A pair of readers rather than a test that plants records, because the
+    /// subject is a probe that was built with neither.** `crate::app` seeds a
+    /// pane opened on a keystroke from what the session already knows — the
+    /// repository's worktrees and the sessions abeam has disowned — and both
+    /// arrive here as an absence when they are forgotten: an `Unknown` that
+    /// looks exactly like the feature having been deleted, and an `Idle`
+    /// belonging to somebody else. Neither absence can be told from the
+    /// outside on a probe reading the machine's real `~/.claude`, and
+    /// [`Probe::over`] cannot help, because replacing the probe is replacing
+    /// the thing under test.
+    ///
+    /// `#[cfg(test)]` and `pub` for that function's reason: reachable from any
+    /// test in the crate, and not part of what abeam ships.
+    #[cfg(test)]
+    pub fn disowned(&self) -> &[String] {
+        &self.disowned
+    }
+
+    /// The other half of the pair above.
+    #[cfg(test)]
+    pub fn worktrees(&self) -> &[PathBuf] {
+        &self.worktrees
     }
 
     /// The hosted agent's record, found by pid where that works and by
@@ -693,15 +934,73 @@ impl Probe {
         // Decided before the memory is touched rather than inside the match,
         // because the borrow of `found` that reads the path is still live in
         // the arms that would clear it.
+        //
+        // The accepted record is carried out of the match for that same
+        // reason, one field along: writing [`standing`](Self::standing) inside
+        // the arm would be a `&mut self` while the borrow that read the path is
+        // still live. Both writers of that field are below, and both are on the
+        // far side of an acceptance.
         let mut forget = false;
+        let mut accepted = None;
         if let Some(found) = self.found.as_ref() {
             match record(&found.path) {
                 Record::Read(session) if self.is_still_mine(found, &session) => {
-                    return Some(session);
+                    accepted = Some(session);
+                }
+                // **Still the session that was ours, refused for some other
+                // reason: `Unknown` for this poll, and the memory kept.** This
+                // arm is the whole of what makes a session moving into a
+                // worktree survivable, and without it the feature essentially
+                // never fired.
+                //
+                // The sequence, which is the ordinary one rather than a corner:
+                // the agent runs `git worktree add`, moves in, and rewrites its
+                // record. The next poll is 250 ms later; the *discovery* that
+                // would put the new directory in [`worktrees`](Self::worktrees)
+                // is on a ten-second timer, so at that poll `is_here` is false
+                // and [`has_moved`](Self::has_moved) is false because the
+                // destination is on no list yet. Dropping the memory there is
+                // final: [`has_moved`] is reachable only through
+                // [`is_still_mine`](Self::is_still_mine), which needs a
+                // `found`, and [`search`](Self::search) is strict and matches
+                // the spawn root exactly. So discovery catching up ten seconds
+                // later could never help, and the session was `Unknown` — no
+                // queued send, ever — for the rest of the run.
+                //
+                // **Keeping it costs no identity.** `found` is a path and a
+                // name; what it must never do is go on naming a *different*
+                // session, and [`is_ours_but_unplaced`](Self::is_ours_but_unplaced)
+                // requires the file to still carry the `sessionId` that was
+                // ours, which is exactly the evidence that it does not. Nothing
+                // is admitted by this arm — it answers `None` — and nothing is
+                // deferred: the next poll re-asks `is_still_mine` from scratch,
+                // location included.
+                //
+                // **It is refused *only* on location, and the narrowness is
+                // load-bearing rather than tidy.** The three other conditions
+                // are re-asked here as well, and dropping `started_at` in
+                // particular breaks something already tested: a record of ours
+                // stamped a few milliseconds before `spawned_at` fails
+                // `is_still_mine` on *every* call, and is re-found on every
+                // call by [`search`](Self::search)'s clock-skew `or_else` —
+                // which the memory path does not have. Keeping the memory there
+                // would answer `Unknown` for ever in the one case the fallback
+                // exists to rescue.
+                Record::Read(session) if self.is_ours_but_unplaced(found, &session) => {
+                    return None;
                 }
                 Record::Unreadable => return None,
                 _ => forget = true,
             }
+        }
+        if let Some(session) = accepted {
+            // The one place a *move* is noticed: `is_still_mine` has just
+            // allowed a record whose `cwd` is a worktree of this repository,
+            // on the strength of the `sessionId` that was ours. What that
+            // record says about itself is what a border and the worktree list
+            // want, and it is thrown away everywhere else.
+            self.standing = session.cwd.clone();
+            return Some(session);
         }
         if forget {
             self.found = None;
@@ -713,6 +1012,12 @@ impl Probe {
         // `Unknown` for the rest of the session because of what was true on the
         // frame after the spawn.
         let (path, session) = self.search()?;
+        // Discovery is strict, so what this record says about where it is
+        // standing is the agent's own root — see [`Probe::search`]. It is
+        // written all the same rather than left for the first *move* to set,
+        // because a field that is only ever written by the unusual path is a
+        // field nothing ordinary keeps honest.
+        self.standing = session.cwd.clone();
         self.found = Some(Found {
             path,
             session_id: session.session_id.clone(),
@@ -840,6 +1145,43 @@ impl Probe {
             // over a rounding difference. A record with no `startedAt` at all
             // sorts below every record that has one, so it wins only when it is
             // the only thing in the directory that could be ours.
+            //
+            // ## What this fallback will adopt, asked and answered
+            //
+            // **It is written for milliseconds and it accepts any age**, and
+            // two callers can hand it a record that is minutes old. A pane that
+            // has just been killed leaves its file behind, because a record's
+            // lifetime is Claude's and a killed child does not tidy up. And a
+            // *second* agent started in a root that already has one has no
+            // record of its own for a second or two, during which the newest
+            // candidate in that directory is its sibling's. Either way the
+            // answer is somebody else's `status`, and if that somebody is idle
+            // the answer is `Idle` â€” the one answer that lets
+            // `crate::panes::queue` type.
+            //
+            // **Neither becomes permanent, and `is_still_mine` is why.** It
+            // re-asks `started_at >= spawned_at` on every call, which an older
+            // record fails, so a wrong answer is never memoised: the memory is
+            // dropped and the search runs again. The moment this pane's own
+            // record exists it wins outright â€” by the pid shortcut on a native
+            // install, and by the at-or-after filter on an npm one, where the
+            // pid abeam holds is the interpreter's. So the exposure is a
+            // startup window and not a session.
+            //
+            // **It is closed from outside rather than narrowed here**, and that
+            // is a decision rather than an oversight. `crate::app::App` disowns
+            // a pane's record when the pane is closed, and tells a new pane's
+            // probe about every record already claimed by a pane on screen â€”
+            // both are "this record belongs to somebody else", said by the one
+            // party that knows. Narrowing the fallback to a *window* around
+            // `spawned_at` would help here too, and would be a change to the
+            // discovery rule with its own argument to make: it would leave a
+            // machine whose clocks disagree by more than the window `Unknown`
+            // for the whole run, which is safe and silent, and it would still
+            // not separate two agents started a fraction of a second apart. The
+            // hazard the window would catch and the disowning does not is a
+            // pane whose probe never settled on a record before it was closed
+            // or before its sibling started.
             .or_else(|| {
                 candidates
                     .iter()
@@ -905,11 +1247,52 @@ impl Probe {
     /// standing, because this record has already been positively ours and the
     /// session in it is allowed to have moved since. [`Probe::set_worktrees`] is
     /// where the split between this and [`Probe::is_mine`] is argued.
+    ///
+    /// The three facts that are not about a place are
+    /// [`is_a_session_of_ours`](Self::is_a_session_of_ours), because
+    /// [`is_ours_but_unplaced`](Self::is_ours_but_unplaced) is this question
+    /// with the place taken out and the two must not be able to drift.
     fn is_still_mine(&self, found: &Found, session: &Session) -> bool {
+        self.is_a_session_of_ours(session)
+            && (self.is_here(session) || self.has_moved(found, session))
+    }
+
+    /// Everything a remembered record has to be **apart from where it is
+    /// standing**.
+    ///
+    /// Split out so that [`is_still_mine`](Self::is_still_mine) and
+    /// [`is_ours_but_unplaced`](Self::is_ours_but_unplaced) ask one question
+    /// rather than two that happen to agree — the second is defined as the
+    /// first minus its location clause, and a copy of three conditions is a
+    /// copy that gets edited once.
+    fn is_a_session_of_ours(&self, session: &Session) -> bool {
         !self.is_disowned(session)
             && session.kind == Kind::Interactive
             && session.started_at.is_some_and(|at| at >= self.spawned_at)
-            && (self.is_here(session) || self.has_moved(found, session))
+    }
+
+    /// Still this probe's session by every test except where it is standing.
+    ///
+    /// **The predicate that keeps a memory alive across a move discovery has
+    /// not caught up with**, and the refusal arm in [`session`](Self::session)
+    /// is its only caller and carries the argument. It is
+    /// [`is_still_mine`](Self::is_still_mine) with the location clause replaced
+    /// by an identity one: the record has to be the same *session* — the
+    /// `sessionId` that was ours, by
+    /// [`is_the_session_found`](Self::is_the_session_found) — and it has to be
+    /// interactive, undisowned and no older than the spawn, exactly as it would
+    /// to be answered with.
+    ///
+    /// **It is strictly narrower than `is_still_mine` on identity and strictly
+    /// wider on place, and both halves matter.** Wider on place, or this would
+    /// not keep the memory of a session standing in a worktree nobody has named
+    /// yet, which is the whole point. Narrower on identity, because
+    /// `is_still_mine` deliberately requires no `sessionId` when the record is
+    /// at the agent's own root — see [`is_mine`](Self::is_mine)'s documented
+    /// blind spot — and a memory kept on the strength of a *place* nobody has
+    /// vouched for would be a memory kept for anybody's record.
+    fn is_ours_but_unplaced(&self, found: &Found, session: &Session) -> bool {
+        Self::is_the_session_found(found, session) && self.is_a_session_of_ours(session)
     }
 
     /// Whether the session that was ours has moved to a directory git named as
@@ -919,36 +1302,66 @@ impl Probe {
     /// this module. Two conditions, and dropping either one gives back a bug
     /// that has already happened:
     ///
-    /// *The same session.* The remembered path is `<pid>.json`, and a pid
-    /// outlives the process it named — so a record that was ours can be
-    /// rewritten by whatever got the number next. Without this, a recycled pid
-    /// landing on a neighbouring agent in a worktree passes every other check
-    /// (interactive, started after abeam, in a directory on the list) and is
-    /// then *memoised*: a wrong `Idle`, stably, for the rest of the run. That is
-    /// the same failure `a_dead_sessions_record_is_never_read_as_the_agent_on_screen`
-    /// pins for the root, arriving one worktree over.
+    /// *The same session*, which is [`is_the_session_found`](Self::is_the_session_found)
+    /// and lives there because [`session`](Self::session)'s refusal arm needs
+    /// exactly that half. Without it, a recycled pid landing on a neighbouring
+    /// agent in a worktree passes every other check (interactive, started after
+    /// abeam, in a directory on the list) and is then *memoised*: a wrong
+    /// `Idle`, stably, for the rest of the run. That is the same failure
+    /// `a_dead_sessions_record_is_never_read_as_the_agent_on_screen` pins for
+    /// the root, arriving one worktree over.
     ///
     /// *A named directory, matched exactly.* A set, never a prefix, and never a
     /// directory merely inside a member of it — `crate::paths::parts` is explicit
     /// that a loose comparison in this decision "sends somebody's prompt to a
     /// session in another checkout, and it is not one they would see happen".
     ///
-    /// A record carrying no `sessionId` is refused outright rather than waved
-    /// through on the directory alone. Every record a real Claude writes has
-    /// one, so this costs nothing that exists, and what it buys is that the
-    /// identity check cannot be skipped by a record that simply omits the field.
+    /// **This answering `false` is not the end of the matter, and it used to
+    /// be.** The list is ten seconds old at worst and a worktree the agent
+    /// makes for itself is newer than that by construction, so the *first* poll
+    /// after a move always lands here and always answers `false`. What that
+    /// costs is a poll answered `Unknown`; what it used to cost was the memory,
+    /// and therefore the session, for the rest of the run. See the refusal arm
+    /// in [`session`](Self::session).
     fn has_moved(&self, found: &Found, session: &Session) -> bool {
+        Self::is_the_session_found(found, session)
+            && session.cwd.as_deref().is_some_and(|cwd| {
+                self.worktrees
+                    .iter()
+                    .any(|worktree| crate::paths::same_dir(cwd, worktree))
+            })
+    }
+
+    /// Whether the record at the remembered path is still the session that was
+    /// remembered there.
+    ///
+    /// **The identity half of [`has_moved`](Self::has_moved), split out because
+    /// a second caller needs exactly it and nothing else.** That caller is the
+    /// refusal arm in [`session`](Self::session), which keeps a memory that has
+    /// been refused for a reason that is not identity — a session standing in a
+    /// worktree discovery has not named yet — so that a later
+    /// [`set_worktrees`](Self::set_worktrees) can revalidate it. Splitting it
+    /// is what stops that arm from being a second, looser idea of what "still
+    /// ours" means.
+    ///
+    /// The remembered path is `<pid>.json` and a pid outlives the process it
+    /// named, so a file that was ours can be rewritten by whatever got the
+    /// number next. This is the only thing that separates the two, and it is a
+    /// `sessionId` rather than a pid because the operating system does not hand
+    /// those out again.
+    ///
+    /// A record carrying no `sessionId` is refused, and so is a memory that
+    /// carries none. Every record a real Claude writes has one, so this costs
+    /// nothing that exists, and what it buys is that the check cannot be
+    /// skipped by a record that simply omits the field.
+    ///
+    /// No `&self`: it compares a record against a memory and consults nothing
+    /// about this probe, which is the property that keeps both callers honest.
+    fn is_the_session_found(found: &Found, session: &Session) -> bool {
         let Some(known) = found.session_id.as_deref() else {
             return false;
         };
-        if session.session_id.as_deref() != Some(known) {
-            return false;
-        }
-        session.cwd.as_deref().is_some_and(|cwd| {
-            self.worktrees
-                .iter()
-                .any(|worktree| crate::paths::same_dir(cwd, worktree))
-        })
+        session.session_id.as_deref() == Some(known)
     }
 
     /// [`Session::readiness`], or `Unknown` when there is no record to read.
@@ -1442,18 +1855,23 @@ mod tests {
         assert_eq!(readiness(r#","status":"Busy""#), Readiness::Busy);
         assert_eq!(readiness(r#","state":"Working""#), Readiness::Busy);
 
-        // The other two of Claude's four statuses, both `Unknown` and both for
-        // a reason rather than by falling off the end of the list.
+        // The other two of Claude's four statuses. Both refuse a send and
+        // neither does so by falling off the end of the list — and they stopped
+        // being the *same* refusal when a collapsed pane's title row needed one
+        // of them by name.
         //
         // `waiting` is the permission dialog â€” the state the module header's
         // nightmare is about, and the proof that reading this file rather than
         // watching the pty is what makes the nightmare impossible: a queued
-        // prompt is only ever sent on `idle`.
-        assert_eq!(readiness(r#","status":"waiting""#), Readiness::Unknown);
+        // prompt is only ever sent on `idle`. It is `Waiting` rather than
+        // `Unknown` because a person can end it and a border can say so.
+        assert_eq!(readiness(r#","status":"waiting""#), Readiness::Waiting);
         assert!(!readiness(r#","status":"waiting""#).is_idle());
         // `shell` is idle with a shell open over it. Not `Busy`, because
         // nothing is working; not `Idle`, because what is in front of the
-        // keyboard is `bash` and a prompt sent now goes there.
+        // keyboard is `bash` and a prompt sent now goes there; and not
+        // `Waiting`, because nobody is being waited *for* — there is nothing
+        // for a reader to go and answer.
         assert_eq!(readiness(r#","status":"shell""#), Readiness::Unknown);
 
         // A record with neither field knows nothing, and says so.
@@ -1477,9 +1895,12 @@ mod tests {
         );
 
         // Only `Idle` is idle. Nothing else in this module may be treated as a
-        // permission to type.
+        // permission to type, and the list is exhaustive on purpose: a variant
+        // added so that something can *describe* an agent has to be brought
+        // past this line before it can describe one.
         assert!(Readiness::Idle.is_idle());
         assert!(!Readiness::Busy.is_idle());
+        assert!(!Readiness::Waiting.is_idle());
         assert!(!Readiness::Unknown.is_idle());
     }
 
@@ -1492,13 +1913,26 @@ mod tests {
         // prompt, and the first character of a queued prompt answers that
         // prompt instead of arriving as a prompt. `failed` is here for the same
         // reason: it has stopped too, and it is no more at its own input.
-        for state in ["blocked", "failed", "BLOCKED", "Failed"] {
+        //
+        // **The assertion that matters is `!is_idle`, and it is the one written
+        // second.** The two states answer differently now — `blocked` is
+        // somebody waiting for a person, which a border says out loud, and
+        // `failed` is a task that has ended, which nobody can act on — and a
+        // test that pinned the *word* rather than the refusal would have to be
+        // rewritten every time a border learns to say something new. What may
+        // never change is that neither is a permission to type.
+        for (state, expected) in [
+            ("blocked", Readiness::Waiting),
+            ("failed", Readiness::Unknown),
+            ("BLOCKED", Readiness::Waiting),
+            ("Failed", Readiness::Unknown),
+        ] {
             let session = parse_session(&format!(r#"{{"sessionId":"s","state":"{state}"}}"#))
                 .expect("a record");
             assert_eq!(
                 session.readiness(),
-                Readiness::Unknown,
-                "`{state}` was not read as unknown"
+                expected,
+                "`{state}` was not read as {expected:?}"
             );
             assert!(
                 !session.readiness().is_idle(),
@@ -1510,9 +1944,11 @@ mod tests {
         // entries came from.
         let roster = parse_roster(ROSTER).expect("the real roster");
         assert_eq!(roster[0].state.as_deref(), Some("blocked"));
-        assert_eq!(roster[0].readiness(), Readiness::Unknown);
+        assert_eq!(roster[0].readiness(), Readiness::Waiting);
+        assert!(!roster[0].readiness().is_idle());
         assert_eq!(roster[1].state.as_deref(), Some("failed"));
         assert_eq!(roster[1].readiness(), Readiness::Unknown);
+        assert!(!roster[1].readiness().is_idle());
     }
 
     // --- what is not a record ---------------------------------------------
@@ -2220,9 +2656,15 @@ mod tests {
             found: None,
             worktrees: Vec::new(),
             disowned: Vec::new(),
+            standing: None,
         };
         assert!(nowhere.session().is_none());
         assert_eq!(nowhere.readiness(), Readiness::Unknown);
+        assert_eq!(
+            nowhere.standing_in(),
+            None,
+            "a probe that has accepted no record named a directory anyway"
+        );
 
         // An empty directory is the same answer, and so is one that has gone
         // between construction and the frame that asks â€” a probe is held for
@@ -2766,5 +3208,236 @@ mod tests {
         assert_eq!(probe.readiness(), Readiness::Busy);
         moves_to(&dir, 46256, &worktree("other"), STARTED, "idle");
         assert_eq!(probe.readiness(), Readiness::Idle);
+    }
+
+    #[test]
+    fn a_session_that_moves_before_discovery_names_the_worktree_is_recovered_when_it_does() {
+        // **The order every real move happens in, and the one that made the
+        // whole feature never fire.** `crate::app` refreshes this list from a
+        // `git worktree list` on a ten-second timer; a worktree the agent has
+        // just made for itself is newer than the last one of those by
+        // construction. So the first poll after a move — 250 ms later — finds
+        // `is_here` false and `has_moved` false, because the destination is on
+        // no list yet.
+        //
+        // Dropping the memory there was final. `has_moved` is reachable only
+        // through `is_still_mine`, which needs a `found`, and `search` matches
+        // the spawn root exactly — so discovery catching up ten seconds later
+        // could never put it back, and the session was `Unknown`, with no
+        // queued send ever delivered to it, for the rest of the run.
+        let dir = TempDir::new("agentstate-moved-early");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        // What discovery had said when the pane started: the repository, and
+        // nothing that did not exist yet.
+        probe.set_worktrees(vec![PathBuf::from(ROOT)]);
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // The move, into a directory the list does not have.
+        moves_to(&dir, 46256, &worktree("review"), STARTED, "idle");
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Unknown,
+            "a worktree nothing has vouched for was answered for anyway"
+        );
+        // Twice, because what this is really about is what the *second* poll
+        // can still do — and a dozen polls happen before discovery next runs.
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+
+        // Discovery catches up, and the session comes back rather than being
+        // lost with the memory.
+        probe.set_worktrees(the_repository());
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Idle,
+            "the memory was thrown away, so the session could never be recovered"
+        );
+        assert!(
+            probe
+                .standing_in()
+                .is_some_and(|at| crate::paths::same_dir(at, Path::new(&worktree("review")))),
+            "the recovered session is not reported where it went: {:?}",
+            probe.standing_in()
+        );
+    }
+
+    #[test]
+    fn a_memory_kept_across_an_unnamed_move_is_still_dropped_on_identity() {
+        // The boundary of the arm above, and the reason it tests the
+        // `sessionId` rather than the directory. Keeping a memory is keeping a
+        // *name*; the moment the file under it stops carrying that name it is
+        // somebody else's record, and no amount of discovery may bring it back.
+        let dir = TempDir::new("agentstate-unplaced-identity");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(vec![PathBuf::from(ROOT)]);
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // A different session, under the pid ours had, in a worktree nothing
+        // has named yet: interactive, started after abeam, and refused.
+        dir.write(
+            "46256.json",
+            format!(
+                r#"{{"pid":46256,"sessionId":"somebody-else","cwd":{},"startedAt":{},"peerProtocol":1,"kind":"interactive","status":"idle"}}"#,
+                serde_json::to_string(&worktree("review")).expect("a JSON string"),
+                STARTED + 1
+            )
+            .as_bytes(),
+        );
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+
+        // And the memory went with it, so naming that worktree does not hand
+        // this probe a session it never identified. `search` is strict, and
+        // this is the assertion that says the keeping arm did not quietly
+        // widen it.
+        probe.set_worktrees(the_repository());
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Unknown,
+            "a stranger's record was revalidated by a list arriving later"
+        );
+
+        // **The step that makes the two versions of this tell apart**, and
+        // without it the assertions above pass whether the identity is checked
+        // or not: a kept memory and a dropped one both answer `Unknown` while
+        // the file is a stranger's. So the file becomes ours again — the same
+        // `sessionId`, in a worktree that is now on the list — and the answer
+        // is still `Unknown`, because a memory that was dropped is dropped and
+        // a session standing where discovery cannot vouch for it is not
+        // rediscovered. That is the documented cost of the strict half, and it
+        // is what a kept memory would silently buy back.
+        moves_to(&dir, 46256, &worktree("review"), STARTED, "idle");
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Unknown,
+            "the memory survived a stranger and let our own session back in \
+             through a door `search` had closed"
+        );
+    }
+
+    #[test]
+    fn the_probe_names_the_directory_of_the_record_it_accepted() {
+        // The display half of the bug the widening closed for readiness. A
+        // session that moves into a worktree goes on being read — and nothing
+        // outside this module could find out *where* it went, so a border named
+        // the checkout the pane was spawned in and the worktree list credited
+        // its occupancy to that same wrong row.
+        let dir = TempDir::new("agentstate-standing");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(the_repository());
+
+        // Nothing has been read yet, so there is nothing to say. `None` is also
+        // the answer a pane hosting a Codex or a Copilot keeps for ever.
+        assert_eq!(
+            probe.standing_in(),
+            None,
+            "a probe named a directory before it had accepted a record"
+        );
+
+        assert_eq!(probe.readiness(), Readiness::Busy);
+        assert!(
+            probe
+                .standing_in()
+                .is_some_and(|at| crate::paths::same_dir(at, Path::new(ROOT))),
+            "discovery is strict, so the first accepted record is at the root: {:?}",
+            probe.standing_in()
+        );
+
+        // The session moves, and the answer moves with it.
+        moves_to(&dir, 46256, &worktree("review"), STARTED, "idle");
+        assert_eq!(probe.readiness(), Readiness::Idle);
+        assert!(
+            probe
+                .standing_in()
+                .is_some_and(|at| crate::paths::same_dir(at, Path::new(&worktree("review")))),
+            "the probe went on naming the directory the pane was spawned in: {:?}",
+            probe.standing_in()
+        );
+
+        // **And the anchor did not move**, which is the safety argument written
+        // as an assertion rather than left as a property nothing observes.
+        // `is_here` compares a record's `cwd` against this directory; an anchor
+        // that followed the record would be the record vouching for itself, and
+        // the revalidation `has_moved` gates on a `sessionId` would have nothing
+        // left to be strict about.
+        assert!(
+            crate::paths::same_dir(probe.anchor(), Path::new(ROOT)),
+            "the identity anchor followed the session it anchors: {:?}",
+            probe.anchor()
+        );
+
+        // Back where it started, which is `is_here` again rather than the
+        // widening — so this is the hop that proves the field is written by
+        // every acceptance and not only by the interesting one.
+        moves_to(&dir, 46256, ROOT, STARTED, "busy");
+        assert_eq!(probe.readiness(), Readiness::Busy);
+        assert!(
+            probe
+                .standing_in()
+                .is_some_and(|at| crate::paths::same_dir(at, Path::new(ROOT))),
+            "a session that came back was still reported one worktree over: {:?}",
+            probe.standing_in()
+        );
+    }
+
+    #[test]
+    fn a_record_this_probe_refuses_does_not_move_where_it_says_the_session_is() {
+        // The rule that keeps the accessor from becoming a second way of asking
+        // whether a record is ours: it is written on the far side of an
+        // acceptance and nowhere else. A refused record answers `Unknown` for
+        // the readiness, and must leave the directory alone rather than
+        // reporting where the stranger was standing.
+        let dir = TempDir::new("agentstate-refused-standing");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(the_repository());
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // A different session under the pid ours had, in a worktree on the
+        // list: interactive, started after abeam, refused on the identity
+        // alone. `only_the_session_that_was_ours_is_allowed_to_have_moved` is
+        // where that refusal is pinned; this is what it must not leak.
+        dir.write(
+            "46256.json",
+            format!(
+                r#"{{"pid":46256,"sessionId":"somebody-else","cwd":{},"startedAt":{},"peerProtocol":1,"kind":"interactive","status":"idle"}}"#,
+                serde_json::to_string(&worktree("other")).expect("a JSON string"),
+                STARTED + 1
+            )
+            .as_bytes(),
+        );
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+        assert!(
+            probe
+                .standing_in()
+                .is_some_and(|at| crate::paths::same_dir(at, Path::new(ROOT))),
+            "a refused record moved the answer a border is drawn from: {:?}",
+            probe.standing_in()
+        );
+
+        // And a record that has simply *gone* leaves it alone too, which is the
+        // never-cleared rule: abeam cannot see the session this poll, and that
+        // is not the same as the session having gone back where it came from.
+        // The alternative is a border flapping between two names on a
+        // transient.
+        //
+        // Through the root on the way, because the refusal above dropped the
+        // memory and a session in a worktree cannot be *discovered* — the cost
+        // the strict half of the widening pays, asserted in
+        // `only_the_session_that_was_ours_is_allowed_to_have_moved`.
+        moves_to(&dir, 46256, ROOT, STARTED, "busy");
+        assert_eq!(probe.readiness(), Readiness::Busy);
+        moves_to(&dir, 46256, &worktree("review"), STARTED, "idle");
+        assert_eq!(probe.readiness(), Readiness::Idle);
+        std::fs::remove_file(dir.path().join("46256.json")).expect("a record to remove");
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+        assert!(
+            probe
+                .standing_in()
+                .is_some_and(|at| crate::paths::same_dir(at, Path::new(&worktree("review")))),
+            "a record going missing was read as the session moving home: {:?}",
+            probe.standing_in()
+        );
     }
 }

@@ -1098,19 +1098,31 @@ pane is switched, so a workspace with no row on it is a workspace nobody can get
 back to, and neither absence is exotic: `git worktree list` names the repository
 rather than the subdirectory you started abeam in.
 
-**The left pane never moves, and that asymmetry is the design rather than an
-unfinished half of it.** A live child's working directory belongs to the child;
-there is no call that moves a running process to another directory, so the agent
-stays where it was started for as long as it runs. The window therefore
-deliberately disagrees with itself about where it is, and the border is what
-keeps that honest — it names the workspace the *right* pane is on, and **only
-when that is not the agent's own**. That suppression is not tidiness either. The
-pane is 46 columns; a label on every title spends three or four of them saying
-the one thing that is true by default, and pushes the branch name and change
-count the git title exists for off the end of the border. Shown only when it is
-news, it costs nothing and says everything. The list marks `agent` separately
-from `▸` for the same reason: the point of opening it is to look at a workspace
-the agent is *not* in.
+**The left pane is never moved *by abeam*, and that asymmetry is the design
+rather than an unfinished half of it.** A live child's working directory belongs
+to the child; there is no call that moves a running process to another
+directory, so nothing here re-roots an agent pane the way `Enter` re-roots the
+right one. (The session inside the pty is another matter, and the sentence used
+to be written as though it were not: Claude Code makes worktrees and moves into
+them, and the pane's border, the list's count and the row `x` acts on follow it
+there. `docs/multi-agent.md` has the correction and the two facts it rests on.)
+The window therefore deliberately disagrees with itself about where it is, and
+the borders are what keep that honest. The right pane names the workspace it is
+on, and **only when that is not the root abeam was started in** — which is
+`spaces[0]`, the one workspace that is never removed, and not "the agent's own",
+a phrase that stopped naming one directory the moment an agent could move. Each
+agent pane names where its own session is working, suppressed on the same
+condition and against the same root, so the shortest use of the feature — a
+second agent in the checkout you are already in — spends no columns saying the
+default.
+
+That suppression is not tidiness either. The pane is 46 columns; a label on
+every title spends three or four of them saying the one thing that is true by
+default, and pushes the branch name and change count the git title exists for
+off the end of the border. Shown only when it is news, it costs nothing and says
+everything. The list marks the agent count separately from `▸` for the same
+reason: the point of opening it is to look at a workspace the agents are *not*
+in.
 
 Three views read a directory, and the switch reaches all three. The git pane
 re-roots and says "reading the repository…" until the first refresh lands, in

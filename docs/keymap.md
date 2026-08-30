@@ -130,7 +130,7 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `Alt+E` | right pane → files / markdown view (focus unchanged) |
 | `Alt+S` | right pane → a shell, **and focus it**; again to hand focus back |
 | `F8` | right pane → the queue of work for the agent (focus unchanged) |
-| `F4` / `F5` | move focus left / right |
+| `F4` / `F5` | move focus left / right; `F4` again moves along the agents |
 | `Alt+J` / `Alt+K` | scroll right pane one line — **without focusing it** |
 | `Alt+PageDown` / `Alt+PageUp` | scroll right pane one page — without focusing it |
 | `Alt+Z` | zoom: hide / show the right pane |
@@ -142,6 +142,157 @@ Typing at the agent is byte-for-byte what the pty spike did.
 | `F7` | select rows of the right pane by keyboard, **and focus it**; again to put the selection away |
 | `F9` | right pane → the scratch pad, **and focus it**; again to hand focus back |
 | `Ctrl+\` or `F12` | literal-next: send the following key to the agent verbatim |
+
+**`F4`'s second meaning cost this document no audit, and that is the point of
+it.** A press while the keys are already on the left used to do nothing at all,
+so "again" is a meaning added to a dead press rather than a key taken from any
+agent — the table above is one row longer in words and no rows longer in keys.
+The gesture that *starts* another agent is `a` on a row of the worktree list,
+which is not in this table either: it is a pane-local key, and the exemption is
+`crates/abeam/src/panes/git.rs`'s, stated above `enum Mode` and standing since
+`w` and `Enter` were claimed there. **That exemption is about delivery and not
+about what is on screen**, which is the precise claim and the only one that
+holds: the key is *only ever delivered* while the right pane has focus and this
+view is up, so it never reaches a pane while anything is being typed at an
+agent. Paraphrasing it as "a view that is only up while the right pane has
+focus" says something weaker and untrue — the list stays up when focus moves —
+and the weaker sentence would not carry `x`. There is no `Shift+F4` for the other
+direction, deliberately: a modified F-key is a key abeam knows nothing about and
+therefore the agent's, which `keys.rs` says in a comment about `Ctrl+F12`.
+
+**`a` is bound twice in that pane and it is one gesture, which is the exemption
+earning its keep rather than being stretched.** In the worktree list it is the
+row under the cursor; in the git **status** view — the one `Alt+G` opens — it is
+the checkout that pane is showing, which is the row that list would have drawn
+as `here`. So `Alt+G`, `a` is a shortcut through `Alt+G`, `w`, find the row you
+are already on, `a`, and it asks for the same thing in the same request slot.
+
+**Both arms decline `Ctrl` and `Alt`, and getting that wrong was a real
+binding rather than a tidiness.** The status list has refused `Ctrl`+letter
+since it was written — `Ctrl` plus a letter is the agent's everywhere in this
+program — while the worktree list matched on the key code alone. So `Ctrl+A`
+started an agent and `Ctrl+X` armed a kill on a running one, three lines under a
+comment saying the opposite. Writing the second `a` arm is what made it visible,
+because the two then had to be described as one request and were not.
+
+`Alt` is refused as well, and that half is not symmetry: **`Alt+A` is Codex's
+own key** by the inventory at the foot of this document, in a program that hosts
+Codex, and a reader whose hand knows that chord must not discover that it starts
+an abeam agent. The cost is `Alt+R` and `Alt+W`, which meant refresh and the
+worktree list by accident and were never anybody's spelling of either. `Ctrl+D`
+and `Ctrl+U` are unaffected — they are the shared half-page scroll, and the rule
+is a hand-off to that vocabulary rather than a bare refusal, so this list is not
+made the one exception to something the `F1` overlay promises.
+
+That second spelling exists because the workflow it serves is not about
+worktrees at all. Claude Code makes its own — it runs `git worktree add` and
+moves into it — so the ordinary way to want a second agent is to open one where
+you already are and tell it to branch off, and framing that gesture around a
+list of *the checkouts you are not in* made the common case the long way round.
+**No global was spent on it and none could be**: this document records `F1`–`F9`
+and `F12` as abeam's, `F10` and `F11` as eaten by terminal emulators before an
+application sees them, and the `Alt` letters as close to spent across three
+agents' shipped defaults — a claim that could only be renewed by repeating the
+whole extraction below. The exemption above carries this arm word for word,
+because it is about *delivery*: `handle_key` offers a pane a key only under
+`Focus::Right`, whichever of the two lists is up. `?` and `w` in that same match
+have stood on it for longer.
+
+**The gesture that *closes* one is `x`, in two places, and neither is in the
+table.** `a` leans on the worktree list's exemption — a key claimed inside a
+view, and *delivered* only while the right pane has focus and that view is up,
+so it never reaches a pane while anything is being typed at an agent. The two
+`x`es split along exactly that line, and the split is not tidiness: it is what
+the letter costs.
+
+**What that buys, and it is the answer phase 3 owed the `q` comparison below.**
+Refusing `q` cost a shared vocabulary — one letter for "leave this pane" and
+another for "destroy it" — and the objection then was that abeam had gained a
+verb without a habit behind it. It has one now: `x` means *close that agent
+pane* in both places it appears, and the difference between them is where the
+key is legal rather than what it does. A reader who learns it at a dead pane has
+learned the gesture in the list, and vice versa. `q` could never have carried
+that, because it is already the way *out* of the right pane and would have had
+to mean two things.
+
+**At an agent pane, `x` closes one whose child has exited.** That is claimed in
+the **left** column, which is where typing at an agent happens, and it is
+nevertheless outside this document's invariant, for a reason stronger than the
+exemption: it is only ever offered to a pane whose child has **gone**. There is
+no process left to have a binding for it. Every key delivered to such a pane is
+already going into a closed pty and doing nothing, so a letter intercepted there
+cannot shadow any agent's binding in any session — which is a claim no audit
+could make about a live one, and the reason the audits below are unaffected. It
+sits inside `handle_key`'s `Focus::Left` arm and *after* the literal-next hatch,
+so `Ctrl+\` `x` still goes to the child; `crates/abeam/src/app.rs`'s `close_key`
+is where that is written down. Two presses, because what closing destroys is the
+frozen last screen and the scrollback behind it, and nothing in abeam can get
+either back.
+
+**In the worktree list, `x` closes the agent standing on that row, alive or
+not.** This is where a *running* agent is ended, and where it had to go. The
+argument for the left column above inverts exactly: a live child is listening,
+so intercepting `x` in front of one would eat the letter out of every word
+somebody types at it, and forwarding it while arming a confirmation anyway would
+make `box` — or any second `x` in a sentence — kill a running session. Neither
+is a program anybody can type at. Nor is there a global to spend: this document
+records the `Alt` namespace as close to spent, and a new letter would need the
+whole extraction below repeated against three agents' current builds, which is
+not an afternoon's work and would be a claim resting on nothing until it was
+done. So the key lives in the one list that shows abeam's own panes, next to the
+`a` that starts them.
+
+Three things about it are deliberate. **Two presses**, `Alt+Q`'s shape, and the
+question is carried by the row it was asked about, so `x`, `Tab`, `x` is not a
+kill. **The confirmation is drawn on the border of the pane it would destroy**,
+not in the list — `x` `x` in a list is two presses on a key with no memory of
+what it destroyed — and it reads `x again to kill this running agent`, which is
+different wording from the exited pane's `x again to close this pane` because
+what is at stake is different. And **the detour is part of the guard**: reaching
+this key means `Alt+G`, `w`, and finding the row, which is harder than the two
+presses at a dead pane by exactly the margin a running agent deserves.
+
+Two panes in one checkout are one row, and abeam refuses rather than guessing:
+the answer names the count and says `F4` to the one you mean, which makes the
+gesture two-factor where it is ambiguous and leaves it alone where it is not.
+The session's own agent is refused on the first press, so no confirmation is
+ever drawn for it — a border promising something the program will not do is the
+failure `App::cannot_close` is shaped around.
+
+The question survives `F4` and back — it has to, or the sentence above about
+choosing between two panes would be impossible to act on — and it is withdrawn
+by any other key in the list, by a paste, by a mouse press and by leaving the
+git view. What keeps a long-lived one honest is that it is not a memory: the
+border of the pane it would destroy carries the words, so a second press an
+hour later is made in front of the same sentence the first one was.
+
+And where the border *cannot* carry them — a window with fewer rows than agents
+paints nothing into some panes, and a countdown leads the same slot and can take
+the columns — the second press is refused rather than honoured, and becomes the
+first press instead. The same rule catches two `x`es arriving in one input
+batch, which is what key repeat and a pasted `xx` produce: abeam drains every
+queued event before it draws, so a confirmation a fast typist could skip would
+be no confirmation at all.
+
+**`x` and not `q`, which was the first choice and was wrong.** `q` looked like
+the program's own word for "I am done with this pane", on the strength of the
+right pane's `Esc`/`q`. That is not abeam's key: it is a pane answering
+`Handled::No`, which the shell reads as the reader being finished, and all it
+does is move focus — `F5` puts it back and nothing is lost. This table
+documents `q` as the way *out* of the right pane, so the habit it teaches is
+"press q to leave this", and aiming that habit at the one irreversible action in
+the program is the opposite of a shared vocabulary. `x` teaches nothing it has
+to unlearn, and the gate in front of it is identical.
+
+One consequence is worth disclosing rather than leaving to be discovered.
+**While the right pane is hidden — `Alt+Z`, or a window narrower than
+`MIN_SPLIT_COLS` — every `F4` cycles, including the first.** Focus cannot be on
+the right when there is no right pane, so abeam holds it on the left, and a
+press meaning "back to the agent" is a press that already has the keys. What
+stops that silently handing your next sentence to another session is the agent
+pane's own border, which reads `claude · 2/3` whenever there is more than one
+agent. The position is the disclosure, and it is drawn for this reason rather
+than as decoration.
 
 **"Focus unchanged" holds in both directions.** The four rows marked so —
 `Alt+G`, `Alt+E`, `F8` and `F2` — neither take focus nor hand it back:
@@ -858,7 +1009,12 @@ them fall past the `!alt` guard. `plain_typing_is_never_a_global` pins the bare
 `Esc` and `Tab` halves of that; the modified spelling of `Shift+Tab` is pinned
 by nothing and is safe by the same structural argument as every other
 unmentioned key. The right pane's own `Esc` and `q` are reachable only when that
-pane has focus, so Copilot never loses them.
+pane has focus, so Copilot never loses them — and the same is now true of `x` in
+the *left* column, which is claimed only at a pane whose child has exited and is
+therefore only ever taken from a Copilot that is no longer running. Every bare
+letter abeam claims is claimed somewhere a live agent is not listening; that is
+the whole of the exemption, and it is stated twice above because the two places
+it applies are reached by different routes.
 
 `Alt+Enter` is Copilot's newline on Windows and Linux both, and abeam already
 excluded it for a reason belonging to only one of those (Windows Terminal

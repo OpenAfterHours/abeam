@@ -218,6 +218,9 @@ fn file(root: &Path) -> String {
 /// somebody who cannot run it.
 #[cfg_attr(
     unix,
+    // `#[allow]` and not `#[expect]`: the condition is a `cfg`, so on the
+    // platform this *is* used an expectation would be unfulfilled. The crate
+    // root's module docs have the rule and why it is written down.
     allow(dead_code, reason = "the other platform's rule, tested on both")
 )]
 fn from_appdata(appdata: Option<PathBuf>) -> Option<PathBuf> {
@@ -247,6 +250,9 @@ fn from_appdata(appdata: Option<PathBuf>) -> Option<PathBuf> {
 /// ignore it.
 #[cfg_attr(
     windows,
+    // `#[allow]` and not `#[expect]`: the condition is a `cfg`, so on the
+    // platform this *is* used an expectation would be unfulfilled. The crate
+    // root's module docs have the rule and why it is written down.
     allow(dead_code, reason = "the other platform's rule, tested on both")
 )]
 fn from_xdg(data: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
