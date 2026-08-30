@@ -67,6 +67,19 @@
 > **And `a` gained a second home**, in the git *status* view, meaning "start an
 > agent in the checkout this pane is showing". No global was spent; see the keys
 > section.
+>
+> **The first version of that change did all of the above and still never
+> fired**, which is the most useful thing in this document to have written
+> down. The probe refused the move — correctly, because the destination was on
+> no list yet — and then *dropped the record it had identified*. That was
+> final: the widened revalidation is reachable only through a remembered
+> record, and discovery matches the pane's spawn root exactly, so the ten-second
+> `git worktree list` that would have named the worktree could never put it
+> back. Readiness was `Unknown` and the queue silently undeliverable for the
+> rest of the session. Every test passed, because every test seeded the
+> worktree list before the move — the one ordering production never has. The
+> section on the roster carries the fix and the section below it carries the
+> alternative that was declined.
 
 ## What is being asked for
 
@@ -280,6 +293,63 @@ be one answer: a row that exists and a gesture that resolves against a different
 directory is a row that does nothing when it is pressed. Handing the spawn
 directory instead is the phase-4 bug back again, and *silently*, because the row
 on the checkout the agent left is still there and still says something.
+
+## The ten-second list, and the refusal that used to be permanent
+
+**Every real move is refused when it happens, and that is not a bug — losing
+the record over it was.** `git worktree list` runs on a ten-second timer, and a
+worktree an agent has just made for itself is newer than the last run of it by
+construction. So the readiness poll 250 ms after a move always finds a `cwd`
+that is neither the pane's own root nor on any list, and always answers
+`Unknown`.
+
+What made that fatal rather than slow is where the widening lives.
+`Probe::has_moved` is reachable only through `is_still_mine`, which is only
+asked of a record the probe *remembers*; and `Probe::search`, which is what runs
+when there is no memory, matches the spawn root exactly and by design. So the
+first refusal dropped the memory, and from that moment no discovery arriving
+later had anything to revalidate. The pane read `Unknown` for the rest of the
+session, `pump_queue` silently stopped delivering to it, and the border went on
+naming the checkout it had left. Every part of this feature was built and none
+of it fired.
+
+**The fix is to distinguish two refusals, and it costs no identity.** A record
+that is still the session that was ours — the `sessionId` in the file matching
+the one the memory was made with — and is refused only for *where it is
+standing* answers `Unknown` for that poll and **keeps** the memory. A record
+that has stopped being that session drops it, exactly as before, which is what
+`only_the_session_that_was_ours_is_allowed_to_have_moved` pins and which is
+unchanged. The keeping arm admits nothing — it returns `Unknown`, and the next
+poll re-asks every condition from scratch. What it declines to do is throw away
+a name that is still correct.
+
+The other three conditions are re-asked in that arm as well, and the narrowness
+is load-bearing. Dropping `started_at >= spawned_at` in particular would break
+something already tested: a record of ours stamped a few milliseconds *before*
+the spawn fails `is_still_mine` on every call and is re-found on every call by
+`search`'s clock-skew fallback, which the memory path does not have — so keeping
+the memory there would answer `Unknown` for ever in the one case that fallback
+exists to rescue.
+
+**A watcher-driven discovery was the obvious way to shorten the ten seconds, and
+it was declined.** The reasons are recorded so that nobody re-proposes it blind:
+
+- **The obvious predicate does not fire.** A path inside a new nested worktree
+  *is* owned by the repository root as far as `workspace::owner` is concerned,
+  until git has been asked which is which — and that is the very question being
+  answered. "The router saw a path it could not place" is not a signal that
+  exists.
+- **`git worktree add` overflows the batch.** It writes enough at once to pass
+  `crate::watch`'s `MAX_PATHS`, so the batch carrying the evidence arrives
+  overflowed and empty. The trigger would have to fire on empty batches, which
+  is every noisy build in the repository.
+- **`git worktree add ../elsewhere` produces no event at all.** There is one
+  recursive watch, of the repository root; a worktree made outside it is
+  invisible to the watcher and always will be.
+- **And it only narrows the window**, which is the objection that decides it. A
+  latency fix turns "fails almost always" into "fails sometimes, permanently" —
+  the worse bug, because it will not reproduce. Keeping the record is the
+  correctness fix, and the ten seconds are then a latency and nothing more.
 
 ## What `main` has to hand over
 
@@ -855,6 +925,20 @@ untouched.
   session's would need a second cursor or pinning, and either is a feature.
 - **The diag pane** reads the current agent's `diagnostics()`, which is almost
   certainly right and is still worth one sentence in its border saying which.
+- ~~**A cursor in the worktree list that moves on its own.**~~ **Fixed, and it
+  is the fourth time an index has outlived the list it pointed into.**
+  `workspace::rows` adds its guaranteed rows in front of git's, so an insert
+  shifted every row down under a stationary `wt_sel` — which clamping keeps
+  inside the list and does not keep on the row. It was survivable while a row
+  could only appear from a keystroke the reader had made or from the ten-second
+  discovery; an agent branching off is a third trigger and it fires from a
+  *hosted agent's* action with no keystroke at all, at the moment this list is
+  most likely to be open. Open `w`, tab to a row, let an agent make a worktree,
+  and the next `a` starts a child in a checkout you were not pointing at while
+  the next `x` asks about it. The cursor is re-found by root now, which is
+  `sync_workspaces`' argument one list along — `Agent::id`, `Aim::Agent(u64)`
+  and phase 4's queue targeting are the other three places this project has
+  paid for it.
 - **A queued item cannot be re-aimed.** New in phase 4 and named in the queue
   section: the target is stamped when the item is written and nothing moves it,
   which is the property that whole section exists to protect, and it was easy to

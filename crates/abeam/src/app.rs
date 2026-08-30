@@ -2703,6 +2703,58 @@ impl App {
             .unwrap_or(0);
     }
 
+    /// Take a fresh `git worktree list` and tell everything that depends on it.
+    ///
+    /// **Four things, and a function rather than four lines in a `match` arm
+    /// because a fixture that set up three of them would be testing an
+    /// arrangement production never has.** Whether a session that moved is
+    /// still readable depends on this list reaching the probes, and whether the
+    /// row and the count follow it depends on the same list reaching
+    /// [`refresh_worktree_rows`](Self::refresh_worktree_rows) — so a test that
+    /// wrote one of those by hand could pass over a wiring that had come apart.
+    /// One entry point, one order, and the tests use it too.
+    ///
+    /// - `sync_workspaces` first, and before `found` is moved into the field,
+    ///   so the reconciliation reads one list rather than borrowing `self`
+    ///   twice.
+    /// - **The set the probe will let a session it has *already* identified
+    ///   move to.** A hosted Claude that moves into a worktree keeps writing
+    ///   records — with a different `cwd` — and without this the exact match
+    ///   fails, readiness goes `Unknown`, and the queue's automatic send stalls
+    ///   silently and permanently. Every root git printed, which includes the
+    ///   worktrees Claude Code's *neighbouring* agents are running at: that is
+    ///   not a leak, because `crate::agentstate::Probe::set_worktrees` spells
+    ///   out that discovery is strict and only revalidation consults this list,
+    ///   precisely because what is handed over here is a list with the
+    ///   neighbours on it. Every probe, because what git printed is a fact
+    ///   about the repository rather than about whichever pane has the
+    ///   keyboard.
+    /// - The field, which is what `route` and the rows read.
+    /// - The rows, for the count, the row guarantee and the `x` that resolves
+    ///   through them.
+    ///
+    /// **This is also the arrival that recovers an agent that moved too soon**,
+    /// which is why the ten-second clock it runs on is a latency and no longer
+    /// a loss. A worktree an agent makes for itself is newer than the last
+    /// discovery by construction, so the probe refuses the move on the poll
+    /// that follows it; `crate::agentstate::Probe::session`'s refusal arm keeps
+    /// the memory so that *this* call can revalidate it. Before that arm
+    /// existed the session was `Unknown` for the rest of the run and no list
+    /// arriving later could help.
+    ///
+    /// Returns whether a frame is owed — only if the list is the thing on
+    /// screen. This runs every ten seconds for the whole session and a redraw
+    /// is a full re-render of the agent's screen.
+    fn absorb_worktrees(&mut self, found: Vec<Worktree>) -> bool {
+        self.sync_workspaces(&found);
+        let roots: Vec<PathBuf> = found.iter().map(|worktree| worktree.root.clone()).collect();
+        for agent in self.agents_mut() {
+            agent.probe.set_worktrees(roots.clone());
+        }
+        self.worktrees = found;
+        self.refresh_worktree_rows()
+    }
+
     /// Rebuild the worktree list the git pane draws, from everything that feeds
     /// it: what git said, what Claude said, and where this window is standing.
     ///
@@ -4127,40 +4179,7 @@ impl App {
                 }
                 Work::Worktrees(found) => {
                     self.worktrees_running = false;
-                    // Before `found` is moved into the field, so the
-                    // reconciliation reads one list rather than borrowing
-                    // `self` twice.
-                    self.sync_workspaces(&found);
-                    // The set the probe will let a session it has *already*
-                    // identified move to. A hosted Claude that moves into a
-                    // worktree keeps writing records — with a different `cwd` —
-                    // and without this the exact match fails, readiness goes
-                    // `Unknown`, and the queue's automatic send stalls silently
-                    // and permanently.
-                    //
-                    // Every root git printed, which includes the worktrees
-                    // Claude Code's *neighbouring* agents are running at. That
-                    // is not a leak: `crate::agentstate::Probe::set_worktrees`
-                    // spells out that discovery is strict and only revalidation
-                    // consults this list, precisely because what is being handed
-                    // over here is a list with the neighbours on it.
-                    //
-                    // Every probe, because what git printed is a fact about
-                    // the repository rather than about whichever pane has the
-                    // keyboard. This list arrives on a ten-second timer, so an
-                    // agent that routing missed is not late — it is one that
-                    // will be missed again, and the paragraph above says what
-                    // that costs.
-                    let roots: Vec<PathBuf> =
-                        found.iter().map(|worktree| worktree.root.clone()).collect();
-                    for agent in self.agents_mut() {
-                        agent.probe.set_worktrees(roots.clone());
-                    }
-                    self.worktrees = found;
-                    // A frame only if the list is the thing on screen. This
-                    // runs every ten seconds for the whole session, and a
-                    // redraw is a full re-render of the agent's screen.
-                    redraw |= self.refresh_worktree_rows();
+                    redraw |= self.absorb_worktrees(found);
                 }
             }
         }
@@ -9431,9 +9450,17 @@ mod tests {
     /// do that, so what is staged is the *evidence* it leaves — which is the
     /// only thing abeam ever sees of it.
     ///
+    /// **Seeded through `absorb_worktrees` and never by writing a probe's list
+    /// directly**, which is the difference between staging the state
+    /// production reaches and staging one it cannot. A probe told about a
+    /// worktree the *app* has never heard of is a pane that knows more than the
+    /// window it is in — and the bug this whole change is about lives in
+    /// exactly that gap, because in production both the probe's list and the
+    /// row list come off one `git worktree list` on one ten-second clock.
+    ///
     /// Returns the records directory, which has to outlive the probe reading
     /// it, and the worktree the session moved to.
-    fn moves_to_a_worktree(fx: &mut Fixture, ix: usize) -> (TempDir, PathBuf) {
+    fn moves_to_a_worktree(fx: &mut Fixture, ix: usize, named: bool) -> (TempDir, PathBuf) {
         // A child that stays and asks for bracketed paste: `Agent::send_readiness`
         // refuses to read the probe at all without one, so without this the
         // probe never settles and every assertion below would be about a pane
@@ -9448,13 +9475,17 @@ mod tests {
             .join("worktrees")
             .join("branched-off");
         std::fs::create_dir_all(&moved).expect("a worktree to move into");
-        // What `crate::app` hands every probe once discovery has answered: the
-        // repository and every worktree of it. `Probe::has_moved` is the only
-        // reader, and without this the record below is refused — which is the
-        // pre-widening behaviour and is tested where it lives.
-        fx.app.agents[ix]
-            .probe
-            .set_worktrees(vec![fx.dir.path().to_path_buf(), moved.clone()]);
+
+        // What discovery has said so far. `named` is the whole difference
+        // between the two cases this stages: a worktree git already knew
+        // about, and one the agent has just made for itself — which is what
+        // every real move looks like, since discovery runs every ten seconds
+        // and the worktree is seconds old.
+        let mut listed = vec![the_main_worktree(fx)];
+        if named {
+            listed.push(worktree(moved.clone(), "branched-off"));
+        }
+        fx.app.absorb_worktrees(listed);
 
         polled(fx);
         assert_eq!(
@@ -9487,7 +9518,10 @@ mod tests {
     fn an_agent_that_branches_off_is_named_by_its_border_where_it_is_working() {
         let mut fx = app();
         second_agent(&mut fx);
-        let (_records, moved) = moves_to_a_worktree(&mut fx, 1);
+        // Named, because the border is what this is about and the timing of
+        // discovery is the subject of
+        // [`an_agent_that_branches_off_before_git_is_asked_is_found_when_it_is`].
+        let (_records, moved) = moves_to_a_worktree(&mut fx, 1, true);
 
         assert!(polled(&mut fx), "a pane that has moved is worth a frame");
         assert!(
@@ -9537,13 +9571,7 @@ mod tests {
     fn the_worktree_list_counts_an_agent_where_it_is_working_and_x_reaches_it_there() {
         let mut fx = app();
         second_agent(&mut fx);
-        // Only the repository is named, so the row for the worktree the agent
-        // makes for itself can only come from the guarantee. That is the real
-        // shape: a worktree created a moment ago is one the ten-second
-        // discovery has not seen.
-        fx.app.worktrees = vec![worktree(fx.dir.path().to_path_buf(), "main")];
-        let (_records, moved) = moves_to_a_worktree(&mut fx, 1);
-        fx.app.refresh_worktree_rows();
+        let (_records, moved) = moves_to_a_worktree(&mut fx, 1, true);
         fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
 
         // Both panes are in one checkout, which is what `a` where you already
@@ -9592,6 +9620,117 @@ mod tests {
             Err("that pane is the session — its exit is abeam's. Alt+Q is the way out."
                 .to_string()),
             "the checkout the agent left still resolves to it"
+        );
+    }
+
+    /// An agent that branches off *before* git has been asked is found when it
+    /// is, rather than lost for the session.
+    ///
+    /// **The regression fence for the whole feature, and the order every real
+    /// move happens in.** `git worktree list` runs on a ten-second timer, and
+    /// the worktree an agent makes for itself is newer than the last one of
+    /// those by construction — so the poll that follows a move always finds a
+    /// destination on no list. The probe refuses it, which is right; what was
+    /// wrong is that it *dropped the memory*, and `Probe::search` matches the
+    /// spawn root exactly, so no discovery arriving later could put it back.
+    /// The session went `Unknown` for the rest of the run, the queue silently
+    /// stopped delivering to that pane, and nothing on screen said why.
+    ///
+    /// So the two halves are asserted in sequence: refused now, recovered when
+    /// git catches up. `crate::agentstate` owns the probe's half of this;
+    /// what is under test here is that the recovery reaches the border, the
+    /// count and the row — which it does only because `absorb_worktrees` is one
+    /// function and the poll after it re-reads the record.
+    #[test]
+    fn an_agent_that_branches_off_before_git_is_asked_is_found_when_it_is() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        // `false`: discovery has named the repository and nothing else, which
+        // is what a worktree created seconds ago looks like from here.
+        let (_records, moved) = moves_to_a_worktree(&mut fx, 1, false);
+
+        polled(&mut fx);
+        assert_eq!(
+            fx.app.agents[1].readiness,
+            Readiness::Unknown,
+            "a worktree nothing has vouched for was answered for anyway"
+        );
+        assert!(
+            paths::same_dir(fx.app.agents[1].standing(), fx.dir.path()),
+            "the window followed an agent into a directory it cannot identify"
+        );
+        // Several polls, because a dozen of them happen before discovery next
+        // runs and the failure this pins is the one that never recovers.
+        polled(&mut fx);
+        polled(&mut fx);
+
+        // Git catches up. This is the arrival that used to be able to do
+        // nothing at all.
+        fx.app.absorb_worktrees(vec![
+            the_main_worktree(&fx),
+            worktree(moved.clone(), "branched-off"),
+        ]);
+        assert!(polled(&mut fx), "the recovery is worth a frame");
+
+        assert_eq!(
+            fx.app.agents[1].readiness,
+            Readiness::Idle,
+            "the session was lost with the memory and never came back"
+        );
+        assert!(
+            paths::same_dir(fx.app.agents[1].standing(), &moved),
+            "the readiness recovered and the border did not: {}",
+            fx.app.agents[1].standing().display()
+        );
+        assert_eq!(
+            fx.app.agent_in(&moved),
+            Ok(fx.app.agents[1].id),
+            "the row the work is happening in still does not reach the pane"
+        );
+    }
+
+    /// A row for the worktree an agent is working in survives git forgetting
+    /// it.
+    ///
+    /// **The guarantee, asked about the directory it now has to cover.**
+    /// `workspace::rows` promises a row for every agent's directory whatever
+    /// git said, and phase 4 added that because a pane whose directory has no
+    /// row cannot be closed at all. `git worktree remove` under a live pane is
+    /// how the row goes away, and it is not exotic — a person tidying up a
+    /// worktree an agent is still standing in is exactly the mistake the row
+    /// exists to make recoverable.
+    #[test]
+    fn a_row_survives_git_forgetting_the_worktree_an_agent_is_working_in() {
+        let mut fx = app();
+        second_agent(&mut fx);
+        let (_records, moved) = moves_to_a_worktree(&mut fx, 1, true);
+        polled(&mut fx);
+        assert!(paths::same_dir(fx.app.agents[1].standing(), &moved));
+
+        // git stops naming it, which is what `git worktree remove` looks like
+        // from here. The workspace is retained by `sync_workspaces` and the row
+        // can now come from nowhere but the guarantee.
+        fx.app.absorb_worktrees(vec![the_main_worktree(&fx)]);
+        assert!(
+            !fx.app
+                .worktrees
+                .iter()
+                .any(|worktree| paths::same_dir(&worktree.root, &moved)),
+            "git still names it, so this test is about nothing"
+        );
+
+        fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
+        assert!(
+            right_rows(&mut fx.app, 120, 40)
+                .iter()
+                .any(|line| line.contains("branched-off") && line.contains("agent")),
+            "the pane has no row, which is a pane with no way out: {:#?}",
+            right_rows(&mut fx.app, 120, 40)
+        );
+        assert_eq!(
+            fx.app.agent_in(&moved),
+            Ok(fx.app.agents[1].id),
+            "the row is drawn and `x` on it reaches nobody"
         );
     }
 

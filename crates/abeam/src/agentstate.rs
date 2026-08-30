@@ -921,6 +921,48 @@ impl Probe {
                 Record::Read(session) if self.is_still_mine(found, &session) => {
                     accepted = Some(session);
                 }
+                // **Still the session that was ours, refused for some other
+                // reason: `Unknown` for this poll, and the memory kept.** This
+                // arm is the whole of what makes a session moving into a
+                // worktree survivable, and without it the feature essentially
+                // never fired.
+                //
+                // The sequence, which is the ordinary one rather than a corner:
+                // the agent runs `git worktree add`, moves in, and rewrites its
+                // record. The next poll is 250 ms later; the *discovery* that
+                // would put the new directory in [`worktrees`](Self::worktrees)
+                // is on a ten-second timer, so at that poll `is_here` is false
+                // and [`has_moved`](Self::has_moved) is false because the
+                // destination is on no list yet. Dropping the memory there is
+                // final: [`has_moved`] is reachable only through
+                // [`is_still_mine`](Self::is_still_mine), which needs a
+                // `found`, and [`search`](Self::search) is strict and matches
+                // the spawn root exactly. So discovery catching up ten seconds
+                // later could never help, and the session was `Unknown` — no
+                // queued send, ever — for the rest of the run.
+                //
+                // **Keeping it costs no identity.** `found` is a path and a
+                // name; what it must never do is go on naming a *different*
+                // session, and [`is_ours_but_unplaced`](Self::is_ours_but_unplaced)
+                // requires the file to still carry the `sessionId` that was
+                // ours, which is exactly the evidence that it does not. Nothing
+                // is admitted by this arm — it answers `None` — and nothing is
+                // deferred: the next poll re-asks `is_still_mine` from scratch,
+                // location included.
+                //
+                // **It is refused *only* on location, and the narrowness is
+                // load-bearing rather than tidy.** The three other conditions
+                // are re-asked here as well, and dropping `started_at` in
+                // particular breaks something already tested: a record of ours
+                // stamped a few milliseconds before `spawned_at` fails
+                // `is_still_mine` on *every* call, and is re-found on every
+                // call by [`search`](Self::search)'s clock-skew `or_else` —
+                // which the memory path does not have. Keeping the memory there
+                // would answer `Unknown` for ever in the one case the fallback
+                // exists to rescue.
+                Record::Read(session) if self.is_ours_but_unplaced(found, &session) => {
+                    return None;
+                }
                 Record::Unreadable => return None,
                 _ => forget = true,
             }
@@ -1179,11 +1221,52 @@ impl Probe {
     /// standing, because this record has already been positively ours and the
     /// session in it is allowed to have moved since. [`Probe::set_worktrees`] is
     /// where the split between this and [`Probe::is_mine`] is argued.
+    ///
+    /// The three facts that are not about a place are
+    /// [`is_a_session_of_ours`](Self::is_a_session_of_ours), because
+    /// [`is_ours_but_unplaced`](Self::is_ours_but_unplaced) is this question
+    /// with the place taken out and the two must not be able to drift.
     fn is_still_mine(&self, found: &Found, session: &Session) -> bool {
+        self.is_a_session_of_ours(session)
+            && (self.is_here(session) || self.has_moved(found, session))
+    }
+
+    /// Everything a remembered record has to be **apart from where it is
+    /// standing**.
+    ///
+    /// Split out so that [`is_still_mine`](Self::is_still_mine) and
+    /// [`is_ours_but_unplaced`](Self::is_ours_but_unplaced) ask one question
+    /// rather than two that happen to agree — the second is defined as the
+    /// first minus its location clause, and a copy of three conditions is a
+    /// copy that gets edited once.
+    fn is_a_session_of_ours(&self, session: &Session) -> bool {
         !self.is_disowned(session)
             && session.kind == Kind::Interactive
             && session.started_at.is_some_and(|at| at >= self.spawned_at)
-            && (self.is_here(session) || self.has_moved(found, session))
+    }
+
+    /// Still this probe's session by every test except where it is standing.
+    ///
+    /// **The predicate that keeps a memory alive across a move discovery has
+    /// not caught up with**, and the refusal arm in [`session`](Self::session)
+    /// is its only caller and carries the argument. It is
+    /// [`is_still_mine`](Self::is_still_mine) with the location clause replaced
+    /// by an identity one: the record has to be the same *session* — the
+    /// `sessionId` that was ours, by
+    /// [`is_the_session_found`](Self::is_the_session_found) — and it has to be
+    /// interactive, undisowned and no older than the spawn, exactly as it would
+    /// to be answered with.
+    ///
+    /// **It is strictly narrower than `is_still_mine` on identity and strictly
+    /// wider on place, and both halves matter.** Wider on place, or this would
+    /// not keep the memory of a session standing in a worktree nobody has named
+    /// yet, which is the whole point. Narrower on identity, because
+    /// `is_still_mine` deliberately requires no `sessionId` when the record is
+    /// at the agent's own root — see [`is_mine`](Self::is_mine)'s documented
+    /// blind spot — and a memory kept on the strength of a *place* nobody has
+    /// vouched for would be a memory kept for anybody's record.
+    fn is_ours_but_unplaced(&self, found: &Found, session: &Session) -> bool {
+        Self::is_the_session_found(found, session) && self.is_a_session_of_ours(session)
     }
 
     /// Whether the session that was ours has moved to a directory git named as
@@ -1193,36 +1276,66 @@ impl Probe {
     /// this module. Two conditions, and dropping either one gives back a bug
     /// that has already happened:
     ///
-    /// *The same session.* The remembered path is `<pid>.json`, and a pid
-    /// outlives the process it named — so a record that was ours can be
-    /// rewritten by whatever got the number next. Without this, a recycled pid
-    /// landing on a neighbouring agent in a worktree passes every other check
-    /// (interactive, started after abeam, in a directory on the list) and is
-    /// then *memoised*: a wrong `Idle`, stably, for the rest of the run. That is
-    /// the same failure `a_dead_sessions_record_is_never_read_as_the_agent_on_screen`
-    /// pins for the root, arriving one worktree over.
+    /// *The same session*, which is [`is_the_session_found`](Self::is_the_session_found)
+    /// and lives there because [`session`](Self::session)'s refusal arm needs
+    /// exactly that half. Without it, a recycled pid landing on a neighbouring
+    /// agent in a worktree passes every other check (interactive, started after
+    /// abeam, in a directory on the list) and is then *memoised*: a wrong
+    /// `Idle`, stably, for the rest of the run. That is the same failure
+    /// `a_dead_sessions_record_is_never_read_as_the_agent_on_screen` pins for
+    /// the root, arriving one worktree over.
     ///
     /// *A named directory, matched exactly.* A set, never a prefix, and never a
     /// directory merely inside a member of it — `crate::paths::parts` is explicit
     /// that a loose comparison in this decision "sends somebody's prompt to a
     /// session in another checkout, and it is not one they would see happen".
     ///
-    /// A record carrying no `sessionId` is refused outright rather than waved
-    /// through on the directory alone. Every record a real Claude writes has
-    /// one, so this costs nothing that exists, and what it buys is that the
-    /// identity check cannot be skipped by a record that simply omits the field.
+    /// **This answering `false` is not the end of the matter, and it used to
+    /// be.** The list is ten seconds old at worst and a worktree the agent
+    /// makes for itself is newer than that by construction, so the *first* poll
+    /// after a move always lands here and always answers `false`. What that
+    /// costs is a poll answered `Unknown`; what it used to cost was the memory,
+    /// and therefore the session, for the rest of the run. See the refusal arm
+    /// in [`session`](Self::session).
     fn has_moved(&self, found: &Found, session: &Session) -> bool {
+        Self::is_the_session_found(found, session)
+            && session.cwd.as_deref().is_some_and(|cwd| {
+                self.worktrees
+                    .iter()
+                    .any(|worktree| crate::paths::same_dir(cwd, worktree))
+            })
+    }
+
+    /// Whether the record at the remembered path is still the session that was
+    /// remembered there.
+    ///
+    /// **The identity half of [`has_moved`](Self::has_moved), split out because
+    /// a second caller needs exactly it and nothing else.** That caller is the
+    /// refusal arm in [`session`](Self::session), which keeps a memory that has
+    /// been refused for a reason that is not identity — a session standing in a
+    /// worktree discovery has not named yet — so that a later
+    /// [`set_worktrees`](Self::set_worktrees) can revalidate it. Splitting it
+    /// is what stops that arm from being a second, looser idea of what "still
+    /// ours" means.
+    ///
+    /// The remembered path is `<pid>.json` and a pid outlives the process it
+    /// named, so a file that was ours can be rewritten by whatever got the
+    /// number next. This is the only thing that separates the two, and it is a
+    /// `sessionId` rather than a pid because the operating system does not hand
+    /// those out again.
+    ///
+    /// A record carrying no `sessionId` is refused, and so is a memory that
+    /// carries none. Every record a real Claude writes has one, so this costs
+    /// nothing that exists, and what it buys is that the check cannot be
+    /// skipped by a record that simply omits the field.
+    ///
+    /// No `&self`: it compares a record against a memory and consults nothing
+    /// about this probe, which is the property that keeps both callers honest.
+    fn is_the_session_found(found: &Found, session: &Session) -> bool {
         let Some(known) = found.session_id.as_deref() else {
             return false;
         };
-        if session.session_id.as_deref() != Some(known) {
-            return false;
-        }
-        session.cwd.as_deref().is_some_and(|cwd| {
-            self.worktrees
-                .iter()
-                .any(|worktree| crate::paths::same_dir(cwd, worktree))
-        })
+        session.session_id.as_deref() == Some(known)
     }
 
     /// [`Session::readiness`], or `Unknown` when there is no record to read.
@@ -3069,6 +3182,111 @@ mod tests {
         assert_eq!(probe.readiness(), Readiness::Busy);
         moves_to(&dir, 46256, &worktree("other"), STARTED, "idle");
         assert_eq!(probe.readiness(), Readiness::Idle);
+    }
+
+    #[test]
+    fn a_session_that_moves_before_discovery_names_the_worktree_is_recovered_when_it_does() {
+        // **The order every real move happens in, and the one that made the
+        // whole feature never fire.** `crate::app` refreshes this list from a
+        // `git worktree list` on a ten-second timer; a worktree the agent has
+        // just made for itself is newer than the last one of those by
+        // construction. So the first poll after a move — 250 ms later — finds
+        // `is_here` false and `has_moved` false, because the destination is on
+        // no list yet.
+        //
+        // Dropping the memory there was final. `has_moved` is reachable only
+        // through `is_still_mine`, which needs a `found`, and `search` matches
+        // the spawn root exactly — so discovery catching up ten seconds later
+        // could never put it back, and the session was `Unknown`, with no
+        // queued send ever delivered to it, for the rest of the run.
+        let dir = TempDir::new("agentstate-moved-early");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        // What discovery had said when the pane started: the repository, and
+        // nothing that did not exist yet.
+        probe.set_worktrees(vec![PathBuf::from(ROOT)]);
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // The move, into a directory the list does not have.
+        moves_to(&dir, 46256, &worktree("review"), STARTED, "idle");
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Unknown,
+            "a worktree nothing has vouched for was answered for anyway"
+        );
+        // Twice, because what this is really about is what the *second* poll
+        // can still do — and a dozen polls happen before discovery next runs.
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+
+        // Discovery catches up, and the session comes back rather than being
+        // lost with the memory.
+        probe.set_worktrees(the_repository());
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Idle,
+            "the memory was thrown away, so the session could never be recovered"
+        );
+        assert!(
+            probe
+                .standing_in()
+                .is_some_and(|at| crate::paths::same_dir(at, Path::new(&worktree("review")))),
+            "the recovered session is not reported where it went: {:?}",
+            probe.standing_in()
+        );
+    }
+
+    #[test]
+    fn a_memory_kept_across_an_unnamed_move_is_still_dropped_on_identity() {
+        // The boundary of the arm above, and the reason it tests the
+        // `sessionId` rather than the directory. Keeping a memory is keeping a
+        // *name*; the moment the file under it stops carrying that name it is
+        // somebody else's record, and no amount of discovery may bring it back.
+        let dir = TempDir::new("agentstate-unplaced-identity");
+        plant(&dir, 46256, ROOT, STARTED, "busy");
+        let mut probe = probe(&dir, Some(46256), STARTED);
+        probe.set_worktrees(vec![PathBuf::from(ROOT)]);
+        assert_eq!(probe.readiness(), Readiness::Busy);
+
+        // A different session, under the pid ours had, in a worktree nothing
+        // has named yet: interactive, started after abeam, and refused.
+        dir.write(
+            "46256.json",
+            format!(
+                r#"{{"pid":46256,"sessionId":"somebody-else","cwd":{},"startedAt":{},"peerProtocol":1,"kind":"interactive","status":"idle"}}"#,
+                serde_json::to_string(&worktree("review")).expect("a JSON string"),
+                STARTED + 1
+            )
+            .as_bytes(),
+        );
+        assert_eq!(probe.readiness(), Readiness::Unknown);
+
+        // And the memory went with it, so naming that worktree does not hand
+        // this probe a session it never identified. `search` is strict, and
+        // this is the assertion that says the keeping arm did not quietly
+        // widen it.
+        probe.set_worktrees(the_repository());
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Unknown,
+            "a stranger's record was revalidated by a list arriving later"
+        );
+
+        // **The step that makes the two versions of this tell apart**, and
+        // without it the assertions above pass whether the identity is checked
+        // or not: a kept memory and a dropped one both answer `Unknown` while
+        // the file is a stranger's. So the file becomes ours again — the same
+        // `sessionId`, in a worktree that is now on the list — and the answer
+        // is still `Unknown`, because a memory that was dropped is dropped and
+        // a session standing where discovery cannot vouch for it is not
+        // rediscovered. That is the documented cost of the strict half, and it
+        // is what a kept memory would silently buy back.
+        moves_to(&dir, 46256, &worktree("review"), STARTED, "idle");
+        assert_eq!(
+            probe.readiness(),
+            Readiness::Unknown,
+            "the memory survived a stranger and let our own session back in \
+             through a door `search` had closed"
+        );
     }
 
     #[test]

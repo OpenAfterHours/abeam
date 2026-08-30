@@ -167,6 +167,23 @@ the checkout that pane is showing, which is the row that list would have drawn
 as `here`. So `Alt+G`, `a` is a shortcut through `Alt+G`, `w`, find the row you
 are already on, `a`, and it asks for the same thing in the same request slot.
 
+**Both arms decline `Ctrl` and `Alt`, and getting that wrong was a real
+binding rather than a tidiness.** The status list has refused `Ctrl`+letter
+since it was written — `Ctrl` plus a letter is the agent's everywhere in this
+program — while the worktree list matched on the key code alone. So `Ctrl+A`
+started an agent and `Ctrl+X` armed a kill on a running one, three lines under a
+comment saying the opposite. Writing the second `a` arm is what made it visible,
+because the two then had to be described as one request and were not.
+
+`Alt` is refused as well, and that half is not symmetry: **`Alt+A` is Codex's
+own key** by the inventory at the foot of this document, in a program that hosts
+Codex, and a reader whose hand knows that chord must not discover that it starts
+an abeam agent. The cost is `Alt+R` and `Alt+W`, which meant refresh and the
+worktree list by accident and were never anybody's spelling of either. `Ctrl+D`
+and `Ctrl+U` are unaffected — they are the shared half-page scroll, and the rule
+is a hand-off to that vocabulary rather than a bare refusal, so this list is not
+made the one exception to something the `F1` overlay promises.
+
 That second spelling exists because the workflow it serves is not about
 worktrees at all. Claude Code makes its own — it runs `git worktree add` and
 moves into it — so the ordinary way to want a second agent is to open one where

@@ -197,6 +197,32 @@ not been re-run against `abeam` itself since the panes landed — and have never
 been run on Linux at all, against anything. Do that before trusting it with real
 work, on either platform.
 
+> **Observed, because the whole of "the window follows an agent into a worktree"
+> rests on it.** The claim is that a *running* session rewrites the `cwd` in its
+> own `~/.claude/sessions/<pid>.json` when it moves into a git worktree. Every
+> worktree record on this machine could have been *launched* in the worktree it
+> names, so none of them settled it; this one does, and it is recorded here in
+> `docs/keymap.md`'s register — what was seen, when, and out of which record —
+> because it was awkward to obtain and will rot silently.
+>
+> Record `33644.json`, session `2aab7d20-4158-4913-a695-062b2b9ba929`, Claude
+> Code **2.1.251**, read on 2026-08-30. Its `startedAt` is `1788023044756` —
+> 2026-08-29 18:04:04 — and its `cwd` is
+> `…\forge\.claude\worktrees\multi-agent-proposal`. That directory's creation
+> time is **2026-08-29 18:08:59**, four minutes and fifty-five seconds *after*
+> the session started, so the path in the record cannot be the one written at
+> startup. The session rewrote it.
+>
+> **Two residuals, and they are the reason this is a note rather than a
+> proof.** The rewrite was inferred from two timestamps rather than watched, and
+> more seriously the record says `"kind":"bg"` while
+> `crate::agentstate::Probe::is_still_mine` will only accept `"interactive"`.
+> So what is observed is a *background* session moving. That the same
+> record-writer serves both kinds — one `peerProtocol`, one file layout, one
+> `cwd` field — is inference from the shape of the record and not evidence. An
+> interactive session observed doing the same thing would close it, and nobody
+> has captured one.
+
 **More than one agent in the window is built, and no human has ever used it.**
 That sentence is the whole entry and the rest of this paragraph is detail. `a`
 in the git view (`Alt+G`) starts another agent in the checkout on screen, and
@@ -213,7 +239,7 @@ not move. The agent abeam was started with is still the session: its exit is
 abeam's exit code, and it cannot be closed. `docs/multi-agent.md` is the design
 and the record of what each phase cost.
 
-What that is built on is **fifty-seven tests** — the number of `#[test]`
+What that is built on is **sixty-five tests** — the number of `#[test]`
 attributes this work added, so it can be checked rather than taken — some
 of which spawn real ptys and draw real frames, and a mutation audit that broke
 each new rule on purpose to check something went red. It is a suite for one
@@ -250,15 +276,28 @@ Six specific things to expect, in the order they are likely to bite.
   label; and `x` on that row refuses rather than guessing, pointing at `F4` —
   which is five keystrokes from there, not one. A pane has no name a person
   chose, which is the missing piece.
-- **An agent that branches off is followed on a poll, and only once its record
-  has been read.** The window learns where a session has gone by re-reading the
-  record that session writes about itself, every 250 ms, and it will only follow
-  a session it identified *before* the move — discovery matches the pane's own
-  directory exactly, on purpose. So a session that leaves inside the first
-  second or so of its life is never followed at all: readiness reads `Unknown`,
-  and the border, the count and `x` go on naming the checkout the pane was
-  spawned in. That is the safe direction and it is not the obvious one, and
-  nobody has seen either case happen.
+- **An agent that branches off is followed up to ten seconds later, not at
+  once.** Where a session has gone is read from the record it writes about
+  itself, every 250 ms — but abeam will only believe a directory `git worktree
+  list` has named, and that list is refreshed every ten seconds. A worktree an
+  agent has just made for itself is newer than the last refresh by
+  construction, so the poll straight after a move refuses it. Until the next
+  discovery the pane reads `Unknown`: its border still names the checkout it
+  started in, the count is still on that row, and a queued prompt aimed at it
+  waits. Then git is asked, and the window catches up in one poll.
+
+  **That refusal was permanent until the review found it**, which is worth
+  knowing because it is the shape to watch for: the probe threw away the record
+  it had identified, and nothing could re-adopt it — so the session was
+  `Unknown` and undeliverable for the rest of the run, with nothing on screen
+  saying why. It now keeps the record and re-checks it, and the regression test
+  is named after the sequence. Nobody has watched either the failure or the
+  fix in a real terminal.
+
+  A narrower case is still open and fails the same safe way: a session that
+  leaves inside the second or so before its *first* record is read is never
+  identified at all, so it is never followed. That is discovery being strict on
+  purpose, and closing it would be a change to the discovery rule.
 - **Killing a pane throws away every prompt queued for it.** They are not
   retargeted — the whole design refuses that — and they are not lost silently
   either: each row says which pane it was written for and that the pane has
