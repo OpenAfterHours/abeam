@@ -2231,11 +2231,39 @@ mod tests {
         assert_eq!(hosted.name, "abeam-test-fleet");
         assert_eq!(hosted.agent, "abeam-test-direct");
 
+        // **And the row's own words kept apart from the line, which is the
+        // field a pane opened an hour later is started from.** `launch.args`
+        // above is the preset's *and* what was typed, joined;
+        // [`Hosted::args`] is the first half alone, and `crate::app::Recipe`
+        // carries exactly it — `App::new` copies it across and
+        // `Recipe::launch` resolves the program again from it.
+        //
+        // Asserted here because every other assertion in this file reads the
+        // joined line, so nothing anywhere was reading this field: replacing it
+        // with `Vec::new()` left the whole crate green, and the `+fleet` pane
+        // that `a` opens would have gone quietly back to being a bare `claude`
+        // under a border still reading `fleet`.
+        assert_eq!(hosted.args, args(&["agent", "--fleet"]));
+        // The typed half is the half that must *not* be in it. `--resume` was
+        // on the line above and belongs to the session that was started rather
+        // than to a pane somebody opens later — so resolving the same row with
+        // nothing typed has to answer the same words.
+        assert_eq!(
+            resolve_within(&PRESET[0], &[], PRESET).unwrap().args,
+            hosted.args,
+            "what was typed reached the field a later pane is started from"
+        );
+
         // A built-in adds nothing and answers both questions with one word,
         // which is the promise `crate::agentstate` reads this file for.
         let plain = resolve_within(&DIRECT, &args(&["--resume"]), PRESENT).expect(EVERY_MACHINE);
         assert_eq!(plain.launch.args, args(&["--resume"]));
         assert_eq!(plain.name, plain.agent);
+        assert!(
+            plain.args.is_empty(),
+            "a built-in put an argument of abeam's own in front of somebody's \
+             agent"
+        );
     }
 
     #[test]

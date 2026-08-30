@@ -470,8 +470,16 @@ impl GitPane {
     /// `open` goes for the reason [`Ask`] gives. It holds a porcelain path,
     /// which is relative to a worktree root, and the `Enter` that produced it
     /// was aimed at the toplevel this pane is about to stop having.
+    ///
+    /// And [`cancel_choice`](Self::cancel_choice) goes for the same reason one
+    /// gesture up the scale: the chooser has captured a checkout, and the
+    /// `Enter` that answers it **starts a process** there. A question left
+    /// standing across a workspace switch draws the old worktree's name in the
+    /// title over the new workspace's pane, and answers it by starting an agent
+    /// in a checkout the reader has stopped looking at.
     pub fn set_root(&mut self, root: PathBuf) {
         self.root = root;
+        self.cancel_choice();
         // Before the request, so the request carries the new stamp and every
         // answer already in flight is now stale by construction.
         self.generation = self.generation.wrapping_add(1);
@@ -597,6 +605,29 @@ impl GitPane {
     /// `App::cannot_close` is shaped around.
     pub fn cancel_close(&mut self) {
         self.kill = None;
+    }
+
+    /// Forget which agent `A` was asking about, because the pane has been put
+    /// away or pointed at another workspace.
+    ///
+    /// **Public for [`cancel_close`](Self::cancel_close)'s reason and worse
+    /// than it in one way.** That question is drawn on another pane's border,
+    /// so at least something stays on screen while it stands; this one is the
+    /// whole pane, and a pane that is not showing draws nothing at all — so the
+    /// question survives *invisibly*. [`choose_key`](Self::choose_key) swallows
+    /// every key, so the only way out of it from in here is the `Esc` the
+    /// border promises; and `F8`, `F9`, `F2`, `Alt+E`, `Alt+S` and `Alt+Z` are
+    /// resolved by `crate::keys::global` in `crate::app::App::handle_key`,
+    /// which returns before any pane is offered the key. None of them can reach
+    /// this pane to end it.
+    ///
+    /// What it costs to leave standing is a captured [`Choice::root`] that goes
+    /// on ageing behind whatever the reader did next, and the habitual `Enter`
+    /// on the way back starts an agent in a checkout they have forgotten they
+    /// named. That is a process, in a directory, on a key the reader thinks
+    /// they are pressing at something else.
+    pub fn cancel_choice(&mut self) {
+        self.choosing = None;
     }
 
     /// Whether anything has asked to see the worktree list yet.
@@ -1539,12 +1570,11 @@ impl Pane for GitPane {
 
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
         // The same early return the keys get, and owed for the same reason one
-        // input path along: without it the wheel scrolls a list nobody can see
-        // and a click moves a selection underneath the chooser. Not a
-        // correctness bug — [`Choice`] carries its own root, so the captured
-        // checkout cannot change under it — but "one branch is the whole of the
-        // chooser's handling" is only true of keys, and there are two ways into
-        // this pane.
+        // input path along: without it the wheel scrolls a list nobody can see.
+        // Not a correctness bug — [`Choice`] carries its own root, so the
+        // captured checkout cannot change under it — but "one branch is the
+        // whole of the chooser's handling" is only true of keys, and there are
+        // two ways into this pane.
         //
         // Nothing here chooses a row: a click that started an agent would be
         // the one gesture in this file that spawns a process without a
@@ -1553,8 +1583,17 @@ impl Pane for GitPane {
         // `Yes` and not `No`, which costs one affordance and is worth saying:
         // `crate::app` turns what a pane declines into a text selection, so
         // while the question stands the four rows of it cannot be dragged over
-        // and copied. That is a question that ends on the next keystroke, and
-        // owning every input for its lifetime is the simpler rule.
+        // and copied. Owning every input for the lifetime of the question is
+        // the simpler rule.
+        //
+        // **A press never gets this far, which is the shell's doing and not
+        // this branch's.** `crate::app::App::handle_mouse` calls
+        // [`cancel_choice`](Self::cancel_choice) on every press before any pane
+        // is offered the event, on the rule it already keeps for the `x`
+        // confirmation — a press is a reader doing something else, and nothing
+        // here would have answered the question anyway. So what reaches this
+        // line is the wheel, and the drag and release of a gesture that started
+        // before the question did.
         if self.choosing.is_some() {
             return Ok(Handled::Yes);
         }

@@ -142,6 +142,14 @@ const ARM_DELAY: Duration = Duration::from_secs(3);
 /// Narrower than this and the live state of a dispatched agent is worth less
 /// than the columns it takes from the text it is annotating. The same threshold
 /// `crate::scroll` uses to decide it can afford a scrollbar.
+///
+/// **It is reached in real windows rather than only in tests, which is what
+/// makes [`QueuePane::item_line`]'s one exception to it worth having.**
+/// `crate::layout::split` gives the right pane 40% of the window and
+/// `crate::layout::MIN_SPLIT_COLS` lets it split from 60 columns, so a
+/// 60-column terminal leaves this pane 22 columns inside its border and a
+/// 66-column one leaves 23 after the scrollbar's. Every terminal from 60 to 66
+/// columns draws a queue whose asides are all below this number.
 const ASIDE_MIN_WIDTH: usize = 24;
 
 /// What the composer writes in front of the draft.
@@ -255,14 +263,33 @@ pub struct Target {
     /// **The exit half is a cached answer and not a syscall, which the next
     /// reader will assume the other way round.** `TerminalPane::has_exited` is
     /// `poll_exit`'s last answer, and only `App::reap` refreshes it — so a
-    /// child can be gone while this still reads `true`. The honest claim is not
-    /// that it is current but that it is *exactly as current as the readiness
-    /// beside it*: both are the same cache, read on the same pass, and the
-    /// loop's periodic pass reaps a few statements before it polls readiness.
-    /// On the keystroke paths that also sync this pane, to withdraw a countdown
-    /// on the press, it is as old as the last reap and no older. Being wrong
-    /// costs a sentence here and nothing at the gate, which is
-    /// [`readiness`](Self::readiness)'s.
+    /// child can be gone while this still reads `true`.
+    ///
+    /// **It is nonetheless the *fresher* of the two fields, not the equal of
+    /// [`readiness`](Self::readiness), and the difference is visible.** This is
+    /// recomputed from `has_exited` every time the shell fills a `Target` in,
+    /// and the loop reaps once per frame it draws; `readiness` is a *stored*
+    /// answer that `App::poll_readiness` rewrites at most every
+    /// `READINESS_EVERY` — a quarter second. From that poll the two describe
+    /// one pass, because it fills this pane in as its last statement. From the
+    /// five keystroke paths that sync this pane without polling — a pane
+    /// change, a close, a key or a paste at the agent, a selection handed over
+    /// — `readiness` is up to a quarter second old and this is as old as the
+    /// last frame.
+    ///
+    /// So a `Target` can arrive carrying `Idle` beside `can_receive: false`,
+    /// and for that quarter second every sentence the queue has about that pane
+    /// says `cannot receive` — all three of its readers ask this flag before
+    /// the readiness — while the pane's own collapsed title row, drawn straight
+    /// off `crate::app::Agent::readiness`, still says `idle`. Two rows of one
+    /// frame, disagreeing about one pane, bounded by one readiness interval.
+    ///
+    /// **What it does not cost is a send.** This is read by nothing in the
+    /// gate, and `App::pump_queue` asks the pane itself again at the write —
+    /// `has_exited` and `bracketed_paste`, against the `&mut Agent` it is about
+    /// to type into. Only the exit half can go stale at all: a pane's kind is
+    /// settled at construction and nothing assigns to it, so the `is_claude`
+    /// half of this flag is the same answer for the life of the pane.
     pub can_receive: bool,
 }
 
@@ -1815,8 +1842,46 @@ impl QueuePane {
 
         // In a narrow pane the text is worth more than the annotation, and a
         // two-column budget for a prompt is not a row anybody can read.
+        //
+        // **Except for the one annotation that says the row will never
+        // happen.** That rule was written when every aside was a report about
+        // something in flight — a live state, a name — and dropping one of
+        // those costs a reader a fact they can get back by widening the window
+        // or by waiting. [`undeliverable`](Self::undeliverable) is not that: it
+        // is the whole of what phase 2 of `docs/mixed-agents.md` put on this
+        // row, it is the case the footer cannot reach because
+        // [`gate_target`](Self::gate_target) picks one pane, and at this width
+        // the footer cannot even finish the sentence about the pane it *did*
+        // pick — ` disarmed · agent cannot receive` is thirty-two columns and
+        // [`clip_line`] has twenty-two, so it stops inside the word. So below
+        // the threshold there is nowhere else for it, and the reader who is
+        // told nothing waits for ever.
+        //
+        // **What it costs is the prompt, and that is not a rounding error.**
+        // Fourteen columns of `cannot receive` out of twenty-two leaves the
+        // text one or two, so such a row shows its sigil, its marker and its
+        // reason and no words of what was queued. The reader can still select
+        // the row and press `Enter`, which answers with the same sentence and
+        // the pane's name — see [`why_not`](Self::why_not) — and one more
+        // column of window gives the text back. A prompt that is illegible for
+        // as long as the window is narrow is recoverable; a prompt parked for
+        // ever with nothing on screen saying so is what this whole disclosure
+        // exists to stop being.
+        //
+        // The name goes, though, because it is the half that does not fit and
+        // the half a reader can work out: the aside is `elsewhere · cannot
+        // receive` above the threshold and the reason alone below it.
+        //
+        // **And [`aside`](Self::aside)'s one-agent suppression goes with it,
+        // which is the one place a narrow row says more than a wide one.**
+        // Above the threshold a single-target queue draws no aside at all,
+        // because with one agent the footer is necessarily about that agent and
+        // says the same thing in the same words. That is the very sentence the
+        // clip is eating here, so the deference has nobody left to defer to.
         let aside = if w >= ASIDE_MIN_WIDTH {
             self.aside(item)
+        } else if self.undeliverable(item) {
+            "cannot receive".to_string()
         } else {
             String::new()
         };
@@ -1893,15 +1958,34 @@ impl QueuePane {
             // happen.
             _ if item.mode == Mode::Send && self.targets.len() > 1 => {
                 let whose = self.whose(item);
-                match self.target(item.target) {
-                    Some(t) if !t.can_receive && item.state == ItemState::Pending => {
-                        format!("{whose} · cannot receive")
-                    }
-                    _ => whose.to_string(),
+                if self.undeliverable(item) {
+                    format!("{whose} · cannot receive")
+                } else {
+                    whose.to_string()
                 }
             }
             _ => String::new(),
         }
+    }
+
+    /// Whether this item is aimed at a pane that can never take it.
+    ///
+    /// **A predicate rather than the condition written twice**, and the two
+    /// readers are what makes that worth a function: [`aside`](Self::aside)
+    /// draws the reason beside the pane's name, and
+    /// [`item_line`](Self::item_line) draws it alone in a pane too narrow for
+    /// both. Two spellings of "this will never go" would be one edit away from
+    /// a wide row and a narrow one disagreeing about the same item.
+    ///
+    /// [`ItemState::Pending`] is in it rather than around it. An item that was
+    /// sent before its pane exited *went* — the reason belongs to a prompt that
+    /// is still waiting, and `cannot receive` over a `✓` would be a reason given
+    /// for something that did not happen. [`Mode::Send`] likewise: a dispatch
+    /// reads no target at all, so a pane's readiness is nothing to do with it.
+    fn undeliverable(&self, item: &Item) -> bool {
+        item.mode == Mode::Send
+            && item.state == ItemState::Pending
+            && self.target(item.target).is_some_and(|t| !t.can_receive)
     }
 
     /// What to call an item's target.
@@ -1967,33 +2051,53 @@ impl QueuePane {
         // [`gate_target`](Self::gate_target).
         let state = self.gate_state();
         spans.push(Span::styled(format!(" · {} ", state.whose), dim()));
-        spans.push(match state.readiness {
-            Readiness::Idle => Span::styled("idle", Style::default().fg(Color::Green)),
-            Readiness::Busy => Span::styled("busy", Style::default().fg(Color::Yellow)),
-            // The one refusal a person can end, and the only thing on this
-            // line that is a request. Yellow like `busy`, because it is the
-            // same class of "not now" and the word is what separates them —
-            // spending a third colour on a state that already has a word buys
-            // nothing a reader was not already told.
-            Readiness::Waiting => Span::styled("waiting on you", Style::default().fg(Color::Yellow)),
-            // **`Unknown` is two facts and only one of them is worth waiting
-            // for**, which is why the arm splits rather than the vocabulary
-            // growing a variant. `crate::app::Agent::send_readiness` answers it
-            // for a child that has exited, for one that never asked for
-            // bracketed paste, and for a pane that is not Claude; the first and
-            // last are permanent, and a reader told `state unknown` about them
-            // is waiting for a sentence that will never change. That is the
-            // whole of what an exited-but-unclosed pane used to say about the
-            // prompts queued at it.
-            //
-            // Dim like the line it replaces, not [`err`]: nothing has gone
-            // wrong, the item is intact, and this pane simply is not one abeam
-            // may type into.
-            Readiness::Unknown if !state.can_receive => Span::styled("cannot receive", dim()),
-            // Named rather than hidden. It is not a worse `busy`, it is the
-            // state in which abeam does not know, and nothing will be sent
-            // until it does.
-            Readiness::Unknown => Span::styled("state unknown", dim()),
+        // **`can_receive` is asked first and outside the match, which is
+        // [`why_not`](Self::why_not)'s shape and is the whole of what makes
+        // this sentence reachable by itself.**
+        //
+        // It was a guard on the [`Readiness::Unknown`] arm, and that spelling
+        // needed two functions to agree without either reading the other:
+        // `crate::app::App::sync_queue_targets` computes `can_receive`, and the
+        // guarantee that such a pane's `readiness` is also `Unknown` came from
+        // `Agent::send_readiness` separately testing the same two conditions.
+        // Loosen either — and that function's own doc block invites exactly
+        // that, for a border that wants a friendlier answer than the gate's —
+        // and this line stops being reached, with the footer quietly back to
+        // `state unknown` and nothing failing.
+        //
+        // It is also what is true *today*, and not only a hedge against an
+        // edit: see `crate::app::Agent::send_readiness` and
+        // [`Target::can_receive`] for the quarter second in which a `Target`
+        // carries a stale `Idle` beside a fresh `false`. The old spelling drew
+        // green `idle` for that pane; this one draws the same word its own row
+        // does.
+        //
+        // Dim, not [`err`]: nothing has gone wrong, the item is intact, and
+        // this pane simply is not one abeam may type into.
+        spans.push(if !state.can_receive {
+            Span::styled("cannot receive", dim())
+        } else {
+            match state.readiness {
+                Readiness::Idle => Span::styled("idle", Style::default().fg(Color::Green)),
+                Readiness::Busy => Span::styled("busy", Style::default().fg(Color::Yellow)),
+                // The one refusal a person can end, and the only thing on this
+                // line that is a request. Yellow like `busy`, because it is the
+                // same class of "not now" and the word is what separates them —
+                // spending a third colour on a state that already has a word
+                // buys nothing a reader was not already told.
+                Readiness::Waiting => {
+                    Span::styled("waiting on you", Style::default().fg(Color::Yellow))
+                }
+                // Named rather than hidden, and now it means one thing rather
+                // than three. `crate::app::Agent::send_readiness` answers
+                // `Unknown` for a child that has exited, for one that never
+                // asked for bracketed paste, and for a pane that is not Claude;
+                // the first and last are permanent and are the branch above, so
+                // what is left here is the one a reader is right to wait
+                // through — abeam does not know yet, and nothing will be sent
+                // until it does.
+                Readiness::Unknown => Span::styled("state unknown", dim()),
+            }
         });
         if state.drafting {
             spans.push(Span::styled(" · you are typing", dim()));
@@ -2714,6 +2818,15 @@ mod tests {
         p.stub_item("for the busy one", Mode::Send);
         p.stub_item("for the other one", Mode::Send);
         p.items[1].target = OTHER;
+        // **A third item at the same dead pane, and it already went.** The
+        // reason on the row is only drawn for a [`ItemState::Pending`] item,
+        // and it is reachable rather than defensive: a send at a live Claude
+        // pane, then the child exits, then `App::reap` fills the cache — the
+        // item is `Sent` and its target now cannot receive. `cannot receive`
+        // over a `✓` is a reason given for something that did not happen.
+        p.stub_item("this one already went", Mode::Send);
+        p.items[2].target = OTHER;
+        p.items[2].state = ItemState::Sent;
         p.set_targets(
             vec![
                 target(AGENT, "main", Readiness::Busy),
@@ -2722,7 +2835,7 @@ mod tests {
             AGENT,
         );
 
-        // Row 0 is the dispatch notice, rows 1 and 2 are the items, row 7 is
+        // Row 0 is the dispatch notice, rows 1 to 3 are the items, row 7 is
         // the status line.
         let text = screen(&mut p, 60, 8);
         let foot = row_of(&text, 60, 7);
@@ -2747,6 +2860,86 @@ mod tests {
         let row = row_of(&text, 60, 1);
         assert!(row.contains("main"), "{row}");
         assert!(!row.contains("cannot receive"), "{row}");
+
+        // And the item that went before the pane did keeps its receipt. Same
+        // target as row 2, same flag, and the only difference is the state —
+        // so this is the guard and nothing else.
+        let row = row_of(&text, 60, 3);
+        assert!(row.contains("elsewhere"), "{row}");
+        assert!(
+            !row.contains("cannot receive"),
+            "a reason was given for something that had already happened: {row}"
+        );
+    }
+
+    /// And it goes on saying it in a pane too narrow for the rest of the aside.
+    ///
+    /// **The width is the program's own rather than a number chosen to fail**,
+    /// which is the half of this that needed establishing before anything was
+    /// changed: `crate::layout::split` hands the right pane 40% of the window
+    /// from `MIN_SPLIT_COLS` upwards, so the narrowest queue abeam will draw is
+    /// 22 columns inside its border — two short of [`ASIDE_MIN_WIDTH`], and the
+    /// width every terminal from 60 to 66 columns produces. Derived here rather
+    /// than written down, so that raising either constant is what re-decides
+    /// it.
+    ///
+    /// Below that threshold every aside was dropped, this one included — so on
+    /// those terminals a prompt aimed at a pane that can never take it went
+    /// back to being named nowhere, which is the case phase 2 of
+    /// `docs/mixed-agents.md` was written to end. The footer is no substitute
+    /// at this width twice over: it describes
+    /// [`gate_target`](QueuePane::gate_target)'s pane, which is routinely
+    /// another one, and it is clipped long before the words in any case.
+    #[test]
+    fn a_row_that_can_never_be_sent_says_so_in_a_pane_too_narrow_for_a_name() {
+        let right = crate::layout::split(Rect::new(0, 0, crate::layout::MIN_SPLIT_COLS, 40), false)
+            .right
+            .expect("`MIN_SPLIT_COLS` is the width at which it starts splitting");
+        let w = crate::layout::inner(right).width;
+        let w = w - crate::scroll::bar_width(w);
+        assert!(
+            (w as usize) < ASIDE_MIN_WIDTH,
+            "the queue is never drawn this narrow, so this test is about \
+             nothing: {w}"
+        );
+
+        let mut p = pane();
+        p.stub_item("for the busy one", Mode::Send);
+        p.stub_item("for the other one", Mode::Send);
+        p.items[1].target = OTHER;
+        p.set_targets(
+            vec![
+                target(AGENT, "main", Readiness::Busy),
+                cannot_receive(OTHER, "elsewhere"),
+            ],
+            AGENT,
+        );
+
+        let text = screen(&mut p, w, 8);
+        let row = row_of(&text, w, 2);
+        assert!(
+            row.contains("cannot receive"),
+            "a prompt that can never be delivered is named nowhere on a \
+             60-column terminal: {row}"
+        );
+
+        // The name is still dropped, which is the rest of the threshold left
+        // standing: the exception is the disclosure and not the aside.
+        assert!(
+            !row.contains("elsewhere"),
+            "the name took the columns the reason needed: {row}"
+        );
+        let row = row_of(&text, w, 1);
+        assert!(
+            !row.contains("main"),
+            "a pane that is merely busy spent columns saying whose it is: {row}"
+        );
+
+        // And the footer really cannot stand in for it here, which is why the
+        // row has to. It is about `main`, and clipped before it reaches even
+        // that far.
+        let foot = row_of(&text, w, 7);
+        assert!(!foot.contains("cannot receive"), "{foot}");
     }
 
     /// `Enter` on such an item answers.
@@ -2829,6 +3022,59 @@ mod tests {
         // disclosure is the footer, which is about that one agent by
         // construction.
         assert!(!row_of(&screen(&mut p, 60, 8), 60, 1).contains("cannot receive"));
+
+        // ...until the pane is too narrow for that footer to finish the
+        // sentence, at which point the row says it after all. The deference
+        // above is to a line that is being clipped mid-word here, so there is
+        // nobody left to defer to — see `QueuePane::item_line`.
+        let narrow = screen(&mut p, 22, 8);
+        assert!(
+            !row_of(&narrow, 22, 7).contains("cannot receive"),
+            "the footer fitted after all, so the row has nothing to say: {}",
+            row_of(&narrow, 22, 7)
+        );
+        assert!(
+            row_of(&narrow, 22, 1).contains("cannot receive"),
+            "neither line says it, and the prompt waits for ever: {}",
+            row_of(&narrow, 22, 1)
+        );
+    }
+
+    /// And it says so off the flag, whatever the readiness beside it says.
+    ///
+    /// **The two fields are filled out of caches of different ages, so they
+    /// really do disagree.** `crate::app::App::sync_queue_targets` recomputes
+    /// `can_receive` from a `has_exited` the loop refreshes on every frame,
+    /// while `readiness` is the stored answer of a poll that runs four times a
+    /// second — so for up to one `READINESS_EVERY` after a child leaves, a
+    /// [`Target`] arrives here carrying `Idle` beside `can_receive: false`.
+    /// See [`Target::can_receive`], which has the bound and what it costs.
+    ///
+    /// While this was a guard on the [`Readiness::Unknown`] arm the footer drew
+    /// that pane a green `idle`, on the same frame as
+    /// [`QueuePane::why_not`] — the sentence `Enter` on such an item gives,
+    /// about the same pane — said `cannot receive`. And the arm was reachable
+    /// at all only because `sync_queue_targets` and `Agent::send_readiness`
+    /// test the same two conditions without either reading the other. Asked
+    /// first, as `why_not` has always asked it, the sentence is reachable from
+    /// `can_receive` alone.
+    #[test]
+    fn the_footer_says_cannot_receive_off_the_flag_and_not_off_the_readiness() {
+        let mut p = pane();
+        p.stub_item("nobody will ever read this", Mode::Send);
+        let mut stale = cannot_receive(AGENT, "main");
+        stale.readiness = Readiness::Idle;
+        p.set_targets(vec![stale], AGENT);
+
+        let foot = row_of(&screen(&mut p, 60, 8), 60, 7);
+        assert!(
+            foot.contains("cannot receive"),
+            "the footer read the readiness rather than the flag: {foot}"
+        );
+        assert!(
+            !foot.contains("idle"),
+            "a green `idle` for a pane nothing can ever type at: {foot}"
+        );
     }
 
     #[test]
