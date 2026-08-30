@@ -31,6 +31,80 @@ the worktree list, or in the checkout on screen in the status view. It starts
 working in a Claude session, press a key, and get a Codex pane in the stack
 beside it.
 
+## What the reader does
+
+**`A` where they would have pressed `a`, then `Enter`.** Everything before
+that is what they press today.
+
+```
+Alt+G          the git pane takes the keys, showing this checkout's status
+A              the agent list opens over it, cursor on the session's own agent
+j j            down to `codex`
+Enter          a Codex pane opens in this checkout and takes the keys
+```
+
+Or, when the agent belongs in a different worktree, in the list that is already
+about worktrees:
+
+```
+Alt+G  w       the worktree list
+j              down to the worktree the agent belongs in
+A              the same agent list, asking about *that* worktree
+Enter          the pane opens there
+```
+
+**`a` is unchanged and is still the fast path.** `Alt+G`, `a` starts the
+session's own agent in the checkout on screen, with no list and no
+confirmation, exactly as it does today. `A` is that key with a question in
+front of it, and the question is only ever "which one".
+
+What is on screen while it stands:
+
+```
+┌ git · start an agent in main ────┐
+│ ▸ claude                  session│
+│   copilot                        │
+│   codex                          │
+│   fleet                  → claude│
+│   reviewer                → codex│
+│                                  │
+│ enter starts                     │
+└──────────────────────────────────┘
+```
+
+Four things about that screen, each of which is the answer to a question the
+rest of this document then argues:
+
+- **The list is the names `+` already takes.** `claude`, `copilot` and `codex`
+  are `crate::agent::AGENTS`; `fleet` and `reviewer` are this reader's
+  `[preset.*]` blocks from `abeam.toml`. It is the same table that answers
+  `abeam +codex` on the command line — `crate::config::Config::table` — so
+  there is nothing new to learn and nothing new to configure. A machine with no
+  presets sees three rows.
+- **The border names the checkout**, because the question is about one. `A` in
+  the worktree list is asking about the row the cursor was on; `A` in the status
+  view is asking about the checkout the pane is showing. Neither is "wherever
+  the cursor ends up" — the answer is captured on the keystroke that asked.
+- **The cursor starts on the session's own agent**, marked `session` on the
+  right. So `A` `Enter` is "another one of what I already have", and the common
+  case stays two keystrokes. The *order* is the table's and never moves.
+- **A preset says what it hosts.** `fleet → claude` is a Claude pane whatever it
+  is called, and that is worth seeing before choosing, because it decides
+  whether the queue will be able to type at the pane at all. `crate::agent::Agent::hosts`
+  is a static field, so this costs nothing to draw.
+
+The sketch marks the cursor with `▸`; the real list highlights the row's
+background, as `worktree_lines` does today. While the question stands the
+border's `exit_hint` reads `esc→list` rather than `esc→git`, because `Esc` here
+puts the reader back in the list they pressed `A` in.
+
+**What happens when the answer is a program that is not installed.** The list is
+what abeam can *name*, not what is on the machine — see "Resolution happens on
+the keystroke" below — so choosing `codex` on a box without Codex opens no pane
+and puts `crate::agent::missing`'s paragraph on the left border, naming what was
+looked for and how to install it. That is the same sentence, at the same
+quality, that `abeam +codex` gives at startup.
+
 ## Why this is smaller than it sounds
 
 Five things are already in the shape this needs, and none of them were built
@@ -279,7 +353,10 @@ refused, and that half is not symmetry — `crate::keys` records that abeam
 yielded `Alt+A` to Codex, which after this change is an agent any session can be
 hosting.
 
-## The chooser
+## The chooser, in code
+
+What it looks like and what the reader presses is "What the reader does" above.
+This is where that screen comes from.
 
 **A standing question beside the mode, and not a third mode.** `GitPane` already
 has the shape for this and it is not `Mode`: `kill: Option<PathBuf>` is the `x`
@@ -331,15 +408,8 @@ list's match, and that branch is the whole of the chooser's key handling.
 
 ### The rows say what a preset hosts
 
-```
- claude          ·  session
- copilot
- codex
- fleet           →  claude
- reviewer        →  codex
-```
-
-`crate::agent::Agent::hosts` is a static field — no filesystem, no cost — and it
+The `→ claude` column in the sketch above is one field read straight off the
+table. `crate::agent::Agent::hosts` is a static field — no filesystem, no cost — and it
 is the field that decides whether a pane will have readiness at all. A reader
 choosing `fleet` should be able to see that they are getting a Claude pane, and
 therefore a pane the queue can type at; a reader choosing `reviewer` should be
