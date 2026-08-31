@@ -10,7 +10,7 @@
 //!         abeam +pwsh               (anything else)
 //!         abeam +help               (abeam's own; `--help` is the agent's)
 //!
-//! Alt+Q quits, F1 lists the keys, F2 shows what the pty is doing.
+//! F1 opens commands; F1, Q quits and F1, D shows pty diagnostics.
 //!
 //! ## Waiving `dead_code`: `#[expect]` unless a `cfg` is what makes it dead
 //!

@@ -7,6 +7,10 @@
 > code disagrees with a paragraph here, the code is the answer and the
 > paragraph says so.
 >
+> **Current keyboard map:** the Option A `F1` command hub is authoritative.
+> Historical examples below that use global `Alt` bindings or retired direct
+> function keys are not current commands; see [docs/keymap.md](keymap.md).
+>
 > **What the four phases changed about this document**, so nobody has to diff
 > it against the source:
 >

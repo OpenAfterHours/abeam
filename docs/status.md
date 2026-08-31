@@ -5,6 +5,15 @@
 > and it is the honest half of the project. If you are deciding whether to trust
 > abeam with real work, this is the page to read.
 
+> **Keyboard cutover:** the current release uses the `F1` command hub. `F1, S`
+> opens the shell; `F1, ?` opens the full reference; `F1`, `F4`, `F5`, `F7`,
+> `F12` (and `Ctrl+\`) are the only direct global routes. The former Alt globals and
+> direct `F2`/`F3`/`F6`/`F8`/`F9` routes are removed, not aliases. This status
+> page preserves earlier test and audit notes, so a direct-key reference below
+> describes the retired map unless it is explicitly labelled as the hub.
+>
+> [docs/keymap.md](keymap.md) is the authoritative current command reference.
+
 ## Platforms
 
 **Windows x86-64 and Linux x86-64 are what ships, and the two are not equally
@@ -68,7 +77,7 @@ highlighted, `F7` is the keyboard's way in, and `Enter` puts the rows in the
 agent's composer without sending them — with the limits listed at the foot of
 this document. The Windows test suite, and `clippy --all-targets` clean on both.
 
-The seventh view is the **scratch pad** on `F9`: a markdown pad per workspace
+The seventh view is the **scratch pad** on `F1, P`: a markdown pad per workspace
 that opens on its source with a caret in it, turns over to the rendering on
 `Alt+T` — from either `Alt` key — and writes itself to
 `%APPDATA%\abeam\scratch\` on Windows and
@@ -84,7 +93,7 @@ Codex support means the interactive TUI in the left pty. The official Windows
 Codex 0.149.0 binary was hosted through abeam with an isolated `CODEX_HOME`:
 the welcome/sign-in UI rendered, Down-arrow navigation worked, a 120×40 →
 100×32 outer resize completed with the UI still navigable, and the two-step
-`Alt+Q` quit completed. No account was connected and no prompt was submitted.
+`F1, Q` quit completed. No account was connected and no prompt was submitted.
 
 One configuration name changes meaning on upgrade: `codex` is now built in, so
 an existing `[preset.codex]` is refused and must be renamed, with its callers
@@ -95,14 +104,11 @@ above.
 Two of those changed Windows behaviour on the way past, and both are worth
 seeing before you upgrade rather than after.
 
-**AltGr is Ctrl+Alt, and abeam now says so in one place instead of four.**
-On a UK, Irish or continental layout the right-hand `Alt` key is AltGr, and
-Windows reports it by setting the control bit as well — so half the keyboard
-delivered every `Alt` binding with CONTROL set. `keys::global` had always
-ignored that bit and three other places had not, which is why `Alt+S` reached
-the shell from either key while `Alt+T` turned the scratch pad over from the
-left one alone. `keys::alt_chord` is the single answer now, and `altgr_is_alt`
-walks the whole table to keep it single.
+**AltGr is not part of the global command map.** On a UK, Irish or continental
+layout Windows reports the right-hand Alt key as Ctrl+Alt. The command hub
+avoids making that delivery detail a prerequisite for opening a shell or any
+other application view: `F1, S` is the supported route. Alt combinations are
+released to the focused child, apart from a right-pane editor's own local keys.
 
 Two more fell out of the same fact. The pad, the ask and the queue all guarded
 typing with `!ctrl && !alt`, which is a guard against AltGr and so against every
@@ -112,11 +118,11 @@ matched `Ctrl+\` on the control bit alone, so on the layouts that put `\` behind
 AltGr, typing a backslash armed it and sent the *next* keystroke to the agent
 raw. It reads `ctrl && !alt` now, and `F12` is still the alias on those layouts.
 
-None of that reaches a terminal that takes `Alt`+letter for its own menus before
+None of that changes a terminal that takes `Alt`+letter for its own menus before
 abeam sees it, or one that reports `Alt` as an `Esc` prefix. `cargo run -p abeam
---example keyprobe` tells the three cases apart, names which `Alt` key arrived,
-and names the binding each event resolves to; it covers all twenty globals and
-the pad's `Alt+T`.
+--example keyprobe` is the diagnostic for seeing which physical Alt key arrived;
+it is not a route to a retired global command. The hub itself is exercised with
+its `F1` sequences, while the pad's `Alt+T` remains a pane-local edit/view key.
 
 **An earlier `PATH` entry holding something abeam cannot start no longer hides
 the program behind it.** A `claude.ps1` with no `.cmd` beside it, or the
@@ -147,11 +153,11 @@ On top of that, `crates/abeam/tests/end_to_end.rs` does to abeam what abeam does
 to an agent: it spawns **the built binary** in a pty, types at it as bytes,
 and reads the screen that comes back. That is what proves the parts no in-process
 test can reach — that abeam starts at all, that raw mode and the alternate
-screen survive being someone else's child, that `Alt+S` written as `ESC s`
-becomes the binding it should, and that a command typed into the shell view runs
+screen survive being someone else's child, that `F1, S` opens the shell, and
+that a command typed into the shell view runs
 in the right directory and puts its answer on screen. Four paths are pinned that
 way today: type a command in the shell and read its output; reach a file nothing
-pointed the pane at, by `Alt+E` `Alt+E` `/`; select rows of the shell view with
+pointed the pane at, by `F1, B` `/`; select rows of the shell view with
 `F7` and copy them, which is the only place `ESC [ 1 8 ~` is proved to come back
 out of ConPTY as the function key it names *and* the only place the mode's
 promise — that nothing reaches the child while a caret is up — is asked in front
@@ -225,9 +231,9 @@ work, on either platform.
 
 **More than one agent in the window is built, and no human has ever used it.**
 That sentence is the whole entry and the rest of this paragraph is detail. `a`
-in the git view (`Alt+G`) starts another agent in the checkout on screen, and
-`a` on a row of the worktree list (`Alt+G`, `w`) starts one in that checkout;
-`F4` pressed again moves along them; they are stacked vertically, one title row
+in the git view (`F1, G`) starts another agent in the checkout on screen, and
+`a` on a row of the worktree list (`F1, G`, `w`) starts one in that checkout;
+`F1, N` moves along them; they are stacked vertically, one title row
 each for the ones there is no room to draw whole; the queue's `Send` items carry
 the pane they were written for and are typed there and nowhere else; `x` twice
 at a pane whose child has exited closes it, and `x` twice on a worktree row ends
@@ -332,16 +338,16 @@ opinion, and nobody has made one.
   keys — moving the cursor to the third collapses the second on the way past.
   Comparing two panes neither of which is the session's would need a second
   cursor or a pinned pane, and either is a feature rather than a fix. There is
-  also no "show me only this agent": `Alt+Z` hides the *right* pane, which buys
+  also no "show me only this agent": `F1, Z` hides the *right* pane, which buys
   the left column columns and not one extra row, and a second zoom was declined
   because its whole effect would be to delete the roster of collapsed title rows
   that the feature exists to keep.
 - **Ending a live agent is only reachable through the worktree list**, which is
-  `Alt+G`, `w`, find the row, `x`, `x`. That is deliberate — `x` at the pane
+  `F1, G`, `w`, find the row, `x`, `x`. That is deliberate — `x` at the pane
   itself is that child's letter, and abeam may not take a key a live agent might
   bind — but it means the gesture is not discoverable from the pane a reader is
-  looking at while wondering how to get rid of it. The signposts are the `F1`
-  overlay, `docs/keymap.md` and the README's own section, and not one of them is
+  looking at while wondering how to get rid of it. The signposts are the
+  `F1, ?` reference, `docs/keymap.md` and the README's own section, and not one of them is
   where the question is asked. If that turns out to be the common complaint, the
   honest fix is a sentence in the agent pane's own border rather than a key.
 - **Nobody has typed into the scratch pad by hand, on either platform.** That is
@@ -548,7 +554,7 @@ opinion, and nobody has made one.
   door.** A shell cannot be re-rooted for the same reason the agent cannot, so
   switching workspaces with the command view up starts a second child rather
   than moving the first; the number of shell processes grows with the number of
-  worktrees somebody has typed in, and `Alt+Q` asks about every one of them, so
+  worktrees somebody has typed in, and `F1, Q` asks about every one of them, so
   a build left running in a workspace nobody is looking at still makes quitting
   ask twice. The related cost is a workspace `git worktree remove` has deleted
   while a child of yours is still running in it: abeam keeps it rather than
@@ -629,7 +635,7 @@ opinion, and nobody has made one.
   every message type it does not know — so a child that stops mid-turn to ask
   abeam for something abeam has never heard of gets no reply, never sends the
   `result` that is the only reliable end of a turn, and stays `answering` for
-  the rest of the session. `Alt+Q` is the whole of the escape. What has changed
+  the rest of the session. `F1, Q` is the whole of the escape. What has changed
   is only that it is now *visible*: the composer row counts the seconds, so a
   wedged turn reads `answering 900s` rather than looking like a slow one. Being
   able to tell is not being able to stop it. The dropping is deliberate and the
@@ -768,9 +774,9 @@ opinion, and nobody has made one.
   above, but authenticated composer, approval, pager and agent-session modes
   remain untested. No Codex path has been run on Linux.
 
-  Codex's shipped 0.149.0 defaults collided with the former `Alt+A` queue key,
-  so abeam yielded it and the queue is now `F8`. Codex can bind `F8` through a
-  custom `tui.keymap`; abeam does not parse that configuration, and
+  Codex's shipped 0.149.0 defaults collided with the former `Alt+A` queue key.
+  The clean hub cutover removes that queue binding; the queue is `F1, W`.
+  Codex can bind direct keys through a custom `tui.keymap`; abeam does not parse that configuration, and
   literal-next (`Ctrl+\` or `F12`) is the recovery path. `docs/keymap.md` has the
   provenance and the remaining live-audit checklist.
 - **abeam has never been run with Copilot CLI.** Not once, not for a minute. It
@@ -907,7 +913,7 @@ opinion, and nobody has made one.
   process group is nobody's handle: `SIGKILL` to abeam runs no destructor, and
   what is left is the kernel's own `SIGHUP` to the foreground process group when
   the pty master closes. That reaches a shell sitting at a prompt. It does not
-  reach a build that ignores it. Quit with `Alt+Q`, which is the path that runs
+  reach a build that ignores it. Quit with `F1, Q`, which is the path that runs
   the destructor.
 - **A second, narrower hole in the same place.** `killpg` signals the group the
   child leads, and job control gives every job an interactive shell starts a
@@ -1037,7 +1043,7 @@ opinion, and nobody has made one.
   one honest rule that costs something.
   `crates/abeam/src/panes/viewer/search.rs` has the argument, written down
   rather than half-done.
-- **The reader is the only pane that paints its own background.** `F3` gives it
+- **The reader is the only pane that paints its own background.** `F1, T` gives it
   a light or a dark page — with a matching syntax theme, since base16-ocean.dark
   on a white page is washed out — and that is what makes one key enough in a
   bright room. Everything else still draws in named ANSI colours on the
@@ -1045,7 +1051,7 @@ opinion, and nobody has made one.
   profile the terminal has and the two pty views show whatever their child sent.
   A TUI still cannot ask the terminal for its palette; the reader sidesteps the
   question by owning every colour inside its own rect. The choice is still per
-  session — `F3` flips it and the flip is not written back — but where it starts
+  session — `F1, T` flips it and the flip is not written back — but where it starts
   is now `[defaults] theme` in the config file rather than always dark.
 - **UTF-16 files are reported as binary.** The sniff is a NUL byte in the first
   8 KiB, which is what git does.

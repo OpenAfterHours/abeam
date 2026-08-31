@@ -876,6 +876,7 @@ impl ViewerPane {
 
     /// Swap between the document and the file list. The seam a second `Alt+E`
     /// drives from the shell.
+    #[allow(dead_code)] // retained for the pane's direct transition tests
     pub fn toggle_browse(&mut self) {
         // The results are peeled off first, and then `Alt+E` does what it has
         // always done. It has meant "between the document and the file list"
@@ -922,6 +923,22 @@ impl ViewerPane {
             // exist to make unreachable rather than a case with an answer.
             Mode::Results { back } => back.mode(),
         };
+    }
+
+    /// Show the file browser without making the reader command stateful.
+    /// `F1, B` owns this explicit transition; `F1, E` always selects the
+    /// reader, so repeating either command cannot mean its opposite.
+    pub fn open_browse(&mut self) {
+        if let Mode::Results { back } = self.mode {
+            self.mode = back.mode();
+            self.grep.close_box();
+        }
+        if !matches!(self.mode, Mode::Browse) {
+            let doc = self.path().map(Path::to_path_buf);
+            self.browse.align_to(doc.as_deref());
+            self.close_search();
+            self.mode = Mode::Browse;
+        }
     }
 
     /// Leave the results, putting the reader back where `f` was pressed. `Esc`
@@ -1325,7 +1342,7 @@ impl ViewerPane {
                 // arrives without having asked to, and Tab walks the markdown
                 // list, which is not where they came from.
                 lines.extend(text::block(
-                    "r to retry · Tab for the next markdown file · Alt+G for git",
+                    "r to retry · Tab for the next markdown file · F1, G for git",
                     width,
                     t.dim(),
                 ));
@@ -2784,7 +2801,7 @@ fn empty_hint(width: usize, watching: bool, t: &theme::Theme) -> Vec<Line<'stati
     // Alt+G: this is a screen someone arrives at with nothing to press, and
     // the file list is the one thing that gets them off it under their own
     // steam. Tab only walks markdown, and there may be none.
-    lines.extend(hint("Alt+E  the file list"));
+    lines.extend(hint("F1, B  the file list"));
     lines.extend(hint("Tab    next file"));
     lines.extend(hint("r      look again"));
     lines.extend(hint("j k    scroll"));
@@ -3643,7 +3660,7 @@ mod tests {
         // Nobody asks to be here, so the screen has to name a way out that
         // leads back to where they were — Tab only walks the markdown list.
         let text: String = lines.concat();
-        assert!(text.contains("Alt+G"), "{text}");
+        assert!(text.contains("F1, G"), "{text}");
     }
 
     #[test]

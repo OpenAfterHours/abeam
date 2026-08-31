@@ -3,7 +3,8 @@
 //! What it is for is the round trip that otherwise costs a second window:
 //! `git branch`, `uv run ruff format`, `cargo test` — run in the directory
 //! abeam was pointed at, next to the agent session that is about to be told
-//! what they printed. `Alt+S` out, type, `Alt+S` home.
+//! what they printed. `F1, S` opens and focuses it; `F4` returns focus to the
+//! agent.
 //!
 //! What it deliberately is not is a multiplexer. There is one child, started
 //! when the pane is first drawn and never restarted behind your back; there are
@@ -38,7 +39,7 @@
 //! - **Spawned on the first frame that draws it**, never at startup. Being
 //!   drawn is the only signal a pane gets that it is the one on screen, and the
 //!   viewer already uses it for exactly this. A session that never presses
-//!   `Alt+S` must never have paid for a shell process.
+//!   `F1, S` must never have paid for a shell process before it is chosen.
 //! - **Restartable.** A child that exits leaves the pane saying so, with
 //!   `Enter` to start another. While it is dead the pane must *not* claim every
 //!   key — `Esc` and `q` fall through so the way back to the agent is the one
@@ -536,7 +537,7 @@ impl Pane for ShellPane {
     /// would be one more place for the two to disagree.
     fn exit_hint(&self) -> &'static str {
         if self.is_live() {
-            "alt+s→agent"
+            "f4→agent"
         } else {
             "esc→agent"
         }
@@ -908,7 +909,7 @@ mod tests {
 
         let mut live = pane(&dir, "cmd.exe", &[]);
         draw(&mut live, 40, 8);
-        assert!(live.takes_input(), "the border promises alt+s as the way out");
+        assert!(live.takes_input(), "the border promises F4 as the way out");
         // The same fact the app reads before it lets abeam exit: quitting would
         // kill this child, so quitting has to ask first.
         assert!(live.is_live());
@@ -1639,7 +1640,7 @@ mod unix_tests {
 
         let mut live = pane(&dir, SH, &[]);
         draw(&mut live, 40, 8);
-        assert!(live.takes_input(), "the border promises alt+s as the way out");
+        assert!(live.takes_input(), "the border promises F4 as the way out");
         // The same fact the app reads before it lets abeam exit: quitting would
         // kill this child, so quitting has to ask first.
         assert!(live.is_live());

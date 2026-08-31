@@ -142,7 +142,7 @@ seven views, and switching between them or scrolling them costs you nothing —
 you only need to move focus to pick something out of a list, to type, or to copy
 with the keyboard rather than the mouse.
 
-**git** (`Alt+G`) — read-only. Branch, ahead/behind, staged / unstaged /
+**git** (`F1, G`) — read-only. Branch, ahead/behind, staged / unstaged /
 untracked files with per-file line counts, and recent commits. Every `git` call
 is a read: it stages nothing and commits nothing. It refreshes when the watcher
 sees a write, and on a two-second timer for changes the watcher cannot see, such
@@ -150,7 +150,7 @@ as a commit made in another terminal. `Enter` opens the selected file in the
 reader. `a` starts another agent in this checkout. `w` lists the repository's
 other worktrees, which is how the right pane is pointed at one.
 
-**files** (`Alt+E`) — read-only markdown and source. Markdown is rendered rather
+**files** (`F1, E`) — read-only markdown and source. Markdown is rendered rather
 than shown as source: headings, lists, tables, quotes, GFM alerts, footnotes,
 YAML front matter as a header rather than a slab of source,
 syntax-highlighted code fences, and `graph`/`flowchart` and `sequenceDiagram`
@@ -174,11 +174,11 @@ breadcrumb of the section you have scrolled into.
 
 On startup it opens the newest markdown under the
 root; after that it follows what the agent writes. A document arriving while you
-are looking at something else waits, and the border says `◆ Alt+E` rather than
+are looking at something else waits, and the border says `◆ F1, E` rather than
 switching under you.
 
-A second `Alt+E` opens the **file list**, a gitignore-aware browser starting
-where the open file lives. `Enter` descends or opens, `Backspace` climbs.
+`F1, B` opens the **file browser**, a gitignore-aware list starting where the
+open file lives, and focuses it. `Enter` descends or opens, `Backspace` climbs.
 
 Inside a repository it shows dot-named files too — `.claude`, `.github`,
 `.gitignore` — because that is where a good deal of the work lives, and
@@ -204,14 +204,14 @@ Only `f` touches the disk, and it is the only one whose box waits for `Enter`
 rather than narrowing as you type. `Enter` on a result opens that file with the
 document search already looking for the same phrase.
 
-**shell** (`Alt+S`) — a real shell in the directory abeam was pointed at, next to
+**shell** (`F1, S`) — a real shell in the directory abeam was pointed at, next to
 the session that is about to be told what it printed. `pwsh` on Windows, falling
 back to `powershell` then `cmd`; `$SHELL` then `bash` then `sh` on Linux; or
 whatever `ABEAM_SHELL` names. It starts the first time you open the view and
 never before. This is the one view that keeps `Esc` and `q` — they belong to the
-shell — so `Alt+S` or `F4` is the way out. abeam will not quit out from under a
+shell — so `F4` is the reliable way out. abeam will not quit out from under a
 running command: the agent exiting holds the door and the left title says
-`shell open · Alt+Q to quit`.
+`shell open · F1, Q to quit`.
 
 **Telling the agent what it printed is a drag and a keystroke.** Highlight the
 output with the mouse — that copies it — and press `Enter` while the highlight
@@ -220,7 +220,7 @@ come back as the lines they were written as, not as the rows the pane was too
 narrow to fit them in. See [Copying out of the right
 pane](#copying-out-of-the-right-pane).
 
-**queue** (`F8`) — work lined up for the agent, for the gap between having a
+**queue** (`F1, W`) — work lined up for the agent, for the gap between having a
 thought and being able to act on it. Items go one of two ways: **send**, typed
 into one agent's session the moment *that* agent goes idle, continuing its
 conversation; or **dispatch**, started as its own background agent with none of
@@ -235,11 +235,11 @@ command there is. A send waits for the agent's own record to say it is idle and 
 nothing to be sitting unsubmitted in its composer, and announces itself in the
 left title first — typing at the agent during that pause defers it.
 
-**pad** (`F9`) — a scratch pad, one per workspace, and the only thing on screen
+**pad** (`F1, P`) — a scratch pad, one per workspace, and the only thing on screen
 that nobody but you wrote. It is where the thought goes when the agent is
-mid-task and interrupting it would cost you the turn. `F9` opens it **and gives
+mid-task and interrupting it would cost you the turn. `F1, P` opens it **and gives
 it your keys**, because a pad you have to press a second key to type into is a
-picture of a pad; `F9` again hands them back. It holds markdown and opens on the
+picture of a pad. `F4` hands them back to the agent. It holds markdown and opens on the
 source with a caret in it, so every plain key is a letter rather than a command —
 the arrows, `Home` and `End` move the caret, and `Alt+T` shows you the rendering
 instead, which is read-only and where a bare `t` brings the source back. What
@@ -248,18 +248,18 @@ directory rather than in the repository, so it is still there next week and it
 never appears in `git status`. `Alt+T` here is the pad's own key rather than a
 global, and it works from either `Alt` key like every other one. One thing to
 know about it: it needs the pad
-to have your keys. Hand them back with a second `F9` and the pad is still on
+to have your keys. After `F4`, the pad is still on
 screen but no longer listening, so `Alt+T` goes to the agent instead and the
-page does not turn over. `F9` again, or a click, and it does. `F7`, a drag and
+page does not turn over. `F1, P` again, or a click, and it does. `F7`, a drag and
 `Enter` work here as they do in every other
 right-hand view, which is how a line of it reaches the agent.
 
-**ask** (`?` from the document or the git view, `F6` from anywhere) — for Claude
+**ask** (`?` from the document or the git view, `F1, A` from anywhere) — for Claude
 and Copilot, a second copy of your agent in the right pane which **may read and
 may not write**. For
 the question that is about what is on screen — what does this call do, where is
 this written, is this the only caller — without spending the conversation on the
-left. `?` attaches the file you were looking at and shows you that it has; `F6`
+left. `?` attaches the file you were looking at and shows you that it has; `F1, A`
 attaches nothing, which is the question you have while typing at the agent, and
 is also the only way to take an attachment back off.
 
@@ -284,7 +284,7 @@ has never been run by anyone, the pane says so on its opening screen, and
 [status](docs/status.md) has the detail. Under Codex, Ask is unavailable rather
 than starting a different provider or guessing at a safe non-interactive mode.
 
-**pty diagnostics** (`F2`) — what the emulation layer is doing: alt-screen,
+**pty diagnostics** (`F1, D`) — what the emulation layer is doing: alt-screen,
 application cursor, bracketed paste, mouse mode, byte counts, sizes, and the
 frame clock. **DSR answered** is the one that matters on Windows — a red zero
 means the session is hung rather than slow. `docs/conpty-findings.md` explains
@@ -292,54 +292,50 @@ each field.
 
 ## Keys
 
-Everything abeam binds lives under `Alt` and the F-keys, with one exception:
-`Ctrl+\`, the escape hatch. `docs/keymap.md` is the audit behind the table.
-Codex's shipped defaults leave `F8` unused, but Codex keymaps are configurable,
-so a local `tui.keymap` can still collide. Press `Ctrl+\` or `F12`, then the key,
-to send it to Codex untouched.
+`F1` is the application-command hub. Press and release `F1`, then press the
+displayed mnemonic: `F1, S` means the sequence, not a simultaneous chord. This
+is the only global command language. The former Alt bindings and direct
+`F2`/`F3`/`F6`/`F8`/`F9` routes were removed; they are not aliases.
+An unrecognised or modified continuation stays in the hub and is never typed
+into the focused child.
 
-| Key | |
-| --- | --- |
-| `Alt+G` | right pane → git |
-| `Alt+E` | right pane → files (again for the file list) |
-| `Alt+S` | right pane → a shell, **and focus it** (again to hand focus back) |
-| `F8` | right pane → the queue |
-| `F6` | right pane → ask, nothing attached, **and focus it** (again for what it displaced) |
-| `F2` | right pane → pty diagnostics, and back to what it displaced |
-| `F3` | file reader → light / dark page |
-| `F7` | select rows of the right pane by keyboard, **and focus it** (a drag copies on its own) |
-| `F9` | right pane → the scratch pad, **and focus it** (again to hand focus back) |
-| `F4` / `F5` | move focus left / right; `F4` again moves along the agents |
-| `Alt+J` / `Alt+K` | scroll the right pane a line — **without focusing it** |
-| `Alt+PgDn` / `Alt+PgUp` | scroll the right pane a page — without focusing it |
-| `Alt+Z` | zoom: hide / show the right pane |
-| `Alt+Q` | quit (twice while a child is live) |
-| `F1` | key help overlay |
-| `Ctrl+\` or `F12` | send the *next* key to the agent verbatim |
+| Key or sequence | Action | Focus result |
+| --- | --- | --- |
+| `F1` | Open the command hub; `F1, ?` opens the full reference | Unchanged until a command is chosen |
+| `F1, G` / `F1, E` | Show git / files-reader | Keep current focus |
+| `F1, B` | Open the file browser | Focus right |
+| `F1, S` | Open the shell | Focus right |
+| `F1, W` / `F1, P` / `F1, A` | Queue / scratch pad / ask without an attachment | Queue keeps focus; pad and ask focus right |
+| `F1, D` / `F1, T` | Diagnostics / reader theme | Keep current focus |
+| `F1, Z` | Hide or show the right pane | Keep focus on the meaningful pane |
+| `F1, J` / `F1, K` | Scroll the right pane one line | Keep current focus |
+| `F1, PageUp` / `F1, PageDown` | Page the right pane | Keep current focus |
+| `F1, N` | Focus the next agent | Focus left |
+| `F1, Q` | Quit; enter `F1, Q` again to confirm while a child is live | As confirmed |
+| `F1, Esc` | Dismiss the hub | Unchanged |
+| `F4` / `F5` | Focus the current agent / show and focus the right pane | Left / right respectively |
+| `F7` | Start or end keyboard selection in the right pane | Focus right |
+| `Ctrl+\` or `F12` | Send the *next* key to the agent verbatim | Agent receives that key |
 
-**Either `Alt` key works.** Windows reports AltGr as Ctrl+Alt, so on a UK, Irish
-or continental layout the right-hand `Alt` key arrives carrying an extra
-modifier; abeam counts both, for every row above and for the pad's `Alt+T`. The
-one place that is deliberately *not* true is `Ctrl+\`: on the layouts that put
-`\` behind AltGr, `AltGr+\` is a backslash you were trying to type, so
-literal-next declines it and `F12` is the alias to reach for there.
+`F4` always returns to the current agent; it no longer cycles agents. Use
+`F1, N` when choosing the next agent is the intention. The command hub makes
+the primary shell route independent of the physical Alt key and Windows AltGr
+reporting. `Alt` combinations are forwarded to the focused child unless a
+right-pane mode owns one as a local text-editing command. On layouts where a
+backslash needs AltGr, `F12` remains the portable literal-next route.
 
-A view key leaves focus where it found it. `Alt+G`, `Alt+E`, `F8` and `F2`
-change what the right pane is showing without moving your keys: if you were
-typing at the agent you still are, and if the right pane had them the view that
-arrives has them. Two other things go with the switch — a view key un-zooms, so
-that asking to see something always shows it, and it drops any highlight you had
-up rather than leaving one hanging over text it no longer names. And "keeps
-them" is about the *slot*, not the pane: the shell you were typing at is not on
-screen any more, so what you type next goes to whatever is.
+View commands un-zoom and drop any active highlight. Git, files, queue, and
+diagnostics are glances and retain the existing focus. Shell, pad, and ask
+accept text, so their commands focus the right pane. To leave any right-pane
+view reliably, press `F4`.
 
-You can always tell which it is. While the right pane holds your keys its
-border *leads* with the way out — `esc→agent`, or `alt+s→agent` at a live
-shell — ahead of the pane's own title, so a long branch name cannot clip it
-off the end. Nothing else on screen says it: four of the seven views draw no
-cursor, so a focused one leaves the window with no cursor anywhere at all. The
-pad draws one while you are editing and none in the rendering, for the same
-reason: there is nothing there to put it in front of.
+While the right pane holds your keys its border leads with the way out —
+`esc→agent`, or `f4→agent` at a live shell — ahead of the pane's own title, so a
+long branch name cannot clip it off the end. Nothing else on screen says it:
+four of the seven views draw no cursor, so a focused one leaves the window with
+no cursor anywhere at all. The pad draws one while you are editing and none in
+the rendering, for the same reason: there is nothing there to put it in front
+of.
 
 Once the right pane has focus, plain keys work — deliberately the same
 vocabulary as Claude's own transcript view:
@@ -362,12 +358,12 @@ is the same: its composer is live the whole time the pane is, so `j`, `k`, `g`,
 arrows, PgUp/PgDn, Home/End and `Ctrl+D`/`Ctrl+U`. So is the **pad** while you
 are editing, which is why `t` there is `Alt+T` — the letter is a letter. The
 pad's rendering is read-only, so the vocabulary comes back to it, `t` included.
-That is what the F1 overlay's mode rows are for: a pane whose keys mean
+That is what the `F1, ?` reference's mode rows are for: a pane whose keys mean
 something else, with nothing on screen saying so, reads as a broken pane.
 
 `Ctrl+\` exists so abeam can never permanently shadow a binding of the agent you
-are typing at. If a future release of an agent binds `Alt+G`, `Ctrl+\` then
-`Alt+G` still reaches it.
+are typing at. If a future release of an agent binds a key needed outside the
+hub, `Ctrl+\` then that key still reaches it.
 
 ### Copying out of the right pane
 
@@ -479,8 +475,8 @@ difference is why the queue can never type at such a pane: its item says
 `cannot receive` on its own row rather than waiting for a state that will not
 arrive.
 
-`F4` gives your keys to the left column, and pressed again it moves along the
-agents. The border of the pane that has them is highlighted and reads
+`F4` gives your keys to the left column. `F1, N` moves to the next agent. The
+border of the pane that has them is highlighted and reads
 `claude · 2/3`, which is the only thing on screen that says which session your
 next sentence is going to.
 
@@ -492,25 +488,25 @@ terminal and three want 42; below that you get one pane and title rows. The
 right pane does **not** follow the agent cursor: moving between agents never
 costs you the thing you were reading.
 
-The **queue** (`F8`) aims each item at the agent that had your keys when you
+The **queue** (`F1, W`) aims each item at the agent that had your keys when you
 wrote it, and it stays aimed there — moving the cursor afterwards does not move
 the prompt. The row says which pane it is for once there is more than one, the
 three-second countdown appears on that pane's border, and if you close the pane
 before the item goes, the item disarms and says so rather than being sent
-somewhere else. There is no way to re-aim an item: press `F4` and write it at
-the pane you meant.
+somewhere else. There is no way to re-aim an item: use `F1, N` to select the
+pane you meant, then write it there.
 
 **Closing.** `x` twice at an agent whose child has exited closes that pane; `x`
 twice on its row in the worktree list ends it even if it is still running, and
 the pane's own border asks first, in those words — the second press is refused
 if those words were not actually on screen, so a fast double tap becomes the
 question rather than the answer. Two agents in one checkout are one row, and
-abeam refuses to guess between them: it says so and points at `F4`, which from
-the list is `F4` `F4` `F5` and then `x` `x`. Prompts queued for a pane you close
+abeam refuses to guess between them: it says so and points at `F1, N`, then
+`F5` and `x` `x`. Prompts queued for a pane you close
 are not sent anywhere else — each says which pane it was for, and the border
 counts them. The agent abeam started with
 is the session and never closes — its exit is what abeam exits with, so leaving
-it is `Alt+Q`. While any agent or shell is still live, `Alt+Q` asks twice and
+it is `F1, Q`. While any agent or shell is still live, `F1, Q` asks twice and
 the title says which of them is holding the door.
 
 **Read `docs/status.md` before relying on any of this.** It works in the tests
@@ -597,7 +593,7 @@ before you install it.
   It has tests and it has never had a user. It also has no undo and no
   selection, it holds 64 KiB, and it saves two seconds after you stop typing —
   so a machine that loses power in that gap loses that much.
-- **A turn in the ask pane that never ends has no way out** but `Alt+Q`. There is
+- **A turn in the ask pane that never ends has no way out** but `F1, Q`. There is
   no cancel key and no timeout.
 - **Copying takes whole rows, of the right pane, that are on screen.** Not a
   column range, so a hash comes with the row around it; not the left pane, so

@@ -1,5 +1,18 @@
 //! The global binding table, isolated so collisions are auditable in one file.
 //!
+//! ## Current command model
+//!
+//! Bare `F1` opens the command hub. Its bare or Shift mnemonic selects an
+//! application command; `F4`, `F5`, `F7`, `F12`, and `Ctrl+\\` are the only
+//! other globals. Alt and AltGr are deliberately unclaimed so Windows AltGr
+//! text and agent shortcuts always reach the focused pane.
+//!
+//! ## Historical audit context
+//!
+//! The remaining audit narrative records the retired Alt-first design and why
+//! it was replaced. It is not a description of the current bindings; consult
+//! [`HUB`], [`HELP`], and [`global`] for those.
+//!
 //! # The invariant
 //!
 //! **Nothing abeam intercepts is a key any hosted agent can act on.** "Any" is
@@ -173,45 +186,43 @@ pub fn is_text(key: &KeyEvent) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    /// Open the F1 command hub. This is deliberately a distinct action from
+    /// the reference inside that hub: F1 is the reliable way *into* abeam's
+    /// command namespace, while `F1, ?` is the exhaustive reference once the
+    /// user has deliberately entered it.
+    OpenHub,
     Quit,
     ShowGit,
     ShowViewer,
+    /// Show the file browser and focus it. Unlike [`ShowViewer`](Self::ShowViewer),
+    /// this is an explicit interactive view command rather than a repeated-key
+    /// toggle on the reader command.
+    ShowBrowser,
     /// Show the command view *and* focus it, because a command line you cannot
     /// type into is a picture of one. One of the two workspace views that move
     /// focus — [`Action::ShowPad`] is the other, and it is the other for this
     /// key's reason rather than for one of its own. ([`Action::ShowAsk`] and
     /// [`Action::ToggleSelect`] take focus too, and say so below; neither is a
-    /// workspace view at all.) Pressed again while it already has focus, it
-    /// hands focus back, so the round trip to run `git branch` is one key out
-    /// and the same key home.
+    /// workspace view at all.) Repeating a hub command does not toggle focus;
+    /// `F4` returns it to the agent.
     ShowShell,
-    /// Show the queue: work lined up for the agent. A workspace view like git
-    /// and the reader, reached with `F8` — it does *not* take focus,
-    /// because the common case is glancing at what is still to come while the
-    /// agent works and you keep typing at it.
+    /// Show the queue without moving focus. Selected by F1, W.
     ShowQueue,
-    /// Show the scratch pad *and* focus it, on `F9`.
-    ///
-    /// It takes focus for [`Action::ShowShell`]'s reason rather than by
-    /// analogy with it: the pad exists to be typed into, and a pad that needed
-    /// a second key before it would accept a word is one nobody reaches for in
-    /// the ten seconds the thought lasts. Pressed again from inside it hands
-    /// focus back, so the round trip is `F9`, type, `F9` — the same shape as
-    /// the shell's, because it is the same promise.
-    ///
-    /// A workspace view, unlike [`Action::ShowAsk`] and [`Action::ToggleDiag`]:
-    /// it displaces nothing and puts nothing back, so `F2` and `Esc` return to
-    /// it. See `crate::panes::RightView::Pad`.
+    /// Show and focus the scratch pad. Selected by F1, P; repeat presses
+    /// keep focus there, while F4 returns it to the agent.
     ShowPad,
     FocusLeft,
     FocusRight,
+    /// Move to the next hosted agent and give it the keyboard. This is a hub
+    /// command rather than F4's second meaning: focus and agent navigation are
+    /// separate questions and no direct key answers both depending on state.
+    NextAgent,
     /// Scroll the right pane *without focusing it* — glancing at git or at the
     /// markdown the agent just wrote is a read, and a read should not cost a focus
     /// round-trip. Carries the bare key the pane would have seen had it been
     /// focused, so there is one scroll vocabulary rather than two.
     ScrollRight(KeyCode),
     ToggleZoom,
-    ToggleHelp,
     /// Show the pty instrument, or put back whatever it displaced.
     ToggleDiag,
     /// Show the ask with **nothing attached**, or put back whatever it
@@ -234,38 +245,11 @@ pub enum Action {
     /// [`Action::ShowShell`], for that key's reason — a box you have to press a
     /// second key to type into is not a box you can ask a question in.
     ShowAsk,
-    /// Select rows of the right pane, to copy them or to hand them to the
-    /// agent. Pressed again, it puts the selection away.
-    ///
-    /// An F-key for a reason the three above it only half have. `F2`, `F3` and
-    /// `F6` are F-keys because the `Alt` letters they wanted were taken; this
-    /// one could not have been a letter under *any* namespace, because the pane
-    /// it acts on is the one pane that takes every key it is given. `Alt+S`,
-    /// type, `Alt+S` is the shell's whole round trip, and a selection key that
-    /// only worked in the four read-only views would be missing from the view
-    /// the feature exists for — you select what a command printed.
-    ///
-    /// It takes focus, like [`Action::ShowShell`] and [`Action::ShowAsk`] and
-    /// for their reason: a caret you have to press a second key to move is not
-    /// a caret. What it does *not* do is switch views. The rows it selects are
-    /// the rows already on screen, so dragging another view in front of them
-    /// would be selecting from somewhere nobody was looking.
+    /// Select rows of the right pane, focusing it when selection begins.
     ToggleSelect,
     /// Flip the file reader between its light and dark palettes.
-    ///
-    /// Global rather than a key the viewer handles, so it works from the left
-    /// pane — the reader is a thing you *glance* at, and reaching for it with
-    /// `Alt+E` first to change how it looks would defeat the point. It affects
-    /// no other view; see `panes::viewer::theme`.
     ToggleReaderTheme,
-    /// Send the *next* keystroke to the agent verbatim, bypassing everything
-    /// here.
-    ///
-    /// The pressure-release valve. If a future release of either agent binds
-    /// `Alt+G`, this still reaches it, so abeam can never permanently shadow
-    /// anything. It is what made `Alt+←` survivable for as long as it did, and
-    /// what a third agent's collisions will be met with on the day they are
-    /// found rather than on the day they are fixed.
+    /// Send the next keystroke to the agent verbatim, bypassing every binding.
     LiteralNext,
 }
 
@@ -281,188 +265,126 @@ pub fn global(key: &KeyEvent) -> Option<Action> {
     // following keystroke as well. One press, two keys misrouted.
     let bare = key.modifiers.is_empty();
 
+    // This return is intentionally the whole global key map. Application
+    // commands now live behind F1; Alt and the retired F-key aliases must fall
+    // through to the focused agent or pane.
     match key.code {
-        // Ctrl+\ is awkward on layouts that put backslash behind AltGr, so F12
-        // is an alias. No F-key is bound by Claude, which is also why F1 works.
-        //
-        // `!alt` is the whole of what makes that sentence true rather than
-        // merely sympathetic. On a German, Spanish or Italian layout `\` *is*
-        // AltGr+key, and AltGr is Ctrl+Alt — so without this, typing a
-        // backslash anywhere in abeam armed literal-next and the next keystroke
-        // went to the agent raw. The key an F-key was aliased for was not
-        // awkward on those layouts, it was unusable, and it took the character
-        // with it. With `!alt` the combination falls through to the pane, where
-        // `is_text` reads it as the backslash it is.
         KeyCode::Char('\\') if ctrl && !alt => Some(Action::LiteralNext),
         KeyCode::F(12) if bare => Some(Action::LiteralNext),
-        KeyCode::F(1) if bare => Some(Action::ToggleHelp),
-        // An F-key rather than another Alt letter, and not because Alt is
-        // short of room. The audit that cleared `Alt+E` also found `Alt+F`
-        // bound by a readline binding Claude does not declare anywhere, and
-        // the classic readline set includes `Alt+U`, `Alt+L` and `Alt+C` —
-        // exactly the letters a diagnostics key would want. F-keys are bound
-        // by Claude in no context at all, which is already why F1 is safe.
-        KeyCode::F(2) if bare => Some(Action::ToggleDiag),
-        // F3 for the same reason as F2: the letters a theme key would want
-        // under Alt — `t` for theme, `l` for light, `d` for dark — are all
-        // spoken for. `Alt+T` is Claude's outright, and `Alt+L`/`Alt+D` are
-        // readline bindings its prompt editor handles without declaring them.
-        // No F-key is bound by Claude in any context.
-        KeyCode::F(3) if bare => Some(Action::ToggleReaderTheme),
-        // Two direct keys rather than one toggle, for the reason the view keys
-        // are two direct keys: a toggle needs you to know the current state
-        // before you press it, which fails exactly when you are glancing rather
-        // than looking. Focus is glanced at the same way a view is.
-        //
-        // These were `Alt+←`/`Alt+→` until abeam gained a second agent. GitHub
-        // declares that pair as word-motion in Copilot CLI's command reference,
-        // so it is the agent's key and not abeam's; the module doc has the
-        // argument, and `the_agents_alt_bindings_are_left_alone` pins it.
-        //
-        // **`F4` has since acquired a second meaning, and it is the exception
-        // the paragraph above has to admit rather than a counter-example
-        // somebody will find later.** Pressed while the keys are already on the
-        // left it moves along the hosted agents — see `crate::app`'s
-        // `Action::FocusLeft` arm — which is a *cycle*, on a key whose whole
-        // defence was that it is not one.
-        //
-        // What keeps the defence standing is that the two meanings are not the
-        // same question. The first press answers "give me the keys", is a
-        // direct key still, and is the only meaning in a session with one
-        // agent — which is most of them. The second answers "the next one", and
-        // by then the reader is not glancing: they have the keyboard, they are
-        // looking at the pane it belongs to, and its border says `2/3`.
-        //
-        // The state to know before pressing is therefore on screen, which is
-        // the condition the paragraph above actually imposes — and it is on
-        // screen *because* of this key rather than as a coincidence, which is
-        // why `crate::app::App::agent_tag` is not optional chrome. The case
-        // that pays for it is zoom: with the right pane hidden `App::ui` holds
-        // focus on the left, so every press cycles, including the one somebody
-        // pressed meaning "back to the agent". Without the position in the
-        // border that press would silently hand their next sentence to another
-        // session.
+        KeyCode::F(1) if bare => Some(Action::OpenHub),
         KeyCode::F(4) if bare => Some(Action::FocusLeft),
         KeyCode::F(5) if bare => Some(Action::FocusRight),
-        // F6 for the ask, and an F-key rather than an `Alt` letter for a
-        // stronger version of F2's and F3's reason. The letters this key would
-        // want are gone twice over: `?` is not reachable under `Alt` on every
-        // layout, `Alt+A` is Codex's, and the classic readline meta set that
-        // caught `Alt+F` covers most of what is left. Copilot CLI is an Ink
-        // application whose `useInput` cannot describe a function key to a
-        // handler at all; Claude binds none, and Codex's defaults leave F6
-        // alone. Codex can remap it, which is the custom-keymap limitation the
-        // module documentation and docs/keymap.md disclose.
-        //
-        // It joins F2 rather than the view keys, and the grouping is real
-        // rather than a leftover: `Diag` and `Ask` are the two views that
-        // *displace* something and put it back, and neither is remembered as a
-        // workspace view. The row further down this file arguing that a view
-        // spelled `F6` would be a key nobody groups with the workspace ones
-        // still stands — this is not one of them.
-        KeyCode::F(6) if bare => Some(Action::ShowAsk),
-        // F7 for the selection, and the argument is not "one more F-key was
-        // free". It is the only namespace that *can* carry this: the key has to
-        // work while the shell view has focus, and a shell with a live child in
-        // it takes every key including `Esc` and `q`. A letter — bare, or under
-        // the `Alt` the agents use — would either be swallowed by that child or
-        // shadow a binding of the agent on the left. The default-keymap audits
-        // in this file's header are what make this one safe, and they are about
-        // the *agent*; what makes it safe in the shell is that abeam claims it
-        // before any pane is offered it, which is what `global` means.
         KeyCode::F(7) if bare => Some(Action::ToggleSelect),
-        // Codex owns the queue's former `Alt+A`: its default global keymap uses
-        // that key to open the agent-session overview. No Codex `F8` action
-        // surfaced in the shipped binary's strings. Unlike Claude and Copilot,
-        // Codex can distinguish and remap function keys, so this is absence
-        // evidence rather than a structural guarantee; docs/keymap.md records
-        // the audited build and the custom-keymap limitation.
-        KeyCode::F(8) if bare => Some(Action::ShowQueue),
-        // Whether `F9` is clear of the three hosted agents is the audit
-        // docs/keymap.md carries, recorded there beside the builds it was run
-        // against rather than restated here.
-        //
-        // The other half of the argument is not about agents at all, and it is
-        // why the pad is `F9` rather than the next number along: `F11` is
-        // fullscreen in Windows Terminal and in most other emulators, and `F10`
-        // activates the menu bar in several, so neither reliably reaches an
-        // application at all. A key the terminal eats is worse than a key an
-        // agent binds — literal-next can hand a key to a child, and nothing
-        // abeam can do reaches past the emulator. That leaves `F9` as the only
-        // clean slot, and it is a fact about terminals rather than one about
-        // whatever is running in them.
-        KeyCode::F(9) if bare => Some(Action::ShowPad),
-
-        _ if !alt => None,
-
-        // Two direct keys rather than one cycle key: a cycle needs you to know
-        // the current state before you press it, which fails exactly when you
-        // are glancing rather than looking.
-        KeyCode::Char('g') | KeyCode::Char('G') => Some(Action::ShowGit),
-        KeyCode::Char('e') | KeyCode::Char('E') => Some(Action::ShowViewer),
-        // `s` for shell. Not in Claude's declared table, and not one of the
-        // four letters its undeclared readline switch handles (`b f d y`) —
-        // held to the same standard as `g` and `e`, and re-checked against the
-        // installed binary when the command view landed. See docs/keymap.md.
-        KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ShowShell),
-        KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
-        KeyCode::Char('z') | KeyCode::Char('Z') => Some(Action::ToggleZoom),
-        // There is no arm here for `Alt+←` or `Alt+→`, and the gap is the
-        // point: they moved focus until Copilot CLI turned out to declare them
-        // as word-motion. They fall through to the agent now, like every other
-        // key abeam does not claim, and focus is `F4`/`F5` above.
-        KeyCode::Char('k') | KeyCode::Char('K') => Some(Action::ScrollRight(KeyCode::Up)),
-        KeyCode::Char('j') | KeyCode::Char('J') => Some(Action::ScrollRight(KeyCode::Down)),
-        KeyCode::PageUp => Some(Action::ScrollRight(KeyCode::PageUp)),
-        KeyCode::PageDown => Some(Action::ScrollRight(KeyCode::PageDown)),
-
         _ => None,
     }
 }
 
-/// Rendered by the F1 overlay. Kept next to the table so the two cannot drift.
+/// An input accepted by the F1 command hub. The second key is deliberately
+/// interpreted only after F1, which leaves normal typing and every Alt/AltGr
+/// combination to the focused child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HubCommand {
+    /// Reopen the concise command hub from the exhaustive reference.
+    Open,
+    /// Show the exhaustive reference in the hub.
+    Reference,
+    /// Run the selected application action.
+    Action(Action),
+}
+
+/// Resolve an F1-hub key. Only bare and Shift variants are accepted: modified
+/// events remain in the hub and do not execute, leak to a child, or turn an
+/// AltGr character into an application command.
+pub fn hub(key: &KeyEvent) -> Option<HubCommand> {
+    if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
+        return None;
+    }
+
+    Some(match key.code {
+        KeyCode::F(1) => HubCommand::Open,
+        KeyCode::Char('?') => HubCommand::Reference,
+        KeyCode::Char('g') | KeyCode::Char('G') => HubCommand::Action(Action::ShowGit),
+        KeyCode::Char('e') | KeyCode::Char('E') => HubCommand::Action(Action::ShowViewer),
+        KeyCode::Char('b') | KeyCode::Char('B') => HubCommand::Action(Action::ShowBrowser),
+        KeyCode::Char('s') | KeyCode::Char('S') => HubCommand::Action(Action::ShowShell),
+        KeyCode::Char('w') | KeyCode::Char('W') => HubCommand::Action(Action::ShowQueue),
+        KeyCode::Char('p') | KeyCode::Char('P') => HubCommand::Action(Action::ShowPad),
+        KeyCode::Char('a') | KeyCode::Char('A') => HubCommand::Action(Action::ShowAsk),
+        KeyCode::Char('d') | KeyCode::Char('D') => HubCommand::Action(Action::ToggleDiag),
+        KeyCode::Char('t') | KeyCode::Char('T') => HubCommand::Action(Action::ToggleReaderTheme),
+        KeyCode::Char('z') | KeyCode::Char('Z') => HubCommand::Action(Action::ToggleZoom),
+        KeyCode::Char('j') | KeyCode::Char('J') => {
+            HubCommand::Action(Action::ScrollRight(KeyCode::Down))
+        }
+        KeyCode::Char('k') | KeyCode::Char('K') => {
+            HubCommand::Action(Action::ScrollRight(KeyCode::Up))
+        }
+        KeyCode::PageUp => HubCommand::Action(Action::ScrollRight(KeyCode::PageUp)),
+        KeyCode::PageDown => HubCommand::Action(Action::ScrollRight(KeyCode::PageDown)),
+        KeyCode::Char('n') | KeyCode::Char('N') => HubCommand::Action(Action::NextAgent),
+        KeyCode::Char('q') | KeyCode::Char('Q') => HubCommand::Action(Action::Quit),
+        _ => return None,
+    })
+}
+
+/// The concise command hub, rendered as soon as F1 is pressed.
+pub const HUB: &[(&str, &str)] = &[
+    ("G", "git (keeps current focus)"),
+    ("E", "files / reader (keeps current focus)"),
+    ("B", "file browser (opens and focuses)"),
+    ("S", "shell (opens and focuses)"),
+    ("W", "work queue (keeps current focus)"),
+    ("P", "scratch pad (opens and focuses)"),
+    ("A", "ask (opens and focuses)"),
+    ("D", "diagnostics (keeps current focus)"),
+    ("T", "reader theme (keeps current focus)"),
+    ("Z", "hide / show right pane"),
+    ("J / K", "scroll right pane down / up"),
+    ("PgDn / PgUp", "page right pane down / up"),
+    ("N", "next agent (focuses it)"),
+    ("Q", "quit (confirm with F1, Q if a child is live)"),
+    ("?", "full key reference"),
+    ("Esc", "dismiss commands"),
+];
+
+/// Rendered by `F1, ?`. Kept next to the table so the two cannot drift.
 pub const HELP: &[(&str, &str)] = &[
     // First, because it is a fact about every row under it rather than a
     // binding of its own, and because somebody whose `Alt` key "does not work"
     // opens this overlay before they open an issue. Every `Alt` row below is
     // reachable from either `Alt` key: Windows spells AltGr as Ctrl+Alt, and
     // `alt_chord` counts both.
-    ("Alt or AltGr", "either key works for every Alt row below"),
-    ("Alt+G", "right pane: git"),
-    ("Alt+E", "right pane: files (again for the file list)"),
-    ("Alt+S", "right pane: a shell, focused (again to leave)"),
-    ("F8", "right pane: the queue of work for the agent"),
-    (
-        "F9",
-        "right pane: the scratch pad, focused (again to leave)",
-    ),
+    ("F1", "open the command hub; command keys below are sequences, not chords"),
+    ("F1, G / E", "show git / reader, keeping current focus"),
+    ("F1, B", "open the file browser and focus it"),
+    ("F1, S / W", "open the shell and focus it / show the work queue"),
+    ("F1, P / A", "open the scratch pad / ask composer and focus it"),
+    ("F1, D / T", "toggle diagnostics / reader theme, keeping current focus"),
+    ("F1, Z", "hide / show the right pane"),
     // The parenthetical is the whole of what a second agent costs this table.
     // `F4` has always meant "give the keys to the left" and a second press did
     // nothing at all, so "again" is a meaning added to a dead press rather than
     // a key taken from anybody — which is why there is no new row here and no
     // new audit under docs/keymap.md. One direction, because a modified F-key
     // is deliberately not abeam's; see `global` above on `Ctrl+F12`.
-    ("F4 / F5", "move focus left / right (F4 again: next agent)"),
-    ("Alt+J / Alt+K", "scroll right pane, without focusing it"),
+    ("F4 / F5", "focus agent / right pane"),
+    ("F1, J / K", "scroll right pane, without focusing it"),
     (
-        "Alt+PgDn / Alt+PgUp",
+        "F1, PgDn / PgUp",
         "page right pane, without focusing it",
     ),
-    ("Alt+Z", "zoom: hide / show the right pane"),
+    ("F1, N", "next agent and focus it"),
     // "while a child is live", not "while the agent is running": `app::act`
     // quits outright only when the agent has exited *and* no shell is live, so
     // a dead agent with a shell still in the right pane asks twice as well.
-    ("Alt+Q", "quit (press twice while a child is live)"),
-    ("F1", "this help"),
-    ("F2", "pty diagnostics, and back"),
-    ("F3", "file reader: light / dark page"),
+    ("F1, Q", "quit (repeat F1, Q while a child is live)"),
+    ("F1, ?", "this full reference"),
     // Next to F2 because it behaves like F2 — a view that displaces one and puts
     // it back — and phrased against `?` two dozen rows below, which is the same
     // pane reached the other way. "about nothing in particular" is the whole
     // difference between them, and it is the half a reader is looking for when
     // they are typing at the agent and have a question about the repository
     // rather than about a file.
-    ("F6", "ask a second agent, about nothing in particular"),
     // Next to F6 rather than beside the view keys, because it is not a view: it
     // acts on whatever is already on screen. "rows" and not "text" is the
     // honest word — the selection is whole rows of the pane, which is the one
@@ -511,7 +433,7 @@ pub const HELP: &[(&str, &str)] = &[
     // when it does.
     (
         "a (worktrees)",
-        "start another agent there (F4 again reaches it)",
+        "start another agent there (F1, N reaches it)",
     ),
     // The same request, reached the short way, and it is in this table because
     // it is the one most sessions want. Claude Code makes its own worktrees, so
@@ -892,36 +814,12 @@ mod tests {
     #[test]
     fn the_abeam_namespace_resolves() {
         assert_eq!(
-            global(&k(KeyCode::Char('g'), KeyModifiers::ALT)),
-            Some(Action::ShowGit)
-        );
-        assert_eq!(
-            global(&k(KeyCode::Char('e'), KeyModifiers::ALT)),
-            Some(Action::ShowViewer)
-        );
-        assert_eq!(
-            global(&k(KeyCode::Char('s'), KeyModifiers::ALT)),
-            Some(Action::ShowShell)
-        );
-        assert_eq!(
-            global(&k(KeyCode::Char('q'), KeyModifiers::ALT)),
-            Some(Action::Quit)
-        );
-        assert_eq!(
             global(&k(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
             Some(Action::LiteralNext)
         );
         assert_eq!(
             global(&k(KeyCode::F(1), KeyModifiers::NONE)),
-            Some(Action::ToggleHelp)
-        );
-        assert_eq!(
-            global(&k(KeyCode::F(2), KeyModifiers::NONE)),
-            Some(Action::ToggleDiag)
-        );
-        assert_eq!(
-            global(&k(KeyCode::F(3), KeyModifiers::NONE)),
-            Some(Action::ToggleReaderTheme)
+            Some(Action::OpenHub)
         );
         assert_eq!(
             global(&k(KeyCode::F(4), KeyModifiers::NONE)),
@@ -932,21 +830,54 @@ mod tests {
             Some(Action::FocusRight)
         );
         assert_eq!(
-            global(&k(KeyCode::F(6), KeyModifiers::NONE)),
-            Some(Action::ShowAsk)
-        );
-        assert_eq!(
             global(&k(KeyCode::F(7), KeyModifiers::NONE)),
             Some(Action::ToggleSelect)
         );
-        assert_eq!(
-            global(&k(KeyCode::F(8), KeyModifiers::NONE)),
-            Some(Action::ShowQueue)
-        );
-        assert_eq!(
-            global(&k(KeyCode::F(9), KeyModifiers::NONE)),
-            Some(Action::ShowPad)
-        );
+    }
+
+    #[test]
+    fn retired_globals_fall_through_and_the_hub_owns_their_actions() {
+        for mods in [
+            KeyModifiers::ALT,
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        ] {
+            for c in "gesqwpadztjk".chars() {
+                assert_eq!(global(&k(KeyCode::Char(c), mods)), None, "{mods:?}+{c}");
+            }
+            for code in [KeyCode::PageUp, KeyCode::PageDown] {
+                assert_eq!(global(&k(code, mods)), None, "{mods:?}+{code:?}");
+            }
+        }
+        for n in [2, 3, 6, 8, 9] {
+            assert_eq!(global(&k(KeyCode::F(n), KeyModifiers::NONE)), None, "F{n}");
+        }
+
+        let cases = [
+            (KeyCode::Char('g'), Action::ShowGit),
+            (KeyCode::Char('e'), Action::ShowViewer),
+            (KeyCode::Char('b'), Action::ShowBrowser),
+            (KeyCode::Char('s'), Action::ShowShell),
+            (KeyCode::Char('w'), Action::ShowQueue),
+            (KeyCode::Char('p'), Action::ShowPad),
+            (KeyCode::Char('a'), Action::ShowAsk),
+            (KeyCode::Char('d'), Action::ToggleDiag),
+            (KeyCode::Char('t'), Action::ToggleReaderTheme),
+            (KeyCode::Char('z'), Action::ToggleZoom),
+            (KeyCode::Char('n'), Action::NextAgent),
+            (KeyCode::Char('q'), Action::Quit),
+        ];
+        for (code, action) in cases {
+            assert_eq!(hub(&k(code, KeyModifiers::NONE)), Some(HubCommand::Action(action)));
+            assert_eq!(hub(&k(code, KeyModifiers::SHIFT)), Some(HubCommand::Action(action)));
+            assert_eq!(hub(&k(code, KeyModifiers::ALT)), None);
+            assert_eq!(
+                hub(&k(code, KeyModifiers::ALT | KeyModifiers::CONTROL)),
+                None,
+                "AltGr must not trigger F1 hub commands"
+            );
+        }
+        assert_eq!(hub(&k(KeyCode::Char('?'), KeyModifiers::SHIFT)), Some(HubCommand::Reference));
+        assert_eq!(hub(&k(KeyCode::F(1), KeyModifiers::NONE)), Some(HubCommand::Open));
     }
 
     #[test]
@@ -986,10 +917,10 @@ mod tests {
             resolved += usize::from(want.is_some());
             assert_eq!(global(&k(code, altgr)), want, "AltGr+{code:?}");
         }
-        // A loop that compared nothing to nothing would pass just as happily,
-        // so the count is the part that keeps this test honest: seven letters
-        // (`g e s q z j k`) and the two page keys.
-        assert_eq!(resolved, 9, "the Alt bindings this test actually walked");
+        // The F1 hub releases the Alt namespace outright, including Windows'
+        // Ctrl+Alt representation of AltGr. This count proves the loop did not
+        // accidentally retain a classic binding.
+        assert_eq!(resolved, 0, "no Alt binding remains global");
 
         // And the one key where AltGr must *not* mean Alt, which is the same
         // fact read the other way: on the layouts that put `\` behind AltGr the
@@ -1056,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ad_hoc_ask_is_an_f_key_because_alt_belongs_to_the_agents() {
+    fn the_ask_is_a_hub_command_and_question_marks_remain_local() {
         // The argument for F6 rather than a letter, written as the assertion it
         // rests on: `?` is the pane-local half and it cannot be the global one,
         // because a bare `?` typed at the agent is a `?`.
@@ -1088,11 +1019,11 @@ mod tests {
         // it carries no file.
         let (key, said) = HELP
             .iter()
-            .find(|(key, _)| *key == "F6")
+            .find(|(key, _)| *key == "F1, P / A")
             .expect("the key the overlay promises");
-        assert_eq!(*key, "F6");
+        assert_eq!(*key, "F1, P / A");
         assert!(said.contains("ask"), "got: {said}");
-        assert!(said.contains("nothing"), "what it does not attach: {said}");
+        assert!(said.contains("focus"), "the ask focus rule: {said}");
     }
 
     #[test]
@@ -1132,8 +1063,8 @@ mod tests {
         }
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
         for expected in [
-            "Alt+G", "Alt+E", "Alt+S", "Alt+Q", "Alt+Z", "F1", "F2", "F3", "F4", "F5", "F6", "F7",
-            "F8", "F9",
+            "F1", "F1, G / E", "F1, B", "F1, S / W", "F1, P / A", "F1, D / T", "F1, Z", "F1, N",
+            "F1, Q", "F4 / F5", "F7", "Ctrl+\\ or F12",
         ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),
