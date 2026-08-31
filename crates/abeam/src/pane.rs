@@ -165,6 +165,17 @@ pub trait Pane {
         "esc→agent"
     }
 
+    /// A pane-local action worth keeping in the border while this pane has
+    /// focus, before [`exit_hint`](Pane::exit_hint).
+    ///
+    /// Unlike a pane's title, this is an instruction and is shown only while
+    /// its key can honestly be acted on by that pane. Most views need no such
+    /// instruction and leave the slot empty. The shell owns the separators and
+    /// padding for the same reason it owns them around [`exit_hint`](Pane::exit_hint).
+    fn action_hint(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Pane-relative `(col, row)` of a text cursor, or `None` for no cursor.
     ///
     /// Drawn only while the pane has focus. It is the strongest focus signal

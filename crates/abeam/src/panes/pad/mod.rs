@@ -56,6 +56,9 @@
 //! third state — no filter box, no confirmation — so [`Pane::exit_hint`] is the
 //! default `esc→agent` in every state this pane can be in, including the ones
 //! it passes through, which is what that method's documentation asks of it.
+//! [`Pane::action_hint`] keeps the way between the two forms beside it while
+//! the pad has focus. That condition matters: with focus on the agent, `Alt+T`
+//! belongs to the agent and advertising it over the pad would be a lie.
 //!
 //! ## One layout, read forwards and backwards
 //!
@@ -1086,6 +1089,17 @@ impl Pane for PadPane {
         }
     }
 
+    /// The route to the other form, shown by the shell only while this pane has
+    /// the keys. In the edit form the chord is necessary because bare `t` is
+    /// text; in the rendering it is free and is the same toggle the file reader
+    /// already teaches.
+    fn action_hint(&self) -> Option<&'static str> {
+        Some(match self.form {
+            Form::Edit => "alt+t→rendered",
+            Form::Rendered => "t→editing",
+        })
+    }
+
     fn render(&mut self, f: &mut Frame, inner: Rect) {
         self.drawn = inner;
         self.caret = None;
@@ -1475,10 +1489,12 @@ mod tests {
         assert_eq!(p.handle_key(key(KeyCode::Esc)).unwrap(), Handled::No);
         assert_eq!(p.text.text(), "a note", "esc must not clear the pad");
         assert_eq!(p.exit_hint(), "esc→agent");
+        assert_eq!(p.action_hint(), Some("alt+t→rendered"));
 
         p.handle_key(alt(KeyCode::Char('t'))).unwrap();
         assert_eq!(p.handle_key(key(KeyCode::Esc)).unwrap(), Handled::No);
         assert_eq!(p.exit_hint(), "esc→agent");
+        assert_eq!(p.action_hint(), Some("t→editing"));
     }
 
     #[test]
