@@ -7,9 +7,9 @@
 //! moves focus implicitly — not the file watcher, not a view switch, not a git
 //! refresh — and there is one function that moves it at all, [`App::set_focus`],
 //! so "what can take my keys" is a list of its callers rather than an argument.
-//! They are: `F4`/`F5`; `Alt+S` out to the shell and home again; `F6` out to
-//! the ask and back to what it displaced; `F7`, and the `Esc`, `q` or `Enter`
-//! that ends the selection it started; `Alt+Z`, when zooming the right pane off
+//! They are: `F4`/`F5`; `F1, S`, `F1, P`, and `F1, A` when their interactive
+//! views are selected; `F7`, and the `Esc`, `q` or `Enter` that ends the
+//! selection it started; `F1, Z`, when zooming the right pane off
 //! the screen it was focused on; a mouse click; `Esc` or `q` out of the right
 //! pane; and the two wires that carry a key pressed in one pane into another —
 //! `?` from git or the reader into the ask, and a command chosen in the ask
@@ -71,6 +71,15 @@ use crate::watch::{Change, Watch};
 use crate::workspace::{self, Worktree};
 
 pub type Tui = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
+/// The F1 overlay has two deliberate states. The concise command hub is the
+/// normal first screen; `F1, ?` expands it to the exhaustive reference without
+/// giving the next key to the focused child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hub {
+    Commands,
+    Reference,
+}
 
 /// The longest the loop will sleep when nothing has woken it.
 ///
@@ -148,7 +157,7 @@ const REFUSAL_FLOOR: usize = 30;
 /// that can take it.
 ///
 /// A window rather than a single attempt, because the common case is a hand-off
-/// to a shell that does not exist yet: `Alt+S` has never been pressed, the view
+/// to a shell that does not exist yet: `F1, S` has never been pressed, the view
 /// switch is what spawns the child, and `pwsh` takes a few hundred milliseconds
 /// to print a prompt and enable bracketed paste. Ten seconds is long enough for
 /// a cold PowerShell on a busy machine and short enough that a shell which is
@@ -304,10 +313,10 @@ struct Space {
     ///
     /// So switching workspaces with the command view up spawns a *second* child
     /// on the next frame, which is deliberate and is the same lazy rule abeam
-    /// has always had — a session that never presses `Alt+S` never pays for a
+    /// has always had — a session that never presses `F1, S` never pays for a
     /// shell. The cost is named rather than denied: the number of shell
     /// processes grows with the number of workspaces somebody has typed in, and
-    /// each of them holds abeam open at `Alt+Q` until it is finished with.
+    /// each of them holds abeam open at `F1, Q` until it is finished with.
     shell: ShellPane,
     /// The second agent, one per workspace and here for the shell's reason
     /// rather than by analogy with it.
@@ -1362,7 +1371,7 @@ pub struct App {
     watch: Option<Watch>,
     focus: Focus,
     zoom: bool,
-    help: bool,
+    hub: Option<Hub>,
     /// The next keystroke bypasses every abeam binding. See `keys::Action`.
     literal_next: bool,
     /// Quitting kills a live session, so it asks twice. One bit rather than a
@@ -1384,7 +1393,7 @@ pub struct App {
     /// being true, and closing a pane is not undoable: the cheaper of the two
     /// guarantees should not be the only one.
     ///
-    /// **What it is protecting is smaller than what `Alt+Q` protects, and it is
+    /// **What it is protecting is smaller than what `F1, Q` protects, and it is
     /// still worth a press.** The child has already gone: there is no turn to
     /// interrupt and nothing costs money to redo. What is destroyed is the
     /// frozen screen and the scrollback behind it — the agent's last several
@@ -1660,7 +1669,7 @@ enum Aim {
 /// **Three fields and not one, because two of them are what keeps it from being
 /// typed somewhere nobody meant.** A cold shell cannot take a hand-off on the
 /// pass that switches to it, so this waits — and ten seconds of waiting is ten
-/// seconds in which `Alt+G`, `w` and `Enter` will point the right pane at
+/// seconds in which `F1, G`, `w` and `Enter` will point the right pane at
 /// another worktree. Carrying only the text, the wait was resolved against
 /// whichever workspace happened to be on screen when the prompt appeared, and
 /// the command was typed at *that* checkout's shell with nothing said anywhere.
@@ -1841,7 +1850,7 @@ impl App {
             watch,
             focus: opening.focus,
             zoom: opening.zoom,
-            help: false,
+            hub: None,
             literal_next: false,
             pending_quit: false,
             pending_close: None,
@@ -1931,7 +1940,7 @@ impl App {
     /// questions are not the same question.** [`current`](Self::current) is
     /// "whose keys are these"; this is "whose exit is abeam's exit". Four
     /// callers want the second one — the loop's exit check, the title that
-    /// explains why abeam is still on screen after it, the `Alt+Q` that leaves
+    /// explains why abeam is still on screen after it, the `F1, Q` that leaves
     /// without confirming because that child has already gone, and
     /// [`finish`](Self::finish), which turns the status into abeam's own — and
     /// they must all name the same child or a scripted `abeam -p … &&
@@ -2108,7 +2117,7 @@ impl App {
     ///
     /// **One predicate over the two, because the two call sites are one
     /// question asked twice** — the loop's "the session's agent has gone, may I
-    /// go with it" and `Alt+Q`'s "may I leave without asking first" — and a
+    /// go with it" and `F1, Q`'s "may I leave without asking first" — and a
     /// third condition added to one of them and not the other is a door held
     /// open in the loop and slammed by the key, which is the shape of bug
     /// nobody notices until it costs them a build.
@@ -2551,10 +2560,10 @@ impl App {
         // `spaces[0]` for the analogous reason — there would be nothing to fall
         // back to.
         // The action last, for [`App::ui`]'s elision: what survives a narrow
-        // border is `Alt+Q is the way out`, which is the half a reader can
+        // border is `F1, Q is the way out`, which is the half a reader can
         // press.
         (ix == 0).then(|| {
-            "that pane is the session — its exit is abeam's. Alt+Q is the way out."
+            "that pane is the session — its exit is abeam's. F1, Q is the way out."
                 .to_string()
         })
     }
@@ -2684,7 +2693,7 @@ impl App {
     /// *before* the first one, so a pane that may not be closed says why
     /// instead of offering a confirmation it would then refuse. Its sentences
     /// go in [`agent_refused`](Self::agent_refused) — including the one about
-    /// `agents[0]`, which is a session-level instruction ("Alt+Q is the way
+    /// `agents[0]`, which is a session-level instruction ("F1, Q is the way
     /// out") and belongs on the border the session's facts are drawn on.
     ///
     /// `None` when the key was not this one, which is the caller's signal to go
@@ -2778,7 +2787,7 @@ impl App {
     /// Every one of them, not just the one on screen, because that is what
     /// quitting has to ask. A `cargo build` left running in a worktree somebody
     /// has since switched away from is exactly as alive as one in front of them,
-    /// and `Alt+Q` killing it without asking is the decision abeam does not get
+    /// and `F1, Q` killing it without asking is the decision abeam does not get
     /// to make on its own.
     ///
     /// **A live ask child is deliberately not counted here, and the omission is
@@ -2791,7 +2800,7 @@ impl App {
     /// reader loses a conversation — which is nothing this program was keeping
     /// anyway, since nothing here is persisted across a restart by design, and
     /// which the reader can start again by asking. Holding the door for it
-    /// would mean `Alt+Q` asking twice for the rest of the session because
+    /// would mean `F1, Q` asking twice for the rest of the session because
     /// somebody asked one question an hour ago, and a confirmation that fires
     /// when nothing is at stake is a confirmation nobody reads when something
     /// is.
@@ -3248,12 +3257,12 @@ impl App {
             // `cargo build` because the *other* pane finished is not a decision
             // this program gets to make on its own. Neither is ending a turn
             // somebody is paying for in a pane they opened by hand. So it
-            // waits, says so in the title, and Alt+Q is the answer.
+            // waits, says so in the title, and F1, Q is the answer.
             //
             // "Open", not "busy", and the difference is worth knowing: ConPTY
             // cannot be asked whether a command is running, so a shell sitting
             // at a prompt holds the door exactly as a build does. The cost is
-            // that pressing Alt+S once, early, changes how the session ends —
+            // that pressing F1, S once, early, changes how the session ends —
             // which is why the title names what is holding the door rather than
             // just saying abeam is still here.
             if self.session_agent().exit.is_some() && !self.anything_live() {
@@ -3301,7 +3310,7 @@ impl App {
         // the only thing that reaps a child, so a shell nobody has switched
         // back to could never be observed to have exited — `any_shell_live`
         // would go on reporting a live child for the rest of the session, and
-        // `Alt+Q` would go on asking twice about a process that finished
+        // `F1, Q` would go on asking twice about a process that finished
         // minutes ago.
         //
         // What does *not* change is which of them earns a frame. A `cargo
@@ -3545,7 +3554,7 @@ impl App {
     /// cleared this flag over a live draft and pasted a queued prompt into the
     /// middle of it three seconds later. `Esc` dismissing the same popup is the
     /// same bug. Modifiers do not separate them: `Shift+Enter` inserts a
-    /// newline here and `Alt+Enter` is Copilot's only newline.
+    /// newline here and `F1, Enter` is Copilot's only newline.
     ///
     /// Waiting to see the agent *start* asks a question that has one answer. A
     /// message that was really submitted makes the agent work; an accepted
@@ -3602,7 +3611,7 @@ impl App {
 
     /// What to report on the way out.
     ///
-    /// `Alt+Q` after the agent has gone is still the agent's exit — it is the
+    /// `F1, Q` after the agent has gone is still the agent's exit — it is the
     /// same session ending, delayed by however long the shell was busy — and
     /// reporting it as a detach would throw away both the transcript `main`
     /// prints and the status code anything scripting abeam reads.
@@ -3916,7 +3925,7 @@ impl App {
                 deadline: Instant::now() + HANDOFF_WINDOW,
             });
             self.set_right_view(RightView::Shell);
-            // Focused, like `Alt+S`: a command line you have to press a second
+            // Focused, like `F1, S`: a command line you have to press a second
             // key to correct is not a command line, and the whole promise here
             // is that the reader gets to read it before it runs.
             if abeam_layout::split(self.area, self.zoom).right.is_some() {
@@ -3947,7 +3956,7 @@ impl App {
         }
         if ix != self.at {
             // **The reader has moved, so the command does not go.** Ten seconds
-            // is long enough for `Alt+G`, `w` and `Enter` on another worktree
+            // is long enough for `F1, G`, `w` and `Enter` on another worktree
             // row, and a cold shell is the ordinary case rather than the odd
             // one — it is why the window exists at all. Typed at the shell that
             // happened to be on screen, a command chosen while reading one
@@ -4461,7 +4470,7 @@ impl App {
     /// `select_took_focus` is `F7`'s claim on focus: "I moved it, so pressing
     /// me again should move it back." That claim is only true until something
     /// else moves focus, and *something else* is not a list anybody can keep up
-    /// to date — a mouse click, `F4`, `Alt+Z`, the ask hand-off. So every write
+    /// to date — a mouse click, `F4`, `F1, Z`, the ask hand-off. So every write
     /// but `F7`'s own voids it, which makes the memo mean what it says instead
     /// of meaning "focus was `Left` when this selection was made".
     ///
@@ -4471,7 +4480,7 @@ impl App {
     /// right pane is exactly that write. Without the guard: `F7` on a shell
     /// with a live child, drag over a line of output to copy it, `F7` to put
     /// the highlight away — and focus stays on the shell, where `Esc` belongs
-    /// to the child and only `Alt+S` gets out. The user pressed one key twice
+    /// to the child and only `F1, S` gets out. The user pressed one key twice
     /// and ended somewhere they had no obvious way to leave.
     ///
     /// The pad is written on the way out, and it is written *here* rather than
@@ -4508,8 +4517,8 @@ impl App {
             Event::Key(key) => {
                 // Windows sends Press *and* Release for every key. `encode_key`
                 // drops releases, but the shell matches its own bindings before
-                // reaching that — without this line Alt+G would toggle to git
-                // and straight back, and Alt+Q would skip its confirmation.
+                // reaching that — without this line F1, G would toggle to git
+                // and straight back, and F1, Q would skip its confirmation.
                 if key.kind == KeyEventKind::Release {
                     return Ok(Flow::idle());
                 }
@@ -4535,7 +4544,7 @@ impl App {
                 };
                 // A paste is a keystroke as far as the confirmation is
                 // concerned: "any other key cancels it" has to include the ones
-                // that do not arrive as keys, or Alt+Q, paste, Alt+Q quits.
+                // that do not arrive as keys, or F1, Q, paste, F1, Q quits.
                 //
                 // **All three confirmations, which is what the line above was
                 // missing.** `pending_close` is the same mechanism one pane
@@ -4600,6 +4609,15 @@ impl App {
             return Ok(Flow::redraw());
         }
 
+        if self.hub.is_some() {
+            return self.hub_key(key);
+        }
+        if matches!(keys::global(&key), Some(Action::OpenHub)) {
+            self.pending_close = None;
+            self.hub = Some(Hub::Commands);
+            return Ok(Flow::redraw());
+        }
+
         let confirming = std::mem::take(&mut self.pending_quit);
         // The same, one pane down. Taken here rather than read where it is used
         // so that *any* key clears it — including `F4`, which is what moves the
@@ -4607,16 +4625,14 @@ impl App {
         let closing = std::mem::take(&mut self.pending_close);
         // Any key at all dismisses the help overlay: it says "any key to
         // dismiss" on it, and a reader who has started pressing keys has
-        // stopped reading. Cleared *before* the bindings are matched, or Alt+G
+        // stopped reading. Cleared *before* the bindings are matched, or F1, G
         // would draw the overlay back over the git view it just asked for.
-        let was_helping = std::mem::take(&mut self.help);
-
         if let Some(action) = keys::global(&key) {
-            return self.act(action, confirming, was_helping);
+            return self.act(action, confirming);
         }
 
         // After the globals and before the pane, which is the whole of where a
-        // mode like this can sit. After, so `F1`, `F4`/`F5`, `Alt+J`/`Alt+K`
+        // mode like this can sit. After, so `F1`, `F4`/`F5`, `F1, J`/`F1, K`
         // and the view keys all go on working while a selection is up — and so
         // `Ctrl+\` can still hand a key to whatever is hosted. Before, because
         // the point of the mode is that the pane and the child in it hear
@@ -4690,14 +4706,46 @@ impl App {
                 // Nothing came of it — `j` at the end of a document, a letter
                 // this pane has no use for. The only thing that could still
                 // need a frame is the overlay this keystroke dismissed.
-                Ok(Flow::Continue {
-                    redraw: was_helping,
-                })
+                Ok(Flow::idle())
             }
         }
     }
 
-    fn act(&mut self, action: Action, confirming: bool, was_helping: bool) -> Result<Flow> {
+    /// Consume one key while the F1 hub is visible. Nothing in this method is
+    /// offered to a pane: the menu is a deliberate leader state, not a help
+    /// overlay that happens to be drawn over live input.
+    fn hub_key(&mut self, key: KeyEvent) -> Result<Flow> {
+        self.pending_close = None;
+        let plain_or_shift = matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
+        if plain_or_shift && key.code == KeyCode::Esc {
+            self.hub = None;
+            self.pending_quit = false;
+            return Ok(Flow::redraw());
+        }
+
+        match keys::hub(&key) {
+            // Repeated F1 is idempotent and, importantly, does not clear the
+            // first half of a live-child quit confirmation. That makes
+            // `F1, Q`, `F1, Q` the direct replacement for the old double quit.
+            Some(keys::HubCommand::Open) => self.hub = Some(Hub::Commands),
+            Some(keys::HubCommand::Reference) => {
+                self.pending_quit = false;
+                self.hub = Some(Hub::Reference);
+            }
+            Some(keys::HubCommand::Action(action)) => {
+                let confirming = std::mem::take(&mut self.pending_quit);
+                self.hub = None;
+                return self.act(action, confirming);
+            }
+            // Invalid and modified inputs stay visibly in the hub. Taking the
+            // confirmation bit keeps the rule that only the immediate repeated
+            // quit gesture can confirm a live-child exit.
+            None => self.pending_quit = false,
+        }
+        Ok(Flow::redraw())
+    }
+
+    fn act(&mut self, action: Action, confirming: bool) -> Result<Flow> {
         match action {
             Action::Quit => {
                 // Straight out when nothing would be killed by leaving. A shell
@@ -4716,20 +4764,20 @@ impl App {
                 }
                 self.pending_quit = true;
             }
-            // Direct selection, not a cycle: Alt+G always means "git is now
+            // Direct selection, not a cycle: `F1, G` always means "git is now
             // showing", whatever was there.
             Action::ShowGit => self.set_right_view(RightView::Git),
             Action::ShowViewer => {
-                // Pressing it again while the viewer is already up would
-                // otherwise be a key that does nothing. It used to reload;
-                // reload is what `r` does from inside the pane and what the
-                // watcher does unasked, so the second press is now the way to
-                // the file list — the fastest route to a file nothing has
-                // pointed the pane at.
-                if self.right_view == RightView::Viewer {
-                    self.viewer.toggle_browse();
-                }
+                // Direct reader selection. `F1, B` is the separate command
+                // that opens the interactive file browser.
                 self.set_right_view(RightView::Viewer);
+            }
+            Action::ShowBrowser => {
+                self.viewer.open_browse();
+                self.set_right_view(RightView::Viewer);
+                if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                    self.set_focus(Focus::Right);
+                }
             }
             Action::ShowShell => {
                 // One of the two workspace views that move focus, because a
@@ -4738,9 +4786,12 @@ impl App {
                 // a workspace view; `F9` is the other one that is, and it takes
                 // focus for this key's reason. Pressed again from inside, it is
                 // the way home — so the whole round trip for `git branch` is
-                // Alt+S, type, Alt+S.
+                // F1, S, type, F1, S.
                 if self.right_view == RightView::Shell && self.focus == Focus::Right {
-                    self.set_focus(Focus::Left);
+                    self.set_right_view(RightView::Shell);
+                    if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                        self.set_focus(Focus::Right);
+                    }
                 } else {
                     self.set_right_view(RightView::Shell);
                     // Asked of the layout rather than of the last frame.
@@ -4750,7 +4801,7 @@ impl App {
                     // does not exist yet. Taking focus optimistically and
                     // letting the frame correct it is not good enough either —
                     // the loop drains every pending event before drawing, so
-                    // `Alt+S` followed by a typed command in the same batch
+                    // `F1, S` followed by a typed command in the same batch
                     // would route those keys at a pane that will never appear.
                     if abeam_layout::split(self.area, self.zoom).right.is_some() {
                         self.set_focus(Focus::Right);
@@ -4771,7 +4822,10 @@ impl App {
             // type, F9.
             Action::ShowPad => {
                 if self.right_view == RightView::Pad && self.focus == Focus::Right {
-                    self.set_focus(Focus::Left);
+                    self.set_right_view(RightView::Pad);
+                    if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                        self.set_focus(Focus::Right);
+                    }
                 } else {
                     self.set_right_view(RightView::Pad);
                     // Asked of the layout rather than of the last frame, for
@@ -4812,16 +4866,17 @@ impl App {
             // hidden by it: the attachment row is what disappears, on the frame
             // the key was pressed.
             Action::ShowAsk => {
+                self.ask_mut().attach(None);
                 if self.right_view == RightView::Ask {
                     // Displaced and put back, exactly as `F2` does, and for the
                     // same reason `Esc` in this pane restores rather than merely
                     // hands focus over: the ask is somewhere you went *from*
                     // something, and leaving it on screen would cost the reader
                     // whatever they were looking at.
-                    self.set_right_view(self.last_workspace_view);
-                    self.set_focus(Focus::Left);
+                    if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                        self.set_focus(Focus::Right);
+                    }
                 } else {
-                    self.ask_mut().attach(None);
                     self.set_right_view(RightView::Ask);
                     // Focused, because asking a question means typing one — and
                     // asked of the layout rather than of the last frame for
@@ -4917,17 +4972,16 @@ impl App {
             // `agents` is never empty, so the modulus is safe by the invariant
             // rather than by a check: `agents[0]` is the session's and is never
             // removed.
-            Action::FocusLeft => {
-                if self.focus == Focus::Left {
-                    self.set_agent((self.at_agent + 1) % self.agents.len());
-                } else {
-                    self.set_focus(Focus::Left);
-                }
-            }
+            Action::FocusLeft => self.set_focus(Focus::Left),
             Action::FocusRight => {
-                if self.right_inner.is_some() {
+                self.zoom = false;
+                if abeam_layout::split(self.area, self.zoom).right.is_some() {
                     self.set_focus(Focus::Right);
                 }
+            }
+            Action::NextAgent => {
+                self.set_agent((self.at_agent + 1) % self.agents.len());
+                self.set_focus(Focus::Left);
             }
             Action::ScrollRight(code) => {
                 // Delivered as the bare key the pane would have seen had it
@@ -4939,7 +4993,7 @@ impl App {
             }
             // **This key is about the divider and has nothing to do with the
             // stack**, which is worth one line here because somebody reading
-            // "zoom" will wonder. `Alt+Z` buys the left column *columns*, and a
+            // "zoom" will wonder. `F1, Z` buys the left column *columns*, and a
             // stack is short of rows; hiding the right pane makes every agent
             // wider and not one of them taller. The different question a stack
             // raises — "show me only this agent" — was asked and declined, and
@@ -4951,9 +5005,7 @@ impl App {
                     self.set_focus(Focus::Left);
                 }
             }
-            // Every other binding has already cleared it; this is the one that
-            // brings it back.
-            Action::ToggleHelp => self.help = !was_helping,
+            Action::OpenHub => self.hub = Some(Hub::Commands),
             Action::LiteralNext => self.literal_next = true,
         }
         Ok(Flow::redraw())
@@ -5015,7 +5067,7 @@ impl App {
 
         // Any other chord is aimed at something this mode is standing in front
         // of. Swallowed like everything else, and worth its own arm rather than
-        // falling into the match below: `Ctrl+Q` and `Alt+Q` must not be read
+        // falling into the match below: `Ctrl+Q` and `F1, Q` must not be read
         // as the bare `q` that leaves.
         if chord(&key) {
             return Ok(Flow::idle());
@@ -5482,7 +5534,7 @@ impl App {
         if self.right_inner.is_none() {
             self.set_focus(Focus::Left);
             // And a selection over a pane that is not on screen is a highlight
-            // nobody can see and rows nothing drew. `Alt+Z` while selecting is
+            // nobody can see and rows nothing drew. `F1, Z` while selecting is
             // the ordinary way to get here.
             self.select = None;
         }
@@ -5522,7 +5574,7 @@ impl App {
         // border at once is what made a per-item answer expressible at all. See
         // [`App::pump_queue`].
         let state = if self.pending_quit {
-            Some("Alt+Q again to quit".to_string())
+            Some("F1, Q again to quit".to_string())
         } else {
             None
         };
@@ -5532,7 +5584,7 @@ impl App {
         // to know is that something of theirs is still running.
         //
         // **One of the two is named, never both**, and the ranking is the
-        // border's rule rather than a preference. `Alt+Q` ends whichever it
+        // border's rule rather than a preference. `F1, Q` ends whichever it
         // was, so the second name buys no action at the price of the pane's
         // own; and the agent leads because it is the more expensive thing to
         // end — a turn somebody is paying for, against a shell sitting at a
@@ -5554,7 +5606,7 @@ impl App {
             } else {
                 ""
             };
-            format!("{holding}Alt+Q to quit")
+            format!("{holding}F1, Q to quit")
         });
         // The queue reports in an agent's title because everything it says is
         // about an agent pane: how much is waiting to be typed there, and — the
@@ -5651,7 +5703,7 @@ impl App {
         // **The refusal is fitted to what the line actually has spare, and it
         // is a separate part rather than an arm of the `if` above** — which is
         // the whole of what it used to get wrong. Sitting in that chain it
-        // replaced `Alt+Q to quit` in the one state where that is the only exit
+        // replaced `F1, Q to quit` in the one state where that is the only exit
         // instruction on screen, so a spawn that failed while the session's
         // agent had already gone took away the way out to explain itself.
         let refusal = self.agent_refused.as_ref().map(|why| {
@@ -5707,7 +5759,7 @@ impl App {
             // the part a reader can act on at the end**, because that is the
             // half a narrow window keeps. `agent_in` and `cannot_close` are
             // written that way on purpose — `` `a` starts one ``, `` then x ``,
-            // `` Alt+Q is the way out ``.
+            // `` F1, Q is the way out ``.
             //
             // Below the floor the sentence is *replaced* rather than shortened
             // further, because an elision that has run out of room says less
@@ -5917,8 +5969,8 @@ impl App {
             ));
         }
 
-        if self.help {
-            help_overlay(f);
+        if let Some(hub) = self.hub {
+            hub_overlay(f, hub);
         }
     }
 
@@ -5982,7 +6034,7 @@ impl App {
     /// the frame collapsed this pane; the root is suppressed when it is the
     /// repository abeam was started on. Suppressing them on the *root*
     /// condition alone leaves the shortest use of the whole feature invisible:
-    /// `Alt+G`, `w`, `a` on the row you are already on starts a second agent in
+    /// `F1, G`, `w`, `a` on the row you are already on starts a second agent in
     /// the session's own root, so both panes draw byte-identical borders and
     /// `F4` looks like a key that does nothing.
     ///
@@ -6195,7 +6247,7 @@ impl App {
 
         if self.right_view != RightView::Viewer && self.viewer.has_pending() {
             spans.push(Span::styled(
-                "◆ Alt+E · ",
+                "◆ F1, E · ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -6229,7 +6281,7 @@ impl App {
     /// what you are looking at, never who is taking your keys. Six of its
     /// callers do move focus, and every one of them sets it itself on the line
     /// after it calls this, through [`App::set_focus`] like everything else:
-    /// `Alt+S`; `F6` both ways, the press that raises the ask and the press
+    /// `F1, S`; `F6` both ways, the press that raises the ask and the press
     /// that puts back what the ask displaced; the `Esc` or `q` that leaves the
     /// ask the same way; the `?` that raises one from git or from the reader;
     /// and the hand-off that carries a command the reader chose to a shell.
@@ -6239,13 +6291,13 @@ impl App {
     /// the agent whenever the view being left took typing and the one arriving
     /// did not, in the name of "one keystroke, one meaning" — and that is the
     /// thing it cost. [`Pane::takes_input`] is a question about *this instant*,
-    /// so `Alt+E` out of a shell whose child was alive moved focus and `Alt+E`
+    /// so `F1, E` out of a shell whose child was alive moved focus and `F1, E`
     /// out of the same shell a second after that child exited did not: the same
     /// key, over the same rows on the same screen, with two destinations.
     ///
     /// Not because the pane's state was invisible — a dead shell says so three
     /// times over, retitling itself `exited (0) · enter restarts · …`, turning
-    /// its `exit_hint` from `alt+s→agent` to `esc→agent`, and dropping its
+    /// its `exit_hint` from `f4→agent` to `esc→agent`, and dropping its
     /// cursor. What nothing said was that those three changes had also silently
     /// changed what the *next view key* was about to do, which is a meaning no
     /// border can advertise because the key it belongs to is about some other
@@ -6483,11 +6535,15 @@ fn relative(ev: &MouseEvent, r: Rect) -> MouseEvent {
     out
 }
 
-/// Width of the key column in the overlay. Every binding in `keys::HELP` fits.
+/// Width of the key column in the command hub and full reference.
 const HELP_KEYS: usize = 24;
 
-fn help_overlay(f: &mut Frame) {
-    let lines: Vec<Line> = keys::HELP
+fn hub_overlay(f: &mut Frame, hub: Hub) {
+    let entries = match hub {
+        Hub::Commands => keys::HUB,
+        Hub::Reference => keys::HELP,
+    };
+    let lines: Vec<Line> = entries
         .iter()
         .map(|(k, what)| {
             Line::from(vec![
@@ -6522,7 +6578,13 @@ fn help_overlay(f: &mut Frame) {
 
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(block(" keys · any key to dismiss ", true)),
+        Paragraph::new(lines).block(block(
+            match hub {
+                Hub::Commands => " F1 commands · choose a key · Esc dismiss · ? full help ",
+                Hub::Reference => " F1 key reference · F1 commands · Esc dismiss ",
+            },
+            true,
+        )),
         area,
     );
 }
@@ -6781,6 +6843,14 @@ mod tests {
 
     fn alt(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    /// Exercise a global command through its real F1 leader sequence. Tests
+    /// that are about pane behaviour use this rather than reviving a retired
+    /// Alt or function-key alias incidentally.
+    fn hub(app: &mut App, code: KeyCode) -> Flow {
+        app.handle_key(key(KeyCode::F(1))).expect("open command hub");
+        app.handle_key(key(code)).expect("run command hub action")
     }
 
     /// The same frame, as background colours. The reader is the one pane that
@@ -7507,11 +7577,11 @@ mod tests {
         let mut fx = app();
         a_startable_recipe(&mut fx);
 
-        // The keys where the gesture puts them: `Alt+G` is a global and moves
+        // The keys where the gesture puts them: `F1, G` is a global and moves
         // no focus, so `F5` is what hands the right pane the keyboard — and
         // without it the letter goes to the agent, which is the whole of the
         // exemption this key stands on.
-        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('g'));
         // A frame first, because `F5` refuses when there is no right pane to
         // hand the keys to and "no right pane" is what a window that has never
         // been drawn looks like.
@@ -7619,7 +7689,7 @@ mod tests {
 
         // `claude` is not a row of that table, so nothing is marked `session`
         // and the cursor starts at the top — which is the only row there is.
-        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('g'));
         let _ = screen(&mut fx.app, 120, 40);
         fx.app.handle_key(key(KeyCode::F(5))).unwrap();
         assert_eq!(fx.app.focus, Focus::Right, "the right pane has no keys");
@@ -7755,7 +7825,7 @@ mod tests {
         // **And it does not take the way out with it.** This is a part of the
         // title rather than an arm of a chain, and the state that proves the
         // difference is the one where the session's agent has already gone: a
-        // refusal that displaced `Alt+Q to quit` there would have removed the
+        // refusal that displaced `F1, Q to quit` there would have removed the
         // only exit instruction on screen in order to explain itself. Reaped
         // first, because `exit` being set while `has_exited` is still `false`
         // is a state only a test can build and it is not the one under test.
@@ -7767,7 +7837,7 @@ mod tests {
         let both = screen(&mut fx.app, 300, 24);
         assert!(both.contains("was not found on PATH"), "got: {both}");
         assert!(
-            both.contains("Alt+Q to quit"),
+            both.contains("F1, Q to quit"),
             "the refusal took the way out with it: {both}"
         );
 
@@ -7789,7 +7859,7 @@ mod tests {
     /// somebody reaching for another agent is mid-read, and the keystroke that
     /// gets them the keyboard must not cost them their place.
     #[test]
-    fn f4_again_moves_along_the_agents_and_leaves_the_right_pane_where_it_was() {
+    fn f1_n_moves_along_the_agents_and_f4_only_focuses_the_current_one() {
         // With one agent it is the no-op it has always been, which is every
         // session that existed before this key learned a second meaning.
         let mut solo = app();
@@ -7810,9 +7880,9 @@ mod tests {
         assert_eq!(fx.app.focus, Focus::Left);
         assert_eq!(fx.app.at_agent, 0);
 
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 0, "it does not wrap");
 
         assert_eq!(fx.app.at, was_at, "the workspace cursor followed the agent");
@@ -7876,7 +7946,7 @@ mod tests {
 
         // 2. `F4` to agent 1, and typed there too. Now both are shut, each by
         // its own keystroke.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
         fx.app.queue.stub_item("for-the-neighbour", Mode::Send);
         fx.app.note_left_key(&key(KeyCode::Char('y')));
@@ -7901,7 +7971,7 @@ mod tests {
         );
 
         // 4. Back to agent 0, which has moved nothing.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 0);
         assert!(fx.app.queue.is_draft_open(zero));
 
@@ -7962,7 +8032,7 @@ mod tests {
         // ...and then the cursor is moved to the pane the send is *not* for,
         // which is the whole test.
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
 
         fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
@@ -8181,7 +8251,7 @@ mod tests {
         // pane behind it.
         fx.app.queue.stub_item("blocked-at-the-head", Mode::Send);
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         fx.app.queue.stub_item("neighbour-first", Mode::Send);
         fx.app.queue.stub_item("neighbour-second", Mode::Send);
 
@@ -8254,9 +8324,9 @@ mod tests {
 
         // Aimed at the second pane, and then the cursor comes back.
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         fx.app.queue.stub_item("for-the-neighbour", Mode::Send);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 0);
 
         // A draft at the session's pane, which is both `agents[0]` and the pane
@@ -8278,10 +8348,10 @@ mod tests {
 
         // The control. Another item for the same pane, and this time the draft
         // is at the pane it names.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         fx.app.queue.stub_item("also-for-the-neighbour", Mode::Send);
         fx.app.note_left_key(&key(KeyCode::Char('y')));
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert!(fx.app.agents[1].draft_open);
 
         // The `Enter` owed for the first prompt goes out on this pass; nothing
@@ -8316,13 +8386,13 @@ mod tests {
 
         // Aimed at the *second* pane, which is what makes this a test.
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
         fx.app.queue.stub_item("announce-on-the-neighbour", Mode::Send);
 
         // ...and the cursor back on the first, so that neither `agents[0]` nor
         // the pane with the keys is the answer.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 0);
 
         queue_sees(&mut fx, 1, Readiness::Idle);
@@ -8375,13 +8445,13 @@ mod tests {
         polled(&mut fx);
 
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
         fx.app.queue.stub_item("aimed-at-the-neighbour", Mode::Send);
 
         // Back to the session's pane, so the cursor and the target disagree
         // again — the other way round this time.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 0);
 
         fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
@@ -8447,10 +8517,10 @@ mod tests {
 
         // One item for the second pane, written there...
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         fx.app.queue.stub_item("written-for-a-doomed-pane", Mode::Send);
         // ...and one for the session's, written there, behind it in the list.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 0);
         fx.app.queue.stub_item("written-for-the-session", Mode::Send);
 
@@ -8527,13 +8597,13 @@ mod tests {
         // The keys on the pane the rows will land in, which is not the one the
         // item names.
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
 
         // The queue's own view, for `what_is_copied_is_what_was_drawn`'s
         // reason: it is the one right-hand pane a test can put a known string
         // into without a worker thread.
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         selecting(&mut fx.app);
         let row = fx
             .app
@@ -8762,7 +8832,7 @@ mod tests {
         // whole point: a countdown that followed the cursor would pass this
         // test by standing in the wrong place.
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
 
         // Wide, for the reason every other title test here is: a departed
@@ -8824,7 +8894,7 @@ mod tests {
         // with `at_agent` at 0 the session's agent and the current one are the
         // same object and a gate wired to either would pass.
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
         polled(&mut fx);
 
@@ -8839,10 +8909,10 @@ mod tests {
         // An item aimed at the busy pane, armed and asked for by hand. The
         // idle neighbour has the cursor, so a gate that read `current()` would
         // let this through.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 0);
         fx.app.queue.stub_item("aimed-at-the-busy-one", Mode::Send);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
         fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
         fx.app.queue.handle_key(key(KeyCode::Enter)).unwrap();
@@ -8906,7 +8976,7 @@ mod tests {
         // The cursor on the other pane, so `agents[0]` is the one the stack
         // collapses — and the send is still going to `agents[0]`.
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
 
         // 120 columns is a 72-column left border, which is the ordinary
@@ -9236,7 +9306,7 @@ mod tests {
         std::fs::create_dir_all(&elsewhere).expect("a worktree to stand in");
         fx.app.agents[1].root = elsewhere;
 
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
         let closing = fx.app.agents[1].id;
 
@@ -9264,7 +9334,7 @@ mod tests {
         );
 
         // ...and any other key withdraws the question, `pending_quit`-fashion.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.pending_close, None, "the question outlived a keystroke");
         assert_eq!(fx.app.at_agent, 0, "F4 did not move");
 
@@ -9281,12 +9351,12 @@ mod tests {
             .agent_refused
             .clone()
             .expect("closing the session's pane said nothing");
-        assert!(why.contains("Alt+Q"), "the refusal names no way out: {why}");
+        assert!(why.contains("F1, Q"), "the refusal names no way out: {why}");
         assert_eq!(fx.app.agents.len(), 2, "the session's pane was closed");
 
         // Two presses at a pane that may go, and it goes. The cursor lands on
         // `agents[0]` because the pane it was on is the one that left.
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         fx.app.handle_key(key(KeyCode::Char('x'))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('x'))).unwrap();
         assert_eq!(fx.app.agents.len(), 1, "two presses did not close it");
@@ -9455,7 +9525,7 @@ mod tests {
             .agent_refused
             .clone()
             .expect("closing the session's pane said nothing");
-        assert!(why.contains("Alt+Q"), "the refusal names no way out: {why}");
+        assert!(why.contains("F1, Q"), "the refusal names no way out: {why}");
         assert_eq!(fx.app.agents.len(), 2);
     }
 
@@ -9554,8 +9624,8 @@ mod tests {
     /// between, until the habitual `Enter` on the way back starts an agent in
     /// it.
     ///
-    /// `F8` stands in for five more — `F9`, `F2`, `Alt+E`, `Alt+S` and
-    /// `Alt+Z` arrive the same way — because all six end up in
+    /// `F8` stands in for five more — `F9`, `F2`, `F1, E`, `F1, S` and
+    /// `F1, Z` arrive the same way — because all six end up in
     /// [`set_right_view`](App::set_right_view), and that is the one place a
     /// test of any of them pins.
     #[test]
@@ -9565,7 +9635,7 @@ mod tests {
         fx.app.git.handle_key(key(KeyCode::Char('A'))).unwrap();
         assert_eq!(fx.app.git.exit_hint(), "esc→list", "nothing was asked");
 
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         assert_eq!(
             fx.app.right_view,
             RightView::Queue,
@@ -9580,7 +9650,7 @@ mod tests {
         // And what comes back is the list rather than the question, so `Enter`
         // is the list's `Enter` — which is the press that would have started
         // the agent.
-        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('g'));
         fx.app.git.handle_key(key(KeyCode::Enter)).unwrap();
         assert_eq!(
             fx.app.git.take_agent_request(),
@@ -9670,7 +9740,7 @@ mod tests {
         fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
         fx.app.pump();
         let why = fx.app.agent_refused.clone().expect("no answer at all");
-        assert!(why.contains("Alt+Q"), "got: {why}");
+        assert!(why.contains("F1, Q"), "got: {why}");
 
         // ...and two of somebody else's on one row is the ambiguity again,
         // reached with `agents[0]` nowhere near it.
@@ -9696,7 +9766,7 @@ mod tests {
         // reaches a refusal, so without the control it would pass against a
         // key that never works at all.
         fx.app.set_focus(Focus::Left);
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.at_agent, 1);
         fx.app.git.handle_key(key(KeyCode::Char('x'))).unwrap();
         fx.app.pump();
@@ -9932,12 +10002,12 @@ mod tests {
         assert!(fx.app.any_agent_live());
 
         assert!(matches!(
-            fx.app.handle_key(alt(KeyCode::Char('q'))).unwrap(),
+            hub(&mut fx.app, KeyCode::Char('q')),
             Flow::Continue { .. }
         ));
         assert!(
             fx.app.pending_quit,
-            "Alt+Q went straight out over a live agent"
+            "F1, Q went straight out over a live agent"
         );
 
         // And the window says why it is still here. This is the state the loop
@@ -9956,9 +10026,9 @@ mod tests {
             "the title does not say what is holding the door open: {shown}"
         );
 
-        fx.app.handle_key(alt(KeyCode::Char('q'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('q'));
         assert!(matches!(
-            fx.app.handle_key(alt(KeyCode::Char('q'))).unwrap(),
+            hub(&mut fx.app, KeyCode::Char('q')),
             Flow::Quit
         ));
     }
@@ -10049,7 +10119,7 @@ mod tests {
             .app
             .close_agent(session)
             .expect_err("the session's own agent was closed out from under it");
-        assert!(why.contains("Alt+Q"), "got: {why}");
+        assert!(why.contains("F1, Q"), "got: {why}");
 
         // **The shape a key produces: the pane with the keys is the pane that
         // goes.** There is nothing left to re-find, so the cursor lands on the
@@ -10376,7 +10446,7 @@ mod tests {
         );
         assert_eq!(
             fx.app.agent_in(fx.dir.path()),
-            Err("that pane is the session — its exit is abeam's. Alt+Q is the way out."
+            Err("that pane is the session — its exit is abeam's. F1, Q is the way out."
                 .to_string()),
             "the checkout the agent left still resolves to it"
         );
@@ -11060,10 +11130,10 @@ mod tests {
 
         fx.app.pending_quit = true;
         let quitting = screen(&mut fx, 300, 24);
-        assert!(quitting.contains("Alt+Q again to quit"), "got: {quitting}");
+        assert!(quitting.contains("F1, Q again to quit"), "got: {quitting}");
         assert!(
             quitting.contains("sending in"),
-            "Alt+Q removed the only warning on screen that abeam was about to \
+            "F1, Q removed the only warning on screen that abeam was about to \
              type at the agent: {quitting}"
         );
         fx.app.pending_quit = false;
@@ -11082,14 +11152,14 @@ mod tests {
         fx.app.agents[0].exit = Some((status, Vec::new()));
 
         let ended = screen(&mut fx, 300, 24);
-        // "Alt+Q to quit" and not "shell open", which is what this said while
+        // "F1, Q to quit" and not "shell open", which is what this said while
         // the title named a live shell unconditionally. Nothing is live here —
         // no shell has been opened and there is one agent, which has just gone
         // — so naming one would be the border inventing something. What holds
         // the door is named when there is something to name, and
         // [`a_live_agent_holds_the_door_at_quit_and_the_title_says_which`] is
         // where that is under test.
-        assert!(ended.contains("Alt+Q to quit"), "got: {ended}");
+        assert!(ended.contains("F1, Q to quit"), "got: {ended}");
         assert!(
             ended.contains("sending in"),
             "the agent leaving removed the announcement: {ended}"
@@ -11329,7 +11399,7 @@ mod tests {
         for out in [key(KeyCode::Esc), key(KeyCode::Char('q'))] {
             let mut fx = app();
             fx.app.queue.stub_item("do not lose me", Mode::Send);
-            fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+            hub(&mut fx.app, KeyCode::Char('w'));
             screen(&mut fx.app, 120, 24);
             fx.app.handle_key(key(KeyCode::F(5))).unwrap();
             fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
@@ -11349,22 +11419,22 @@ mod tests {
         // The shell's half of the queue's confirmation, and the half only the
         // shell can do: a pane is never told it has been put away — `tick` runs
         // whether or not it is showing — so `set_right_view` is the one place
-        // that knows. Without the call, `d`, `Alt+G`, `F8`, `d` deleted an
+        // that knows. Without the call, `d`, `F1, G`, `F8`, `d` deleted an
         // item on what the user experienced as a single press, having been
         // asked about it on a screen they had long since left. The view keys
         // leave focus in the pane now, which is what makes the sequence a
         // natural one rather than a contrivance.
         let mut fx = app();
         fx.app.queue.stub_item("do not lose me", Mode::Send);
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         screen(&mut fx.app, 120, 24);
         fx.app.handle_key(key(KeyCode::F(5))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
         let asked = screen(&mut fx.app, 120, 24);
         assert!(asked.contains("d again to delete"), "{asked}");
 
-        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('g'));
+        hub(&mut fx.app, KeyCode::Char('w'));
         assert_eq!(fx.app.focus, Focus::Right, "the view keys moved focus");
         fx.app.handle_key(key(KeyCode::Char('d'))).unwrap();
         let drawn = screen(&mut fx.app, 120, 24);
@@ -11377,19 +11447,19 @@ mod tests {
 
 
     #[test]
-    fn the_queue_is_a_workspace_view_and_f2_remembers_it() {
+    fn the_queue_is_a_workspace_view_and_f1_w_remembers_it() {
         let mut app = app();
         screen(&mut app, 120, 24);
 
-        app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut app, KeyCode::Char('w'));
         assert_eq!(app.right_view, RightView::Queue);
-        // Pointedly not like Alt+S: the common case is glancing at what is
+        // Pointedly not like F1, S: the common case is glancing at what is
         // still queued while the agent works and you keep typing at it.
         assert_eq!(app.focus, Focus::Left);
 
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
         assert_eq!(app.right_view, RightView::Diag);
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
         assert_eq!(app.right_view, RightView::Queue);
 
         // The key this replaced is Codex's. It must pass through the whole App
@@ -11404,14 +11474,14 @@ mod tests {
     /// and the reader repaints. Each end is tested on its own — this is the only
     /// thing that would catch the dispatch arm being dropped in the middle.
     #[test]
-    fn f3_repaints_the_reader_and_leaves_the_rest_of_the_frame_alone() {
+    fn f1_t_repaints_the_reader_and_leaves_the_rest_of_the_frame_alone() {
         let mut fx = app();
-        fx.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut fx, KeyCode::Char('e'));
 
         let before = page(&mut fx, 120, 24);
-        fx.handle_key(key(KeyCode::F(3))).unwrap();
+        hub(&mut fx, KeyCode::Char('t'));
         let after = page(&mut fx, 120, 24);
-        assert_ne!(before, after, "F3 never reached the reader");
+        assert_ne!(before, after, "F1, T never reached the reader");
 
         // The left pane and the borders are not the reader's to repaint, so
         // most of the frame is untouched — this would fail if the palette had
@@ -11419,37 +11489,37 @@ mod tests {
         let same = before.iter().zip(&after).filter(|(a, b)| a == b).count();
         assert!(
             same > before.len() / 2,
-            "F3 repainted {} of {} cells — that is more than the reader",
+            "F1, T repainted {} of {} cells — that is more than the reader",
             before.len() - same,
             before.len()
         );
 
         // And back, so the key is a toggle rather than a one-way trip.
-        fx.handle_key(key(KeyCode::F(3))).unwrap();
+        hub(&mut fx, KeyCode::Char('t'));
         assert_eq!(page(&mut fx, 120, 24), before);
     }
 
     #[test]
     fn the_instrument_is_a_detour_and_comes_back_to_where_you_were() {
         let mut app = app();
-        app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut app, KeyCode::Char('e'));
         assert_eq!(app.right_view, RightView::Viewer);
 
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
         assert_eq!(app.right_view, RightView::Diag);
         // F2 out of diagnostics must land on the view it displaced, never on
         // diagnostics again — which is why `last_workspace_view` refuses to
         // record it.
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
         assert_eq!(app.right_view, RightView::Viewer);
 
-        // Alt+G from the instrument is still a direct selection, and it is what
+        // F1, G from the instrument is still a direct selection, and it is what
         // F2 then remembers.
-        app.handle_key(key(KeyCode::F(2))).unwrap();
-        app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
+        hub(&mut app, KeyCode::Char('g'));
         assert_eq!(app.right_view, RightView::Git);
-        app.handle_key(key(KeyCode::F(2))).unwrap();
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
+        hub(&mut app, KeyCode::Char('d'));
         assert_eq!(app.right_view, RightView::Git);
     }
 
@@ -11464,13 +11534,13 @@ mod tests {
 
         // The one workspace view key that moves focus. A command line you have
         // to press a second key to type into is not a command line.
-        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        hub(&mut app, KeyCode::Char('s'));
         assert_eq!(app.right_view, RightView::Shell);
         assert_eq!(app.focus, Focus::Right);
 
         // ...and pressing it again is the way home, so the whole round trip for
-        // `git branch` is Alt+S, type, Alt+S.
-        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        // `git branch` is F1, S, type, F1, S.
+        app.handle_key(key(KeyCode::F(4))).unwrap();
         assert_eq!(app.focus, Focus::Left);
         assert_eq!(
             app.right_view,
@@ -11480,8 +11550,8 @@ mod tests {
 
         // From any other view it selects rather than toggles. Otherwise the
         // press that brings the view up would be the press that leaves it.
-        app.handle_key(alt(KeyCode::Char('g'))).unwrap();
-        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        hub(&mut app, KeyCode::Char('g'));
+        hub(&mut app, KeyCode::Char('s'));
         assert_eq!(app.right_view, RightView::Shell);
         assert_eq!(app.focus, Focus::Right);
     }
@@ -11491,7 +11561,7 @@ mod tests {
         // Every other view key, and the rule `set_right_view` states and the
         // keymap prints in the table as "(focus unchanged)". It used to
         // hold in one direction only: leaving a pane that took typing for one
-        // that did not handed focus back to the agent, so `Alt+E` pressed to
+        // that did not handed focus back to the agent, so `F1, E` pressed to
         // glance at a file while typing in the shell put the next thing typed
         // two panes away from where it was aimed.
         //
@@ -11500,12 +11570,7 @@ mod tests {
         // to prove it.
         let mut fx = app();
         reading(&mut fx, |_| unstarted());
-        let view_keys = [
-            alt(KeyCode::Char('g')),
-            alt(KeyCode::Char('e')),
-            key(KeyCode::F(8)),
-            key(KeyCode::F(2)),
-        ];
+        let view_keys = ['g', 'e', 'w', 'd'];
 
         for pressed in view_keys {
             fx.app.set_right_view(RightView::Ask);
@@ -11516,7 +11581,7 @@ mod tests {
                 "the ask is not taking typing, so this proves nothing"
             );
 
-            fx.app.handle_key(pressed).unwrap();
+            hub(&mut fx.app, KeyCode::Char(pressed));
             assert_ne!(
                 fx.app.right_view,
                 RightView::Ask,
@@ -11535,7 +11600,7 @@ mod tests {
             fx.app.set_right_view(RightView::Ask);
             fx.app.focus = Focus::Left;
             screen(&mut fx.app, 120, 24);
-            fx.app.handle_key(pressed).unwrap();
+            hub(&mut fx.app, KeyCode::Char(pressed));
             assert_eq!(
                 fx.app.focus,
                 Focus::Left,
@@ -11548,11 +11613,11 @@ mod tests {
     fn a_composer_left_open_in_one_view_is_still_yours_when_you_come_back() {
         // The half of that rule somebody notices. A half-typed queue item is a
         // draft, and a glance at git on the way past must not cost it the keys:
-        // before this, `Alt+G` here handed focus to the agent and the rest of
+        // before this, `F1, G` here handed focus to the agent and the rest of
         // the sentence went into the agent's prompt, with the queue's own
         // composer still open behind it and still showing a cursor.
         let mut fx = app();
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         screen(&mut fx.app, 120, 24);
         fx.app.handle_key(key(KeyCode::F(5))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('i'))).unwrap();
@@ -11561,14 +11626,14 @@ mod tests {
             "the composer never opened, so this proves nothing"
         );
 
-        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('g'));
         assert_eq!(
             fx.app.focus,
             Focus::Right,
             "a glance at git cost the draft its keys"
         );
 
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         assert!(
             fx.app.right_pane().takes_input(),
             "the composer was shut by a view switch"
@@ -11585,16 +11650,16 @@ mod tests {
 
     #[test]
     fn focus_taken_before_the_pane_is_drawn_is_corrected_by_the_frame() {
-        // Alt+S takes focus optimistically, because the pane it un-zooms has
+        // F1, S takes focus optimistically, because the pane it un-zooms has
         // not been drawn yet and `right_inner` still says there is nowhere to
         // go. That is only safe because the next frame is the authority.
         let mut app = app();
         screen(&mut app, 120, 24);
-        app.handle_key(alt(KeyCode::Char('z'))).unwrap();
+        hub(&mut app, KeyCode::Char('z'));
         screen(&mut app, 120, 24);
         assert!(app.right_inner.is_none(), "zoom hides the right pane");
 
-        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        hub(&mut app, KeyCode::Char('s'));
         assert!(!app.zoom, "asking for a view is asking to see it");
         assert_eq!(app.focus, Focus::Right);
 
@@ -11618,7 +11683,7 @@ mod tests {
         app.app.spaces[0].shell =
             ShellPane::new(app.dir.path().to_path_buf(), Some(A_PLAIN_SHELL.into()));
 
-        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        hub(&mut app, KeyCode::Char('s'));
         screen(&mut app, 120, 24); // the frame that spawns it
 
         // Wait for the banner, so the pane is known to have produced output at
@@ -11635,7 +11700,7 @@ mod tests {
         // no window this test can pick that is guaranteed to be quiet. What
         // *is* guaranteed: if a hidden shell's output counted, every one of
         // these would be true, because every one of them follows fresh output.
-        app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        hub(&mut app, KeyCode::Char('g'));
         let mut quiet = false;
         for _ in 0..8 {
             app.shell_mut()
@@ -11648,7 +11713,7 @@ mod tests {
 
         // ...and the same output does earn one when it is the view on screen,
         // or the pane would be frozen rather than merely quiet.
-        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        hub(&mut app, KeyCode::Char('s'));
         app.shell_mut()
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
@@ -11667,25 +11732,25 @@ mod tests {
     fn a_live_shell(fx: &mut Fixture) {
         fx.app.spaces[0].shell =
             ShellPane::new(fx.dir.path().to_path_buf(), Some(A_PLAIN_SHELL.into()));
-        // A frame before the key, because `Alt+S` asks the layout whether there
+        // A frame before the key, because `F1, S` asks the layout whether there
         // is a right pane to focus and `area` is whatever the last frame drew.
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('s'));
         screen(&mut fx.app, 120, 24); // the frame that spawns it
         assert!(fx.app.shell().is_live(), "the frame never spawned a child");
-        assert_eq!(fx.app.focus, Focus::Right, "Alt+S is the key that focuses");
+        assert_eq!(fx.app.focus, Focus::Right, "F1, S is the key that focuses");
     }
 
     #[test]
     fn a_view_key_out_of_a_live_shell_leaves_focus_in_the_right_pane() {
         // The report, with a real child in it: typing at a prompt in the shell
-        // view, `Alt+E` to look something up in a file, and focus was yanked to
+        // view, `F1, E` to look something up in a file, and focus was yanked to
         // the agent — so what was typed next went to the agent rather than to
         // the pane that had just come up in front of the user.
         let mut fx = app();
         a_live_shell(&mut fx);
 
-        fx.app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('e'));
         assert_eq!(fx.app.right_view, RightView::Viewer);
         assert_eq!(
             fx.app.focus,
@@ -11698,17 +11763,17 @@ mod tests {
     fn a_view_key_out_of_the_shell_means_the_same_thing_live_or_dead() {
         // The argument `set_right_view` makes, run: the deleted rule turned on
         // `takes_input`, which is a question about *this instant*, so the same
-        // `Alt+E` over the same rows on the same screen moved focus with the
+        // `F1, E` over the same rows on the same screen moved focus with the
         // child alive and left focus alone once it had exited. This is the two
         // halves side by side.
         let mut fx = app();
         a_live_shell(&mut fx);
-        fx.app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('e'));
         assert_eq!(fx.app.focus, Focus::Right, "with the child alive");
 
         // Typed at the pane rather than through the app: `exit` is the child's
         // business and the shell's key routing is not what is under test.
-        fx.app.handle_key(alt(KeyCode::Char('s'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('s'));
         for c in "exit".chars() {
             fx.app.shell_mut().handle_key(key(KeyCode::Char(c))).unwrap();
         }
@@ -11726,7 +11791,7 @@ mod tests {
             "a dead shell that still takes typing would make the two halves one"
         );
 
-        fx.app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('e'));
         assert_eq!(
             fx.app.focus,
             Focus::Right,
@@ -11740,17 +11805,17 @@ mod tests {
         // F2 out of diagnostics can never land back on diagnostics — and can
         // land on the shell, which is a place you leave a command running.
         let mut app = app();
-        app.handle_key(alt(KeyCode::Char('s'))).unwrap();
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('s'));
+        hub(&mut app, KeyCode::Char('d'));
         assert_eq!(app.right_view, RightView::Diag);
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
         assert_eq!(app.right_view, RightView::Shell);
     }
 
     #[test]
     fn the_instrument_reports_the_live_session_rather_than_a_blank() {
         let mut app = app();
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
 
         // ConPTY asks where the cursor is before the child runs at all, and the
         // reader thread answers. That is a handshake between two threads, so
@@ -11826,7 +11891,7 @@ mod tests {
         assert!(screen(&mut app, 120, 24).contains('◆'));
 
         // Switching to the viewer takes the file up, and the mark goes with it.
-        app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut app, KeyCode::Char('e'));
         let text = screen(&mut app, 120, 24);
         assert!(!text.contains('◆'), "got: {text}");
         assert!(!app.viewer.has_pending());
@@ -11895,23 +11960,23 @@ mod tests {
     #[test]
     fn asking_for_a_view_while_zoomed_brings_the_pane_back() {
         let mut app = app();
-        app.handle_key(alt(KeyCode::Char('z'))).unwrap();
+        hub(&mut app, KeyCode::Char('z'));
         assert!(app.zoom);
         screen(&mut app, 120, 24);
         assert!(app.right_inner.is_none(), "zoom hides the right pane");
 
         // Otherwise every view key is a dead key while zoomed, which is the
-        // same trap as Alt+E doing nothing when the viewer is already up.
-        app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        // same trap as F1, E doing nothing when the viewer is already up.
+        hub(&mut app, KeyCode::Char('e'));
         assert!(!app.zoom);
         assert_eq!(app.right_view, RightView::Viewer);
 
-        app.handle_key(alt(KeyCode::Char('z'))).unwrap();
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('z'));
+        hub(&mut app, KeyCode::Char('d'));
         assert!(!app.zoom);
         assert_eq!(app.right_view, RightView::Diag);
         // ...and F2 still remembers what it displaced, through the un-zoom.
-        app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut app, KeyCode::Char('d'));
         assert_eq!(app.right_view, RightView::Viewer);
     }
 
@@ -11933,21 +11998,21 @@ mod tests {
     fn quitting_a_live_session_asks_twice() {
         let mut app = app();
         assert!(matches!(
-            app.handle_key(alt(KeyCode::Char('q'))).unwrap(),
+            hub(&mut app, KeyCode::Char('q')),
             Flow::Continue { .. }
         ));
         assert!(app.pending_quit);
-        assert!(screen(&mut app, 120, 24).contains("Alt+Q again"));
+        assert!(screen(&mut app, 120, 24).contains("F1, Q again"));
 
         // Any other key is the cancel, and there is no other cancel to learn.
         app.handle_key(key(KeyCode::Char('x'))).unwrap();
         assert!(!app.pending_quit);
         assert!(matches!(
-            app.handle_key(alt(KeyCode::Char('q'))).unwrap(),
+            hub(&mut app, KeyCode::Char('q')),
             Flow::Continue { .. }
         ));
         assert!(matches!(
-            app.handle_key(alt(KeyCode::Char('q'))).unwrap(),
+            hub(&mut app, KeyCode::Char('q')),
             Flow::Quit
         ));
     }
@@ -11961,11 +12026,11 @@ mod tests {
             .unwrap();
         assert!(app.literal_next);
 
-        app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut app, KeyCode::Char('e'));
         assert!(!app.literal_next);
-        // Alt+E went to the pty instead of switching the view.
+        // F1, E went to the pty instead of switching the view.
         assert_eq!(app.right_view, RightView::Git);
-        app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut app, KeyCode::Char('e'));
         assert_eq!(app.right_view, RightView::Viewer);
     }
 
@@ -11987,8 +12052,8 @@ mod tests {
         // somebody minds.
         let mut app = app();
         app.handle_key(key(KeyCode::F(1))).unwrap();
-        let text = screen(&mut app, 120, keys::HELP.len() as u16 + 2);
-        for (k, what) in keys::HELP {
+        let text = screen(&mut app, 120, keys::HUB.len() as u16 + 2);
+        for (k, what) in keys::HUB {
             if k.is_empty() {
                 continue;
             }
@@ -11998,14 +12063,23 @@ mod tests {
 
         // Any unbound key dismisses it: a reader who has started typing has
         // stopped reading.
-        app.handle_key(key(KeyCode::Char('x'))).unwrap();
-        assert!(!app.help);
+        app.handle_key(key(KeyCode::Char('?'))).unwrap();
+        let text = screen(&mut app, 120, keys::HELP.len() as u16 + 2);
+        for (k, what) in keys::HELP {
+            if k.is_empty() {
+                continue;
+            }
+            assert!(text.contains(k), "{k} is missing from the reference");
+            assert!(text.contains(what), "'{what}' was clipped off the reference");
+        }
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(app.hub.is_none());
     }
 
     #[test]
     fn the_help_overlay_says_any_key_and_means_any_key() {
         // It used to mean "any key abeam has no binding for". Press F1 then
-        // Alt+G and the overlay was still drawn on top of the git view you had
+        // F1, G and the overlay was still drawn on top of the git view you had
         // just asked to see, and a third keystroke was needed to get it back.
         let mut app = app();
         for dismiss in [
@@ -12016,16 +12090,21 @@ mod tests {
             key(KeyCode::F(2)),
         ] {
             app.handle_key(key(KeyCode::F(1))).unwrap();
-            assert!(app.help, "F1 opens it");
+            assert!(matches!(app.hub, Some(Hub::Commands)), "F1 opens it");
             app.handle_key(dismiss).unwrap();
-            assert!(!app.help, "{dismiss:?} left the overlay up");
+            assert!(
+                matches!(app.hub, Some(Hub::Commands)),
+                "{dismiss:?} must stay in the command hub"
+            );
         }
 
         // ...and F1 itself is still the toggle it always was.
         app.handle_key(key(KeyCode::F(1))).unwrap();
-        assert!(app.help);
+        assert!(matches!(app.hub, Some(Hub::Commands)));
         app.handle_key(key(KeyCode::F(1))).unwrap();
-        assert!(!app.help);
+        assert!(matches!(app.hub, Some(Hub::Commands)));
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(app.hub.is_none());
     }
 
     #[test]
@@ -12061,7 +12140,7 @@ mod tests {
     fn a_release_event_is_dropped_before_it_can_fire_a_binding_twice() {
         // Windows sends Press and Release for every key. `encode_key` filters
         // releases, but the shell matches its own bindings first — without the
-        // filter in `handle_event`, Alt+E would switch to the viewer and Alt+G
+        // filter in `handle_event`, F1, E would switch to the viewer and F1, G
         // straight back on the release of the same press.
         //
         // The release is built here rather than typed, so this runs everywhere
@@ -12129,13 +12208,13 @@ mod tests {
     }
 
     #[test]
-    fn f9_opens_the_pad_with_the_keys_already_in_it() {
+    fn f1_p_opens_the_pad_with_the_keys_already_in_it() {
         // The whole promise of the key. A view that opened without focus would
         // make the round trip F9, F5, type, F4 — which nobody performs
         // mid-sentence, so the note would not get written down at all.
         let mut fx = app();
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         assert_eq!(fx.app.right_view, RightView::Pad);
         assert_eq!(fx.app.focus, Focus::Right);
         assert!(
@@ -12145,7 +12224,7 @@ mod tests {
 
         // ...and the same key is the way home, which is the command view's
         // round trip and is meant to be read as the same one.
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
         assert_eq!(fx.app.focus, Focus::Left);
         assert_eq!(
             fx.app.right_view,
@@ -12155,7 +12234,7 @@ mod tests {
     }
 
     #[test]
-    fn f9_while_zoomed_brings_the_pane_back_and_still_lands_in_it() {
+    fn f1_p_while_zoomed_brings_the_pane_back_and_still_lands_in_it() {
         // The hazard `Action::ShowShell` names, met by the second key that has
         // it: `set_right_view` un-zooms, so `right_inner` is still describing a
         // window with no right pane in it at the moment focus is decided. Ask
@@ -12163,11 +12242,11 @@ mod tests {
         // beside them, waiting for typing that is going somewhere else.
         let mut fx = app();
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(alt(KeyCode::Char('z'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('z'));
         screen(&mut fx.app, 120, 24);
         assert!(fx.app.right_inner.is_none(), "zoom hides the right pane");
 
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         assert!(!fx.app.zoom);
         assert_eq!(fx.app.right_view, RightView::Pad);
         assert_eq!(fx.app.focus, Focus::Right);
@@ -12181,10 +12260,10 @@ mod tests {
         // the instrument and the ask.
         let mut fx = app();
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
-        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
+        hub(&mut fx.app, KeyCode::Char('d'));
         assert_eq!(fx.app.right_view, RightView::Diag);
-        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('d'));
         assert_eq!(fx.app.right_view, RightView::Pad);
         assert_eq!(fx.app.last_workspace_view, RightView::Pad);
     }
@@ -12198,7 +12277,7 @@ mod tests {
         // arriving in one more pane.
         let mut fx = app();
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         assert_eq!(fx.app.focus, Focus::Right);
 
         fx.app.handle_key(key(KeyCode::Esc)).unwrap();
@@ -12221,7 +12300,7 @@ mod tests {
         // screen would say so, which is why the row carries the condition.
         let mut fx = app();
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         assert_eq!(fx.app.right_pane().title(), "pad");
 
         fx.app.handle_key(alt(KeyCode::Char('t'))).unwrap();
@@ -12230,7 +12309,7 @@ mod tests {
         assert_eq!(fx.app.right_pane().title(), "pad");
 
         // ...and the same chord over the same pane, one focus key later.
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
         assert_eq!(fx.app.focus, Focus::Left);
         fx.app.handle_key(alt(KeyCode::Char('t'))).unwrap();
         assert_eq!(
@@ -12253,7 +12332,7 @@ mod tests {
         // typed at the left pane does.
         let mut fx = app();
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         assert_eq!(fx.app.focus, Focus::Right);
 
         let half = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
@@ -12282,17 +12361,17 @@ mod tests {
         // memory for up to the debounce with the user already somewhere else,
         // and a machine that goes in those two seconds takes it with it.
         //
-        // `Alt+G` and not `Esc`, because this test is about `set_right_view`
+        // `F1, G` and not `Esc`, because this test is about `set_right_view`
         // alone: a view key moves no focus, so the flush beside `set_focus`
         // cannot stand in for the one being tested here.
         let mut fx = app();
         let path = pad_at(&mut fx, 0, "away.md");
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         typed(&mut fx, "ask about the retry budget");
         assert!(!path.exists(), "the debounce has not run and must not have");
 
-        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('g'));
         assert_eq!(fx.app.focus, Focus::Right, "a view key moves no focus");
         let written = std::fs::read_to_string(&path).expect("the pad the view key left behind");
         assert!(written.contains("retry budget"), "got: {written}");
@@ -12311,11 +12390,11 @@ mod tests {
         let mut fx = app();
         let path = pad_at(&mut fx, 0, "focus.md");
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         typed(&mut fx, "the retry budget again");
         assert!(!path.exists(), "the debounce has not run and must not have");
 
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
         assert_eq!(fx.app.focus, Focus::Left);
         assert_eq!(fx.app.right_view, RightView::Pad, "the view did not move");
         let written = std::fs::read_to_string(&path).expect("the pad the round trip left behind");
@@ -12338,7 +12417,7 @@ mod tests {
 
         assert!(fx.app.set_workspace(1));
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         typed(&mut fx, "this branch has the same bug");
         // Back to the agent's own workspace, so the one about to be dropped is
         // not the one on screen — which is the only interesting version of
@@ -12366,7 +12445,7 @@ mod tests {
         let there = pad_at(&mut fx, 1, "there.md");
 
         screen(&mut fx.app, 120, 24);
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         typed(&mut fx, "the agent is wrong about the cache");
         assert!(fx.app.set_workspace(1));
         typed(&mut fx, "and this branch has the same bug");
@@ -12382,22 +12461,22 @@ mod tests {
     }
 
     #[test]
-    fn f3_moves_the_pad_with_the_reader() {
+    fn f1_t_moves_the_pad_with_the_reader() {
         // The pad draws through the reader's own markdown renderer, whose
         // colours are absolute RGB chosen against a page it paints itself, so
         // it is in this key's loop for the ask pane's reason: left out, a
         // session that has gone light keeps one dark pane in the corner of it.
         let mut fx = app();
-        fx.app.handle_key(key(KeyCode::F(9))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('p'));
         assert_eq!(fx.app.theme, Theme::Dark);
 
         let dark = right_page(&mut fx.app);
-        fx.app.handle_key(key(KeyCode::F(3))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('t'));
         assert_eq!(fx.app.theme, Theme::Light);
         assert_ne!(
             dark,
             right_page(&mut fx.app),
-            "F3 repainted the reader and left the pad on the page it had"
+            "F1, T repainted the reader and left the pad on the page it had"
         );
     }
 
@@ -13091,7 +13170,7 @@ mod tests {
             .join("a-design-document-with-a-name-long-enough-to-fill-the-border.md");
         std::fs::write(&long, "# hello").unwrap();
         fx.app.viewer.show(long);
-        fx.app.handle_key(alt(KeyCode::Char('e'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('e'));
         screen(&mut fx.app, 120, 24);
 
         let title = |fx: &Fixture, focused: bool| -> String {
@@ -13339,12 +13418,12 @@ mod tests {
             "the fixture's child stayed"
         );
         assert!(matches!(
-            fx.app.handle_key(alt(KeyCode::Char('q'))).unwrap(),
+            hub(&mut fx.app, KeyCode::Char('q')),
             Flow::Continue { .. }
         ));
         assert!(
             fx.app.pending_quit,
-            "Alt+Q left without asking, and took a build in another worktree \
+            "F1, Q left without asking, and took a build in another worktree \
              down with it"
         );
 
@@ -13949,7 +14028,7 @@ mod tests {
         assert!(alive(pid), "the shim was not running to begin with");
         assert!(
             !fx.app.any_shell_live(),
-            "a reader made Alt+Q ask twice, which is the confirmation losing \
+            "a reader made F1, Q ask twice, which is the confirmation losing \
              its meaning for the shell it exists for"
         );
 
@@ -14016,7 +14095,7 @@ mod tests {
     }
 
     #[test]
-    fn f6_asks_about_nothing_in_particular_from_wherever_you_are() {
+    fn f1_a_asks_about_nothing_in_particular_from_wherever_you_are() {
         // The gap `?` leaves and the reason F6 exists: `?` is pane-local, so
         // from the agent — which is where you are most of the time — there is no
         // way in at all. A question about the repository rather than about a
@@ -14028,7 +14107,7 @@ mod tests {
         fx.app.focus = Focus::Left;
         screen(&mut fx.app, 120, 24);
 
-        fx.app.handle_key(key(KeyCode::F(6))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('a'));
         assert_eq!(fx.app.right_view, RightView::Ask);
         assert_eq!(
             fx.app.focus,
@@ -14036,15 +14115,15 @@ mod tests {
             "asking a question means typing one"
         );
 
-        // And back again, which is `F2`'s contract rather than a second key:
-        // the ask is somewhere you went *from* something.
-        fx.app.handle_key(key(KeyCode::F(6))).unwrap();
-        assert_eq!(fx.app.right_view, RightView::Git);
-        assert_eq!(fx.app.focus, Focus::Left);
+        // Repeating the command keeps the compose surface ready; F4 is the
+        // direct return to the agent.
+        hub(&mut fx.app, KeyCode::Char('a'));
+        assert_eq!(fx.app.right_view, RightView::Ask);
+        assert_eq!(fx.app.focus, Focus::Right);
     }
 
     #[test]
-    fn f6_takes_the_attached_file_back_off_and_shows_that_it_has() {
+    fn f1_a_takes_the_attached_file_back_off_and_shows_that_it_has() {
         // The half of F6 that is not about reach. An attachment survives until
         // the question it rides on has gone, so before this there was no way to
         // take a file back off: `?` on the wrong one left you asking about it or
@@ -14069,8 +14148,8 @@ mod tests {
         // Out and back in through F6, which is the ordinary way somebody
         // changes their mind: the row above the composer is what goes away, on
         // the frame the key was pressed.
-        fx.app.handle_key(key(KeyCode::F(6))).unwrap();
-        fx.app.handle_key(key(KeyCode::F(6))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('a'));
+        hub(&mut fx.app, KeyCode::Char('a'));
         assert_eq!(fx.app.right_view, RightView::Ask);
         let detached = screen(&mut fx.app, 120, 24);
         assert!(
@@ -14152,9 +14231,9 @@ mod tests {
 
         // And `F2` there and back, which is the same field read by the other
         // key that uses it.
-        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('d'));
         assert_eq!(fx.app.right_view, RightView::Diag);
-        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('d'));
         assert_ne!(fx.app.right_view, RightView::Ask);
     }
 
@@ -14265,7 +14344,7 @@ mod tests {
 
     #[test]
     fn a_command_chosen_in_one_workspace_is_never_typed_in_another() {
-        // The ten seconds a cold shell is given is long enough for `Alt+G`, `w`
+        // The ten seconds a cold shell is given is long enough for `F1, G`, `w`
         // and `Enter` on another worktree row — and a cold shell is the ordinary
         // case, since it is why the window exists at all. Carrying only the
         // text, the wait resolved against whichever workspace was on screen when
@@ -14367,7 +14446,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_moves_the_reader_and_the_ask_pane_together() {
+    fn f1_t_moves_the_reader_and_the_ask_pane_together() {
         // B's warning, pinned: the ask draws its answers through the reader's
         // own markdown renderer, whose colours are absolute RGB chosen against
         // a known page, and it paints that page itself. Left out of `F3`, a
@@ -14379,12 +14458,12 @@ mod tests {
         assert_eq!(fx.app.theme, Theme::Dark);
 
         let dark = right_page(&mut fx.app);
-        fx.app.handle_key(key(KeyCode::F(3))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('t'));
         assert_eq!(fx.app.theme, Theme::Light);
         let light = right_page(&mut fx.app);
         assert_ne!(
             dark, light,
-            "F3 repainted the reader and left the ask on the page it had"
+            "F1, T repainted the reader and left the ask on the page it had"
         );
 
         // And a workspace opened *after* the flip starts where the session is,
@@ -14456,7 +14535,7 @@ mod tests {
         let mut fx = app();
 
         // Before any frame there is no pane to select in, and no `area` to ask
-        // about one. Silence is the right answer — the same one `Alt+S` gives
+        // about one. Silence is the right answer — the same one `F1, S` gives
         // when the window is too narrow to split.
         fx.app.handle_key(key(KeyCode::F(7))).unwrap();
         assert!(fx.app.select.is_none(), "a selection over nothing drawn");
@@ -14470,7 +14549,7 @@ mod tests {
         );
 
         // And the same key puts it away, landing on the agent — the round
-        // trip `Alt+S` taught, and the agent is where this press came from.
+        // trip `F1, S` taught, and the agent is where this press came from.
         // Where it lands when it came from somewhere else is the test below.
         fx.app.handle_key(key(KeyCode::F(7))).unwrap();
         assert!(fx.app.select.is_none());
@@ -14510,7 +14589,7 @@ mod tests {
         fx.app.focus = Focus::Left;
         fx.app.handle_key(key(KeyCode::F(7))).unwrap();
         assert_eq!(fx.app.focus, Focus::Right, "that press does take focus");
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         assert!(fx.app.select.is_none(), "a selection outlived its pane");
         assert_eq!(fx.app.focus, Focus::Right);
 
@@ -14529,15 +14608,15 @@ mod tests {
         // for a child to have: `F7` from the agent, a drag over a line of
         // output to take it, `F7` to put the highlight away — and focus stayed
         // on the shell. `Esc` there is the child's, so the only key out is
-        // `Alt+S`, and whatever is typed first is a command at a prompt nobody
+        // `F1, S`, and whatever is typed first is a command at a prompt nobody
         // was aiming at. The drag was blamed for a focus move it never made:
         // `F7` had already moved focus, so the press that began the drag found
         // focus on the right and moved nothing.
         let mut fx = app();
         a_live_shell(&mut fx);
         // Home first — this sequence starts where the app lives.
-        fx.app.handle_key(alt(KeyCode::Char('s'))).unwrap();
-        assert_eq!(fx.app.focus, Focus::Left, "Alt+S is the way back");
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Left, "F4 is the way back");
 
         fx.app.handle_key(key(KeyCode::F(7))).unwrap();
         assert_eq!(fx.app.focus, Focus::Right, "F7 is what takes focus here");
@@ -14568,7 +14647,7 @@ mod tests {
         assert_eq!(
             fx.app.focus,
             Focus::Left,
-            "a drag left the typist on a live shell with only Alt+S out"
+            "a drag left the typist on a live shell with only F1, S out"
         );
     }
 
@@ -14581,13 +14660,13 @@ mod tests {
         // long after `F5` took it over. It then handed focus to the agent on
         // the strength of a move somebody else made.
         let mut fx = app();
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         screen(&mut fx.app, 120, 24);
         assert_eq!(fx.app.focus, Focus::Left);
 
         fx.app.handle_key(key(KeyCode::F(7))).unwrap();
         assert_eq!(fx.app.focus, Focus::Right, "F7 is what takes focus here");
-        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('n'));
         assert_eq!(fx.app.focus, Focus::Left);
         assert!(
             fx.app.select.is_some(),
@@ -14614,7 +14693,7 @@ mod tests {
         // landing two panes apart, with nothing on screen to say which one you
         // had pressed.
         let mut fx = app();
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         screen(&mut fx.app, 120, 24);
 
         // Made from the agent: `F7` took focus, so both exits give it back.
@@ -14660,7 +14739,7 @@ mod tests {
         let mut fx = app();
         stays(&mut fx);
         fx.app.queue.stub_item("wire-check-handback", Mode::Send);
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         screen(&mut fx.app, 120, 24);
 
         // Focused first, and selected second: this is the selection that took
@@ -14698,13 +14777,13 @@ mod tests {
 
     #[test]
     fn zooming_the_right_pane_away_takes_the_selection_with_it() {
-        // `Alt+Z` while selecting is the ordinary way to get here, and a
+        // `F1, Z` while selecting is the ordinary way to get here, and a
         // selection over a pane that is not on screen names rows nothing drew.
         let mut fx = app();
         selecting(&mut fx.app);
         assert!(fx.app.select.is_some());
 
-        fx.app.handle_key(alt(KeyCode::Char('z'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('z'));
         screen(&mut fx.app, 120, 24);
         assert!(fx.app.select.is_none());
         assert_eq!(fx.app.focus, Focus::Left);
@@ -14716,7 +14795,7 @@ mod tests {
         // over different text, with `Enter` sending whatever is under it now.
         let mut fx = app();
         selecting(&mut fx.app);
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         assert!(fx.app.select.is_none(), "a selection outlived its pane");
     }
 
@@ -14726,7 +14805,7 @@ mod tests {
         // nothing of its own: what comes back inverted is this feature's doing
         // and nobody else's.
         let mut fx = app();
-        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('d'));
         selecting(&mut fx.app);
         assert_eq!(inverted(&mut fx.app, 120, 24), vec![0], "the caret's row");
 
@@ -14758,7 +14837,7 @@ mod tests {
         // were not looking at. `w` is the git view's own key and opens its
         // worktree list — a change with a name this test can ask about.
         let mut fx = app();
-        fx.app.handle_key(alt(KeyCode::Char('g'))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('g'));
         selecting(&mut fx.app);
 
         for pressed in "wrt/f?".chars() {
@@ -14779,7 +14858,7 @@ mod tests {
         // the shell's prompt is the case that matters, and it is the same line
         // of code.
         let mut fx = app();
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         screen(&mut fx.app, 120, 24);
         fx.app.handle_key(key(KeyCode::F(5))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('i'))).unwrap();
@@ -14817,7 +14896,7 @@ mod tests {
         // The queue, because it draws text this test chose. Any pane would do:
         // what is under test is that the rows on screen are what leaves.
         fx.app.queue.stub_item("wire-check-selection", Mode::Send);
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         selecting(&mut fx.app);
 
         // The row the item is on, and that row alone. Selecting the whole pane
@@ -14873,7 +14952,7 @@ mod tests {
         let mut fx = app();
         assert!(!fx.app.agents[0].pane.bracketed_paste());
 
-        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('d'));
         selecting(&mut fx.app);
         fx.app.handle_key(key(KeyCode::Enter)).unwrap();
 
@@ -14894,7 +14973,7 @@ mod tests {
         // gets. What it must never be is silent — that is indistinguishable
         // from a dead key, which is what `y` was in every terminal before this.
         let mut fx = app();
-        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('d'));
         selecting(&mut fx.app);
         fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
@@ -14930,7 +15009,7 @@ mod tests {
         // and the terminal on the other end is nobody's to assert about.
         let mut fx = app();
         fx.app.queue.stub_item("wire-check-drag", Mode::Send);
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         screen(&mut fx.app, 120, 24);
         let inner = fx.app.right_inner.expect("a right pane");
 
@@ -15002,7 +15081,7 @@ mod tests {
         // every key anyway.
         let mut fx = app();
         fx.app.queue.stub_item("wire-check-ctrl-c", Mode::Send);
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         selecting(&mut fx.app);
         fx.app.handle_key(key(KeyCode::Char('v'))).unwrap();
         fx.app.handle_key(key(KeyCode::Char('G'))).unwrap();
@@ -15029,7 +15108,7 @@ mod tests {
         // view, the queue and the file list all pick a row on a press, and a
         // press that started a selection would have taken that away from them.
         let mut fx = app();
-        fx.app.handle_key(key(KeyCode::F(2))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('d'));
         screen(&mut fx.app, 120, 24);
         let inner = fx.app.right_inner.expect("a right pane");
 
@@ -15081,7 +15160,7 @@ mod tests {
         // this asks about.
         let mut fx = app();
         fx.app.queue.stub_item("wire-check-drawn", Mode::Send);
-        fx.app.handle_key(key(KeyCode::F(8))).unwrap();
+        hub(&mut fx.app, KeyCode::Char('w'));
         selecting(&mut fx.app);
 
         let row = fx

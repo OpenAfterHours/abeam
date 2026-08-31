@@ -1,5 +1,44 @@
 # Keymap, and the collision audit behind it
 
+## Current keymap: F1 command hub
+
+**This release is a clean cutover.** `F1` opens the application-command hub;
+press and release it, then press the displayed mnemonic. `F1, S` is a sequence,
+not a simultaneous chord. The former global Alt bindings and direct
+`F2`/`F3`/`F6`/`F8`/`F9` bindings are removed, not retained as Classic aliases.
+An unrecognised or modified continuation remains in the hub and is never sent
+to the focused child.
+
+| Key or sequence | Action | Focus result |
+| --- | --- | --- |
+| `F1` | Open the command hub; `F1, ?` opens this full reference | Unchanged until a command is chosen |
+| `F1, G` / `F1, E` | Show git / files-reader | Keep current focus |
+| `F1, B` | Open the file browser | Focus right |
+| `F1, S` | Open the shell | Focus right |
+| `F1, W` / `F1, P` / `F1, A` | Queue / scratch pad / ask without an attachment | Queue keeps focus; pad and ask focus right |
+| `F1, D` / `F1, T` | Diagnostics / reader theme | Keep current focus |
+| `F1, Z` | Hide or show the right pane | Keep focus on the meaningful pane |
+| `F1, J` / `F1, K` | Scroll the right pane one line | Keep current focus |
+| `F1, PageUp` / `F1, PageDown` | Page the right pane | Keep current focus |
+| `F1, N` | Focus the next agent | Focus left |
+| `F1, Q` | Quit; enter `F1, Q` again to confirm while a child is live | As confirmed |
+| `F1, Esc` | Dismiss the hub | Unchanged |
+| `F4` / `F5` | Focus the current agent / show and focus the right pane | Left / right respectively |
+| `F7` | Start or end keyboard selection in the right pane | Focus right |
+| `Ctrl+\` or `F12` | Send the next key to the agent verbatim | Agent receives that key |
+
+`F4` never cycles agents; `F1, N` is the explicit multi-agent command. The
+hub is the portable route for shell and every other application command, so no
+workflow depends on how Windows or a terminal reports left Alt versus AltGr.
+Alt combinations are released to the focused child, except for keys a focused
+right-pane editor owns locally. `F12` is the portable literal-next route when a
+layout needs AltGr to type a backslash.
+
+The material below is retained as a **historical audit of the retired direct
+map**. It records the evidence and collision decisions that led to the hub, but
+its `Alt+…`, `F2`, `F3`, `F6`, `F8`, and `F9` descriptions are not current
+bindings. The table above is authoritative for this release.
+
 > Provenance, for the Claude sections: extracted from
 > `C:/Users/philm/.local/bin/claude.exe` — **Claude Code 2.1.220**, 265,720,480
 > bytes, mtime 2026-07-25 — by the design pass on 2026-08-01 and re-checked on
@@ -64,7 +103,7 @@
 > standing in for them — which is the only reason the two rest on one standard
 > and not on two.
 
-## The invariant
+## Historical collision audit for the retired direct map
 
 **Against each agent's shipped default keymap, nothing abeam intercepts may be
 a key that agent can act on.** The
@@ -120,9 +159,10 @@ The strict invariant therefore applies to Codex's defaults, not to an arbitrary
 
 Typing at the agent is byte-for-byte what the pty spike did.
 
-## abeam's bindings
+### Retired direct bindings (historical)
 
-`crates/abeam/src/keys.rs` is the single table. Globals work at any focus.
+The retired global table was implemented in `crates/abeam/src/keys.rs` and
+worked at any focus.
 
 | Key | Action |
 | --- | --- |

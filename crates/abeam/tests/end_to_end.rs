@@ -61,7 +61,7 @@ const DEADLINE: Duration = Duration::from_secs(20);
 ///
 /// It has to exist on a bare runner, start quickly, print nothing whose text
 /// varies by version, and — because every test here ends by proving that
-/// `Alt+Q` asks before it takes a live child down — stay alive until it is
+/// `F1, Q` asks before it takes a live child down — stay alive until it is
 /// killed. Named absolutely on Unix, exactly as `panes::shell`'s own suite
 /// names it, so that a failure here is a fact about abeam and not about the
 /// runner's `PATH`.
@@ -389,8 +389,10 @@ fn send(session: &PtySession, bytes: &[u8]) {
 /// Both bytes go out in one `write`, which is what keeps them in one read — an
 /// `ESC` arriving alone is `Esc`, and this would then read as abeam ignoring a
 /// binding it in fact never received.
-fn alt(c: char) -> Vec<u8> {
-    vec![0x1b, c as u8]
+/// An F1 command-hub sequence, as a terminal sends it. F1 is SS3 `P` and the
+/// mnemonic follows as ordinary text after the hub has claimed the leader.
+fn command(c: char) -> Vec<u8> {
+    vec![0x1b, b'O', b'P', c as u8]
 }
 
 #[test]
@@ -489,9 +491,9 @@ fn an_official_codex_reaches_its_auth_ui_resizes_and_quits_cleanly() {
     send(&session, b"\x1b[B");
     wait_for(&session, "> 2. Sign in with Device Code");
 
-    send(&session, &alt('q'));
-    wait_for(&session, "Alt+Q again to quit");
-    send(&session, &alt('q'));
+    send(&session, &command('q'));
+    wait_for(&session, "F1, Q again to quit");
+    send(&session, &command('q'));
     let deadline = Instant::now() + DEADLINE;
     while Instant::now() < deadline {
         if session.try_wait().expect("poll abeam after quit").is_some() {
@@ -504,7 +506,7 @@ fn an_official_codex_reaches_its_auth_ui_resizes_and_quits_cleanly() {
 
 #[test]
 fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
-    // Delete this and nothing in the repository notices that `Alt+S` no longer
+    // Delete this and nothing in the repository notices that `F1, S` no longer
     // reaches a shell, that the shell no longer starts, or that what it prints
     // never arrives on screen — every other test of that pane builds it
     // in-process and never presses a key at the binary.
@@ -516,7 +518,7 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
     // abeam started, sized itself and drew — before any key is sent.
     wait_for(&session, "git");
 
-    send(&session, &alt('s'));
+    send(&session, &command('s'));
     wait_for(&session, SHELL_IS_UP);
 
     send(&session, ARITHMETIC);
@@ -545,14 +547,14 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
     );
 
     // Both children are live — the one in the left pane and the shell in the
-    // right — so the first Alt+Q asks and the second answers.
+    // right — so the first F1, Q asks and the second answers.
     //
     // **`wait_for` and not a bare `screen`, which is what this was and which
     // made it the one flaky assertion in this file.** [`send`] ends in a fixed
     // 250 ms sleep, and that pause is written for what it says it is — keeping
     // two bursts of keystrokes in order — not for standing in front of an
     // assertion. Between the write and the words appearing there is a whole
-    // round trip: bytes into abeam's pty, abeam's loop draining them, `Alt+Q`
+    // round trip: bytes into abeam's pty, abeam's loop draining them, `F1, Q`
     // decoded, `pending_quit` set, a frame drawn, and the frame's bytes back
     // out through the pty into this parser. Under a loaded machine — several
     // suites at once, which is exactly when it was caught — that is more than
@@ -561,9 +563,9 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
     //
     // Every other assertion here already waits. This one asserted on a
     // snapshot, so it was the only one that could lose the race.
-    send(&session, &alt('q'));
+    send(&session, &command('q'));
     wait_for(&session, "again to quit");
-    send(&session, &alt('q'));
+    send(&session, &command('q'));
     drop(session);
 }
 
@@ -578,7 +580,7 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
 /// portable-pty hands the bare name straight through when its own `PATH` walk
 /// finds nothing. The directory abeam runs with is the repository, which is the
 /// one directory in the whole question that somebody else gets to write to — so
-/// `Alt+S` falling back through a list of shells was one `git clone` away from
+/// `F1, S` falling back through a list of shells was one `git clone` away from
 /// executing a file out of the repo. `main` standing in `%SystemRoot%` is a
 /// second line of defence behind the resolver.
 ///
@@ -617,7 +619,7 @@ fn a_command_typed_into_the_shell_view_runs_and_its_output_is_on_screen() {
 /// `shell · zz-planted-shell`. Both patches were reverted; neither is anywhere
 /// in this branch.
 #[test]
-fn a_shell_planted_in_the_repository_is_not_what_alt_s_runs() {
+fn a_shell_planted_in_the_repository_is_not_what_f1_s_runs() {
     let dir = Dir::new("planted");
     plant(&dir);
 
@@ -635,7 +637,7 @@ fn a_shell_planted_in_the_repository_is_not_what_alt_s_runs() {
     let session = PtySession::spawn(cfg).expect("spawn abeam in a pty");
 
     wait_for(&session, "git");
-    send(&session, &alt('s'));
+    send(&session, &command('s'));
 
     // Refused, and said why. Had the bare name reached the spawn, the planted
     // copy would be running and this string would never arrive.
@@ -645,15 +647,15 @@ fn a_shell_planted_in_the_repository_is_not_what_alt_s_runs() {
         "the pane should name what it would not run; got:\n{text}"
     );
 
-    // One Alt+Q rather than two: no shell ever started, so the only live child
+    // One F1, Q rather than two: no shell ever started, so the only live child
     // is the one in the left pane, and the press that asks is the last thing
     // this test needs. Dropping the session takes the rest down.
-    send(&session, &alt('q'));
+    send(&session, &command('q'));
     drop(session);
 }
 
 #[test]
-fn the_second_alt_e_opens_a_file_list_that_can_be_walked_to_a_file() {
+fn f1_b_opens_a_file_list_that_can_be_walked_to_a_file() {
     // Delete this and the file list can stop opening, stop finding, or stop
     // showing what it found, and the only thing that would notice is a person.
     let dir = Dir::new("files");
@@ -669,12 +671,12 @@ fn the_second_alt_e_opens_a_file_list_that_can_be_walked_to_a_file() {
     // for. Which file that is depends on mtimes this test does not control, so
     // what is asserted is the rendering: the heading arrives styled, not as its
     // source, which is true of either document here.
-    send(&session, &alt('e'));
+    send(&session, &command('e'));
     wait_for(&session, "rendered");
 
     // Second press is the file list. A directory is the thing a document view
     // could never show, so it is what distinguishes the two on screen.
-    send(&session, &alt('e'));
+    send(&session, &command('b'));
     wait_for(&session, "subdir");
 
     // Then reach a file the pane was never pointed at, from the key that is the
@@ -695,8 +697,8 @@ fn the_second_alt_e_opens_a_file_list_that_can_be_walked_to_a_file() {
     // file the find reached is the file being read.
     wait_for(&session, "found me");
 
-    send(&session, &alt('q'));
-    send(&session, &alt('q'));
+    send(&session, &command('q'));
+    send(&session, &command('q'));
     drop(session);
 }
 
@@ -799,7 +801,7 @@ fn the_right_pane_can_be_pointed_at_a_worktree_and_both_of_its_views_follow() {
     // ...and the reader followed, without being told which file: `set_root`
     // leaves it empty and the startup walk of the *new* root opens the newest
     // document it finds there.
-    send(&session, &alt('e'));
+    send(&session, &command('e'));
     let read = wait_for(&session, "only in the review worktree");
     assert!(
         !read.contains("the agent's own root"),
@@ -810,8 +812,8 @@ fn the_right_pane_can_be_pointed_at_a_worktree_and_both_of_its_views_follow() {
         "the border stopped naming the workspace the reader is in: {read}"
     );
 
-    send(&session, &alt('q'));
-    send(&session, &alt('q'));
+    send(&session, &command('q'));
+    send(&session, &command('q'));
     drop(session);
 }
 
@@ -836,7 +838,7 @@ fn rows_of_the_shell_view_are_selected_and_copied_and_the_child_never_sees_the_k
     let session = abeam(&dir);
     wait_for(&session, "git");
 
-    send(&session, &alt('s'));
+    send(&session, &command('s'));
     wait_for(&session, SHELL_IS_UP);
     send(&session, ARITHMETIC);
     wait_for(&session, "56088");
@@ -870,7 +872,7 @@ fn rows_of_the_shell_view_are_selected_and_copied_and_the_child_never_sees_the_k
     // loud so that it is not "corrected" into the shape above.** The claim is
     // an *absence*, and an absence has nothing to wait for: a frame that has
     // not arrived yet also has no `jjj` in it. So this cannot lose the race the
-    // `Alt+Q` assertion could — it fails the other way, by passing while
+    // `F1, Q` assertion could — it fails the other way, by passing while
     // proving nothing, if [`send`]'s pause is ever too short. There is no
     // positive marker to wait on instead: `jjj` inside a selection moves a
     // caret and changes no word on any border, and adding one for a test to
@@ -906,18 +908,18 @@ fn rows_of_the_shell_view_are_selected_and_copied_and_the_child_never_sees_the_k
     // was kept away from, which is the other half of the claim and the half a
     // mode that never exited would pass without.
     //
-    // No `Alt+S` between the two, and that is the rule rather than a shortcut:
+    // No `F1, S` between the two, and that is the rule rather than a shortcut:
     // `Esc` out of a selection lands where a second `F7` would, and this
-    // selection took no focus — `Alt+S` had focused the shell long before `F7`
+    // selection took no focus — `F1, S` had focused the shell long before `F7`
     // was pressed. Putting the highlight away therefore hands nothing back, so
-    // the keys are the shell's already. `Alt+S` here would have walked *out* to
+    // the keys are the shell's already. `F1, S` here would have walked *out* to
     // the agent and typed three letters into a prompt.
     send(&session, b"\x1b");
     send(&session, b"jjj");
     let typed = wait_for(&session, "jjj");
     assert!(typed.contains("jjj"));
 
-    send(&session, &alt('q'));
-    send(&session, &alt('q'));
+    send(&session, &command('q'));
+    send(&session, &command('q'));
     drop(session);
 }

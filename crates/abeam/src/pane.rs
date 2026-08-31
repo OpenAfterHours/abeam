@@ -134,7 +134,7 @@ pub trait Pane {
     /// Not derivable from [`takes_input`](Pane::takes_input), which is why it
     /// is asked separately: there are three answers, not two. A read-only view
     /// gives focus back to the agent on `Esc`. A shell keeps `Esc` for its
-    /// child, so the way out is `Alt+S`. A view with a filter box open takes
+    /// child, so `F4` returns focus to the agent. A view with a filter box open takes
     /// `Esc` itself and gives you back the list — one press short of the agent,
     /// and a border that said `esc→agent` there would be naming a key that does
     /// something else.

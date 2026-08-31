@@ -16,6 +16,10 @@
 > `crates/abeam/src/ask/` for the second agent. `docs/keymap.md` is the keyboard
 > audit, and `docs/status.md` is what has and has not been proven.
 
+> **Current keyboard map:** the Option A `F1` command hub is authoritative.
+> Historical examples below that use global `Alt` bindings or retired direct
+> function keys are not current commands; see [docs/keymap.md](keymap.md).
+
 ## Why this rather than wezterm + lazygit + glow
 
 Because the right pane knows what the agent just did. A watcher on the

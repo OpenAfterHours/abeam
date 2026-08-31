@@ -11,6 +11,10 @@
 > list at the foot: each entry says what landed and what landed differently, and
 > where the two disagree the phase list is the one to believe.
 >
+> **Current keyboard map:** the Option A `F1` command hub is authoritative.
+> Historical examples below that use global `Alt` bindings or retired direct
+> function keys are not current commands; see [docs/keymap.md](keymap.md).
+>
 > Phase 1 was the seam and nothing a reader can see: `Agent::kind`,
 > `Agent::is_claude`, a `poll_readiness` that asks each pane and a
 > `roster_is_wanted` that asks whether any pane is Claude. `App::has_claude_state`
