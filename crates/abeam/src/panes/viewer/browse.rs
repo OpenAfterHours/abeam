@@ -644,10 +644,20 @@ impl Browser {
     /// `r`, with the guard a synchronous walk on the UI thread has to have.
     /// See [`RELOAD_COOLDOWN`].
     fn refresh(&mut self) -> Outcome {
-        if self.read_at.is_some_and(|at| at.elapsed() < RELOAD_COOLDOWN) {
+        self.refresh_at(Instant::now())
+    }
+
+    /// The clock-bearing half of [`Browser::refresh`], separate so a test can
+    /// describe a batch of repeat events without depending on how long the test
+    /// runner leaves its thread asleep.
+    fn refresh_at(&mut self, now: Instant) -> Outcome {
+        if self
+            .read_at
+            .is_some_and(|at| now.duration_since(at) < RELOAD_COOLDOWN)
+        {
             return Outcome::Ignored;
         }
-        self.read_at = Some(Instant::now());
+        self.read_at = Some(now);
         Outcome::Refreshed {
             changed: self.reload(),
         }
@@ -1745,15 +1755,22 @@ mod tests {
             b.key(key(KeyCode::Char('r'))),
             Outcome::Refreshed { .. }
         ));
+        let repeat_at = b.read_at.expect("the refresh is timestamped");
 
         std::fs::write(dir.path().join("b.md"), b"x\n").expect("write");
         for _ in 0..30 {
             assert!(
-                ignored(b.key(key(KeyCode::Char('r')))),
+                ignored(b.refresh_at(repeat_at)),
                 "a held r must not walk the directory again, or cost a frame"
             );
         }
         assert_eq!(labels(&b), ["a.md"], "and it did not touch the disk");
+
+        assert!(matches!(
+            b.refresh_at(repeat_at + RELOAD_COOLDOWN),
+            Outcome::Refreshed { changed: true }
+        ));
+        assert_eq!(labels(&b), ["a.md", "b.md"], "a later press still reads");
     }
 
     #[test]
