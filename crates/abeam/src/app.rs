@@ -6201,7 +6201,7 @@ impl App {
             if let Some(target) = self.pending_shell_close.as_ref()
                 && self.shell_target_is_current(target)
                 && outer.height > 0
-                && 1 + self.shell_close_prompt().width() <= usize::from(inner.width)
+                && self.shell_close_prompt().width() < usize::from(inner.width)
             {
                 self.shell_close_drawn = Some(target.clone());
             }
