@@ -6239,10 +6239,12 @@ impl App {
             // was a pane owning a piece of chrome the module doc on `Pane` says
             // belongs here — and it is what made moving the hint a rewrite of
             // six files rather than of this line.
-            spans.push(Span::styled(
-                format!("{} · ", self.right_pane_ref().exit_hint()),
-                Style::default().fg(Color::DarkGray),
-            ));
+            let pane = self.right_pane_ref();
+            let hint = match pane.action_hint() {
+                Some(action) => format!("{action} · {} · ", pane.exit_hint()),
+                None => format!("{} · ", pane.exit_hint()),
+            };
+            spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
         }
 
         if self.right_view != RightView::Viewer && self.viewer.has_pending() {
@@ -12317,6 +12319,41 @@ mod tests {
             "pad",
             "the chord reached the agent, and the pad is where it was"
         );
+    }
+
+    #[test]
+    fn the_pad_border_keeps_the_route_to_the_other_form_in_view_only_while_focused() {
+        let mut fx = app();
+        screen(&mut fx.app, 120, 24);
+        hub(&mut fx.app, KeyCode::Char('p'));
+
+        let title = |app: &App, focused: bool| -> String {
+            app.right_title(focused)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        let editing = title(&fx.app, true);
+        assert!(
+            editing.starts_with(" alt+t→rendered · esc→agent · pad "),
+            "{editing}"
+        );
+
+        fx.app.handle_key(alt(KeyCode::Char('t'))).unwrap();
+        let rendered = title(&fx.app, true);
+        assert!(
+            rendered.starts_with(" t→editing · esc→agent · pad · rendered "),
+            "{rendered}"
+        );
+
+        // Once the keys are back at the agent, neither instruction is shown:
+        // `Alt+T` now belongs to that agent and must not be advertised as a pad
+        // command merely because the pad remains visible beside it.
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        let unfocused = title(&fx.app, false);
+        assert_eq!(unfocused, " pad · rendered ");
     }
 
     #[test]
