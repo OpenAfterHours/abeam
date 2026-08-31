@@ -350,6 +350,13 @@ start.
 
 ## Keys
 
+> **Historical keymap audit:** the direct `Alt+…`, `F2`, `F3`, `F6`, `F8`, and
+> `F9` bindings discussed in the design narrative below have been retired. The
+> current interface routes these commands through the `F1` hub; see
+> [`keymap.md`](keymap.md). Later pane sections use the current spellings where
+> they describe current behaviour, while this audit retains the old spellings
+> to preserve the collision decisions that led to the hub.
+
 Everything abeam binds lives under `Alt` and the F-keys, with one exception:
 `Ctrl+\`, the escape hatch at the foot of the table, which has to be reachable
 on the day an `Alt` key stops being safe and so cannot live in the namespace it
@@ -803,27 +810,39 @@ the renderer or a rule true of one body form and not the other. It is written
 down in `crates/abeam/src/panes/viewer/search.rs` rather than half-done, because
 half of it is the inconsistency and not the fix.
 
-**shell** — `Alt+S`, and the reason it is here rather than in another window:
+**shell** — `F1, S`, and the reason it is here rather than in another window:
 `git branch`, `uv run ruff format`, `cargo test`, run in the directory abeam was
-pointed at, next to the session that is about to be told what they printed. It
-is a real pty — on Windows `pwsh`, falling back to `powershell` then `cmd`; on
-Linux `$SHELL` when it is set to anything, then `bash`, then `sh`; or whatever
+pointed at, next to the session that is about to be told what they printed. Each
+workspace owns a collection of independent ptys, with one selected for the
+right pane. `F1, S` shows that shell and creates one only when the collection is
+empty; `F1, C` appends and selects a fresh one; `F1, Left` and `F1, Right` move
+through them, wrapping at either end. Each shell keeps a stable id, because a
+close confirmation or an ask hand-off must still address the same child if the
+selected position changes.
+
+The ptys are real — on Windows `pwsh`, falling back to `powershell` then `cmd`;
+on Linux `$SHELL` when it is set to anything, then `bash`, then `sh`; or whatever
 `ABEAM_SHELL` names, which replaces the list rather than heading it, because a
-program you typed is a choice and falling back from it would hide the typo —
-started the first time the view is drawn and never before, so a session that
-never asks for one never pays for it. `Alt+J`/`Alt+K` scroll its history without
-focusing it, which is why they are not the arrow keys the shell would read as
-history. A child that exits leaves its last screen up with
-`Enter` to start another, and while it is dead `Esc` means what it means
+program you typed is a choice and falling back from it would hide the typo. A
+new shell is cold until its first frame is drawn, so a session nobody opens
+never starts a process. Hidden shells are still polled to drain output and reap
+exits, but only the selected shell can dirty the visible frame. `F1, J`/`F1, K`
+scroll its history without focusing it, which is why they are not the arrow
+keys the shell would read as history. A child that exits leaves its last screen
+up with `Enter` to start another, and while it is dead `Esc` means what it means
 everywhere else.
 
-Nor will abeam close out from under it: the agent exiting holds the door rather
-than killing whatever is running, and says `shell open · Alt+Q to quit` in the
+`F1, X` twice closes the selected shell and drops that exact pty, which kills
+its process tree. Closing the last one leaves the collection empty and returns
+focus to the agent; it does not quietly replace the shell just closed. Nor will
+abeam close out from under any shell: the agent exiting holds the door rather
+than killing whatever is running, and says `shell open · F1, Q to quit` in the
 left title. That is "open", not "busy" — ConPTY cannot be asked whether a
 command is running at all, and on Unix the question has an answer abeam does not
 go and get (`tcgetpgrp` on the master says which process group holds the
 terminal in the foreground) — so on both a shell sitting at a prompt holds the
-door exactly as a build does. Type `exit` in it, or `Alt+Q` twice.
+door exactly as a build does. Type `exit` in each live shell, close it, or enter
+`F1, Q` twice.
 
 **ask** — `?` from the document the reader has open or from the git view, `F6`
 from anywhere, and a second copy of your agent in the right pane which **may

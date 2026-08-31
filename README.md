@@ -204,13 +204,21 @@ Only `f` touches the disk, and it is the only one whose box waits for `Enter`
 rather than narrowing as you type. `Enter` on a result opens that file with the
 document search already looking for the same phrase.
 
-**shell** (`F1, S`) — a real shell in the directory abeam was pointed at, next to
-the session that is about to be told what it printed. `pwsh` on Windows, falling
-back to `powershell` then `cmd`; `$SHELL` then `bash` then `sh` on Linux; or
-whatever `ABEAM_SHELL` names. It starts the first time you open the view and
-never before. This is the one view that keeps `Esc` and `q` — they belong to the
-shell — so `F4` is the reliable way out. abeam will not quit out from under a
-running command: the agent exiting holds the door and the left title says
+**shell** (`F1, S`) — real shells in the directory abeam was pointed at, next to
+the session that is about to be told what they printed. `pwsh` on Windows,
+falling back to `powershell` then `cmd`; `$SHELL` then `bash` then `sh` on Linux;
+or whatever `ABEAM_SHELL` names. `F1, S` shows and focuses the active shell,
+creating one if there are none; `F1, C` always starts and selects a fresh shell.
+The border identifies the active shell and, when there is more than one, shows
+its position in the workspace. Use `F1, Left` and `F1, Right` to select the
+previous or next shell, wrapping at the ends. `F1, X` closes the active shell
+and its process tree after you enter the full `F1, X` sequence a second time to
+confirm. Closing the last shell returns focus to the agent and leaves the view
+empty until `F1, S` or `F1, C` starts another.
+
+This is the one view that keeps `Esc` and `q` — they belong to the shell — so
+`F4` is the reliable way out. abeam will not quit out from under a running
+command: the agent exiting holds the door and the left title says
 `shell open · F1, Q to quit`.
 
 **Telling the agent what it printed is a drag and a keystroke.** Highlight the
@@ -304,7 +312,10 @@ into the focused child.
 | `F1` | Open the command hub; `F1, ?` opens the full reference | Unchanged until a command is chosen |
 | `F1, G` / `F1, E` | Show git / files-reader | Keep current focus |
 | `F1, B` | Open the file browser | Focus right |
-| `F1, S` | Open the shell | Focus right |
+| `F1, S` | Show the active shell, creating one if none exists | Focus right |
+| `F1, C` | Start and select a fresh shell | Focus right |
+| `F1, Left` / `F1, Right` | Select the previous / next shell | Focus right |
+| `F1, X` | Close the active shell; enter `F1, X` again to confirm | Keep current focus if another shell remains; otherwise focus left |
 | `F1, W` / `F1, P` / `F1, A` | Queue / scratch pad / ask without an attachment | Queue keeps focus; pad and ask focus right |
 | `F1, D` / `F1, T` | Diagnostics / reader theme | Keep current focus |
 | `F1, Z` | Hide or show the right pane | Keep focus on the meaningful pane |

@@ -205,6 +205,15 @@ impl ShellPane {
         matches!(&self.state, State::Hosted { term, .. } if !term.has_exited())
     }
 
+    /// Whether no start has been attempted for this pane yet.
+    ///
+    /// This is state rather than a rendering flag: `Enter` can start a cold
+    /// pane after a frame has supplied its dimensions even when the app chose
+    /// not to render it in that frame (while confirming its close).
+    pub fn is_cold(&self) -> bool {
+        matches!(self.state, State::Cold)
+    }
+
     /// Put `text` at the prompt **without submitting it**, and say whether it
     /// went.
     ///
@@ -2217,4 +2226,3 @@ mod unix_tests {
         assert!(pane.selected_text(u16::MAX, u16::MAX).unwrap().is_empty());
     }
 }
-

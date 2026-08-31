@@ -14,7 +14,10 @@ to the focused child.
 | `F1` | Open the command hub; `F1, ?` opens this full reference | Unchanged until a command is chosen |
 | `F1, G` / `F1, E` | Show git / files-reader | Keep current focus |
 | `F1, B` | Open the file browser | Focus right |
-| `F1, S` | Open the shell | Focus right |
+| `F1, S` | Show the active shell, creating one if none exists | Focus right |
+| `F1, C` | Start and select a fresh shell | Focus right |
+| `F1, Left` / `F1, Right` | Select the previous / next shell | Focus right |
+| `F1, X` | Close the active shell; enter `F1, X` again to confirm | Keep current focus if another shell remains; otherwise focus left |
 | `F1, W` / `F1, P` / `F1, A` | Queue / scratch pad / ask without an attachment | Queue keeps focus; pad and ask focus right |
 | `F1, D` / `F1, T` | Diagnostics / reader theme | Keep current focus |
 | `F1, Z` | Hide or show the right pane | Keep focus on the meaningful pane |
@@ -33,6 +36,15 @@ workflow depends on how Windows or a terminal reports left Alt versus AltGr.
 Alt combinations are released to the focused child, except for keys a focused
 right-pane editor owns locally. `F12` is the portable literal-next route when a
 layout needs AltGr to type a backslash.
+
+Shells belong to the current workspace. When there is more than one, the shell
+border shows the active shell's position; `F1, Left` and `F1, Right` move
+through the workspace's shells, wrapping at the ends, without affecting other
+workspaces. `F1, C` always starts fresh, while `F1, S` returns to the active
+shell and creates one only when the collection is empty. Closing is deliberately
+a two-sequence action: enter the full `F1, X` sequence twice to close the active
+shell and its process tree. Closing the last shell returns focus to the agent
+and leaves an empty shell view rather than immediately spawning a replacement.
 
 The material below is retained as a **historical audit of the retired direct
 map**. It records the evidence and collision decisions that led to the hub, but

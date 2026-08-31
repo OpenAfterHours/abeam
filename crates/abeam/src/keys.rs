@@ -206,6 +206,14 @@ pub enum Action {
     /// workspace view at all.) Repeating a hub command does not toggle focus;
     /// `F4` returns it to the agent.
     ShowShell,
+    /// Create a fresh shell, select it, and focus the shell view.
+    CreateShell,
+    /// Select the previous shell in the current workspace.
+    PreviousShell,
+    /// Select the next shell in the current workspace.
+    NextShell,
+    /// Close the selected shell after application-level confirmation.
+    CloseShell,
     /// Show the queue without moving focus. Selected by F1, W.
     ShowQueue,
     /// Show and focus the scratch pad. Selected by F1, P; repeat presses
@@ -307,6 +315,10 @@ pub fn hub(key: &KeyEvent) -> Option<HubCommand> {
         KeyCode::Char('e') | KeyCode::Char('E') => HubCommand::Action(Action::ShowViewer),
         KeyCode::Char('b') | KeyCode::Char('B') => HubCommand::Action(Action::ShowBrowser),
         KeyCode::Char('s') | KeyCode::Char('S') => HubCommand::Action(Action::ShowShell),
+        KeyCode::Char('c') | KeyCode::Char('C') => HubCommand::Action(Action::CreateShell),
+        KeyCode::Left => HubCommand::Action(Action::PreviousShell),
+        KeyCode::Right => HubCommand::Action(Action::NextShell),
+        KeyCode::Char('x') | KeyCode::Char('X') => HubCommand::Action(Action::CloseShell),
         KeyCode::Char('w') | KeyCode::Char('W') => HubCommand::Action(Action::ShowQueue),
         KeyCode::Char('p') | KeyCode::Char('P') => HubCommand::Action(Action::ShowPad),
         KeyCode::Char('a') | KeyCode::Char('A') => HubCommand::Action(Action::ShowAsk),
@@ -332,7 +344,10 @@ pub const HUB: &[(&str, &str)] = &[
     ("G", "git (keeps current focus)"),
     ("E", "files / reader (keeps current focus)"),
     ("B", "file browser (opens and focuses)"),
-    ("S", "shell (opens and focuses)"),
+    ("S", "active shell (starts one if needed; focuses)"),
+    ("C", "new shell (starts fresh and focuses)"),
+    ("← / →", "previous / next shell (wraps)"),
+    ("X", "close active shell (repeat F1, X to confirm)"),
     ("W", "work queue (keeps current focus)"),
     ("P", "scratch pad (opens and focuses)"),
     ("A", "ask (opens and focuses)"),
@@ -354,12 +369,31 @@ pub const HELP: &[(&str, &str)] = &[
     // opens this overlay before they open an issue. Every `Alt` row below is
     // reachable from either `Alt` key: Windows spells AltGr as Ctrl+Alt, and
     // `alt_chord` counts both.
-    ("F1", "open the command hub; command keys below are sequences, not chords"),
+    (
+        "F1",
+        "open the command hub; command keys below are sequences, not chords",
+    ),
     ("F1, G / E", "show git / reader, keeping current focus"),
     ("F1, B", "open the file browser and focus it"),
-    ("F1, S / W", "open the shell and focus it / show the work queue"),
-    ("F1, P / A", "open the scratch pad / ask composer and focus it"),
-    ("F1, D / T", "toggle diagnostics / reader theme, keeping current focus"),
+    (
+        "F1, S",
+        "show and focus the active shell; create one if none exists",
+    ),
+    ("F1, C", "create and focus a fresh shell"),
+    (
+        "F1, ← / →",
+        "select the previous / next shell, wrapping around",
+    ),
+    ("F1, X", "close the active shell (repeat F1, X to confirm)"),
+    ("F1, W", "show the work queue, keeping current focus"),
+    (
+        "F1, P / A",
+        "open the scratch pad / ask composer and focus it",
+    ),
+    (
+        "F1, D / T",
+        "toggle diagnostics / reader theme, keeping current focus",
+    ),
     ("F1, Z", "hide / show the right pane"),
     // The parenthetical is the whole of what a second agent costs this table.
     // `F4` has always meant "give the keys to the left" and a second press did
@@ -369,10 +403,7 @@ pub const HELP: &[(&str, &str)] = &[
     // is deliberately not abeam's; see `global` above on `Ctrl+F12`.
     ("F4 / F5", "focus agent / right pane"),
     ("F1, J / K", "scroll right pane, without focusing it"),
-    (
-        "F1, PgDn / PgUp",
-        "page right pane, without focusing it",
-    ),
+    ("F1, PgDn / PgUp", "page right pane, without focusing it"),
     ("F1, N", "next agent and focus it"),
     // "while a child is live", not "while the agent is running": `app::act`
     // quits outright only when the agent has exited *and* no shell is live, so
@@ -837,10 +868,7 @@ mod tests {
 
     #[test]
     fn retired_globals_fall_through_and_the_hub_owns_their_actions() {
-        for mods in [
-            KeyModifiers::ALT,
-            KeyModifiers::ALT | KeyModifiers::CONTROL,
-        ] {
+        for mods in [KeyModifiers::ALT, KeyModifiers::ALT | KeyModifiers::CONTROL] {
             for c in "gesqwpadztjk".chars() {
                 assert_eq!(global(&k(KeyCode::Char(c), mods)), None, "{mods:?}+{c}");
             }
@@ -857,6 +885,8 @@ mod tests {
             (KeyCode::Char('e'), Action::ShowViewer),
             (KeyCode::Char('b'), Action::ShowBrowser),
             (KeyCode::Char('s'), Action::ShowShell),
+            (KeyCode::Char('c'), Action::CreateShell),
+            (KeyCode::Char('x'), Action::CloseShell),
             (KeyCode::Char('w'), Action::ShowQueue),
             (KeyCode::Char('p'), Action::ShowPad),
             (KeyCode::Char('a'), Action::ShowAsk),
@@ -867,17 +897,65 @@ mod tests {
             (KeyCode::Char('q'), Action::Quit),
         ];
         for (code, action) in cases {
-            assert_eq!(hub(&k(code, KeyModifiers::NONE)), Some(HubCommand::Action(action)));
-            assert_eq!(hub(&k(code, KeyModifiers::SHIFT)), Some(HubCommand::Action(action)));
+            assert_eq!(
+                hub(&k(code, KeyModifiers::NONE)),
+                Some(HubCommand::Action(action))
+            );
+            assert_eq!(
+                hub(&k(code, KeyModifiers::SHIFT)),
+                Some(HubCommand::Action(action))
+            );
+            if let KeyCode::Char(c) = code {
+                assert_eq!(
+                    hub(&k(
+                        KeyCode::Char(c.to_ascii_uppercase()),
+                        KeyModifiers::SHIFT
+                    )),
+                    Some(HubCommand::Action(action)),
+                    "the shifted character spelling must resolve too"
+                );
+            }
             assert_eq!(hub(&k(code, KeyModifiers::ALT)), None);
+            assert_eq!(hub(&k(code, KeyModifiers::CONTROL)), None);
             assert_eq!(
                 hub(&k(code, KeyModifiers::ALT | KeyModifiers::CONTROL)),
                 None,
                 "AltGr must not trigger F1 hub commands"
             );
         }
-        assert_eq!(hub(&k(KeyCode::Char('?'), KeyModifiers::SHIFT)), Some(HubCommand::Reference));
-        assert_eq!(hub(&k(KeyCode::F(1), KeyModifiers::NONE)), Some(HubCommand::Open));
+        assert_eq!(
+            hub(&k(KeyCode::Char('?'), KeyModifiers::SHIFT)),
+            Some(HubCommand::Reference)
+        );
+        assert_eq!(
+            hub(&k(KeyCode::F(1), KeyModifiers::NONE)),
+            Some(HubCommand::Open)
+        );
+    }
+
+    #[test]
+    fn shell_navigation_is_owned_by_the_hub_only() {
+        for (code, action) in [
+            (KeyCode::Left, Action::PreviousShell),
+            (KeyCode::Right, Action::NextShell),
+        ] {
+            assert_eq!(
+                hub(&k(code, KeyModifiers::NONE)),
+                Some(HubCommand::Action(action))
+            );
+            assert_eq!(
+                hub(&k(code, KeyModifiers::SHIFT)),
+                Some(HubCommand::Action(action))
+            );
+            assert_eq!(hub(&k(code, KeyModifiers::ALT)), None);
+            assert_eq!(hub(&k(code, KeyModifiers::CONTROL)), None);
+            assert_eq!(
+                hub(&k(code, KeyModifiers::ALT | KeyModifiers::CONTROL)),
+                None,
+                "AltGr must not trigger shell navigation"
+            );
+            assert_eq!(global(&k(code, KeyModifiers::NONE)), None);
+        }
     }
 
     #[test]
@@ -1063,8 +1141,22 @@ mod tests {
         }
         let listed: Vec<&str> = HELP.iter().map(|(k, _)| *k).collect();
         for expected in [
-            "F1", "F1, G / E", "F1, B", "F1, S / W", "F1, P / A", "F1, D / T", "F1, Z", "F1, N",
-            "F1, Q", "F4 / F5", "F7", "Ctrl+\\ or F12",
+            "F1",
+            "F1, G / E",
+            "F1, B",
+            "F1, S",
+            "F1, C",
+            "F1, ← / →",
+            "F1, X",
+            "F1, W",
+            "F1, P / A",
+            "F1, D / T",
+            "F1, Z",
+            "F1, N",
+            "F1, Q",
+            "F4 / F5",
+            "F7",
+            "Ctrl+\\ or F12",
         ] {
             assert!(
                 listed.iter().any(|k| k.contains(expected)),

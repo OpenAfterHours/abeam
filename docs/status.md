@@ -6,7 +6,8 @@
 > abeam with real work, this is the page to read.
 
 > **Keyboard cutover:** the current release uses the `F1` command hub. `F1, S`
-> opens the shell; `F1, ?` opens the full reference; `F1`, `F4`, `F5`, `F7`,
+> shows the active shell or creates one when none exists; `F1, C` starts a fresh
+> shell; `F1, ?` opens the full reference; `F1`, `F4`, `F5`, `F7`,
 > `F12` (and `Ctrl+\`) are the only direct global routes. The former Alt globals and
 > direct `F2`/`F3`/`F6`/`F8`/`F9` routes are removed, not aliases. This status
 > page preserves earlier test and audit notes, so a direct-key reference below
@@ -550,19 +551,21 @@ opinion, and nobody has made one.
   a third spelling to everything downstream. The fix for a `..`, if a source
   ever emits one, is to resolve it at that source — resolving it textually is
   wrong wherever there is a symlink, since `a/link/..` is not `a`.
-- **Each workspace you visit gets its own shell, and any of them can hold the
-  door.** A shell cannot be re-rooted for the same reason the agent cannot, so
-  switching workspaces with the command view up starts a second child rather
-  than moving the first; the number of shell processes grows with the number of
-  worktrees somebody has typed in, and `F1, Q` asks about every one of them, so
-  a build left running in a workspace nobody is looking at still makes quitting
-  ask twice. The related cost is a workspace `git worktree remove` has deleted
-  while a child of yours is still running in it: abeam keeps it rather than
-  killing the build, it drops off the list because the list is built from what
-  git said, and switching away from it is a one-way trip until that child
-  finishes. Unlisted-and-still-running is the smaller of the two failures, and
-  it is the one deliberately chosen.
-- **The shell view has never been driven by a human.** A test types `set /a
+- **Each workspace you visit gets its own shell collection, and any shell in it
+  can hold the door.** A shell cannot be re-rooted for the same reason the agent
+  cannot, so switching workspaces with the command view up selects that
+  workspace's collection rather than moving a child. `F1, C` can add more than
+  one child to a workspace; the number of processes therefore grows with both
+  the worktrees and the fresh shells somebody has opened. `F1, Q` asks about
+  every one of them, so a build left running in either a hidden workspace or an
+  unselected shell still makes quitting ask twice. The related cost is a
+  workspace `git worktree remove` has deleted while a child of yours is still
+  running in it: abeam keeps it rather than killing the build, it drops off the
+  list because the list is built from what git said, and switching away from it
+  is a one-way trip until every child there finishes. Unlisted-and-still-running
+  is the smaller of the two failures, and it is the one deliberately chosen.
+- **The shell view, including its multiple-shell controls, has never been driven
+  by a human.** A test types `set /a
   123*456` into the real binary and reads `56088` back off the screen, which is
   more than a smoke test and still less than use: the six pass criteria above
   were confirmed against Claude in the *left* pane, and a shell in a
