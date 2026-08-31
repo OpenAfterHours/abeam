@@ -4,6 +4,7 @@ pub mod git;
 pub mod pad;
 pub mod queue;
 pub mod shell;
+pub mod shells;
 pub mod terminal;
 pub mod viewer;
 
@@ -13,6 +14,7 @@ pub use git::GitPane;
 pub use pad::PadPane;
 pub use queue::QueuePane;
 pub use shell::ShellPane;
+pub use shells::{ShellCommand, ShellId, ShellSessions};
 pub use terminal::TerminalPane;
 pub use viewer::ViewerPane;
 
