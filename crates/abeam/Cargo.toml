@@ -1,6 +1,6 @@
 [package]
 name = "abeam"
-description = "A terminal multiplexer for an AI coding workflow on Windows and Linux: the agent in one pane, git, files and a shell in the other. Hosts Claude Code and GitHub Copilot CLI."
+description = "A terminal multiplexer for an AI coding workflow on Windows and Linux: the agent in one pane, git, files and a shell in the other. Built on Claude Code; also hosts OpenAI Codex CLI (smoke-tested), GitHub Copilot CLI and hailer (never run)."
 # Five is crates.io's limit, so this is a choice rather than a list: what abeam
 # is, what it is built on, and the two agents somebody would search for by name.
 # `pty` holds the middle slot that `conpty` used to, now that ConPTY is one of
