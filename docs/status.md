@@ -67,8 +67,8 @@ searches under the reader — a file by its name, a phrase on the page, a phrase
 in every file under the root except directories that are worktrees of another
 repository, which the file list will still walk you into and marks `unindexed`
 on its border while you stand there. Focus, zoom, help, the diagnostics view,
-and the literal-next escape hatch. Agent selection for Claude, Copilot and Codex and the
-launcher underneath it. The
+and the literal-next escape hatch. Agent selection — for Claude, Copilot, Codex
+and hailer — and the launcher underneath it. The
 Unix port, in the sense that the whole workspace builds, tests and lints clean
 for both `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` — see
 "Platforms" for the sense in which it is not done. Mermaid flowcharts and
@@ -101,6 +101,80 @@ an existing `[preset.codex]` is refused and must be renamed, with its callers
 changed to the new `+name`. A preset may still use `host = "codex"`; that
 resolves to the built-in provider and keeps the capability boundaries described
 above.
+
+hailer support means the same thing at the same boundary — `hailer` in the left
+pty, at Codex's tier — with less behind it, because **nobody has hosted it**.
+What has been exercised is uv's mechanism, not the documented routes. Every
+run below used stand-in packages, with uv 0.12.1 on Windows, offline, in
+isolated directories, and none of them started abeam.
+
+- **First pass**, with abeam's own 0.0.1 wheel — which declares no extras —
+  and a hand-built stand-in, `fakehailer`, whose console script is `hailer`.
+  `uv tool install` of the abeam wheel `--with` the stand-in exposed
+  `abeam.exe` alone, as a byte-identical copy in uv's bin directory rather
+  than a link, and left `hailer.exe` in the tool environment's `Scripts\`.
+  Adding `--with-executables-from` the stand-in put `hailer.exe` beside
+  `abeam.exe`, and that flag also installed the stand-in by itself. `uvx` put
+  its environment's `Scripts\` first on a child's `PATH` — seen through `uvx
+  --from fakehailer hailer` and a `python -c` probe, not through abeam. With
+  the stand-in declaring `Requires-Python >=3.12`, `--python 3.9` made both
+  `uv tool install` and `uvx` fail resolution out loud; left to itself, uv
+  chose 3.13.
+- **Second pass**, for the extra, with a stand-in abeam: `abeamx` 1.0 with no
+  extras — as abeam 0.12.0 and every release before it has none — and 1.1
+  with an extra `hailer` requiring `fakehailer>=0.1.3`, which itself declares
+  `Requires-Python >=3.12`. On `--python 3.11`, `uv tool install
+  "abeamx[hailer]"` installed 1.0 and said only `warning: The package
+  abeamx==1.0 does not have an extra named hailer`, and `uvx --from
+  "abeamx[hailer]" abeamx` ran 1.0. What named the stand-in hailer directly
+  failed out loud instead — the extra with `--with-executables-from
+  fakehailer`, and `uvx --with fakehailer abeamx` — and so did a floor on the
+  stand-in abeam, `--from "abeamx[hailer]>=1.1"`. On the default interpreter
+  the extra resolved to 1.1 with the stand-in. And `uv tool install abeamx`
+  followed by `uv tool install abeamx --with-executables-from fakehailer`,
+  without `--force`, added the stand-in to the existing install and exposed
+  `hailer.exe`.
+- **Third pass**, for a marker, adding `abeamx` 1.2 whose extra is
+  `fakehailer>=0.1.3; python_version >= "3.12"`. On `--python 3.11`, `uv tool
+  install "abeamx[hailer]"` installed the newest, 1.2, with no stand-in and no
+  warning at all, and `uvx --python 3.11 --from "abeamx[hailer]"` ran 1.2. On
+  `--python 3.12` the same install brought 1.2 and the stand-in. And `uv tool
+  install abeamx --with-executables-from fakehailer` on 3.11 still failed out
+  loud. This pass is why the extra now carries the marker: on an old Python it
+  yields the newest abeam and no hailer, rather than an abeam from before
+  hailer was built in.
+- **maturin 1.15.0** writes the extra into this project's metadata: `maturin
+  sdist` produces a `PKG-INFO` carrying `Provides-Extra: hailer` and, with the
+  marker, `Requires-Dist: hailer>=0.2.5 ; python_full_version >= '3.12' and
+  extra == 'hailer'` — maturin rewrites `python_version` as
+  `python_full_version`, which answers the same for every final release and
+  differs only for a 3.12 pre-release (read from PEP 440's version ordering;
+  not tested). No wheel was built to read its
+  `METADATA`.
+
+**Never run:** an install of `abeam[hailer]`, or of the real abeam with any
+extra; `uv tool install hailer`; pip, by any route; abeam resolving `+hailer`
+against a hailer uv installed; anything on Linux; an install from a
+maturin-built wheel; and the real hailer inside abeam, for so much as a
+keystroke. The comment beside the
+extra in `pyproject.toml` is where these results become the routes the
+documentation gives, and why the extra is not one of them for uv users.
+
+When the agent abeam could not find is hailer, the sentence on installing it
+that ends the message is, byte for byte:
+
+```
+Install it with `uv tool install hailer`, or beside abeam with `uv tool install abeam --with-executables-from hailer`, then run `hailer login openai` once and `hailer init` in each project.
+```
+
+The same configuration change comes with it: `hailer` is built in now, so a
+`[preset.hailer]` is refused. One that set nothing but `host = "hailer"` only
+repeats the built-in and can be deleted; any other wants a new name, keeping
+its `host` line as it is — a `host = "hailer"` there resolves to the built-in.
+And one command line changes meaning. `abeam hailer …` used to hand `hailer …`
+as a prompt to the default agent — Claude, unless `ABEAM_AGENT` names another —
+and is now refused, as `abeam codex` is. `abeam -- hailer …` is how to write
+that prompt now.
 
 Two of those changed Windows behaviour on the way past, and both are worth
 seeing before you upgrade rather than after.
@@ -782,6 +856,56 @@ opinion, and nobody has made one.
   Codex can bind direct keys through a custom `tui.keymap`; abeam does not parse that configuration, and
   literal-next (`Ctrl+\` or `F12`) is the recovery path. `docs/keymap.md` has the
   provenance and the remaining live-audit checklist.
+- **hailer support stops where Codex's does, and has never been run at all.**
+  Everything in this bullet is read out of code — abeam's, and hailer's at its
+  `v0.2.5` tag — and none of it has been watched; what was run to check the
+  install is recorded above. Ask and background dispatch are unavailable as
+  they are under Codex, and queue send items are blocked for Codex's reason.
+
+  **A first run needs two steps before `abeam +hailer notebook` gets
+  anywhere.** An API key, which `hailer login openai` stores once in the OS
+  credential store or `OPENAI_API_KEY` supplies; and a project, which `hailer
+  init` sets up by writing `hailer.toml`, `.config/hailer/`, a starter
+  notebook under `notebooks/`, and `data/`. Until both are there, `hailer
+  notebook` prints the checks that failed and exits 1. `init` writes into the
+  directory it is run in, while the chat finds its project by walking up from
+  where it starts to the first directory holding a `pyproject.toml` or
+  hailer's config — so run `init` in the directory you start abeam in. An
+  `init` run in a subdirectory of a Python project is missed from its root,
+  which has a `pyproject.toml` of its own. On the one-run route the two steps
+  are `uvx hailer login openai` and `uvx hailer init`.
+
+  Plain `abeam +hailer` hosts a hailer that fails unless a marimo server is
+  already running, so the line is `abeam +hailer notebook`, which starts
+  marimo or reuses one and opens the notebook in a browser. hailer 0.2.5's
+  prompt is a plain line read with `input()` and never asks for bracketed
+  paste, which costs two things: `Enter` on a selection in the right pane is
+  refused with `the agent is not taking pastes`, and a multi-line paste from
+  your own terminal is passed through unbracketed — as it would be outside
+  abeam — so each line in it should arrive as a separate submission.
+
+  **What becomes of marimo when the pane closes depends on who started it.** A
+  marimo that `hailer notebook` reused is not hailer's child, and hailer's own
+  exit path leaves it running, pane or no pane. One it started, it stops when
+  the chat ends normally, unless told `--keep-marimo`. On Linux that flag is
+  expected to do nothing inside abeam, by construction and unobserved.
+  `_spawn_marimo` passes a creation flag only on Windows and never asks for a
+  new session, so marimo stays in hailer's process group; inside abeam hailer
+  leads the pty's session, and when a session leader exits — at an ordinary
+  quit as much as at a closed pane — the kernel sends `SIGHUP` to the
+  terminal's foreground process group, which is that one. When abeam ends the
+  pane it signals the same group. Whether marimo's own kernels stay in it has
+  not been looked at. On Windows, whether abeam's kill reaches marimo is
+  unverified. `hailer.exe` is uv's launcher, which starts Python at once, and
+  abeam adopts a child into its job object only after `CreateProcessW` has
+  returned — the gap `crates/abeam-pty/src/tree/windows.rs` documents — so
+  whether that Python, and marimo after it, lands in the job is not known. No
+  hailer path has been run on Linux, and nothing has been run signed in.
+
+  hailer 0.2.5 binds no keys of its own. On Windows its line is edited by the
+  console, whose cooked read gives `F1`–`F9` meanings of its own, mostly about
+  the previous line and the history, and abeam takes `F1`, `F4`, `F5` and `F7`
+  from that set. `docs/keymap.md` has the audit.
 - **abeam has never been run with Copilot CLI.** Not once, not for a minute. It
   is not installed on the machine abeam is developed on and cannot easily be:
   the npm package wants Node 22 and this box has v20.14.0, and neither `winget

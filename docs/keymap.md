@@ -114,6 +114,19 @@ bindings. The table above is authoritative for this release.
 > checked against the same bytes `F8` was, rather than against a later build
 > standing in for them — which is the only reason the two rest on one standard
 > and not on two.
+>
+> The hailer section carries a fourth, and it is the thinnest because there is
+> the least to read: `OpenAfterHours/hailer` at tag **`v0.2.5`**, commit
+> `91d27ec`, read on 2026-09-18. That release pins `rich>=15.0`, and
+> `Console.input` calling the builtin `input()` was read in rich 15.0.0. What
+> edits that line is the platform's, so two more sources stand behind it:
+> CPython's `Parser/myreadline.c` on the `3.12` branch, the oldest Python
+> hailer accepts, and Microsoft's
+> [`doskey` reference](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/doskey)
+> for the console's own editing keys. No hailer has been hosted, so nothing in
+> that section was audited live. Its note on prompt_toolkit reads **3.0.53**,
+> the version on the `master` branch of `prompt-toolkit/python-prompt-toolkit`
+> on the same day.
 
 ## Historical collision audit for the retired direct map
 
@@ -462,7 +475,10 @@ every letter, which is why the border there advertises `Alt+S` as the way out �
 so a pane-local key would be missing from the view the whole feature exists for.
 You select what a command printed. That leaves only what `global` claims before
 any pane is offered anything, and inside `global` only a key that the audited
-shipped defaults for Claude, Copilot and Codex leave alone.
+shipped defaults for Claude, Copilot and Codex leave alone. hailer 0.2.5 binds
+nothing itself, but on Windows the console line it reads with does give `F7`
+a meaning — the history list — which "hailer's bindings" at the foot of this
+document weighs.
 
 It is also not the way most people will copy anything, and the table above is
 right to be the only place it looks central. **A drag in the right pane selects
@@ -1362,3 +1378,79 @@ key and be told to act on one.
 - **The audit is Windows-only.** A Linux Codex binary and Linux terminal path
   were not inspected. Run `keyprobe`, then host Codex and use literal-next to
   exercise every abeam global in the composer, lists, pager and approval UI.
+
+## hailer's bindings, as of 0.2.5
+
+**hailer 0.2.5 binds no keys, and that is a finding rather than a gap in the
+audit.** `ChatLoop.run` in `src/hailer/cli.py` reads every line with
+`self.console.input(...)`; rich's `Console.input` prints the prompt and then
+calls the builtin `input()`. There is no prompt_toolkit and no `import
+readline` anywhere in hailer's source, and the one other prompt in it —
+`hailer login`'s hidden key prompt, through `typer.prompt` — is another plain
+line, in another subcommand. So the only thing hailer claims is a line, and
+what edits that line belongs to the platform underneath it. That makes this the
+one section of this document where the collisions are with a terminal's line
+discipline rather than with an agent.
+
+The keys abeam still takes before a child sees them are the ones in
+`keys::global` — `F1` and the key after it, `F4`, `F5`, `F7`, `F12` and
+`Ctrl+\` — and nothing else reaches the question: the pad's `Alt+T` and a
+selection's `Ctrl+C` are pane-local, heard only while the right pane has the
+keys, which is the exemption `crate::keys` states once for all of them.
+
+**On Windows the line is the console's.** CPython's `input()` on a console goes
+through `_PyOS_WindowsConsoleReadline`, which calls `ReadConsoleW` and sets no
+console mode of its own, so the line is edited by the console's cooked read —
+the keys Microsoft documents under `doskey` for any console process that uses
+buffered input. Four of them are abeam's:
+
+| Key | The console's cooked read | Inside abeam |
+| --- | --- | --- |
+| `F1` | copy one character of the last line | opens the hub |
+| `F4` | delete up to a character typed next | focus the agent — already there, so nothing visible |
+| `F5` | copy the last line into this one | show and focus the right pane |
+| `F7` | the history list, in a popup | keyboard selection in the right pane |
+
+`F2`, `F3`, `F6`, `F8`, `F9`, the arrows — Up and Down are the history — and
+`Esc` all pass through. None of the four is a collision hailer brought: all
+four were abeam's before hailer was added, and every Windows program reading
+lines this way — `cmd.exe` included — loses the same four inside abeam. Each is
+one literal-next away (`Ctrl+\` or `F12`, then the key). This is read out of
+two documents, not observed: nobody has pressed `F7` at a hailer prompt under
+ConPTY and seen what comes up.
+
+**On Linux it depends on one import.** CPython's `input()` edits with GNU
+readline only when something in the process has imported `readline`. hailer's
+own modules do not, and neither of the two `import marimo` lines in its source
+runs in the chat: one is code sent to the kernel, in marimo's server process
+(`tools.py`), and the other is the starter notebook `hailer init` writes to
+disk (`notebooks.py`). A reviewer's import-time trace of the 0.2.5 chat
+process — langchain_openai, polars, duckdb — found no attempt to import
+`readline` either; that trace ran on Windows under CPython 3.13 and covers
+import time only, so an import made only on POSIX would not show in it. If a later dependency makes one, readline's emacs table is
+the one to audit, and nobody has. Without it the line is the kernel's
+canonical mode, where by default `Ctrl+C`, `Ctrl+D`, `Ctrl+U`, `Ctrl+W`,
+`Ctrl+Z` and `Ctrl+V` mean what `stty -a` says — abeam takes none of them — and
+`Ctrl+\` is the quit character, which sends `SIGQUIT`, and Python leaves that
+at its default of ending the process. abeam takes that key for literal-next, so
+the collision runs in hailer's favour: a stray `Ctrl+\` arms the escape hatch
+instead of killing the session, and `Ctrl+\` `Ctrl+\` sends the signal anyway.
+Not observed either.
+
+**If hailer moves to prompt_toolkit**, its default emacs bindings collide with
+nothing abeam intercepts. Checked against 3.0.53: `basic.py` puts `f1`–`f24`
+and `c-\` under `_ignore` — bound only so the escape sequence is not inserted
+as text — and `emacs.py` binds none of abeam's keys, its `Alt+\` being a key
+abeam forwards. That is a library's defaults, not a hailer: an application
+built on it can bind a function key, and one that took abeam's would need
+literal-next like any other.
+
+### Known gaps, against hailer
+
+- **No hailer has been hosted**, so every line above is source- and
+  documentation-derived. The first live check is `abeam +hailer notebook` on
+  Windows, then `F1`, `F4`, `F5`, `F7` behind literal-next at its prompt.
+- **The Linux half rests on one import-time trace.** It was a reviewer's, of
+  the 0.2.5 chat process, and nobody has run hailer on Linux under abeam. A
+  later dependency that imports `readline` would make an unaudited readline
+  table, not the canonical-mode paragraph above, the true one.
