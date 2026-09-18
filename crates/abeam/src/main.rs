@@ -258,15 +258,20 @@ fn main() -> Result<()> {
                 .size(inner.height.max(1), inner.width.max(1)),
         )?;
         // `hosted` whole, rather than the one string the shell used to need.
-        // Three of its fields are read and they go to three different places —
-        // `agent` decides whether `--bg` dispatch exists at all, `name` is the
-        // border's word, and `launch` is how a pane opened on a keystroke is
-        // started. That last one is the reason this is no longer a `&str`: the
-        // resolution happened up there, before `term::setup` and before abeam
-        // walked away from the repository, and `main` is the only place holding
-        // it. `crate::app::Recipe` is where the argument lives about what such
-        // a pane may inherit from the command line this function read — and the
-        // short version is nothing, because `-p` and `--resume` are in there.
+        // Its fields go to different places — `agent` decides whether `--bg`
+        // dispatch exists at all, `name` is the border's word, and `launch` is
+        // how a pane opened on a keystroke is started. That last one is the
+        // reason this is no longer a `&str`: the resolution happened up there,
+        // before `term::setup` and before abeam walked away from the
+        // repository, and `main` is the only place holding it.
+        // `crate::app::Recipe` is where the argument lives about what such a
+        // pane may inherit from the command line this function read — and the
+        // short version is that `a` inherits none of it, because `-p` and
+        // `--resume` are in there, and that the chooser's first row inherits
+        // all of it, because that row will not run until a frame has drawn
+        // the whole line. `program_args` is not handed over beside `hosted`
+        // for that: it travels inside it, as `Hosted::typed`, kept apart from
+        // the table's own words so that the two rules can be told apart.
         // The table goes over with it, because it is `main`'s and because the
         // chooser and the resolve behind it have to be reading the same one:
         // `crate::app::App::table`.
@@ -394,7 +399,7 @@ fn host(
     // `agent::nowhere` writes the paragraph; `whence` is the only fact it needs
     // and the only one that cannot be recovered from a failed `PATH` walk.
     launch::resolve(&program, args)
-        .map(|launch| agent::Hosted::plain(&asked, launch))
+        .map(|launch| agent::Hosted::plain(&asked, args, launch))
         .map_err(|why| agent::nowhere(&asked, whence, &why))
 }
 

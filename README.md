@@ -322,6 +322,7 @@ into the focused child.
 | `F1, J` / `F1, K` | Scroll the right pane one line | Keep current focus |
 | `F1, PageUp` / `F1, PageDown` | Page the right pane | Keep current focus |
 | `F1, N` | Focus the next agent | Focus left |
+| `F1, O` | Open another agent: the git view's chooser, cursor on the row that re-runs this session's command line | Focus right |
 | `F1, Q` | Quit; enter `F1, Q` again to confirm while a child is live | As confirmed |
 | `F1, Esc` | Dismiss the hub | Unchanged |
 | `F4` / `F5` | Focus the current agent / show and focus the right pane | Left / right respectively |
@@ -433,27 +434,45 @@ the whole gesture: no path to type, no confirmation, and the row's own count
 goes up on the frame you pressed it.
 
 `A` is the same key with a question in front of it, and the question is only
-ever *which one*. It opens a list over whichever of the two you pressed it in —
-the names `+` already takes, which is `claude`, `copilot`, `codex` and any
-`[preset.*]` blocks of your own, in that order, with the cursor on the agent
-this session was started with. So `A` `Enter` is another of what you already
-have, and `A` `j` `j` `Enter` is a Codex pane beside your Claude one.
+ever *which one*. It opens a list over whichever of the two you pressed it in.
+The first row is the command line this session was started with, everything
+you typed included, and the cursor starts there; below it are the names `+`
+already takes, which is `claude`, `copilot`, `codex` and any `[preset.*]`
+blocks of your own, in that order, with the one this session was started as
+marked `session`. So `A` `Enter` is an exact copy of the session: `uvx abeam
+agents --cwd "."` reads `claude agents --cwd .` and starts that, `abeam +fleet
+--foo` reads `fleet --foo` and runs what the session ran, `claude agent --foo`,
+and plain `abeam` reads `claude`. The session's own row of the table is `j`
+down to the row marked `session`, and `A` `j` `j` `j` `Enter` is a Codex pane
+beside your Claude one. The plain copy — the session's program without
+anything you typed — is `a`. An argument with a space in it is shown in
+quotes, and a long first row wraps rather than being cut off at the edge, so a
+`--resume <id>` at the end of it is on screen. `F1, O` opens the same list from
+anywhere: it shows the git view, gives it your keys, and asks about the
+checkout that view is showing.
 
-**With one exception, and it is the one case where `A` `Enter` is not another
-of what you have.** `abeam +pwsh` hosts a program named outright, and the list
-is the table — so there is no row for it to start the cursor on. Nothing is
-marked `session`, the cursor starts at the top, and `A` `Enter` would start
-whatever is first rather than another `pwsh`. The list on screen says so before
-you press anything. `a` is the key for another of the same, and it works there
-exactly as it does everywhere else.
+**That first row runs what it shows, verbatim — `-p`, `--resume`, a prompt and
+all.** Nothing is stripped for what it says, because a row that filtered the
+line would run something other than what it shows. What keeps it safe is that
+it must have been on screen whole: `Enter` on it does nothing until abeam has
+drawn the whole line, and a line too long for the pane is drawn as far as it
+fits, marked `too long · widen to run` instead of `as launched`, and does not
+run until the pane is big enough to show all of it. The rule is that anything
+which re-runs your typed arguments shows them to you first. `a` shows nothing,
+so it runs none of them: it starts the session's program with a preset's own
+words and nothing you typed, as it always has.
 
-A preset
-says what it hosts — `fleet → claude` — because that is what decides whether the
-queue can type at the pane. The border names the checkout the pane will start
-in, and `Esc` puts back the list you came from. Choosing something that is not
-on the machine opens no pane and writes the sentence `abeam +codex` would have
-given at startup onto the left border, naming what was looked for and how to
-install it.
+A program named outright has a first row like every other session. `abeam
++pwsh -NoLogo` has no row in the table, so nothing is marked `session`, but the
+first row reads `pwsh -NoLogo` and `A` `Enter` starts another. `a` starts
+another plain `pwsh`, as it does everywhere else.
+
+A preset says what it hosts — `fleet → claude` — because that is what decides
+whether the queue can type at the pane. The border names the checkout the pane
+will start in, and `Esc` puts back the list you came from. Choosing something
+that is not on the machine opens no pane and writes the sentence `abeam +codex`
+would have given at startup onto the left border, naming what was looked for
+and how to install it.
 
 The first of those two is the one most sessions want, because Claude Code makes
 its own worktrees: open a second agent where you already are, tell it to branch

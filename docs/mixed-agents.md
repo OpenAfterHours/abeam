@@ -841,6 +841,18 @@ is owed" return while choosing is asserted nowhere — it is an optimisation the
 document itself marked optional — and the `render` branch is exercised by every
 chooser test that reads the screen.
 
+**After phase 3 — the as-launched row, and `F1, O`. Built.** The chooser gained
+a first row that is not the table's: the session's own command line, typed
+arguments included, which `Enter` re-runs verbatim — and only once a frame has
+drawn the whole of it, wrapping rather than clipping. The cursor starts there
+now rather than on the session's row, so the last clause of the second bullet
+above is history: a program named outright has a first row like every other
+session, and open question 6 below is answered. `Hosted` grew `typed` beside `args`, `Recipe`
+carries both and has two launches, and `AgentRequest::agent` is a three-way
+`Pick` rather than an `Option`. `F1, O` is `A` in the status list, reached from
+anywhere. `docs/multi-agent.md`, "What `main` has to hand over", has the rule
+about which key may re-run what was typed.
+
 **Phase 4 — dispatch, if it is wanted.** The queue's dispatcher becomes
 something that can arrive after a pane opens. Note that there are **two**
 `Dispatcher::new` sites, not one — `QueuePane::new` builds one eagerly and
@@ -917,3 +929,13 @@ to want one.
    It would become worth doing the moment a second thing wants that row — a
    recently-used list, or a way to start a program by typing its name — because
    then the synthetic row is not an exception but the first of a class.
+
+   **Answered since, and by a row that is not only for this case.** The
+   chooser's first row is now the command line every session was started
+   with, typed arguments included, and the cursor starts on it — so it is not
+   an exception for sessions with no table row but a row every session has,
+   which is the objection above met rather than overruled. `abeam +pwsh
+   -NoLogo` reads `pwsh -NoLogo` there and `A` `Enter` starts another. It is
+   not `a` with a name attached, which is what this item proposed: it re-runs
+   what was typed, where `a` re-runs none of it. `docs/multi-agent.md`, "What
+   `main` has to hand over", has the rule that separates them.

@@ -61,6 +61,7 @@ use crate::config::{Opening, Theme};
 use crate::keys::{self, Action};
 use crate::layout as abeam_layout;
 use crate::pane::{Focus, Pane};
+use crate::panes::git::Pick;
 use crate::panes::{
     AskContext, AskPane, AskRequest, DiagPane, FrameStats, GitPane, PadPane, QueuePane, RightView,
     ShellCommand, ShellId, ShellSessions, TerminalPane, ViewerPane,
@@ -451,9 +452,9 @@ static NEXT_AGENT_ID: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 /// about the session on purpose.
 ///
 /// **The two really do disagree now**, which is `docs/mixed-agents.md`'s phase
-/// 3 and the reason the split is worth its second field: `A` starts a pane from
-/// a row of the chooser rather than from the session's own `Recipe`, so `abeam
-/// +claude` can hold a Codex pane and `abeam +codex` a Claude one. What follows
+/// 3 and the reason the split is worth its second field: `A` can start a pane
+/// from a row of the table rather than from the session's own `Recipe`, so
+/// `abeam +claude` can hold a Codex pane and `abeam +codex` a Claude one. What follows
 /// from that is not a tidiness argument — the readiness probe reads Claude's
 /// own session records, and pointing it at a pane hosting something else is
 /// reporting a neighbour's `idle` as that pane's.
@@ -1131,17 +1132,33 @@ impl Agent {
 
 /// What a pane opened on a keystroke is started from.
 ///
-/// **The command line is deliberately not in here, and that is the decision
-/// this struct exists to record rather than a field somebody forgot.**
-/// `abeam -p "fix the tests"` puts `-p` and the prompt in
+/// **The rule: anything that re-runs your typed arguments shows them to you
+/// first.** It is narrower than what this paragraph used to say, which was that
+/// the command line is deliberately not in here at all. The hazard that
+/// sentence was written against is unchanged and is still the reason for the
+/// rule. `abeam -p "fix the tests"` puts `-p` and the prompt in
 /// `crate::agent::Hosted::launch`'s arguments, and `abeam --resume <id>` puts a
 /// conversation there. A pane started an hour later from that argument list
-/// would re-run the prompt non-interactively in a worktree it was never written
-/// about and exit as soon as it had answered, or resume a session belonging to
-/// another directory — and in both cases the border would say `claude` and the
-/// pane would be gone or wrong with nothing on screen explaining it. What a
-/// later pane wants is a plain interactive session of the same program, which
-/// is the *program resolution* and none of the line that was typed.
+/// re-runs the prompt non-interactively in a worktree it was never written
+/// about and exits as soon as it has answered, or resumes a session belonging
+/// to another directory — and if nothing on screen said that was about to
+/// happen, the border says `claude` and the pane is gone or wrong with no
+/// explanation anywhere.
+///
+/// **So the line is carried, as [`typed`](Self::typed), and there are two
+/// launches.** [`launch`](Self::launch) is what `a` starts, and it has none of
+/// the line: `a` asks nothing and shows nothing, so a plain interactive session
+/// of the same program — the *program resolution*, and the table row's own
+/// words — is the only thing it may start. [`as_launched`](Self::as_launched)
+/// is what the chooser's first row starts, and it has all of the line,
+/// verbatim: that row draws [`shown`](Self::shown), wrapping rather than
+/// clipping, and **`Enter` on it is refused unless the last frame drew it
+/// whole** — `crate::panes::git`'s `Choice::drawn` — so a `--resume` in it is a
+/// `--resume` the reader has been shown. Nothing is filtered out of it for what
+/// it says, deliberately: stripping the flags that look dangerous would need
+/// abeam to know every agent's flags, and would make the row run something
+/// other than what it shows, which is the one thing the row exists not to do.
+/// `docs/multi-agent.md`, "What `main` has to hand over", has the history.
 ///
 /// **So what is kept is the file that does the work, and the launch is derived
 /// again from it.** Keeping the resolved `Launch` and merely blanking its
@@ -1152,7 +1169,16 @@ impl Agent {
 /// Dropping the arguments and keeping the environment there would keep the
 /// prompt and lose the agent — a bare `cmd.exe` under a border reading
 /// `claude`. `crate::launch::resolve` is what knows how to put the pair back
-/// together, so it is asked again with [`args`](Self::args) and nothing else.
+/// together, so it is asked again with [`args`](Self::args) — and, for the
+/// as-launched row, [`typed`](Self::typed) after them — and nothing else.
+///
+/// **That is also why carrying the typed line is safe where carrying the
+/// `Launch` was not.** The objection above was to a *stale* environment beside
+/// an argument list that no longer matched it. `resolve_at` derives
+/// `ABEAM_LAUNCH` from `(target, arguments)` on every call, so the as-launched
+/// row's launch is built the way the session's own was, from the same halves in
+/// the same order — and `a_session_is_launched_again_exactly_as_it_was` pins it
+/// equal to `Hosted::launch`, `.cmd` shim and all.
 ///
 /// **"Nothing from the command line" was once spelled "no arguments at all",
 /// and those are two different rules.** A `[preset.fleet]` with `args =
@@ -1161,8 +1187,8 @@ impl Agent {
 /// every pane opened with `a` — two panes, one border word, two different
 /// programs. The preset's own words are not the command line: they were written
 /// in the reader's config file, they select the *program*, and every pane of
-/// this session is meant to be that program. So they are carried, and the line
-/// that was typed still is not.
+/// this session is meant to be that program. So they are carried into both
+/// launches, and the line that was typed still is not carried into `a`'s.
 ///
 /// **Resolving late is safe here for the reason resolving early was necessary
 /// there.** `main` finds the program before `term::setup` and before abeam goes
@@ -1211,10 +1237,30 @@ struct Recipe {
     /// list is the exact failure the paragraphs above are about — for `abeam -p
     /// "fix the tests"` the prompt lives in that variable.
     args: Vec<String>,
+    /// What was typed after abeam's own token: `crate::agent::Hosted::typed`,
+    /// verbatim. Read by [`as_launched`](Self::as_launched), which runs it, and
+    /// by [`shown`](Self::shown), which draws it — and by nothing else, which
+    /// is the rule at the top of this type made into a field.
+    typed: Vec<String>,
 }
 
 impl Recipe {
-    /// The launch a new pane is spawned from: this program, interactively, with
+    /// Everything a later pane needs, out of what `main` resolved at startup.
+    ///
+    /// One constructor rather than a literal in [`App::new`], so that the tests
+    /// which pin what a later pane runs build their recipe the way the program
+    /// does, from a `Hosted`, and cannot pass by building a better one by hand.
+    fn of(hosted: &crate::agent::Hosted) -> Self {
+        Self {
+            target: hosted.launch.target.clone(),
+            name: hosted.name.clone(),
+            kind: hosted.agent.clone(),
+            args: hosted.args.clone(),
+            typed: hosted.typed.clone(),
+        }
+    }
+
+    /// The launch `a` spawns a new pane from: this program, interactively, with
     /// the table row's own arguments and nothing that was typed.
     ///
     /// `resolve_at` and not `resolve`, so the path never becomes a `String` and
@@ -1238,6 +1284,100 @@ impl Recipe {
     fn launch(&self) -> Result<crate::launch::Launch, String> {
         crate::launch::resolve_at(&self.target, &self.args)
     }
+
+    /// The launch the chooser's first row spawns: this program, with the table
+    /// row's own arguments and then everything that was typed — the session's
+    /// own command line, verbatim.
+    ///
+    /// **The same resolution as [`launch`](Self::launch) with the other half of
+    /// the line put back**, in the order `crate::agent::resolve_within` joined
+    /// them at startup: the row's words in front, because a preset's `agent`
+    /// is a subcommand and a subcommand is the first word of its line. So for
+    /// every session this answers what `Hosted::launch` was — the same file,
+    /// the same arguments, and on Windows the same `ABEAM_LAUNCH` for a `.cmd`
+    /// shim, since that variable is derived from the pair here exactly as it
+    /// was there. `resolve_within` would search `PATH` again by name; what it
+    /// does beyond that is choose among the row's candidates, and the choice
+    /// it made is [`target`](Self::target).
+    ///
+    /// Only ever reached from a row that has drawn [`shown`](Self::shown) —
+    /// see the rule at the top of this type.
+    fn as_launched(&self) -> Result<crate::launch::Launch, String> {
+        let line: Vec<String> = self.args.iter().chain(&self.typed).cloned().collect();
+        crate::launch::resolve_at(&self.target, &line)
+    }
+
+    /// The command line [`as_launched`](Self::as_launched) runs, as the
+    /// chooser draws it: the border's word and then what was typed, one word
+    /// per argument, each spelled by [`spelled`].
+    ///
+    /// **The border's word and not the file**, and not the table row's own
+    /// arguments either: `abeam +fleet --foo` reads `fleet --foo`, which is
+    /// what was typed with the `+` taken off and is the name every other part
+    /// of the window calls this session by. The preset's `agent` is still run
+    /// — the row below says `→ claude` and the config file says the rest — and
+    /// the absolute path an npm install resolves to is a fact about starting
+    /// it rather than about what was asked for, the argument `Hosted::name`
+    /// makes for the border.
+    fn shown(&self) -> Vec<String> {
+        std::iter::once(&self.name)
+            .chain(&self.typed)
+            .map(|word| spelled(word))
+            .collect()
+    }
+}
+
+/// One argument as the chooser's as-launched row draws it: bare when it reads
+/// as one argument by itself, and quoted when it would not.
+///
+/// **Quoted so that where one argument ends is visible, and for nothing else.**
+/// The row is never parsed back: `Enter` sends [`Recipe::as_launched`], which
+/// is built from the words abeam is holding and not from this text. So the
+/// quoting is not any shell's and does not try to be — `crate::agent`'s
+/// `ambiguous` already argues why abeam cannot re-quote a line for a shell it
+/// cannot see — and it only has to be unambiguous to a person: `-p "fix the
+/// tests"` is two arguments, and `-p fix the tests` would have been four.
+///
+/// **As typed, as nearly as that can be.** Backslashes stay single, so
+/// `C:\Program Files\pwsh.exe` reads `"C:\Program Files\pwsh.exe"`: this is the
+/// one row whose job is to read as the line was typed, and a path with its
+/// backslashes doubled is a different-looking path. Two things are escaped and
+/// only two. A `"` inside, as `\"`, so an argument cannot close its own quotes.
+/// And every character with no width of its own — control, format, bidi and
+/// combining characters — as `\u{…}`: an ESC drawn raw is an instruction to the
+/// terminal rather than a character on the row, a bidi override draws the row
+/// in an order other than the one that runs, and a joiner or a selector is the
+/// commonest way for `unicode-width` to measure a string differently from its
+/// characters one at a time. Escaping them narrows that gap and does not close
+/// it — an Arabic lam-alef and an emoji with a skin-tone modifier still measure
+/// two ways — so what this promises is only that nothing it emits is a
+/// character with no width. `crate::panes::git`'s `cells` is what makes the
+/// two measures stop mattering: the row is fitted, judged whole and placed by
+/// the character count alone.
+///
+/// The one ambiguity left is a `\` directly before a `"`, which reads as an
+/// escape whether it is one or not. It is the price of leaving backslashes
+/// alone, and the argument that pays it — a quoted Windows directory ending in
+/// `\` — is the one Windows' own argument parsing misreads as well.
+fn spelled(word: &str) -> String {
+    let hidden = |c: char| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) == 0;
+    let bare = !word.is_empty()
+        && !word
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || hidden(c));
+    if bare {
+        return word.to_string();
+    }
+    let mut out = String::from("\"");
+    for c in word.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            c if hidden(c) => out.extend(c.escape_unicode()),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 pub struct App {
@@ -1782,12 +1922,14 @@ impl App {
     /// this signature is.** A pane started on a keystroke has to be built from
     /// the same resolution, and `main` is the only place that holds it: the
     /// program was found before `term::setup`, and before abeam walked away
-    /// from the repository to stand somewhere unwritable. Three fields are read
-    /// from it and each goes somewhere different — `agent` is the *kind*, which
+    /// from the repository to stand somewhere unwritable. Its fields go to
+    /// different places — `agent` is the *kind*, which
     /// decides whether `--bg` dispatch exists at all and what a workspace's ask
     /// pane hosts; `name` is the border's word; and `launch.target` is the file
-    /// a later pane is started from. See [`Recipe`] for why it is the target
-    /// and not the whole `Launch`.
+    /// a later pane is started from, with `args` and `typed` — the table's half
+    /// of the line and the person's — beside it. See [`Recipe`] for why it is
+    /// the target and the two halves and not the whole `Launch`, and for which
+    /// key may re-run which half.
     ///
     /// `table` is every agent this session can name, which `main` is holding
     /// for the same reason it is holding `hosted`: it built it once, before
@@ -1830,6 +1972,7 @@ impl App {
         // Before the first frame, so the reader's page is right the first time
         // it is drawn rather than repainted a frame later.
         viewer.set_theme(opening.theme);
+        let recipe = Recipe::of(hosted);
 
         let mut app = Self {
             // One agent, and the invariant that it is `agents[0]` and stays
@@ -1837,21 +1980,20 @@ impl App {
             // for the clock the comment up there is about.
             agents: vec![agent_pane],
             at_agent: 0,
-            recipe: Recipe {
-                target: hosted.launch.target.clone(),
-                name: hosted.name.clone(),
-                kind: agent.to_string(),
-                args: hosted.args.clone(),
-            },
             table,
             disowned: Vec::new(),
             agent_refused: None,
             // The border's word rather than the kind, because what the chooser
             // marks `session` is a *row* of the table and `fleet` is the row a
             // `[preset.fleet]` session was started from. A program named
-            // outright has no row, which is the case where nothing is marked
-            // and the cursor starts at the top.
-            git: GitPane::new(root.clone(), &hosted.name, table),
+            // outright has no row, which is the case where nothing is marked.
+            //
+            // And the chooser's first row is the recipe's own spelling of the
+            // line it would run, taken from the recipe rather than rebuilt out
+            // of `hosted` beside it, so the words drawn and the words run
+            // cannot come from two places. See `crate::panes::git::GitPane::launched`.
+            git: GitPane::new(root.clone(), &hosted.name, recipe.shown(), table),
+            recipe,
             viewer,
             // The root abeam was started on, and the invariant that it is
             // `spaces[0]` and stays there — `App::root` rather than the
@@ -2271,15 +2413,19 @@ impl App {
     ///   pane opened after somebody has used the ask pane can otherwise adopt
     ///   that reader's record and report its `idle` as its child's.
     ///
-    /// **`choice` is which agent, and `None` is byte-identical to what this
-    /// function did before it had a second parameter.** `a` passes `None` and
-    /// gets the session's [`Recipe`]: the same file, the same border word, the
-    /// same kind, resolved the same way. `A` passes the name of a row the
+    /// **`choice` is which agent, and [`Pick::Session`] is byte-identical to
+    /// what this function did before it had a second parameter.** `a` passes
+    /// it and gets the session's [`Recipe`]: the same file, the same border
+    /// word, the same kind, resolved the same way, and none of the line that
+    /// was typed. The chooser's first row passes [`Pick::AsLaunched`] and gets
+    /// the same recipe with that line put back — the rule for which key may do
+    /// that is [`Recipe`]'s, and it is that the one that does has drawn the
+    /// line first. Every other row passes [`Pick::Row`], the name of a row the
     /// reader picked out of [`table`](Self::table), which is resolved the way
     /// `main` resolves the session's own agent at startup —
-    /// `crate::agent::resolve_within`, whose `Err` is the install sentence and
-    /// lands in [`agent_refused`](Self::agent_refused) exactly as a failure to
-    /// start the session's agent would.
+    /// `crate::agent::resolve_within`, with nothing typed, whose `Err` is the
+    /// install sentence and lands in [`agent_refused`](Self::agent_refused)
+    /// exactly as a failure to start the session's agent would.
     ///
     /// **A chosen row is looked up by name and the session's is not, and that
     /// asymmetry is the right way round.** `Recipe` keeps an absolute path
@@ -2290,7 +2436,7 @@ impl App {
     ///
     /// Returns whether a frame is owed, which is always: either there is a new
     /// pane or there is a sentence saying why there is not.
-    fn start_agent(&mut self, root: &Path, choice: Option<&str>) -> bool {
+    fn start_agent(&mut self, root: &Path, choice: Pick) -> bool {
         let root = paths::resolve_root(root);
 
         // Three things, from one of two places, and they travel together
@@ -2299,18 +2445,29 @@ impl App {
         // says, `kind` is what `Agent::is_claude` will answer, and for a preset
         // the two are `fleet` and `claude`.
         let (launch, name, kind) = match choice {
-            None => match self.recipe.launch() {
-                Ok(launch) => (launch, self.recipe.name.clone(), self.recipe.kind.clone()),
-                Err(why) => {
-                    self.agent_refused = Some(why);
-                    return true;
+            // The session's own program, both ways, and the two differ in the
+            // typed line and in nothing else — the border word and the kind
+            // are the recipe's either way, so a pane re-run as launched is
+            // called what the session is called.
+            Pick::Session | Pick::AsLaunched => {
+                let resolved = if choice == Pick::AsLaunched {
+                    self.recipe.as_launched()
+                } else {
+                    self.recipe.launch()
+                };
+                match resolved {
+                    Ok(launch) => (launch, self.recipe.name.clone(), self.recipe.kind.clone()),
+                    Err(why) => {
+                        self.agent_refused = Some(why);
+                        return true;
+                    }
                 }
-            },
+            }
             // Not reachable from the chooser, whose rows *are* this table — but
             // a sentence costs one arm and the alternative is an `expect` on a
             // lookup that a later caller could get wrong. It reads like the
             // rest of the refusals on this border rather than like a panic.
-            Some(want) => match crate::agent::find_within(want, self.table) {
+            Pick::Row(want) => match crate::agent::find_within(want, self.table) {
                 Some(row) => match crate::agent::resolve_within(row, &[], self.table) {
                     Ok(hosted) => (hosted.launch, hosted.name, hosted.agent),
                     Err(why) => {
@@ -3831,8 +3988,9 @@ impl App {
         // child in one worktree and points the right pane at another, which is
         // exactly what was asked for.
         //
-        // The request carries which agent as well as which checkout, and `None`
-        // there is `a` — the session's own. See [`crate::panes::git::AgentRequest`].
+        // The request carries which agent as well as which checkout, and
+        // `Pick::Session` there is `a` — the session's own, with nothing that
+        // was typed. See [`crate::panes::git::Pick`].
         if let Some(req) = self.git.take_agent_request() {
             redraw |= self.start_agent(&req.root, req.agent);
         }
@@ -5222,6 +5380,30 @@ impl App {
                 self.set_agent((self.at_agent + 1) % self.agents.len());
                 self.set_focus(Focus::Left);
             }
+            // `A` in the git view's status list, from anywhere: the view, the
+            // keys and the question in one gesture, about the checkout the git
+            // view is showing — which is the one `a` there would start in, so
+            // `F1, O` and `a` never disagree about *where*. Only about *what*:
+            // this opens on the line the session was started with, and `a`
+            // re-runs none of it.
+            //
+            // In the order `Action::ShowPad` uses and for its reasons.
+            // `set_right_view` first, because it un-zooms — so a right pane
+            // `F1, Z` hid comes back — and because it withdraws any question
+            // the git view was already asking, this one included, so what
+            // follows starts clean. Then focus and the question are asked of
+            // the layout rather than of the last frame, and **together or not
+            // at all**: a chooser opened in a window with no room for the right
+            // pane is a question standing where nothing draws it, over a
+            // captured checkout, waiting for an `Enter` typed at something
+            // else. `GitPane::cancel_choice` has the whole of that argument.
+            Action::NewAgent => {
+                self.set_right_view(RightView::Git);
+                if abeam_layout::split(self.area, self.zoom).right.is_some() {
+                    self.set_focus(Focus::Right);
+                    self.git.choose_here();
+                }
+            }
             Action::ScrollRight(code) => {
                 // Delivered as the bare key the pane would have seen had it
                 // been focused, so panes implement one scroll vocabulary — but
@@ -6168,6 +6350,13 @@ impl App {
         // Recomputed from this frame only. A stored action is not proof that its
         // warning was visible; the right pane may be hidden or too narrow.
         self.shell_close_drawn = None;
+        // And the chooser's as-launched row, on the same rule: whether `Enter`
+        // may re-run what was typed is a fact about this frame, which the pane
+        // re-establishes below only if it draws the row whole. Here rather than
+        // inside that branch, because the frame that matters most is the one
+        // that draws no right pane at all. See
+        // `crate::panes::git::GitPane::forget_drawn`.
+        self.git.forget_drawn();
         if let (Some(outer), Some(inner)) = (split.right, self.right_inner) {
             let focused = self.focus == Focus::Right;
             // The instrument reads the terminal pane, so it is refreshed from
@@ -6255,6 +6444,12 @@ impl App {
 
         if let Some(hub) = self.hub {
             hub_overlay(f, hub);
+            // Painted over whatever the right pane drew, the chooser's
+            // as-launched row included — so that row was not on screen this
+            // frame, however whole the pane drew it underneath. `Esc` and
+            // `Enter` in the next batch would otherwise answer a line the
+            // overlay hid. See `crate::panes::git::GitPane::forget_drawn`.
+            self.git.forget_drawn();
         }
     }
 
@@ -7122,6 +7317,9 @@ mod tests {
             // the preset case worth a fixture of its own — see
             // [`a_preset_pane_opened_later_runs_the_program_the_session_did`].
             args: Vec::new(),
+            // And nothing was typed: `abeam` on its own, whose as-launched row
+            // reads `claude`. The tests about that row say what was typed.
+            typed: Vec::new(),
             launch,
         }
     }
@@ -7563,6 +7761,48 @@ mod tests {
         )
     }
 
+    /// A program that **says what it was given**, on its first line, and then
+    /// behaves like [`a_pane_that_stays`] with nothing given: asks for bracketed
+    /// paste and waits on its standard input for ever.
+    ///
+    /// The other half of that shim's trick, for the tests that need a pane to
+    /// be started *with* arguments and to stay long enough to be read. What is
+    /// printed is `given:[…]` with the arguments between the brackets exactly as
+    /// the child received them, so a test can tell a pane that was handed the
+    /// session's command line from one that was handed nothing — on the pane's
+    /// own screen, which is where a reader would see it.
+    ///
+    /// Printed rather than written to a file beside it, because on Unix
+    /// [`TempDir::write_exec`] runs a shim once before handing it back and a
+    /// shim with a side effect must not go through there. Arguments without
+    /// spaces only, because `%*` and `$*` rejoin them and disagree about
+    /// quotes; what argument edges survive is `crate::launch`'s subject, and
+    /// its own tests put a real shim in a real pty to read them back.
+    #[cfg(windows)]
+    fn a_pane_that_says_what_it_was_given(dir: &TempDir) -> PathBuf {
+        dir.write("abeam-given-bracketed.txt", b"\x1b[?2004h");
+        dir.write(
+            "abeam-given.cmd",
+            b"@echo off\r\n\
+              echo given:[%*]\r\n\
+              type \"%~dp0abeam-given-bracketed.txt\"\r\n\
+              :loop\r\n\
+              set /p LINE=\r\n\
+              goto loop\r\n",
+        )
+    }
+    #[cfg(unix)]
+    fn a_pane_that_says_what_it_was_given(dir: &TempDir) -> PathBuf {
+        dir.write("abeam-given-bracketed.txt", b"\x1b[?2004h");
+        dir.write_exec(
+            "abeam-given",
+            b"#!/bin/sh\n\
+              printf 'given:[%s]\\n' \"$*\"\n\
+              cat \"$(dirname \"$0\")/abeam-given-bracketed.txt\"\n\
+              while read -r LINE; do :; done\n",
+        )
+    }
+
     /// Point the app's recipe at that program.
     ///
     /// The fixture's own recipe is [`unstarted`] — a path that could exist and
@@ -7582,6 +7822,10 @@ mod tests {
             // [`a_preset_pane_opened_later_runs_the_program_the_session_did`]
             // is about, and it builds a recipe of its own to say so.
             args: Vec::new(),
+            // And nothing typed, for the same reason: the shim leaves at once
+            // when it is given anything, and every test here that starts it
+            // wants it to stay.
+            typed: Vec::new(),
         };
     }
 
@@ -7614,7 +7858,8 @@ mod tests {
         );
     }
 
-    /// Nothing the command line said survives into a pane opened an hour later.
+    /// Nothing the command line said survives into a pane `a` opens an hour
+    /// later — **even though the recipe is now holding all of it.**
     ///
     /// **The failure this pins is silent and expensive.** `abeam -p "fix the
     /// tests"` puts the prompt in the launch `main` resolved; a second pane
@@ -7622,6 +7867,14 @@ mod tests {
     /// nobody wrote it about and exit as soon as it had answered, under a
     /// border still reading `claude`. `--resume` is the same shape with a
     /// conversation in place of a prompt.
+    ///
+    /// **It used to be enough that the recipe had nowhere to put the line.**
+    /// It has one now — [`Recipe::typed`], for the chooser's as-launched row,
+    /// which runs it only once a frame has drawn it whole — so what this pins
+    /// is the rule rather than the absence: the recipe below is given the
+    /// prompt, and the launch `a` spawns still does not carry it. The other
+    /// launch does, which is asserted too, so that this cannot pass by the
+    /// field being empty.
     ///
     /// **It asserts about the environment as well as the arguments, which is
     /// the half a Unix-only reading of this misses.** On Windows an npm agent
@@ -7659,21 +7912,28 @@ mod tests {
             name: "claude".to_string(),
             kind: "claude".to_string(),
             args: Vec::new(),
+            typed: typed.clone(),
         };
         let later = recipe.launch().expect("the same program resolves again");
 
         assert!(
             !carries(&later),
-            "a pane opened later would re-run the prompt the session was started with"
+            "a pane `a` opened later would re-run the prompt the session was started with"
         );
         assert_eq!(
             later.target, startup.target,
             "the arguments went and took the agent with them"
         );
+        // ...and the row that shows the line first is the one place it goes.
+        assert!(
+            carries(&recipe.as_launched().expect("the same program resolves again")),
+            "the recipe was holding the prompt and the as-launched row dropped it"
+        );
 
         // And the wiring that fills it: `main` hands over what it resolved, and
-        // what the recipe keeps is the file, the border's word, the kind and
-        // the table row's own arguments.
+        // what the recipe keeps is the file, the border's word, the kind, the
+        // table row's own arguments and — for the one row that shows them —
+        // what was typed.
         let fx = app();
         assert_eq!(fx.app.recipe.target, unstarted().target);
         assert_eq!(fx.app.recipe.name, "claude");
@@ -7681,6 +7941,10 @@ mod tests {
         assert!(
             fx.app.recipe.args.is_empty(),
             "a built-in put an argument in front of somebody's agent"
+        );
+        assert!(
+            fx.app.recipe.typed.is_empty(),
+            "`abeam` with nothing typed arrived with something typed"
         );
     }
 
@@ -7719,6 +7983,7 @@ mod tests {
             name: "fleet".to_string(),
             kind: "claude".to_string(),
             args: vec!["agent".to_string()],
+            typed: Vec::new(),
         };
         let later = recipe.launch().expect("the shim resolves");
         assert!(
@@ -7750,6 +8015,7 @@ mod tests {
             name: "fleet".to_string(),
             agent: "claude".to_string(),
             args: vec!["agent".to_string()],
+            typed: Vec::new(),
             launch: unstarted(),
         };
         let (program, args) = EXITS;
@@ -7765,6 +8031,183 @@ mod tests {
         assert_eq!(app.recipe.args, ["agent"]);
         assert_eq!(app.recipe.name, "fleet", "the border word is the preset's");
         assert_eq!(app.recipe.kind, "claude", "and the kind is what it hosts");
+    }
+
+    /// Owned words out of borrowed ones, for the tests below that write a
+    /// command line out as a list.
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    /// The chooser's first row starts exactly what the session was started
+    /// as: the same file, the same arguments, and — the half that is easy to
+    /// get wrong — the same environment.
+    ///
+    /// **Three shapes, because a session has three**: an agent out of the
+    /// table with something typed after it, a preset whose own words go in
+    /// front of what was typed, and a program named outright, which has no row
+    /// at all. Each is resolved the way `main` resolves it — `resolve_within`
+    /// for the first two, `resolve` and `Hosted::plain` for the third — and the
+    /// recipe is built from the result by [`Recipe::of`], which is what
+    /// `App::new` does, so nothing here can pass by building a better recipe
+    /// by hand.
+    ///
+    /// **On Windows the shim is a `.cmd`**, the install shape most people
+    /// have: `Launch::program` is `cmd.exe` and the whole line is quoted into
+    /// `ABEAM_LAUNCH`, which is exactly where a recipe that carried a stale
+    /// environment would have diverged. The typed line has a quote, an
+    /// ampersand and a percent sign in it so that the quoting is exercised
+    /// rather than trivially empty.
+    #[test]
+    fn a_session_is_launched_again_exactly_as_it_was() {
+        let dir = TempDir::new("as-launched");
+        let target = a_pane_that_stays(&dir);
+        let typed = words(&[
+            "agents",
+            "--cwd",
+            ".",
+            "-p",
+            "fix \"the\" tests & ship 100%",
+            "--resume",
+            "abc123",
+        ]);
+
+        let candidate: &'static str =
+            Box::leak(target.to_string_lossy().into_owned().into_boxed_str());
+        let candidates: &'static [&'static str] = Box::leak(Box::new([candidate]));
+        let table: &'static [crate::agent::Agent] = Box::leak(Box::new([
+            crate::agent::Agent {
+                name: "shim",
+                candidates,
+                install: "there is nothing to install; this row is a fixture",
+                args: &[],
+                hosts: "claude",
+            },
+            crate::agent::Agent {
+                name: "fleet",
+                candidates,
+                install: "there is nothing to install; this row is a fixture",
+                args: &["agent"],
+                hosts: "claude",
+            },
+        ]));
+
+        let sessions = [
+            crate::agent::resolve_within(&table[0], &typed, table).expect("the shim resolves"),
+            crate::agent::resolve_within(&table[1], &typed, table).expect("the shim resolves"),
+            crate::agent::Hosted::plain(
+                "shim",
+                &typed,
+                crate::launch::resolve(&target.to_string_lossy(), &typed)
+                    .expect("the shim resolves"),
+            ),
+        ];
+        for hosted in &sessions {
+            let recipe = Recipe::of(hosted);
+            assert_eq!(
+                recipe.as_launched().expect("the same program resolves again"),
+                hosted.launch,
+                "`{}` as launched is not what the session was started with",
+                hosted.name
+            );
+            // And `a`'s launch is not it, which is the control: a recipe that
+            // ignored the typed line altogether would pass the assertion above
+            // for a session with nothing typed, and none of these is one.
+            assert_ne!(
+                recipe.launch().expect("the same program resolves again"),
+                hosted.launch,
+                "`{}` re-ran the typed line from the key that shows nothing",
+                hosted.name
+            );
+        }
+
+        // The environment the assertions above compared is not empty, which is
+        // what makes this the Windows test it says it is.
+        #[cfg(windows)]
+        for hosted in &sessions {
+            assert!(
+                hosted
+                    .launch
+                    .env
+                    .iter()
+                    .any(|(key, line)| key == "ABEAM_LAUNCH" && line.contains("100%")),
+                "`{}` did not route through cmd.exe, so the shim case went untested",
+                hosted.name
+            );
+        }
+    }
+
+    /// The as-launched row draws each argument so that where it ends is
+    /// visible, and never draws a character the terminal would act on.
+    ///
+    /// **The quoting is for a person and is never parsed back** — `Enter`
+    /// sends the words abeam is holding — so what is pinned here is that the
+    /// spelling is unambiguous: an argument with a space in it reads as one
+    /// argument, a quote inside one cannot close it early, and an escape
+    /// sequence is shown as the characters it is rather than obeyed.
+    #[test]
+    fn the_as_launched_row_spells_each_argument_so_its_edges_show() {
+        let recipe = |name: &str, args: &[&str], typed: &[&str]| Recipe {
+            target: unstarted().target,
+            name: name.to_string(),
+            kind: "claude".to_string(),
+            args: words(args),
+            typed: words(typed),
+        };
+        // `uvx abeam agents --cwd "."`: the shell took the quotes before abeam
+        // saw anything, and none of the words needs them back.
+        assert_eq!(
+            recipe("claude", &[], &["agents", "--cwd", "."]).shown(),
+            ["claude", "agents", "--cwd", "."]
+        );
+        // A preset reads as it was typed — the border word, then the rest —
+        // and not with its own subcommand in the middle, which it still runs.
+        assert_eq!(
+            recipe("fleet", &["agent"], &["--foo"]).shown(),
+            ["fleet", "--foo"]
+        );
+        // Nothing typed is still a row: `F1, O`, `Enter` always means another
+        // one exactly like what was started.
+        assert_eq!(recipe("claude", &[], &[]).shown(), ["claude"]);
+
+        assert_eq!(spelled("fix the tests"), "\"fix the tests\"");
+        assert_eq!(spelled(""), "\"\"", "an empty argument vanished");
+        // Nothing that reads as one argument by itself is quoted: this is not
+        // a shell's quoting, and a `'` is only a character.
+        assert_eq!(spelled("it's"), "it's");
+        assert_eq!(spelled("say \"hi\""), r#""say \"hi\"""#);
+        assert_eq!(
+            spelled("\u{1b}[2J"),
+            r#""\u{1b}[2J""#,
+            "an escape sequence would be obeyed rather than shown"
+        );
+        // A bidi override and a joiner, which draw nothing of their own and
+        // change what the characters around them look like.
+        assert_eq!(spelled("a\u{202e}b"), r#""a\u{202e}b""#);
+        assert_eq!(spelled("a\u{200d}b"), r#""a\u{200d}b""#);
+        // A Windows path reads as it was typed, backslashes single, whether or
+        // not a space has made it need quotes.
+        assert_eq!(spelled(r"C:\repo"), r"C:\repo");
+        assert_eq!(
+            spelled(r"C:\Program Files\pwsh.exe"),
+            r#""C:\Program Files\pwsh.exe""#
+        );
+        // And nothing it emits has no width of its own, which is all it
+        // promises about measuring: `❤` and a selector measure 1 a character
+        // at a time and 2 together until the selector is escaped. That it
+        // does not make the two measures agree in general — a lam-alef is
+        // left as it is — is `crate::panes::git`'s `cells`' business, and that
+        // module's `pack` test is where it is pinned.
+        for word in ["fix the tests", "\u{1b}[2J", "a\u{200d}b", "❤\u{fe0f}", "設計 文書"] {
+            let shown = spelled(word);
+            assert!(
+                shown
+                    .chars()
+                    .all(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > 0),
+                "{shown:?} still carries a character with no width"
+            );
+        }
+        assert_eq!(spelled("❤\u{fe0f}"), r#""❤\u{fe0f}""#);
     }
 
     /// `a` on a worktree row starts an agent there, shows it, and moves nothing
@@ -7963,7 +8406,12 @@ mod tests {
     fn app_over_table(table: &'static [crate::agent::Agent]) -> Fixture {
         let mut fx = app();
         fx.app.table = table;
-        fx.app.git = GitPane::new(fx.dir.path().to_path_buf(), "claude", table);
+        fx.app.git = GitPane::new(
+            fx.dir.path().to_path_buf(),
+            "claude",
+            fx.app.recipe.shown(),
+            table,
+        );
         fx
     }
 
@@ -7989,8 +8437,10 @@ mod tests {
         let target = a_pane_that_stays(&dir);
         let mut fx = app_over_table(a_table_hosting(&target, "codex"));
 
-        // `claude` is not a row of that table, so nothing is marked `session`
-        // and the cursor starts at the top — which is the only row there is.
+        // `claude` is not a row of that table, so nothing is marked `session`.
+        // The cursor starts on the as-launched row, which is the session's
+        // own program — so one `j` is the table's first row, which is the only
+        // one there is.
         hub(&mut fx.app, KeyCode::Char('g'));
         let _ = screen(&mut fx.app, 120, 40);
         fx.app.handle_key(key(KeyCode::F(5))).unwrap();
@@ -8002,6 +8452,7 @@ mod tests {
             "esc→list",
             "`A` did not reach the pane"
         );
+        fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
         fx.app.handle_key(key(KeyCode::Enter)).unwrap();
         assert!(fx.app.pump(), "a new agent is worth a frame");
 
@@ -8040,6 +8491,351 @@ mod tests {
         );
     }
 
+    /// The git pane alone, drawn at a size of the test's choosing, as rows.
+    ///
+    /// For the chooser tests that ask which row is on which line, which a
+    /// whole frame answers only with the agent's column glued to the front of
+    /// every row.
+    fn git_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.git.render(f, Rect::new(0, 0, width, height)))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buf.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `F1, O` shows the git view, gives it the keys, and asks which agent —
+    /// with the cursor on the command line the session was started with.
+    ///
+    /// **From the worst place to start from**, which is the whole of what the
+    /// key is for: another view on screen, the right pane hidden by `F1, Z`,
+    /// the keys at the agent, and the git pane left in its worktree list. The
+    /// key has to undo all four — the zoom because asking for a view is asking
+    /// to see it, the list because `Esc` has to land somewhere predictable —
+    /// and still ask about the checkout the git view shows rather than the row
+    /// the list was on.
+    #[test]
+    fn f1_o_shows_git_focuses_it_and_asks_with_the_cursor_on_the_line_you_started_with() {
+        let mut fx = app();
+        let other = fx.dir.path().join("other");
+        std::fs::create_dir_all(&other).expect("a second worktree");
+        fx.app.git.set_worktree_rows(vec![
+            wt_row(fx.dir.path(), "main", true),
+            wt_row(&other, "other", false),
+        ]);
+        fx.app.set_right_view(RightView::Git);
+        fx.app.git.handle_key(key(KeyCode::Char('w'))).unwrap();
+        fx.app.git.handle_key(key(KeyCode::Tab)).unwrap();
+        hub(&mut fx.app, KeyCode::Char('e'));
+        let _ = screen(&mut fx.app, 120, 40);
+        hub(&mut fx.app, KeyCode::Char('z'));
+        assert!(fx.app.zoom, "F1, Z did not hide the right pane");
+        assert_eq!(fx.app.focus, Focus::Left);
+
+        hub(&mut fx.app, KeyCode::Char('o'));
+        assert!(!fx.app.zoom, "the right pane F1, Z hid stayed hidden");
+        assert_eq!(fx.app.right_view, RightView::Git);
+        assert_eq!(fx.app.focus, Focus::Right, "the chooser has no keys");
+        assert_eq!(fx.app.git.exit_hint(), "esc→list", "nothing was asked");
+        let shown = screen(&mut fx.app, 120, 40);
+        assert!(
+            shown.contains("start an agent in") && shown.contains("as launched"),
+            "the chooser is not on screen: {shown}"
+        );
+
+        // `Enter` straight away is the as-launched row, about the checkout the
+        // git view is showing — not `other`, where the list's cursor was.
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+        let asked = fx
+            .app
+            .git
+            .take_agent_request()
+            .expect("an agent was asked for");
+        assert_eq!(asked.agent, Pick::AsLaunched);
+        assert!(
+            paths::same_dir(&asked.root, fx.dir.path()),
+            "the question was about {} rather than the checkout on screen",
+            asked.root.display()
+        );
+
+        // And `Esc` is the status list, whatever list was up before, with the
+        // keys still in the pane the reader asked for.
+        hub(&mut fx.app, KeyCode::Char('o'));
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(
+            fx.app.git.exit_hint(),
+            "esc→agent",
+            "`Esc` out of the question did not land on the status list"
+        );
+        assert_eq!(fx.app.focus, Focus::Right);
+        assert_eq!(fx.app.git.take_agent_request(), None, "`Esc` started one");
+
+        // **Together or not at all.** A window with no room for a right pane
+        // shows the git view for when it has room, and asks nothing: a
+        // question nothing draws is one the next `Enter` answers blind.
+        let _ = screen(&mut fx.app, crate::layout::MIN_SPLIT_COLS - 1, 40);
+        fx.app.set_focus(Focus::Left);
+        hub(&mut fx.app, KeyCode::Char('o'));
+        assert_eq!(fx.app.right_view, RightView::Git);
+        assert_eq!(fx.app.focus, Focus::Left, "the keys went to a pane that is not there");
+        assert_eq!(
+            fx.app.git.exit_hint(),
+            "esc→agent",
+            "a question was asked in a window with nowhere to draw it"
+        );
+    }
+
+    /// `F1, O` then `Enter` starts what the session ran — the typed line and
+    /// all — and `a` from the same place still starts none of it.
+    ///
+    /// **The whole wire, read off the child's own screen.** The shim prints
+    /// what it was given before it does anything else, so what is asserted is
+    /// what arrived in the process rather than what abeam meant to send. Two
+    /// sessions, because the typed line is joined to two different things: a
+    /// preset puts its own subcommand in front of it, and a program named
+    /// outright — `abeam +pwsh -NoLogo` — has nothing to put there, and was
+    /// the case the chooser could not offer at all before this row existed.
+    #[test]
+    fn f1_o_then_enter_runs_what_the_session_ran_and_a_still_runs_none_of_it() {
+        let dir = TempDir::new("f1-o");
+        let target = a_pane_that_says_what_it_was_given(&dir);
+        let typed = words(&["--foo", "."]);
+
+        let candidate: &'static str =
+            Box::leak(target.to_string_lossy().into_owned().into_boxed_str());
+        let candidates: &'static [&'static str] = Box::leak(Box::new([candidate]));
+        let preset: &'static [crate::agent::Agent] = Box::leak(Box::new([crate::agent::Agent {
+            name: "fleet",
+            candidates,
+            install: "there is nothing to install; this row is a fixture",
+            args: &["agent"],
+            hosts: "claude",
+        }]));
+        let sessions = [
+            (
+                crate::agent::resolve_within(&preset[0], &typed, preset).expect("the shim resolves"),
+                preset,
+                "fleet --foo .",
+                "given:[agent --foo .]",
+                "given:[agent]",
+            ),
+            (
+                crate::agent::Hosted::plain(
+                    "shim",
+                    &typed,
+                    crate::launch::resolve(&target.to_string_lossy(), &typed)
+                        .expect("the shim resolves"),
+                ),
+                crate::agent::AGENTS,
+                "shim --foo .",
+                "given:[--foo .]",
+                "given:[]",
+            ),
+        ];
+
+        for (hosted, table, drawn, as_launched, plain) in sessions {
+            let (program, args) = EXITS;
+            let left = TerminalPane::spawn(program, &words(args), 20, 60)
+                .expect("spawn a child in a pty");
+            let mut app = App::new(
+                left,
+                dir.path().to_path_buf(),
+                &hosted,
+                table,
+                Opening::default(),
+            );
+            let _ = screen(&mut app, 160, 60);
+
+            hub(&mut app, KeyCode::Char('o'));
+            // Shown before it can be run, which is the whole of the row's
+            // safety.
+            assert!(
+                screen(&mut app, 160, 60).contains(drawn),
+                "the row does not say `{drawn}` before `Enter` runs it"
+            );
+            app.handle_key(key(KeyCode::Enter)).unwrap();
+            assert!(app.pump(), "a new agent is worth a frame");
+            assert_eq!(app.agents.len(), 2, "nothing was started: {:?}", app.agent_refused);
+            assert_eq!(app.agents[1].kind, hosted.agent, "the pane is not the session's kind");
+            until(&format!("`{as_launched}` on the new pane"), || {
+                app.agents[1]
+                    .pane
+                    .last_screen()
+                    .iter()
+                    .any(|row| row.contains(as_launched))
+            });
+
+            // `a`, in the same view: the same program, none of the line.
+            app.handle_key(key(KeyCode::Char('a'))).unwrap();
+            assert!(app.pump(), "a new agent is worth a frame");
+            assert_eq!(app.agents.len(), 3, "nothing was started: {:?}", app.agent_refused);
+            until(&format!("`{plain}` on the pane `a` opened"), || {
+                app.agents[2]
+                    .pane
+                    .last_screen()
+                    .iter()
+                    .any(|row| row.contains(plain))
+            });
+        }
+    }
+
+    /// Every row of the table is in the chooser `F1, O` opens, in the table's
+    /// order and under the as-launched row, and each one can be chosen.
+    ///
+    /// **Driven by the table rather than by a list of names**, and that is the
+    /// point of it. The chooser is supposed to be nothing but the table drawn,
+    /// so an agent added to `crate::agent::AGENTS` — or a `[preset.*]` added to
+    /// somebody's config — is offered here with no line of this file changing.
+    /// A test naming `claude`, `copilot` and `codex` would go on passing while
+    /// a fourth built-in was missing from the list; this one fails.
+    ///
+    /// Nothing is started: the request is taken off the pane rather than
+    /// drained by [`App::pump`], because resolving a real agent's row would
+    /// start whatever is installed on the machine running the suite.
+    #[test]
+    fn f1_o_offers_every_row_of_the_table_and_each_can_be_chosen() {
+        // `crate::config::Config::table`'s shape: the built-ins, then a preset.
+        let table: &'static [crate::agent::Agent] = Box::leak(
+            crate::agent::AGENTS
+                .iter()
+                .copied()
+                .chain([crate::agent::Agent {
+                    name: "fleet",
+                    candidates: &["claude"],
+                    install: "there is nothing to install; this row is a fixture",
+                    args: &["agent"],
+                    hosts: "claude",
+                }])
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let mut fx = app_over_table(table);
+        let _ = screen(&mut fx.app, 160, 60);
+
+        for (i, row) in table.iter().enumerate() {
+            hub(&mut fx.app, KeyCode::Char('o'));
+            let lines = git_rows(&mut fx.app, 60, table.len() as u16 + 4);
+            // Line 0 is the as-launched row — `claude` here, nothing typed —
+            // and the table's rows follow it one to a line.
+            let drawn = lines[1 + i].trim_start().trim_start_matches('▸').trim_start();
+            assert!(
+                drawn.starts_with(row.name),
+                "`{}` is not where the table puts it: {lines:#?}",
+                row.name
+            );
+
+            for _ in 0..=i {
+                fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+            }
+            fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+            assert_eq!(
+                fx.app.git.take_agent_request().map(|req| req.agent),
+                Some(Pick::Row(row.name)),
+                "`{}` could not be chosen",
+                row.name
+            );
+        }
+    }
+
+    /// `F1, O`, `Enter` arriving with no frame between them runs nothing, and
+    /// neither does an `Enter` after a frame that left the pane off screen.
+    ///
+    /// **`crate::app::App::close_drawn`'s rule, on the key that re-runs what was
+    /// typed.** [`App::drive`] drains every queued event before it draws, so
+    /// type-ahead, a macro or a paste Windows delivers as key events puts the
+    /// question and its answer in one batch — and a `--resume` or a `-p` would
+    /// run without its line ever having been on screen. So `Enter` on the
+    /// as-launched row is refused, the key swallowed and the question left up,
+    /// until a frame has drawn that row whole; the next `Enter` is then made in
+    /// front of it.
+    ///
+    /// The second half is the shell's share of the rule: a frame that draws no
+    /// right pane — `F1, Z` hides it without putting the question away — has to
+    /// withdraw what the frame before it showed, and only the shell sees that
+    /// frame happen. See `crate::panes::git::GitPane::forget_drawn`.
+    #[test]
+    fn f1_o_enter_runs_nothing_until_a_frame_has_drawn_the_line() {
+        let mut fx = app();
+        let _ = screen(&mut fx.app, 120, 40);
+
+        hub(&mut fx.app, KeyCode::Char('o'));
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            fx.app.git.take_agent_request(),
+            None,
+            "`F1, O`, `Enter` in one batch ran a line nobody was shown"
+        );
+        assert_eq!(
+            fx.app.git.exit_hint(),
+            "esc→list",
+            "the refusal ended the question"
+        );
+        assert_eq!(fx.app.focus, Focus::Right, "the refusal moved the keys");
+
+        let _ = screen(&mut fx.app, 120, 40);
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            fx.app.git.take_agent_request().map(|req| req.agent),
+            Some(Pick::AsLaunched),
+            "a drawn row did not answer `Enter`"
+        );
+
+        // Drawn, then hidden by `F1, Z` for a frame, then shown again by `F5`
+        // and answered in the same batch: the frame in between drew nothing,
+        // so the question is unanswered until the next one does.
+        hub(&mut fx.app, KeyCode::Char('o'));
+        let _ = screen(&mut fx.app, 120, 40);
+        hub(&mut fx.app, KeyCode::Char('z'));
+        let _ = screen(&mut fx.app, 120, 40);
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right);
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            fx.app.git.take_agent_request(),
+            None,
+            "a row a hidden frame had not drawn was answered as though it had"
+        );
+        let _ = screen(&mut fx.app, 120, 40);
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            fx.app.git.take_agent_request().map(|req| req.agent),
+            Some(Pick::AsLaunched)
+        );
+
+        // And a frame whose `F1` overlay covered the row: the pane drew it
+        // whole underneath, and nobody could see it. Both overlays, because
+        // the reference is the one wide and tall enough to hide it outright.
+        for overlay in [None, Some(KeyCode::Char('?'))] {
+            hub(&mut fx.app, KeyCode::Char('o'));
+            let _ = screen(&mut fx.app, 120, 40);
+            fx.app.handle_key(key(KeyCode::F(1))).unwrap();
+            if let Some(code) = overlay {
+                fx.app.handle_key(key(code)).unwrap();
+            }
+            let _ = screen(&mut fx.app, 120, 40);
+            fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+            assert!(fx.app.hub.is_none(), "`Esc` did not dismiss the overlay");
+            fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+            assert_eq!(
+                fx.app.git.take_agent_request(),
+                None,
+                "a row under the {overlay:?} overlay was answered as though it was seen"
+            );
+            let _ = screen(&mut fx.app, 120, 40);
+            fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+            assert_eq!(
+                fx.app.git.take_agent_request().map(|req| req.agent),
+                Some(Pick::AsLaunched)
+            );
+        }
+    }
+
     /// A chosen agent that is not on the machine is a sentence, and it is the
     /// same sentence `abeam +codex` gives at startup.
     ///
@@ -8063,7 +8859,7 @@ mod tests {
         let root = fx.dir.path().to_path_buf();
 
         assert!(
-            fx.app.start_agent(&root, Some("nowhere")),
+            fx.app.start_agent(&root, Pick::Row("nowhere")),
             "a refusal is worth a frame: it is the only thing that will say why"
         );
         assert_eq!(fx.app.agents.len(), 1, "a pane was started anyway");
@@ -9067,7 +9863,7 @@ mod tests {
         goes_quiet(&rx);
 
         let root = fx.dir.path().to_path_buf();
-        assert!(fx.app.start_agent(&root, None));
+        assert!(fx.app.start_agent(&root, Pick::Session));
         assert_eq!(fx.app.agents.len(), 2, "nothing was started");
         assert_eq!(
             fx.app.agents[1].probe.disowned(),
@@ -10491,7 +11287,7 @@ mod tests {
         // A second agent in the same root, which is what `a` on the row you are
         // already standing in produces.
         assert!(
-            fx.app.start_agent(fx.dir.path(), None),
+            fx.app.start_agent(fx.dir.path(), Pick::Session),
             "nothing was started"
         );
         assert_eq!(fx.app.agents.len(), 2);
@@ -11281,15 +12077,16 @@ mod tests {
         );
     }
 
-    /// `a` opens a pane of the session's own kind, which is what the `None` in
-    /// [`App::start_agent`]'s second argument means where a chosen row would
-    /// otherwise be.
+    /// `a` opens a pane of the session's own kind, which is what the
+    /// `Pick::Session` in [`App::start_agent`]'s second argument means where a
+    /// chosen row would otherwise be.
     ///
     /// **Both constructors, because there are two and only one of them is
     /// obvious.** `App::new` writes the field from the `Hosted` that resolved
     /// at startup. `start_agent` has no `Hosted` — it re-derives a launch from
     /// [`Recipe`], which carries a `kind` beside the file and the border word,
-    /// and `None` is the arm that reads it. That field is phase 3 of
+    /// and `Pick::Session` is the arm that reads it (with `Pick::AsLaunched`,
+    /// which reads the same `kind`). That field is phase 3 of
     /// `docs/mixed-agents.md`, and so is the other arm: `A` starts a chosen row
     /// instead, which is
     /// `choosing_an_agent_starts_that_one_rather_than_the_sessions`. This test
@@ -11309,7 +12106,7 @@ mod tests {
         );
 
         assert!(
-            fx.app.start_agent(fx.dir.path(), None),
+            fx.app.start_agent(fx.dir.path(), Pick::Session),
             "nothing was started"
         );
         assert_eq!(fx.app.agents.len(), 2);

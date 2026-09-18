@@ -42,7 +42,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::pane::{Handled, Pane};
 use crate::panes::AskRequest;
@@ -105,28 +105,90 @@ struct Choice {
     /// `Enter` will do — and while the question stands nothing can move the
     /// cursor anyway, because [`GitPane::choose_key`] swallows every key.
     root: PathBuf,
-    /// Which row of the table the cursor is on. A position into
-    /// [`GitPane::table`], which is `&'static` and never changes length — the
-    /// one index in this file that cannot outlive the list it points into. See
+    /// Which row of the list the cursor is on: `0` is the as-launched row, and
+    /// `1 + i` is row `i` of [`GitPane::table`].
+    ///
+    /// **A row and not a screen line**, which is the distinction the first row
+    /// made necessary: it wraps, so one row can be several lines, and every
+    /// key that moves this counts rows. [`agent_lines`] is the only thing that
+    /// turns it into lines.
+    ///
+    /// Still a position into lists that cannot change length — the table is
+    /// `&'static` and the as-launched row is always there — so it is the one
+    /// index in this file that cannot outlive what it points into. See
     /// [`GitPane::wt_sel_root`] for the three times that has gone the other
     /// way.
     sel: usize,
+    /// Whether the last frame drew row `0` — the command line `Enter` there
+    /// re-runs — **whole**, and so whether `Enter` on it is an answer at all.
+    ///
+    /// **A confirmation a fast typist can skip is not a confirmation**, which
+    /// is `crate::app::App::close_drawn`'s sentence and its rule one gesture
+    /// along. The as-launched row asks nothing; what makes re-running somebody's
+    /// `--resume` or `-p` safe is that the line was on screen before the key
+    /// was pressed, and "on screen" is a fact about a frame rather than about
+    /// the pane having been asked to draw one. `crate::app::App::drive` drains
+    /// every queued event before it draws, so `F1`, `O`, `Enter` in one batch
+    /// — type-ahead, a macro, a paste Windows delivers as keys — would
+    /// otherwise run a line nobody had been shown.
+    ///
+    /// So it is *drawn*, not *recorded*. False when the question opens;
+    /// cleared by the shell at the start of every frame, through
+    /// [`GitPane::forget_drawn`], so a frame that leaves the pane off screen —
+    /// `F1, Z` — leaves it false; and set by [`GitPane::render_choice`] only
+    /// when every line of the row went out uncut. A row too long for the pane
+    /// never sets it, and says so in its own note rather than ending in a `…`
+    /// that looks runnable.
+    ///
+    /// Refused means the key is swallowed and the question left up, never
+    /// answered with something else: the frame that follows draws the row, and
+    /// the next `Enter` is made in front of it. The table's rows are not gated,
+    /// because none of them re-runs anything that was typed, which is the whole
+    /// of what this guards.
+    drawn: bool,
+}
+
+/// Which agent a request is for.
+///
+/// **Three answers, and the two that sound alike differ in exactly the words
+/// somebody typed.** [`Session`](Self::Session) and
+/// [`AsLaunched`](Self::AsLaunched) both start the session's own program from
+/// `crate::app::Recipe` — the same file, the same border word, the same kind —
+/// and the second one adds back the command line the session was started with,
+/// `-p` and `--resume` included, where the first adds none of it. The rule that
+/// decides which key gets which is written once, on `Recipe`: *anything that
+/// re-runs typed arguments shows them first*. `a` shows nothing and asks
+/// nothing, so it is `Session`; the chooser's first row will not answer
+/// `Enter` until a frame has drawn the whole line — see [`Choice::drawn`] — so
+/// it is `AsLaunched`.
+///
+/// `&'static str` in [`Row`](Self::Row) because the table is `&'static`, so
+/// the request borrows nothing and outlives nothing — it can sit in a field
+/// until the shell drains it, exactly as the `PathBuf` it travels with does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// `a`: another of the session's program, with the table row's own
+    /// arguments and nothing that was typed. Not the name `claude`, which
+    /// would send the fast path through a `PATH` search it has never used.
+    Session,
+    /// The chooser's first row: the session's program with the whole command
+    /// line it was started with, verbatim.
+    AsLaunched,
+    /// A row of the table, by name, resolved the way `main` resolves one at
+    /// startup and with nothing typed.
+    Row(&'static str),
 }
 
 /// A pane asking for an agent: where, and which one.
 ///
-/// `&'static str` because the table is `&'static`, so the request borrows
-/// nothing and outlives nothing — it can sit in a field until the shell drains
-/// it, exactly as the `PathBuf` it travels with does.
-///
-/// **`None` is `a`, and it keeps that key byte-identical.** It means the
-/// session's own agent, resolved from `crate::app::Recipe` — not the name
-/// `claude`, which would send the fast path through a `PATH` search it has
-/// never used. `Some` is a row the reader picked out of the chooser.
+/// **[`Pick::Session`] is `a`, and it keeps that key byte-identical** to what
+/// it did before the chooser existed — and, since the chooser grew its first
+/// row, to what it did before that row existed too. The other two are what the
+/// chooser answers.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentRequest {
     pub root: PathBuf,
-    pub agent: Option<&'static str>,
+    pub agent: Pick,
 }
 
 pub struct GitPane {
@@ -150,12 +212,29 @@ pub struct GitPane {
     /// `pwsh` panes with `a`, and simply cannot be *chosen* by name, because
     /// the list is the table.
     ///
-    /// Two readers and one decision behind both: the cursor starts here, so `A`
-    /// `Enter` is "another of what I already have" and the common case stays
-    /// two keystrokes; and the row is marked `session`, so the reader can see
-    /// which that is. The *order* is the table's and never moves — a list that
-    /// reorders itself by session is one nobody can build muscle memory in.
+    /// One reader: the row is marked `session`, so the reader can see which of
+    /// the table's names this session is. The *order* is the table's and never
+    /// moves — a list that reorders itself by session is one nobody can build
+    /// muscle memory in.
+    ///
+    /// **The cursor does not start here**, and the row is the wrong answer to
+    /// "another of what I already have" twice over: `abeam +pwsh` has no row
+    /// at all, and `abeam agents --cwd .` has one that starts plain `claude` —
+    /// another of the *program*, not of what was started. The as-launched row,
+    /// [`launched`](Self::launched), is the right answer for every session,
+    /// so the cursor starts there.
     session: Option<&'static str>,
+    /// The chooser's first row, as it is drawn: the session's command line,
+    /// one word per argument, each spelled so its edges are visible.
+    ///
+    /// **Drawn here and run elsewhere, and the two are the same line by
+    /// construction rather than by care.** `crate::app::Recipe::shown` spells
+    /// it from the very fields `crate::app::Recipe::as_launched` resolves, and
+    /// hands it down once at construction, the way [`session`](Self::session)
+    /// and [`table`](Self::table) are — none of the three can change while the
+    /// program runs. What travels back on `Enter` is [`Pick::AsLaunched`] and
+    /// not this text, so nothing drawn here is ever parsed back into a command.
+    launched: Vec<String>,
     /// The agent `A` is asking about, if it is asking. See [`Choice`].
     choosing: Option<Choice>,
 
@@ -277,8 +356,9 @@ pub struct GitPane {
     /// the other.
     ///
     /// **Three keys write it now and they are still one request.** `A` `Enter`
-    /// is the two above with a name attached; see [`AgentRequest`], whose
-    /// `None` is what keeps `a` the key it was.
+    /// is the two above with a choice attached — and `F1, O` is `A` reached
+    /// from anywhere, so it is not a fourth; see [`AgentRequest`], whose
+    /// [`Pick::Session`] is what keeps `a` the key it was.
     agent: Option<AgentRequest>,
     /// The worktree an `x` has been pressed at **once**, waiting to be meant.
     ///
@@ -371,10 +451,17 @@ struct Answer {
 
 impl GitPane {
     /// `agent` is the session's own, by the name on its border — the row of
-    /// `table` the chooser starts on and marks. See [`session`](Self::session).
-    pub fn new(root: PathBuf, agent: &str, table: &'static [crate::agent::Agent]) -> Self {
+    /// `table` the chooser marks. See [`session`](Self::session). `launched`
+    /// is the command line the chooser's first row draws; see
+    /// [`launched`](Self::launched).
+    pub fn new(
+        root: PathBuf,
+        agent: &str,
+        launched: Vec<String>,
+        table: &'static [crate::agent::Agent],
+    ) -> Self {
         let (req, res) = spawn_worker(root.clone());
-        Self::over(root, agent, table, req, res)
+        Self::over(root, agent, launched, table, req, res)
     }
 
     /// [`GitPane::new`], over channels handed in rather than a worker started.
@@ -389,6 +476,7 @@ impl GitPane {
     fn over(
         root: PathBuf,
         agent: &str,
+        launched: Vec<String>,
         table: &'static [crate::agent::Agent],
         req: Sender<Ask>,
         res: Receiver<Answer>,
@@ -404,6 +492,7 @@ impl GitPane {
             // decided — what is kept is the *table's* spelling, which is what
             // the list draws.
             session: crate::agent::find_within(agent, table).map(|row| row.name),
+            launched,
             choosing: None,
             req,
             res,
@@ -443,11 +532,12 @@ impl GitPane {
     fn detached(
         root: PathBuf,
         agent: &str,
+        launched: Vec<String>,
         table: &'static [crate::agent::Agent],
     ) -> (Self, Receiver<Ask>, Sender<Answer>) {
         let (req, asks) = mpsc::channel::<Ask>();
         let (answers, res) = mpsc::channel::<Answer>();
-        (Self::over(root, agent, table, req, res), asks, answers)
+        (Self::over(root, agent, launched, table, req, res), asks, answers)
     }
 
     /// Point this pane at another worktree.
@@ -628,6 +718,47 @@ impl GitPane {
     /// they are pressing at something else.
     pub fn cancel_choice(&mut self) {
         self.choosing = None;
+    }
+
+    /// `F1, O`: the status list, with the chooser standing over it, about the
+    /// checkout this pane is showing.
+    ///
+    /// **`A` pressed in the status list, reached from anywhere**, and it is
+    /// that key's arm rather than a second chooser: the same [`choose`](Self::choose),
+    /// about the same `self.root` the status list's `a` and `A` use — the
+    /// workspace on screen, which is the checkout the reader is looking at and
+    /// not the toplevel git names. So `Esc` puts back the status list exactly as
+    /// it does after `A` there, and `Enter` is the same request.
+    ///
+    /// **The status list whatever was up before**, because the key names a
+    /// view and not a mode: the reader asked for the git view with a question
+    /// in front of it, and `Esc` has to land somewhere they can predict without
+    /// remembering whether they had `w` open an hour ago. The worktree list's
+    /// standing `x` goes with it, for the reason that list's own `A` arm takes
+    /// it on its way past: a kill left armed behind a full-pane question is a
+    /// kill with one visible warning. The shell's `set_right_view` has already
+    /// withdrawn it by the time this runs; this line is so that the pane's own
+    /// guarantee does not depend on who called it.
+    pub fn choose_here(&mut self) {
+        self.kill = None;
+        self.mode = Mode::Status;
+        self.choose(self.root.clone());
+    }
+
+    /// A frame is about to be drawn: whatever the last one showed of the
+    /// chooser is no longer evidence of anything.
+    ///
+    /// **The shell's, and called at the start of every frame for the reason
+    /// `crate::app::App::close_drawn` is cleared at the start of every frame.**
+    /// [`Choice::drawn`] must describe the frame about to go out, and a pane is
+    /// never told when a frame leaves it off screen — `F1, Z` hides the right
+    /// pane without putting the question away — so only something that runs on
+    /// every frame, drawn or not, can clear it. [`render_choice`](Self::render_choice)
+    /// sets it again on the frames that do draw the row whole.
+    pub fn forget_drawn(&mut self) {
+        if let Some(choice) = self.choosing.as_mut() {
+            choice.drawn = false;
+        }
     }
 
     /// Whether anything has asked to see the worktree list yet.
@@ -999,7 +1130,7 @@ impl GitPane {
                         self.agent = Some(AgentRequest {
                             root: row.root.clone(),
                             // The session's own. See [`AgentRequest`].
-                            agent: None,
+                            agent: Pick::Session,
                         });
                         Handled::Yes
                     }
@@ -1099,17 +1230,29 @@ impl GitPane {
 
     /// `A`: ask which agent, about this checkout.
     ///
-    /// One function for the two arms that press it, so the cursor cannot start
-    /// on the session's agent in one list and at the top in the other. The root
-    /// is whatever the arm was asking about — the row under the cursor in the
-    /// worktree list, the checkout on screen in the status view — and it is
-    /// captured here rather than read again at `Enter`. See [`Choice::root`].
+    /// One function for the three ways in — the two `A` arms and `F1, O`, by
+    /// way of [`choose_here`](Self::choose_here) — so the cursor cannot start
+    /// in one place from one of them and somewhere else from another. The root
+    /// is whatever the caller was asking about — the row under the cursor in
+    /// the worktree list, the checkout on screen in the status view — and it
+    /// is captured here rather than read again at `Enter`. See
+    /// [`Choice::root`].
+    ///
+    /// **The cursor starts on the as-launched row, always**, so `Enter` is
+    /// "another one exactly like what I started" whatever the session was
+    /// started as — a built-in, a preset, or a program with no row at all. Why
+    /// not the session's row of the table is argued at
+    /// [`session`](Self::session).
+    ///
+    /// And **undrawn**, so the `Enter` that arrives in the same input batch as
+    /// the key that asked is refused rather than answered. See
+    /// [`Choice::drawn`].
     fn choose(&mut self, root: PathBuf) {
-        let sel = self
-            .session
-            .and_then(|want| self.table.iter().position(|row| row.name == want))
-            .unwrap_or(0);
-        self.choosing = Some(Choice { root, sel });
+        self.choosing = Some(Choice {
+            root,
+            sel: 0,
+            drawn: false,
+        });
     }
 
     /// The keys the chooser owns, which is **all of them**.
@@ -1131,6 +1274,11 @@ impl GitPane {
     /// this list needs moved is a selection; the table is three rows on a
     /// machine with no presets, so there is nothing to scroll.
     ///
+    /// **They move by row and never by line**, which is only worth saying
+    /// because the first row can be several lines: `j` from the as-launched
+    /// row is the table's first row however far the command line wrapped. See
+    /// [`Choice::sel`].
+    ///
     /// **This is where the swallowing lives, and the two `A` arms are
     /// deliberately not here.** See [`handle_key`](Self::handle_key).
     fn choose_key(&mut self, key: KeyEvent) -> Handled {
@@ -1138,17 +1286,34 @@ impl GitPane {
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => 1,
             KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => -1,
             KeyCode::Enter => {
-                // Taken, so the question is over whichever way the request
-                // goes, and the row is read out of the table by the index the
-                // cursor holds — which is why the name that travels is
-                // `&'static` and borrows nothing.
-                if let Some(choice) = self.choosing.take()
-                    && let Some(row) = self.table.get(choice.sel)
+                // Row `0` re-runs what was typed, and is only an answer once a
+                // frame has shown all of it. Otherwise the key is swallowed and
+                // the question stays up: the frame this key is owed draws the
+                // row, or says why it cannot, and the next `Enter` is made in
+                // front of that. See [`Choice::drawn`].
+                if self
+                    .choosing
+                    .as_ref()
+                    .is_some_and(|choice| choice.sel == 0 && !choice.drawn)
                 {
-                    self.agent = Some(AgentRequest {
-                        root: choice.root,
-                        agent: Some(row.name),
-                    });
+                    return Handled::Yes;
+                }
+                // Taken, so the question is over whichever way the request
+                // goes. Row `0` is the command line the session was started
+                // with and every other row is the table's, read out by the
+                // index the cursor holds — which is why the name that travels
+                // is `&'static` and borrows nothing.
+                if let Some(choice) = self.choosing.take() {
+                    let agent = match choice.sel {
+                        0 => Some(Pick::AsLaunched),
+                        n => self.table.get(n - 1).map(|row| Pick::Row(row.name)),
+                    };
+                    if let Some(agent) = agent {
+                        self.agent = Some(AgentRequest {
+                            root: choice.root,
+                            agent,
+                        });
+                    }
                 }
                 return Handled::Yes;
             }
@@ -1160,10 +1325,10 @@ impl GitPane {
             _ => return Handled::Yes,
         };
 
-        let n = self.table.len() as isize;
-        if let Some(choice) = self.choosing.as_mut()
-            && n > 0
-        {
+        // The as-launched row and then the table, so never empty — which is
+        // why the modulus below needs no guard.
+        let n = self.table.len() as isize + 1;
+        if let Some(choice) = self.choosing.as_mut() {
             // Wraps, like both lists in this pane: `k` at the top is the last
             // row rather than a dead key.
             choice.sel = (((choice.sel as isize + delta) % n + n) % n) as usize;
@@ -1172,20 +1337,47 @@ impl GitPane {
     }
 
     fn render_choice(&mut self, f: &mut Frame, inner: Rect) {
-        if inner.width == 0 || inner.height == 0 {
+        let Some(sel) = self.choosing.as_ref().map(|choice| choice.sel) else {
             return;
+        };
+        // Written on every frame that reaches here, and true only if this one
+        // drew the as-launched row whole — so a pane with no rows, or a resize
+        // that cuts a row an earlier frame drew whole, withdraws what that
+        // earlier frame established. See [`Choice::drawn`].
+        let mut whole = false;
+        if inner.width > 0 && inner.height > 0 {
+            // No scrollbar and no `Scroll`: the table is what a reader wrote
+            // down, and a list somebody has to scroll to see is one they would
+            // rather not have opened. A table long enough to overflow simply
+            // loses its tail here, which is `take` doing what every other list
+            // in this file does to a pane too short for it.
+            //
+            // **The as-launched row is the one exception, and it is budgeted
+            // rather than cut by `take`.** It is the only row that can be
+            // taller than a line, and the only one whose `Enter` re-runs
+            // somebody's arguments — so it gets every line the table and the
+            // hint below do not need, and if even that is not enough it says
+            // it cannot run rather than silently ending. `room` is never more
+            // than the pane's height, so a row that fits it is on screen. See
+            // [`launched_lines`].
+            let room = (inner.height as usize).saturating_sub(self.table.len() + 2);
+            let (mut lines, drawn_whole) = agent_lines(
+                &self.launched,
+                self.table,
+                self.session,
+                sel,
+                inner.width,
+                room,
+            );
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled("enter starts", dim())));
+            let visible: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
+            f.render_widget(Paragraph::new(visible), inner);
+            whole = drawn_whole;
         }
-        let Some(choice) = &self.choosing else { return };
-        // No scrollbar and no `Scroll`: the table is what a reader wrote down,
-        // and a list somebody has to scroll to see is one they would rather not
-        // have opened. A table long enough to overflow simply loses its tail
-        // here, which is `take` doing what every other list in this file does
-        // to a pane too short for it.
-        let mut lines = agent_lines(self.table, self.session, choice.sel, inner.width);
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled("enter starts", dim())));
-        let visible: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
-        f.render_widget(Paragraph::new(visible), inner);
+        if let Some(choice) = self.choosing.as_mut() {
+            choice.drawn = whole;
+        }
     }
 }
 
@@ -1504,8 +1696,9 @@ impl Pane for GitPane {
                     // The session's own agent, and not the name `claude`: `a`
                     // is resolved from `crate::app::Recipe`, which starts *the
                     // same file* this session did rather than searching `PATH`
-                    // again. See [`AgentRequest`].
-                    agent: None,
+                    // again — and with none of the line that was typed, which
+                    // this key never shows. See [`Pick`].
+                    agent: Pick::Session,
                 });
             }
             // `A` is `a` with a question in front of it, and the question is
@@ -1578,11 +1771,14 @@ impl Pane for GitPane {
         //
         // Nothing here chooses a row: a click that started an agent would be
         // the one gesture in this file that spawns a process without a
-        // keystroke.
+        // keystroke. Nor does it move the cursor, which is why the as-launched
+        // row wrapping onto several lines needed no screen-line-to-row mapping
+        // here: there is no mapping, because no pointer event is ever read as
+        // a row. The keys count rows; see [`Choice::sel`].
         //
         // `Yes` and not `No`, which costs one affordance and is worth saying:
         // `crate::app` turns what a pane declines into a text selection, so
-        // while the question stands the four rows of it cannot be dragged over
+        // while the question stands the rows of it cannot be dragged over
         // and copied. Owning every input for the lifetime of the question is
         // the simpler rule.
         //
@@ -1636,8 +1832,9 @@ impl Pane for GitPane {
     /// answer to.
     ///
     /// And the chooser is a fourth, reachable from either list: `Esc` there
-    /// puts back whichever list `A` was pressed in, which is neither the git
-    /// view by name nor the agent. This answers `&'static str`, so a third
+    /// puts back whichever list `A` was pressed in — the status list, when it
+    /// was `F1, O` that asked — which is neither the git view by name nor the
+    /// agent. This answers `&'static str`, so a third
     /// string costs nothing — and the promise is only honest because
     /// [`choose_key`](Self::choose_key) consumes `Esc` itself.
     fn exit_hint(&self) -> &'static str {
@@ -1717,7 +1914,8 @@ fn worktree_lines(rows: &[workspace::Row], width: u16, sel: usize) -> Vec<Line<'
         .collect()
 }
 
-/// The chooser, one line per row of the table.
+/// The chooser: the command line the session was started with, then one line
+/// per row of the table.
 ///
 /// **[`worktree_lines`]'s conventions, deliberately, down to the gutter.** The
 /// two lists are reached by the same key one press apart, and a reader who has
@@ -1727,62 +1925,279 @@ fn worktree_lines(rows: &[workspace::Row], width: u16, sel: usize) -> Vec<Line<'
 /// you are standing in, the cursor is the row's background, and the note is
 /// laid out first with the name taking what is left.
 ///
+/// **The first row is not the table's and is not marked `▸`**, because `▸`
+/// means "this session's row of the table" and the table's rows are what `+`
+/// can name. It is [`launched_lines`]'s, it may be several lines tall — `room`
+/// is how many it may have — and its note says what it is instead. `sel`
+/// counts rows rather than lines, so `0` puts the cursor behind every line of
+/// it and `1 + i` behind row `i` of the table. See [`Choice::sel`].
+///
+/// The `bool` is [`launched_lines`]'s, passed through: whether that row is
+/// whole in these lines, which is what [`Choice::drawn`] is written from.
+///
 /// Built at render for that function's reason: what to drop at 46 columns
 /// cannot be decided before the width is known.
 fn agent_lines(
+    launched: &[String],
     table: &[crate::agent::Agent],
     session: Option<&str>,
     sel: usize,
     width: u16,
-) -> Vec<Line<'static>> {
+    room: usize,
+) -> (Vec<Line<'static>>, bool) {
     let w = width as usize;
+    let (mut lines, whole) = launched_lines(launched, sel == 0, width, room);
     if table.is_empty() {
         // Unreachable through `crate::config::Config::table`, which is the
         // built-ins plus whatever a file added — but this function takes a
         // table and a caller with an empty one gets a sentence rather than a
         // box with nothing in it.
-        return vec![Line::from(Span::styled("no agents to choose from", dim()))];
+        lines.push(Line::from(Span::styled("no agents to choose from", dim())));
+        return (lines, whole);
     }
 
-    table
-        .iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let mine = Some(row.name) == session;
-            let gutter = if mine { " ▸ " } else { "   " };
-            let note = agent_note(row, mine);
-            let budget = w.saturating_sub(gutter.width() + note.width());
-            let label = clip(row.name, budget);
-            let pad = budget.saturating_sub(label.width());
+    lines.extend(table.iter().enumerate().map(|(i, row)| {
+        let mine = Some(row.name) == session;
+        let gutter = if mine { " ▸ " } else { "   " };
+        let note = agent_note(row, mine);
+        let budget = w.saturating_sub(gutter.width() + note.width());
+        let label = clip(row.name, budget);
+        let pad = budget.saturating_sub(label.width());
 
-            let style = if mine {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let mut spans = vec![
-                Span::styled(gutter, style),
-                Span::styled(label, style),
-                Span::raw(" ".repeat(pad)),
-            ];
-            if !note.is_empty() {
-                spans.push(Span::styled(note, dim()));
+        let style = if mine {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let mut spans = vec![
+            Span::styled(gutter, style),
+            Span::styled(label, style),
+            Span::raw(" ".repeat(pad)),
+        ];
+        if !note.is_empty() {
+            spans.push(Span::styled(note, dim()));
+        }
+
+        // Clipped here and nowhere else, for `worktree_lines`' reason: a
+        // pane that overflows its rect corrupts the frame.
+        let spans = clip_line(Line::from(spans), w).spans;
+        // One past the table's own index, because row `0` of the list is
+        // the as-launched row above.
+        if i + 1 == sel {
+            under_cursor(spans, w)
+        } else {
+            Line::from(spans)
+        }
+    }));
+    (lines, whole)
+}
+
+/// A chooser line with the cursor behind it: padded to the whole width, so the
+/// highlight is a bar rather than a smear the length of the text.
+///
+/// Its own function because the as-launched row paints it on every line it
+/// has, and one row's highlight spelled two ways is two chances for a
+/// continuation line to be left unlit.
+fn under_cursor(mut spans: Vec<Span<'static>>, w: usize) -> Line<'static> {
+    let used: usize = spans.iter().map(|s| cells(&s.content)).sum();
+    spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
+    Line::from(spans).style(Style::default().bg(Color::DarkGray))
+}
+
+/// The chooser's first row: the command line the session was started with,
+/// **wrapped rather than clipped**.
+///
+/// **The one row in this pane that wraps, and the reason is what `Enter` does
+/// on it.** Every other row is a name abeam wrote down or a reader put in a
+/// config file, and a name clipped with `…` still says which row it is. This
+/// one re-runs somebody's arguments verbatim — `--resume` and a conversation,
+/// `-p` and a prompt — and the whole of what makes that safe is that the line
+/// is on screen before the key is pressed. A clip puts the end of the line
+/// off the edge, and the end of a command line is exactly where `--resume
+/// <id>` goes.
+///
+/// **It breaks between arguments, and inside one only when that one is wider
+/// than a whole line**, so `--resume` and the id after it are never split. The
+/// two wrappers `crate::text::wrap` already has were each tried against this
+/// row and each is wrong for it. `hard_wrap` breaks at the column, which is
+/// right for code and reads `claude --` / `resume` for `claude --resume` — a
+/// different command line, on the one row whose job is to be read before it is
+/// run. `wrap_spans` breaks at spaces and collapses runs of them, which inside
+/// a quoted argument is a lie about the argument.
+///
+/// Continuation lines hang two cells further in than the first, so a wrapped
+/// line can never be read as a row of the table beneath it. The note is on the
+/// first line, where every other row keeps its own.
+///
+/// **The `bool` is whether the row is whole in these lines**, and the rule it
+/// feeds is [`Choice::drawn`]'s: `Enter` on this row is refused on any frame
+/// that did not draw all of it. `room` is how many lines the row may have, and
+/// a pane too narrow to give it a real line or too short to give it enough of
+/// them draws what fits — cut, and marked `…`, which is `crate::text`'s one
+/// rule — under a note that says it will not run rather than the note that
+/// says what it is. A `…` under `as launched` would be the one thing this row
+/// must not be: a line that looks runnable with part of it out of sight. That
+/// takes a command line most of a screenful long, which is a prompt pasted onto
+/// abeam's command line rather than anything `--resume` produces, and widening
+/// the window is the whole of the answer on purpose: a scroll bar in a list
+/// whose other rows are one word each would be machinery for a case a bigger
+/// pane already answers. The rows below are kept on screen rather than pushed
+/// off by it — `room` is what they leave — so the list stays one that `j` can
+/// be seen to move in.
+fn launched_lines(
+    words: &[String],
+    selected: bool,
+    width: u16,
+    room: usize,
+) -> (Vec<Line<'static>>, bool) {
+    /// Where the other rows put `▸` or nothing, so the text lines up with theirs.
+    const GUTTER: &str = "   ";
+    /// Two cells further in, so a continuation is visibly one.
+    const HANG: &str = "     ";
+    const NOTE: &str = " as launched";
+    /// The note for a row this pane cannot draw whole, in the shape the left
+    /// border's `refused · widen to see why` already taught.
+    const CUT: &str = " too long · widen to run";
+
+    let w = width as usize;
+    let style = Style::default().fg(Color::Gray);
+    let rest = w.saturating_sub(HANG.width());
+    let first_beside = |note: &str| w.saturating_sub(GUTTER.width() + note.width());
+    let room = room.max(1);
+
+    // Laid out as the runnable row first, because that is the row being asked
+    // about: whole means every line is inside the budget it was packed for —
+    // `pack` exceeds one only when it was given less room than a character
+    // needs — and there are no more of them than `room`.
+    let mut first = first_beside(NOTE);
+    let mut texts = pack(words, first, rest);
+    let whole = texts.len() <= room
+        && texts.iter().enumerate().all(|(i, text)| {
+            cells(text) <= if i == 0 { first } else { rest }
+        });
+    let mut note = NOTE;
+    if !whole {
+        // Laid out again beside the longer note, which only ever makes it
+        // longer, so it is still cut — and then cut to what fits.
+        note = CUT;
+        first = first_beside(CUT);
+        texts = pack(words, first, rest);
+        if texts.len() > room {
+            texts.truncate(room);
+            let budget = if room == 1 { first } else { rest };
+            if let Some(last) = texts.last_mut() {
+                // `clip` marks only what overflows, so the marker is written in
+                // first and the pair clipped as one: a line that still has room
+                // ends `…` after its last word, and one that does not loses a
+                // character to it.
+                *last = clip(&format!("{last}…"), budget.max(1));
             }
+        }
+    }
 
-            // Clipped here and nowhere else, for `worktree_lines`' reason: a
-            // pane that overflows its rect corrupts the frame.
-            let mut spans = clip_line(Line::from(spans), w).spans;
-            if i == sel {
-                let used: usize = spans.iter().map(|s| s.content.width()).sum();
-                spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
-                Line::from(spans).style(Style::default().bg(Color::DarkGray))
+    let lines = texts
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let spans = if i == 0 {
+                let pad = first.saturating_sub(cells(&text));
+                vec![
+                    Span::styled(GUTTER, style),
+                    Span::styled(text, style),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(note, dim()),
+                ]
+            } else {
+                vec![Span::styled(HANG, style), Span::styled(text, style)]
+            };
+            // Clipped all the same, for `worktree_lines`' reason: `pack` keeps
+            // to the width it was given, and a pane narrower than the gutter
+            // and the note is one that gave it nothing to keep to — which is
+            // also a row that is not whole, and says so above.
+            let spans = clip_line(Line::from(spans), w).spans;
+            if selected {
+                under_cursor(spans, w)
             } else {
                 Line::from(spans)
             }
         })
-        .collect()
+        .collect();
+    (lines, whole)
+}
+
+/// Lay `words` out in lines of at most `first` cells and then `rest`, breaking
+/// between words — see [`launched_lines`] for why never inside one that fits.
+///
+/// A word that will not fit beside what is already on a line starts the next
+/// one, and that includes the *first* word when the first line is the narrower
+/// kind: an absolute path to `pwsh.exe` that misses the first line by three
+/// cells and fits the second whole is worth an empty first line — the note is
+/// still on it — rather than a break through the middle of the path.
+///
+/// Only a word wider than a whole continuation line is broken, and it is cut at
+/// the column and carried on at the start of the next. What that costs is a
+/// line break that stands for nothing rather than for a space, in the one
+/// argument long enough to need it — nearly always a quoted prompt, whose
+/// quotes say where it ends.
+///
+/// Two promises, which the tests hold it to over every pair of limits from 2
+/// to 60: no line is wider than its limit, and no character is lost. A limit
+/// of 1 cannot keep the first for a character two cells wide, and
+/// [`launched_lines`] treats the line that results as a row it could not draw.
+fn pack(words: &[String], first: usize, rest: usize) -> Vec<String> {
+    let rest = rest.max(1);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut used = 0usize;
+    let mut lim = first.max(1);
+
+    for word in words {
+        // Measured the way the loop below places it, a character at a time.
+        // See [`cells`] for what a whole-string width would get wrong here.
+        let w = cells(word);
+        let gap = usize::from(used > 0);
+        if used + gap + w > lim && (used > 0 || w <= rest) {
+            lines.push(std::mem::take(&mut cur));
+            used = 0;
+            lim = rest;
+        }
+        if used > 0 {
+            cur.push(' ');
+            used += 1;
+        }
+        for ch in word.chars() {
+            let cw = ch.width().unwrap_or(0);
+            if used > 0 && used + cw > lim {
+                lines.push(std::mem::take(&mut cur));
+                used = 0;
+                lim = rest;
+            }
+            cur.push(ch);
+            used += cw;
+        }
+    }
+    lines.push(cur);
+    lines
+}
+
+/// Width in cells, counted a character at a time — the one measure the
+/// as-launched row is laid out, judged whole and padded by.
+///
+/// **Not `UnicodeWidthStr::width`, because the two can disagree.** An Arabic
+/// lam-alef measures 1 as a string and 2 by its characters; an emoji with a
+/// skin-tone modifier measures 2 and 4. [`pack`] places characters one at a
+/// time, so a fit decided by the string measure and a placement made by the
+/// character one is how an argument that fits comes to be split, with its
+/// closing quote alone on the next line. `crate::app`'s `spelled` escapes the
+/// characters that open the widest gaps — every one with no width of its own —
+/// and does not close them all; counting one way throughout does. What this
+/// does not settle is how a given terminal draws such a sequence, which varies
+/// by terminal; it settles that abeam decides a fit and makes the placement by
+/// the same number.
+fn cells(text: &str) -> usize {
+    text.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
 /// Everything about a table row that is not its name, in one string.
@@ -3272,9 +3687,15 @@ mod tests {
 
     /// A pane over the built-in table, hosting `claude` — which is what every
     /// test here that is not about the chooser wants, because it is what an
-    /// ordinary session is.
+    /// ordinary session is: `abeam` with nothing typed, whose as-launched row
+    /// reads `claude`.
     fn detached(root: &str) -> (GitPane, Receiver<Ask>, Sender<Answer>) {
-        GitPane::detached(PathBuf::from(root), "claude", crate::agent::AGENTS)
+        GitPane::detached(
+            PathBuf::from(root),
+            "claude",
+            vec!["claude".to_string()],
+            crate::agent::AGENTS,
+        )
     }
 
     /// The same, hosting something else and reading a table of somebody's own.
@@ -3282,12 +3703,27 @@ mod tests {
     /// The table is `&'static` in the program because `crate::config` leaks it
     /// once at startup; here it is a `const`, which is the same lifetime by a
     /// cheaper route and keeps the fixture readable as a list of rows.
+    ///
+    /// Started with nothing typed, so the as-launched row is the border word on
+    /// its own. The tests about what that row draws say what was typed.
     fn detached_hosting(
         root: &str,
         agent: &str,
         table: &'static [crate::agent::Agent],
     ) -> (GitPane, Receiver<Ask>, Sender<Answer>) {
-        GitPane::detached(PathBuf::from(root), agent, table)
+        detached_launched(root, agent, &[agent], table)
+    }
+
+    /// The same again, started with a command line of the test's choosing —
+    /// the words as `crate::app::Recipe::shown` would hand them down.
+    fn detached_launched(
+        root: &str,
+        agent: &str,
+        launched: &[&str],
+        table: &'static [crate::agent::Agent],
+    ) -> (GitPane, Receiver<Ask>, Sender<Answer>) {
+        let launched = launched.iter().map(|word| (*word).to_string()).collect();
+        GitPane::detached(PathBuf::from(root), agent, launched, table)
     }
 
     /// A report with a branch name and a change count in it — the two things
@@ -3673,10 +4109,12 @@ mod tests {
         );
         let asked = pane.take_agent_request().expect("an agent was asked for");
         assert!(crate::paths::same_dir(&asked.root, Path::new(TWO)));
-        // **The session's own, said as `None` and not as a name.** `a` is the
-        // fast path and stays one: a name here would send it through a `PATH`
-        // search the session's `Recipe` exists to avoid.
-        assert_eq!(asked.agent, None, "`a` chose an agent by name");
+        // **The session's own, said as `Session` and not as a name.** `a` is
+        // the fast path and stays one: a name here would send it through a
+        // `PATH` search the session's `Recipe` exists to avoid. And not as
+        // `AsLaunched` either, which is the chooser's first row: this key
+        // shows nothing, so it re-runs nothing that was typed.
+        assert_eq!(asked.agent, Pick::Session, "`a` chose an agent by name");
         // Drained, not left to fire late — and this one fires by starting a
         // process.
         assert_eq!(pane.take_agent_request(), None);
@@ -3719,7 +4157,7 @@ mod tests {
             "the request names something other than the checkout on screen: {}",
             asked.root.display()
         );
-        assert_eq!(asked.agent, None, "`a` chose an agent by name");
+        assert_eq!(asked.agent, Pick::Session, "`a` chose an agent by name");
         // Drained rather than left to fire late, like the list's own — and
         // this one fires by starting a process.
         assert_eq!(pane.take_agent_request(), None);
@@ -4002,13 +4440,15 @@ mod tests {
     }
 
     #[test]
-    fn the_chooser_opens_on_the_sessions_own_agent_and_enter_starts_it() {
-        // **`A` `Enter` is "another of what I already have", and that is the
-        // whole reason the cursor does not start at the top.** The order is the
-        // table's and never moves — a list that reorders itself by session is
-        // one nobody can build muscle memory in — so the only thing that
-        // follows the session is where the cursor lands.
-        let (mut pane, _asks, _answers) = detached_hosting(ONE, "codex", TABLE);
+    fn the_chooser_opens_on_the_line_the_session_was_started_with_and_enter_starts_it() {
+        // **`A` `Enter` is "another one exactly like what I started"**, which
+        // is why the cursor starts on the as-launched row rather than on the
+        // session's row of the table: for `abeam agents --cwd .` that row
+        // starts plain `claude`, another of the program and not of what was
+        // started. The order below it is the table's and never moves; what
+        // follows the session is the first row.
+        let (mut pane, _asks, _answers) =
+            detached_launched(ONE, "codex", &["codex", "--resume", "abc123"], TABLE);
 
         assert_eq!(
             pane.handle_key(key(KeyCode::Char('A'))).unwrap(),
@@ -4020,6 +4460,23 @@ mod tests {
             "the border went on promising the way out of a list that is not up"
         );
 
+        // **`A` and `Enter` in one input batch**, with no frame between them —
+        // type-ahead, a macro — is a `--resume` run that nobody was shown. So
+        // the key is swallowed and the question stays up, which is
+        // `crate::app::App::close_drawn`'s rule for `x` `x`.
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Enter)).unwrap(),
+            Handled::Yes
+        );
+        assert_eq!(
+            pane.take_agent_request(),
+            None,
+            "the line ran before any frame had drawn it"
+        );
+        assert_eq!(pane.exit_hint(), "esc→list", "the refusal ended the question");
+
+        // Drawn, and the same key is an answer.
+        drawn(&mut pane, 46, 12);
         assert_eq!(
             pane.handle_key(key(KeyCode::Enter)).unwrap(),
             Handled::Yes
@@ -4027,8 +4484,8 @@ mod tests {
         let asked = pane.take_agent_request().expect("an agent was asked for");
         assert_eq!(
             asked.agent,
-            Some("codex"),
-            "the cursor did not start on the session's own agent"
+            Pick::AsLaunched,
+            "the cursor did not start on the line the session was started with"
         );
         assert!(crate::paths::same_dir(&asked.root, Path::new(ONE)));
         // The question is over, so the border is the status list's again.
@@ -4041,15 +4498,30 @@ mod tests {
         // move the shared scroll's offset — which is why this is the pane's own
         // match rather than a `Scroll` handed the key.
         let (mut pane, _asks, _answers) = detached_hosting(ONE, "claude", TABLE);
-        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
 
+        // One `j` off the as-launched row is the table's first row, whatever
+        // the session is. It is `claude`, which is this session's own row only
+        // because this session is `claude`: a `fleet` or a `codex` session
+        // finds its own row further down, marked `session`. A row, and so
+        // resolved with nothing typed.
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request().map(|req| req.agent),
+            Some(Pick::Row("claude")),
+            "one j from the top is not the table's first row"
+        );
+
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
         pane.handle_key(key(KeyCode::Char('j'))).unwrap();
         pane.handle_key(key(KeyCode::Char('j'))).unwrap();
         pane.handle_key(key(KeyCode::Enter)).unwrap();
         assert_eq!(
             pane.take_agent_request().map(|req| req.agent),
-            Some(Some("codex")),
-            "two js from the first row is the third"
+            Some(Pick::Row("codex")),
+            "three js from the top is the table's third row"
         );
 
         // And `k` from the top is the last row rather than a dead key.
@@ -4058,8 +4530,293 @@ mod tests {
         pane.handle_key(key(KeyCode::Enter)).unwrap();
         assert_eq!(
             pane.take_agent_request().map(|req| req.agent),
-            Some(Some("fleet")),
+            Some(Pick::Row("fleet")),
             "the list did not wrap"
+        );
+
+        // ...and `Tab` from the last row is the first one, which is the
+        // as-launched row and not the table's first: the wrap is over the
+        // whole list, not over the table under it. Drawn first, because that
+        // row answers `Enter` only once a frame has shown it.
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        drawn(&mut pane, 46, 12);
+        pane.handle_key(key(KeyCode::BackTab)).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request().map(|req| req.agent),
+            Some(Pick::AsLaunched),
+            "the wrap skipped the as-launched row"
+        );
+    }
+
+    #[test]
+    fn the_as_launched_row_wraps_and_the_cursor_counts_rows_rather_than_lines() {
+        // **The row that must never be clipped, and the keys that must not be
+        // confused by it being tall.** Every other row is a name, and a name
+        // clipped with `…` still says which row it is. This one is re-run
+        // verbatim by `Enter`, and a clip puts the end of the line off the
+        // edge — which is exactly where `--resume <id>` goes.
+        let launched = [
+            "fleet",
+            "--model",
+            "opus",
+            "\"fix the flaky tests\"",
+            "--resume",
+            "3f2a9c1e-5b7d-4e8a-9c0f-1d2e3f4a5b6c",
+        ];
+        let (mut pane, _asks, _answers) = detached_launched(ONE, "fleet", &launched, TABLE);
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+
+        // The pane's ordinary width, at which the id alone takes most of a
+        // continuation line — which is the case this row was built for.
+        let width = 46u16;
+        let rows = drawn(&mut pane, width, 20);
+        // Every word on screen whole, the id included: the only word that
+        // would be cut is one wider than a whole line, and none of these is.
+        let text: String = rows.join("\n");
+        for word in launched {
+            assert!(text.contains(word), "`{word}` is not on screen whole: {rows:#?}");
+        }
+        // Several lines, and the table's first row directly under the last of
+        // them rather than under the first.
+        let first_row = rows
+            .iter()
+            .position(|line| line.trim_start().starts_with("claude"))
+            .expect("the table's first row is not drawn");
+        assert!(first_row > 1, "the command line did not wrap at {width}: {rows:#?}");
+        assert!(rows[0].contains("as launched"), "{:?}", rows[0]);
+        // A continuation hangs further in than the first line does, so it can
+        // never be read as a row of the table.
+        for line in &rows[1..first_row] {
+            assert!(line.starts_with("     "), "a continuation is not indented: {line:?}");
+        }
+
+        // The cursor is behind *every* line of the row, and behind nothing
+        // else — and one `j` moves it to the table's first row however many
+        // lines the first one took.
+        let lit = |sel: usize| -> Vec<bool> {
+            agent_lines(
+                &pane.launched,
+                TABLE,
+                pane.session,
+                sel,
+                width,
+                usize::MAX,
+            )
+            .0
+            .iter()
+            .map(|line| line.style.bg == Some(Color::DarkGray))
+            .collect()
+        };
+        let at_top = lit(0);
+        assert!(
+            at_top[..first_row].iter().all(|&on| on),
+            "a continuation line was left out of the highlight: {at_top:?}"
+        );
+        assert!(
+            at_top[first_row..].iter().all(|&on| !on),
+            "a table row was lit with the as-launched row: {at_top:?}"
+        );
+        let one_down = lit(1);
+        assert!(
+            one_down[..first_row].iter().all(|&on| !on) && one_down[first_row],
+            "the cursor counted lines rather than rows: {one_down:?}"
+        );
+
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request().map(|req| req.agent),
+            Some(Pick::Row("claude")),
+            "one j from a tall first row landed somewhere other than the next row"
+        );
+
+        // Whole at this size, which is what lets `Enter` on it be an answer.
+        assert!(
+            agent_lines(&pane.launched, TABLE, pane.session, 0, width, usize::MAX).1,
+            "a row that fits was reported as cut"
+        );
+
+        // And every line fits, at every width including the absurd ones: a
+        // pane that overflows its rect corrupts the frame.
+        for width in [1u16, 2, 5, 14, 15, 16, 22, 46, 120] {
+            for line in agent_lines(&pane.launched, TABLE, None, 0, width, usize::MAX).0 {
+                let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+                assert!(w <= width as usize, "a line is {w} cells wide at {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn pack_breaks_between_arguments_and_keeps_to_its_limits() {
+        // The two wrappers `crate::text::wrap` already has are each wrong for
+        // a command line: one breaks `--resume` into `--` and `resume`, which
+        // reads as two words, and the other collapses the spaces inside a
+        // quoted argument. So every break here is between two arguments,
+        // unless one argument is wider than a whole line.
+        let words = |list: &[&str]| -> Vec<String> {
+            list.iter().map(|word| (*word).to_string()).collect()
+        };
+
+        assert_eq!(
+            pack(&words(&["claude", "--resume", "abc"]), 12, 20),
+            ["claude", "--resume abc"],
+            "an argument that did not fit beside another was broken instead of moved"
+        );
+        // A first argument that misses the narrow first line and fits a
+        // continuation starts on the continuation, leaving the first line to
+        // the note, rather than being cut through the middle.
+        assert_eq!(
+            pack(&words(&["C:\\tools\\pwsh.exe", "-NoLogo"]), 8, 30),
+            ["", "C:\\tools\\pwsh.exe -NoLogo"]
+        );
+        // An argument wider than any line is cut at the column and carried on.
+        assert_eq!(
+            pack(&words(&["abcdefghij"]), 4, 4),
+            ["abcd", "efgh", "ij"]
+        );
+        // Spaces inside a quoted argument are the argument's, and survive.
+        assert_eq!(
+            pack(&words(&["-p", "\"a  b\""]), 40, 40),
+            ["-p \"a  b\""]
+        );
+        // An argument that fits is not split even where the string measure
+        // and the character measure disagree: a lam-alef is 1 cell as a string
+        // and 2 by its characters, and an emoji with a skin-tone modifier 2
+        // and 4. Fitted by one and placed by the other, each of these came out
+        // with its tail alone on the next line.
+        assert_eq!(
+            pack(&words(&["ab", "\"لا\""]), 6, 6),
+            ["ab", "\"لا\""]
+        );
+        assert_eq!(pack(&words(&["ab", "👍🏽"]), 5, 5), ["ab", "👍🏽"]);
+
+        // **The two promises, over every pair of limits from 2 to 60**: no
+        // line is wider than its limit, and nothing is lost — every character
+        // of every argument comes out, and a break costs at most the one space
+        // it stands for. Wide characters are in there because a limit is
+        // cells, not characters, and the two that measure differently whole
+        // are in there because a limit is [`cells`].
+        let lines_of = [
+            words(&[
+                "claude",
+                "--resume",
+                "3f2a9c1e-5b7d-4e8a-9c0f-1d2e3f4a5b6c",
+                "-p",
+                "\"fix  the  flaky tests\"",
+            ]),
+            words(&["設計文書を読んで", "--cwd", ".", "設計"]),
+            words(&["\"لا لا\"", "👍🏽👍🏽", "x"]),
+            words(&["x"; 40]),
+            vec!["y".repeat(150), "z".to_string()],
+        ];
+        for line in &lines_of {
+            let joined = line.join(" ");
+            let spaces = |s: &str| s.chars().filter(|&c| c == ' ').count();
+            let solid = |s: &str| s.chars().filter(|&c| c != ' ').collect::<String>();
+            for first in 2..=60 {
+                for rest in 2..=60 {
+                    let packed = pack(line, first, rest);
+                    for (i, text) in packed.iter().enumerate() {
+                        let limit = if i == 0 { first } else { rest };
+                        assert!(
+                            cells(text) <= limit,
+                            "{text:?} is wider than {limit} ({first}/{rest})"
+                        );
+                    }
+                    let out = packed.concat();
+                    assert_eq!(
+                        solid(&out),
+                        solid(&joined),
+                        "characters lost at {first}/{rest}"
+                    );
+                    assert!(
+                        spaces(&out) <= spaces(&joined)
+                            && spaces(&out) + packed.len() > spaces(&joined),
+                        "a break cost more than its one space at {first}/{rest}: {packed:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_the_pane_cannot_draw_whole_says_so_and_does_not_run() {
+        // The as-launched row's safety is that what `Enter` runs was on
+        // screen, so a row the pane cannot draw whole is one `Enter` must not
+        // answer — and it must not *look* as if it would. It draws what fits,
+        // cut and marked, under a note that says it will not run. The rows
+        // under it stay on screen, so the list is still one `j` can be seen to
+        // move in, and the table's rows still answer.
+        let prompt = format!("\"{}\"", "word ".repeat(200).trim_end());
+        let launched = ["claude", "-p", prompt.as_str()];
+        let (mut pane, _asks, _answers) = detached_launched(ONE, "claude", &launched, TABLE);
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+
+        let rows = drawn(&mut pane, 30, 12);
+        assert!(
+            rows[0].contains("too long") && !rows[0].contains("as launched"),
+            "a row that cannot run does not say so: {rows:#?}"
+        );
+        // The session's own row, which is marked, so the mark is stepped over.
+        let first_row = rows
+            .iter()
+            .position(|line| line.contains("▸ claude"))
+            .expect("the table was pushed off the pane by the command line");
+        assert!(
+            rows[first_row - 1].trim_end().ends_with('…'),
+            "a command line cut short does not mark the cut: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|line| line.contains("fleet")),
+            "the table's last row was pushed off the pane: {rows:#?}"
+        );
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request(),
+            None,
+            "`Enter` ran a line whose end was not on screen"
+        );
+        assert_eq!(pane.exit_hint(), "esc→list", "the refusal ended the question");
+
+        // Widened until it fits, it is the runnable row again, and it runs.
+        let rows = drawn(&mut pane, 200, 60);
+        assert!(rows[0].contains("as launched"), "{:?}", rows[0]);
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request().map(|req| req.agent),
+            Some(Pick::AsLaunched)
+        );
+
+        // **A frame that drew it whole is withdrawn by the next one that did
+        // not** — a resize that cuts it, and a pane with no rows at all — so
+        // what `Enter` is answered against is always the last frame.
+        for shrink in [(30u16, 12u16), (200, 0)] {
+            pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+            drawn(&mut pane, 200, 60);
+            let (width, height) = shrink;
+            let backend = ratatui::backend::TestBackend::new(width, height.max(1));
+            let mut term = ratatui::Terminal::new(backend).unwrap();
+            term.draw(|f| pane.render(f, Rect::new(0, 0, width, height)))
+                .unwrap();
+            pane.handle_key(key(KeyCode::Enter)).unwrap();
+            assert_eq!(
+                pane.take_agent_request(),
+                None,
+                "a line drawn whole once ran after a {width}x{height} frame had cut it"
+            );
+            pane.handle_key(key(KeyCode::Esc)).unwrap();
+        }
+
+        // The table's rows are not gated: none of them re-runs anything typed.
+        pane.handle_key(key(KeyCode::Char('A'))).unwrap();
+        drawn(&mut pane, 30, 12);
+        pane.handle_key(key(KeyCode::Char('j'))).unwrap();
+        pane.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            pane.take_agent_request().map(|req| req.agent),
+            Some(Pick::Row("claude"))
         );
     }
 
@@ -4085,6 +4842,9 @@ mod tests {
             "the border named a checkout the question is not about"
         );
 
+        // A frame first: the cursor is on the as-launched row, which answers
+        // `Enter` only once one has shown it.
+        drawn(&mut pane, 46, 12);
         pane.handle_key(key(KeyCode::Enter)).unwrap();
         let asked = pane.take_agent_request().expect("an agent was asked for");
         assert!(
@@ -4205,7 +4965,8 @@ mod tests {
         // at the pane at all — so a reader choosing `fleet` can see they are
         // getting a Claude pane, and a reader choosing `codex` can see they are
         // not.
-        let (mut pane, _asks, _answers) = detached_hosting(ONE, "fleet", TABLE);
+        let (mut pane, _asks, _answers) =
+            detached_launched(ONE, "fleet", &["fleet", "--foo"], TABLE);
         pane.handle_key(key(KeyCode::Char('A'))).unwrap();
         let rows = drawn(&mut pane, 34, 8);
 
@@ -4217,24 +4978,32 @@ mod tests {
             1,
             "the session is marked on more than one row, or on none: {rows:?}"
         );
+        // The first row is the command line the session was started with —
+        // the border word and what was typed after it — and it is not the
+        // table's, so it carries its own note and not the `session` mark.
         assert!(
-            rows[3].contains("fleet") && rows[3].contains("session"),
-            "the mark is not on the row the session was started from: {:?}",
-            rows[3]
+            rows[0].contains("fleet --foo") && rows[0].contains("as launched"),
+            "the first row is not the line the session was started with: {:?}",
+            rows[0]
         );
         assert!(
-            rows[3].contains("→ claude"),
+            rows[4].contains("fleet") && rows[4].contains("session"),
+            "the mark is not on the row the session was started from: {:?}",
+            rows[4]
+        );
+        assert!(
+            rows[4].contains("→ claude"),
             "a preset did not say what it hosts: {:?}",
-            rows[3]
+            rows[4]
         );
         // The order is the table's, top to bottom, and never the session's.
-        assert!(rows[0].contains("claude"), "{:?}", rows[0]);
-        assert!(rows[1].contains("copilot"), "{:?}", rows[1]);
-        assert!(rows[2].contains("codex"), "{:?}", rows[2]);
+        assert!(rows[1].contains("claude"), "{:?}", rows[1]);
+        assert!(rows[2].contains("copilot"), "{:?}", rows[2]);
+        assert!(rows[3].contains("codex"), "{:?}", rows[3]);
         // A built-in says nothing about what it hosts, because `claude →
         // claude` is a column of noise on the three rows a machine with no
         // presets has.
-        assert!(!rows[0].contains('→'), "{:?}", rows[0]);
+        assert!(!rows[1].contains('→'), "{:?}", rows[1]);
         // And the list says what `Enter` will do, in the words the sketch uses.
         assert!(
             rows.iter().any(|line| line.contains("enter starts")),
@@ -4243,24 +5012,53 @@ mod tests {
     }
 
     #[test]
-    fn a_session_hosting_a_program_with_no_row_marks_nothing_and_starts_at_the_top() {
-        // `abeam +pwsh` has no row in the table — the list is what abeam can
-        // *name* — so there is nothing to mark and nothing to start the cursor
-        // on. `a` still opens more `pwsh` panes through the recipe; this key
-        // simply cannot choose one by name.
-        let (mut pane, _asks, _answers) = detached_hosting(ONE, "pwsh", TABLE);
+    fn a_session_hosting_a_program_with_no_row_marks_nothing_and_enter_starts_it_again() {
+        // `abeam +pwsh` has no row in the table — the table is what abeam can
+        // *name* — so there is nothing to mark. It still has a first row,
+        // because every session does: `pwsh -NoLogo` here, with the cursor on
+        // it, so `A` `Enter` is another PowerShell and not whatever the table
+        // happens to list first.
+        let (mut pane, _asks, _answers) =
+            detached_launched(ONE, "pwsh", &["pwsh", "-NoLogo"], TABLE);
         pane.handle_key(key(KeyCode::Char('A'))).unwrap();
         let rows = drawn(&mut pane, 34, 8);
         assert!(
             !rows.iter().any(|line| line.contains("session")),
             "a program with no row was marked as one: {rows:?}"
         );
+        assert!(
+            rows[0].contains("pwsh -NoLogo"),
+            "the first row is not the program that was named: {:?}",
+            rows[0]
+        );
 
         pane.handle_key(key(KeyCode::Enter)).unwrap();
         assert_eq!(
             pane.take_agent_request().map(|req| req.agent),
-            Some(Some("claude")),
-            "the cursor did not start at the top of the table"
+            Some(Pick::AsLaunched),
+            "`Enter` did not start another of what the session was started as"
+        );
+    }
+
+    #[test]
+    fn f1_o_disarms_a_kill_the_worktree_list_was_holding() {
+        // A kill armed in the worktree list must not survive behind `F1, O`'s
+        // question, for the reason the list's own `A` arm takes it on the way
+        // past: one visible warning, then an unrelated full-pane list, then an
+        // `x` that kills. The shell withdraws it before calling this; the pane
+        // does too, so its guarantee does not depend on who called it.
+        let (mut pane, _asks, _answers) = detached(ONE);
+        pane.set_worktree_rows(vec![a_row("main", ONE, true), a_row("other", TWO, false)]);
+        pane.handle_key(key(KeyCode::Char('w'))).unwrap();
+        pane.handle_key(key(KeyCode::Tab)).unwrap();
+        pane.handle_key(key(KeyCode::Char('x'))).unwrap();
+        assert!(pane.closing().is_some(), "the first `x` armed nothing");
+
+        pane.choose_here();
+        assert_eq!(pane.exit_hint(), "esc→list", "no question was asked");
+        assert!(
+            pane.closing().is_none(),
+            "a kill was left armed behind a full-pane question"
         );
     }
 

@@ -417,6 +417,27 @@ was wrong is treating *nothing that was typed* and *nothing at all* as one rule.
 The fix landed with phase 3, under a test named after the disagreement:
 `a_preset_pane_opened_later_runs_the_program_the_session_did`.
 
+**And "nothing that was typed" has since been narrowed again, to "nothing that
+was typed, unless it is shown first".** `main` now hands the typed line over as
+well — inside `hosted`, as `Hosted::typed`, kept apart from the row's `args` —
+and `Recipe` carries it. It is run from exactly one place: the first row of the
+agent chooser (`A` in the git view, or `F1, O` from anywhere), which draws the
+session's command line, wrapping rather than clipping, and starts it verbatim
+on `Enter` — `-p`, `--resume` and all, with nothing filtered, because a row
+that ran less than it showed would be the hazard above arriving by a different
+road. **Drawn whole, or `Enter` is refused**: the key answers only if the last
+frame drew every line of the row, so an `Enter` typed ahead of the first frame,
+or one pressed at a row the pane is too small to show whole, runs nothing —
+`crate::app::App::close_drawn`'s rule, and `Choice::drawn` in
+`crate::panes::git` is where it lives. `a` still runs none of it: it shows nothing, so it may re-run
+nothing that was typed, and `Recipe::launch` is still `resolve_at(&self.target,
+&self.args)`. The as-launched row is `Recipe::as_launched`, which resolves the
+same target with `args` and then `typed`, and so derives `ABEAM_LAUNCH` for a
+`.cmd` shim from the same pair in the same order `main` did — the stale-`env`
+objection above was never about carrying the line, only about carrying a
+`Launch` built from it. `a_session_is_launched_again_exactly_as_it_was` pins
+the result equal to `Hosted::launch` for all three shapes a session can have.
+
 It is a small move and a safe one, and the safety is not incidental.
 `crate::launch`'s guarantee is that nothing leaves that module which is not an
 absolute path, which is what makes a spawn issued later, from a process that has
