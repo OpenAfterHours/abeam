@@ -2385,14 +2385,18 @@ mod tests {
     #[test]
     fn only_an_agent_with_a_print_mode_can_be_asked_and_the_rest_are_told_why() {
         // [`ASKABLE`] is deliberately narrower than `crate::agent::AGENTS`:
-        // Codex is a supported interactive host, but has no Ask integration in
-        // this release. Programs abeam does not know reach the same refusal.
+        // Codex and hailer are supported interactive hosts, and neither has an
+        // Ask integration in this release — hailer has no print mode for one to
+        // drive at all. Programs abeam does not know reach the same refusal.
         // Each is a session with no print-mode adapter to drive, and the pane
         // has to say which one and offer the way through.
         for hosting in [
             "codex",
             "Codex",
             "CODEX",
+            "hailer",
+            "Hailer",
+            "HAILER",
             "pwsh",
             "bash",
             "not-an-agent",
