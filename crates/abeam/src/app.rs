@@ -5977,6 +5977,10 @@ impl App {
         let began = Instant::now();
 
         let parts = crate::term::draw(terminal, |f| self.ui(f))?;
+        let completed = Instant::now();
+        for agent in self.agents_mut() {
+            agent.pane.record_presented(completed);
+        }
         self.frames.record(began);
         self.frames.record_parts(parts);
 

@@ -6,10 +6,25 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(all(test, windows))]
+mod probe;
+
 pub(crate) const SYNC_TIMEOUT: Duration = Duration::from_millis(100);
 const TAIL_QUIET: Duration = Duration::from_millis(4);
 const MAX_TAIL: Duration = Duration::from_millis(16);
+// ConPTY forwards END before its next renderer tick restores the final cursor.
+// The measured Codex trailer arrives 14-19 ms later. Commit on its cursor-show
+// command; two nominal ticks bound the wait if no such trailer ever arrives.
+const SYNC_TAIL_TIMEOUT: Duration = Duration::from_millis(32);
 const MAX_PENDING: usize = 256 * 1024;
+
+/// Timing for output included in a display snapshot. Receipt precedes parser
+/// lock acquisition; publication follows replay into the committed screen.
+#[derive(Clone, Copy, Debug)]
+pub struct Publication {
+    pub received_at: Instant,
+    pub published_at: Instant,
+}
 
 #[derive(Default)]
 enum Event {
@@ -19,6 +34,7 @@ enum Event {
     End,
     Reset,
     CursorQuery,
+    CursorShown,
 }
 
 impl vte::Perform for Event {
@@ -32,6 +48,8 @@ impl vte::Perform for Event {
                 'l' => *self = Self::End,
                 _ => {}
             }
+        } else if intermediates == b"?" && c == 'h' && params.iter().any(|p| p == [25]) {
+            *self = Self::CursorShown;
         } else if intermediates.is_empty() && c == 'n' && params.iter().eq([&[6][..]]) {
             *self = Self::CursorQuery;
         }
@@ -53,7 +71,10 @@ pub(crate) struct Screens {
     pub(crate) display: vt100::Parser,
     scanner: vte::Parser,
     pending: Vec<u8>,
+    pending_since: Option<Instant>,
+    pub(crate) unpresented: Option<Publication>,
     sync_since: Option<Instant>,
+    sync_tail: Option<Instant>,
     tail_since: Option<Instant>,
     last_output: Option<Instant>,
     coalesce: bool,
@@ -61,6 +82,9 @@ pub(crate) struct Screens {
     pub(crate) stopped: bool,
     pub(crate) publications: u64,
     pub(crate) sync_timeouts: u64,
+    pub(crate) tail_timeouts: u64,
+    pub(crate) last_hold: Duration,
+    pub(crate) last_replay: Duration,
 }
 
 impl Screens {
@@ -74,7 +98,10 @@ impl Screens {
             display: vt100::Parser::new(rows, cols, scrollback),
             scanner: vte::Parser::new(),
             pending: Vec::new(),
+            pending_since: None,
+            unpresented: None,
             sync_since: None,
+            sync_tail: None,
             tail_since: None,
             last_output: None,
             coalesce,
@@ -82,6 +109,9 @@ impl Screens {
             stopped: false,
             publications: 0,
             sync_timeouts: 0,
+            tail_timeouts: 0,
+            last_hold: Duration::ZERO,
+            last_replay: Duration::ZERO,
         }
     }
 
@@ -102,6 +132,7 @@ impl Screens {
             let segment = &bytes[..used];
             self.live.process(segment);
             self.pending.extend_from_slice(segment);
+            self.pending_since.get_or_insert(now);
             self.last_output = Some(now);
             self.tail_since.get_or_insert(now);
             bytes = &bytes[used..];
@@ -118,13 +149,26 @@ impl Screens {
                     debug_assert_eq!(dispatch, b'h');
                     self.publish();
                     self.pending.push(dispatch);
+                    self.pending_since = Some(now);
                     self.sync_since = Some(now);
                 }
                 Event::End => {
                     if self.sync_since.take().is_some() {
                         // ConPTY can forward END before its final screen bytes.
-                        // Give those trailing bytes their own short quiet window.
+                        // Wait for the delayed cursor-show, with bounded recovery.
                         self.tail_since = Some(now);
+                        if self.coalesce {
+                            self.sync_tail = Some(now);
+                        }
+                    }
+                }
+                Event::CursorShown => {
+                    if self.sync_since.is_none() && self.sync_tail.is_some() {
+                        // ConPTY surrounds its delayed screen/cursor flush with
+                        // hide/show, even when the child never hid its cursor.
+                        // Publishing here avoids both the temporary cursor and
+                        // a second quiet-window delay after the correction.
+                        self.publish();
                     }
                 }
                 Event::Reset => {
@@ -151,6 +195,9 @@ impl Screens {
         if let Some(since) = self.sync_since {
             return Some(since + SYNC_TIMEOUT);
         }
+        if let Some(since) = self.sync_tail {
+            return Some(since + SYNC_TAIL_TIMEOUT);
+        }
         let since = self.tail_since?;
         Some((self.last_output? + TAIL_QUIET).min(since + MAX_TAIL))
     }
@@ -161,6 +208,8 @@ impl Screens {
         }
         if self.sync_since.is_some() {
             self.sync_timeouts += 1;
+        } else if self.sync_tail.is_some() {
+            self.tail_timeouts += 1;
         }
         // Cancel a timed-out mode, rather than imposing another 100ms wait on
         // every subsequent write from a child that never sends END.
@@ -168,12 +217,26 @@ impl Screens {
     }
 
     fn publish(&mut self) -> bool {
+        self.sync_tail = None;
         self.tail_since = None;
         self.last_output = None;
         if self.pending.is_empty() {
             return false;
         }
+        let began = Instant::now();
         self.display.process(&self.pending);
+        let published_at = Instant::now();
+        self.last_replay = published_at.duration_since(began);
+        let received_at = self.pending_since.take().unwrap_or(began);
+        self.last_hold = began.saturating_duration_since(received_at);
+        // Coalescing must not erase the age of older output still waiting for
+        // its first display. A renderer consumes this under its screen guard.
+        self.unpresented = Some(Publication {
+            received_at: self
+                .unpresented
+                .map_or(received_at, |p| p.received_at.min(received_at)),
+            published_at,
+        });
         self.pending.clear();
         self.publications += 1;
         true
@@ -182,6 +245,10 @@ impl Screens {
     pub(crate) fn recover(&mut self) -> bool {
         self.sync_since = None;
         self.publish()
+    }
+
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.pending.len()
     }
 
     pub(crate) fn child_exited(&mut self) -> bool {
@@ -249,7 +316,7 @@ mod tests {
         assert_eq!(s.live.screen().contents(), "B");
         assert!(!s.publish_due(now + Duration::from_millis(99)));
         s.process(b"\x1b[?2026l", now + Duration::from_millis(99));
-        assert!(s.publish_due(now + Duration::from_millis(103)));
+        assert!(s.publish_due(now + Duration::from_millis(131)));
         assert_eq!(s.display.screen().contents(), "B");
     }
 
@@ -298,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn conpty_end_before_final_bytes_waits_for_a_short_quiet_tail() {
+    fn conpty_end_before_final_bytes_without_cursor_show_recovers_on_deadline() {
         let now = Instant::now();
         let mut s = screens(true);
         s.process(b"READY", now);
@@ -309,7 +376,8 @@ mod tests {
         s.process(b"\rFINAL  \x1b[3;2H", start + Duration::from_millis(3));
         assert!(!s.publish_due(start + Duration::from_millis(6)));
         assert_eq!(s.display.screen().contents(), "READY");
-        assert!(s.publish_due(start + Duration::from_millis(7)));
+        assert!(!s.publish_due(start + Duration::from_millis(7)));
+        assert!(s.publish_due(start + SYNC_TAIL_TIMEOUT));
         assert_eq!(s.display.screen().contents(), "FINAL  ");
         assert_eq!(s.display.screen().cursor_position(), (2, 1));
     }
@@ -324,6 +392,85 @@ mod tests {
         }
         assert!(s.publish_due(now + MAX_TAIL));
         assert_eq!(s.display.screen().contents(), "xxxxxx");
+    }
+
+    #[test]
+    fn codex_conpty_cursor_trailer_after_one_tick_commits_without_an_extra_wait() {
+        // Minimized from Codex 0.155.1 on Windows: END arrives with the cursor
+        // above the star field; a separate ConPTY flush restores the input row.
+        for delay in [5, 14, 19, 31] {
+            let now = Instant::now();
+            let mut s = screens(true);
+            s.process(b"READY\x1b[5;3H", now);
+            s.publish_due(now + TAIL_QUIET);
+            let start = now + Duration::from_millis(100);
+            s.process(
+                b"\x1b[?2026h\x1b[?25l\x1b[3;1H*\x1b[2;1H\x1b[?25h\x1b[?2026l",
+                start,
+            );
+            assert!(!s.publish_due(start + Duration::from_millis(delay - 1)));
+            assert_eq!(s.display.screen().cursor_position(), (4, 2));
+            let tail = start + Duration::from_millis(delay);
+            // Split the final show command across reads, just like a pipe can.
+            s.process(b"\x1b[?25l \x1b[5;4H\x1b[?2", tail);
+            assert_eq!(s.display.screen().cursor_position(), (4, 2));
+            s.process(b"5h", tail);
+            assert_eq!(s.display.screen().cursor_position(), (4, 3));
+            assert_eq!(s.display.screen().cell(2, 0).unwrap().contents(), "*");
+            assert_eq!(s.deadline(), None);
+        }
+    }
+
+    #[test]
+    fn missing_conpty_cursor_trailer_is_bounded_and_duplicate_ends_do_not_extend_it() {
+        let now = Instant::now();
+        let mut s = screens(true);
+        s.process(b"\x1b[?2026hREADY\x1b[?2026l", now);
+        s.process(b"\x1b[?2026l", now + Duration::from_millis(20));
+        assert!(!s.publish_due(now + Duration::from_millis(31)));
+        assert!(s.publish_due(now + SYNC_TAIL_TIMEOUT));
+        assert_eq!(s.display.screen().contents(), "READY");
+        assert_eq!(s.deadline(), None);
+        assert_eq!(s.sync_timeouts, 0);
+        assert_eq!(s.tail_timeouts, 1);
+    }
+
+    #[test]
+    fn publication_timing_keeps_oldest_unrendered_receipt_across_coalescing() {
+        let now = Instant::now();
+        let mut s = screens(false);
+        let first = now - Duration::from_millis(30);
+        s.process(b"A", first);
+        s.process(b"B", now - Duration::from_millis(10));
+        let publication = s.unpresented.take().unwrap();
+        assert_eq!(publication.received_at, first);
+        assert!(publication.published_at >= now);
+        assert!(s.last_hold >= Duration::from_millis(10));
+        assert_eq!(s.pending_bytes(), 0);
+        assert!(s.unpresented.is_none());
+        s.process(b"\x1b[?2026hHELD", now);
+        // The prefix before BEGIN can publish, but held cells cannot contribute
+        // a timestamp to the display snapshot until they have been replayed.
+        s.unpresented.take();
+        s.process(b"MORE", now);
+        assert!(s.unpresented.is_none());
+        assert!(s.pending_bytes() > 0);
+        s.process(b"\x1b[?2026l", now);
+        assert_eq!(s.unpresented.unwrap().received_at, now);
+    }
+
+    #[test]
+    fn new_sync_block_and_control_string_cannot_be_mistaken_for_a_cursor_trailer() {
+        let now = Instant::now();
+        let mut s = screens(true);
+        s.process(b"\x1b[?2026hA\x1b[?2026l", now);
+        s.process(b"\x1b]2;[?25h\x07", now);
+        assert!(!s.publish_due(now + Duration::from_millis(5)));
+        s.process(b"\x1b[?2026h\rB\x1b[?25h", now);
+        assert_eq!(s.display.screen().contents(), "A");
+        assert!(!s.publish_due(now + SYNC_TAIL_TIMEOUT));
+        assert!(s.publish_due(now + SYNC_TIMEOUT));
+        assert_eq!(s.display.screen().contents(), "B");
     }
 
     #[test]

@@ -173,6 +173,12 @@ pub struct PtyStats {
     pub last_parse_us: u64,
     pub publications: u64,
     pub sync_timeouts: u64,
+    /// END arrived, but no trailing cursor-show arrived within the recovery window.
+    pub tail_timeouts: u64,
+    pub pending_bytes: u64,
+    /// Receipt to replay start, including reader lock wait and publication hold.
+    pub last_hold_us: u64,
+    pub last_replay_us: u64,
 }
 
 struct Shared {
@@ -196,6 +202,10 @@ struct Shared {
     last_parse_us: AtomicU64,
     publications: AtomicU64,
     sync_timeouts: AtomicU64,
+    tail_timeouts: AtomicU64,
+    pending_bytes: AtomicU64,
+    last_hold_us: AtomicU64,
+    last_replay_us: AtomicU64,
 }
 
 impl Shared {
@@ -214,6 +224,10 @@ impl Shared {
             last_parse_us: AtomicU64::new(0),
             publications: AtomicU64::new(0),
             sync_timeouts: AtomicU64::new(0),
+            tail_timeouts: AtomicU64::new(0),
+            pending_bytes: AtomicU64::new(0),
+            last_hold_us: AtomicU64::new(0),
+            last_replay_us: AtomicU64::new(0),
         }
     }
 
@@ -240,6 +254,14 @@ impl Shared {
             .store(screens.publications, Ordering::Relaxed);
         self.sync_timeouts
             .store(screens.sync_timeouts, Ordering::Relaxed);
+        self.tail_timeouts
+            .store(screens.tail_timeouts, Ordering::Relaxed);
+        self.pending_bytes
+            .store(screens.pending_bytes() as u64, Ordering::Relaxed);
+        self.last_hold_us
+            .store(screens.last_hold.as_micros() as u64, Ordering::Relaxed);
+        self.last_replay_us
+            .store(screens.last_replay.as_micros() as u64, Ordering::Relaxed);
     }
 
     fn stop_publisher(&self) {
@@ -260,6 +282,19 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 pub struct ScreenGuard<'a> {
     screens: MutexGuard<'a, Screens>,
     display: bool,
+}
+
+impl ScreenGuard<'_> {
+    /// Take timing for output included in this display snapshot, once. Call
+    /// while rendering the cells, then measure through completion of the host
+    /// write. Reading the live screen never consumes display timing.
+    pub fn take_publication(&mut self) -> Option<crate::Publication> {
+        if self.display {
+            self.screens.unpresented.take()
+        } else {
+            None
+        }
+    }
 }
 
 impl Deref for ScreenGuard<'_> {
@@ -619,6 +654,10 @@ impl PtySession {
             last_parse_us: self.shared.last_parse_us.load(Ordering::Relaxed),
             publications: self.shared.publications.load(Ordering::Relaxed),
             sync_timeouts: self.shared.sync_timeouts.load(Ordering::Relaxed),
+            tail_timeouts: self.shared.tail_timeouts.load(Ordering::Relaxed),
+            pending_bytes: self.shared.pending_bytes.load(Ordering::Relaxed),
+            last_hold_us: self.shared.last_hold_us.load(Ordering::Relaxed),
+            last_replay_us: self.shared.last_replay_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -727,6 +766,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>, writer: S
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    let received_at = Instant::now();
                     let chunk = &buf[..n];
                     let lock_started = Instant::now();
                     let (queries, published, earlier_deadline) = {
@@ -738,7 +778,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>, writer: S
                         );
                         let before = p.publications;
                         let previous_deadline = p.deadline();
-                        let queries = p.process(chunk, parse_started);
+                        let queries = p.process(chunk, received_at);
                         shared.last_parse_us.store(
                             parse_started.elapsed().as_micros() as u64,
                             Ordering::Relaxed,
@@ -886,5 +926,74 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .stopped
         );
+    }
+
+    #[test]
+    fn only_display_snapshots_consume_publication_timing() {
+        let shared = Shared::new(6, 24, 10);
+        let received = Instant::now() - Duration::from_millis(20);
+        {
+            let mut screens = shared.parser.lock().unwrap();
+            screens.process(b"READY", received);
+            screens.recover();
+        }
+        let mut live = ScreenGuard {
+            screens: shared.parser.lock().unwrap(),
+            display: false,
+        };
+        assert!(live.take_publication().is_none());
+        drop(live);
+        let mut display = ScreenGuard {
+            screens: shared.parser.lock().unwrap(),
+            display: true,
+        };
+        assert_eq!(display.contents(), "READY");
+        assert_eq!(display.take_publication().unwrap().received_at, received);
+        assert!(display.take_publication().is_none());
+    }
+
+    #[test]
+    fn blocked_reader_publishes_a_missing_cursor_trailer_on_deadline() {
+        let shared = Arc::new(Shared::new(6, 24, 10));
+        shared.dirty.store(false, Ordering::Relaxed);
+        let (wake_tx, wake_rx) = mpsc::channel();
+        assert!(
+            shared
+                .waker
+                .set(Box::new(move || {
+                    let _ = wake_tx.send(());
+                }))
+                .is_ok()
+        );
+        let (output_tx, output_rx) = mpsc::channel();
+        let (reply_tx, _reply_rx) = mpsc::channel();
+        let publisher = spawn_publisher(Arc::clone(&shared));
+        spawn_reader(
+            Box::new(ChannelReader(output_rx)),
+            Arc::clone(&shared),
+            Arc::new(Mutex::new(Box::new(ReplyWriter(reply_tx)))),
+        );
+        output_tx
+            .send(b"\x1b[?2026hHELD\x1b[?2026l".to_vec())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            shared.dirty.store(false, Ordering::Relaxed);
+            if shared.parser.lock().unwrap().display.screen().contents() == "HELD" {
+                break;
+            }
+            wake_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
+        assert_eq!(
+            shared.tail_timeouts.load(Ordering::Relaxed),
+            u64::from(cfg!(windows))
+        );
+        assert_eq!(shared.pending_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.sync_timeouts.load(Ordering::Relaxed), 0);
+        shared.stop_publisher();
+        publisher.join().unwrap();
+        drop(output_tx);
     }
 }

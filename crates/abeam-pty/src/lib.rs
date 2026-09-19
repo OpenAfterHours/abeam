@@ -43,6 +43,7 @@ pub mod input;
 mod session;
 mod tree;
 
+pub use frames::Publication;
 pub use session::{PtyConfig, PtyError, PtySession, PtyStats, ScreenGuard};
 
 /// Re-exported so a caller can name the same `vt100` this crate parses into.
