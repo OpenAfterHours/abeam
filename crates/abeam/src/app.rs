@@ -29,7 +29,7 @@
 //! of each other — that is what makes them individually testable — so every
 //! wire between them is here, in [`App::pump`].
 
-use std::io::{BufWriter, Stdout};
+use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::sync::atomic;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
@@ -37,14 +37,11 @@ use std::time::{Duration, Instant};
 
 use abeam_pty::ExitStatus;
 use anyhow::Result;
-use crossterm::QueueableCommand;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -71,7 +68,7 @@ use crate::select::Select;
 use crate::watch::{Change, Watch};
 use crate::workspace::{self, Worktree};
 
-pub type Tui = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+pub type Tui = Terminal<crate::term::FrameBackend<Stdout>>;
 
 /// The F1 overlay has two deliberate states. The concise command hub is the
 /// normal first screen; `F1, ?` expands it to the exhaustive reference without
@@ -102,6 +99,11 @@ const TICK: Duration = Duration::from_millis(10);
 /// and a smaller worst-case delay than the 10 ms poll it replaces, so nothing
 /// about typing got slower.
 const MIN_FRAME: Duration = Duration::from_millis(8);
+
+// A bounded channel can still be refilled forever while it is being drained.
+// Give drawing and pane maintenance a turn even under continuous output/input.
+const MAX_WAKE_BATCH: usize = 64;
+const WAKE_BUDGET: Duration = Duration::from_millis(2);
 
 /// How often the agent's own idle/busy record is re-read. See
 /// [`App::poll_readiness`] for why this is a poll and not a watch.
@@ -175,10 +177,10 @@ const SHELL_KILL_PROMPT: &str = "again F1, X: kill · ";
 enum Wake {
     /// The console had something to say. Carried rather than re-read, because
     /// the thread that reads them is the only one that may.
-    Input(Event),
+    Input { event: Event, at: Instant },
     /// The agent produced output. No payload — the news is the pty's sticky
     /// dirty flag, and this only says "go and look".
-    Output,
+    Output { at: Instant },
 }
 
 pub enum Outcome {
@@ -235,6 +237,12 @@ struct Frames {
     worst: Duration,
     last_worst: Duration,
     fps: f32,
+    parts: crate::term::DrawStats,
+    pending: Option<Instant>,
+    latency: Duration,
+    recent_latency: std::collections::VecDeque<Duration>,
+    maintenance: Duration,
+    resize: Duration,
 }
 
 impl Frames {
@@ -252,6 +260,12 @@ impl Frames {
             worst: Duration::ZERO,
             last_worst: Duration::ZERO,
             fps: 0.0,
+            parts: crate::term::DrawStats::default(),
+            pending: None,
+            latency: Duration::ZERO,
+            recent_latency: std::collections::VecDeque::with_capacity(120),
+            maintenance: Duration::ZERO,
+            resize: Duration::ZERO,
         }
     }
 
@@ -265,6 +279,15 @@ impl Frames {
     }
 
     fn record(&mut self, began: Instant) {
+        let completed = Instant::now();
+        self.latency = Duration::ZERO;
+        if let Some(at) = self.pending.take() {
+            self.latency = completed.saturating_duration_since(at);
+            if self.recent_latency.len() == 120 {
+                self.recent_latency.pop_front();
+            }
+            self.recent_latency.push_back(self.latency);
+        }
         self.started = began;
         self.cost = began.elapsed();
         self.drawn += 1;
@@ -281,8 +304,24 @@ impl Frames {
         }
     }
 
+    fn request(&mut self, at: Instant) {
+        self.pending = Some(self.pending.map_or(at, |before| before.min(at)));
+    }
+
+    fn record_parts(&mut self, parts: crate::term::DrawStats) {
+        self.parts = parts;
+    }
+
     fn stats(&self) -> FrameStats {
         let ms = |d: Duration| d.as_secs_f32() * 1e3;
+        let mut recent: Vec<_> = self.recent_latency.iter().copied().collect();
+        recent.sort_unstable();
+        let percentile = |percent: usize| {
+            recent
+                .get((recent.len() * percent).div_ceil(100).saturating_sub(1))
+                .copied()
+                .unwrap_or_default()
+        };
         FrameStats {
             drawn: self.drawn,
             last_ms: ms(self.cost),
@@ -290,6 +329,16 @@ impl Frames {
             // window in progress, which is better than reporting zero.
             worst_ms: ms(self.last_worst.max(self.worst)),
             fps: self.fps,
+            ui_ms: ms(self.parts.ui),
+            backend_ms: ms(self.parts.backend),
+            output_ms: ms(self.parts.output),
+            bytes: self.parts.bytes,
+            writes: self.parts.writes,
+            event_ms: ms(self.latency),
+            event_p95_ms: ms(percentile(95)),
+            event_p99_ms: ms(percentile(99)),
+            maintenance_ms: ms(self.maintenance),
+            resize_ms: ms(self.resize),
         }
     }
 }
@@ -948,7 +997,7 @@ impl Agent {
     fn arm_waker(&self, tx: &SyncSender<Wake>) {
         let tx = tx.clone();
         self.pane.wake_on_output(move || {
-            let _ = tx.try_send(Wake::Output);
+            let _ = tx.try_send(Wake::Output { at: Instant::now() });
         });
     }
 
@@ -3491,20 +3540,29 @@ impl App {
 
             match rx.recv_timeout(wait) {
                 Ok(first) => {
-                    // Drain everything queued before drawing. Windows floods
-                    // Resize events during a window drag and ConPTY resize is
-                    // the flakiest operation in the stack; one batch is one
-                    // resize.
-                    let mut next = Some(first);
-                    while let Some(wake) = next.take() {
+                    // Coalesce resize/output bursts, but yield to drawing if
+                    // producers keep the channel full. Unconsumed input stays
+                    // queued for the next pass.
+                    let batch_started = Instant::now();
+                    for wake in wake_batch(first, rx) {
                         match wake {
-                            Wake::Output => redraw = true,
-                            Wake::Input(ev) => match self.handle_event(ev)? {
+                            Wake::Output { at } => {
+                                self.frames.request(at);
+                                redraw = true;
+                            }
+                            Wake::Input { event, at } => match self.handle_event(event)? {
                                 Flow::Quit => return Ok(()),
-                                Flow::Continue { redraw: wanted } => redraw |= wanted,
+                                Flow::Continue { redraw: wanted } => {
+                                    if wanted {
+                                        self.frames.request(at);
+                                        redraw = true;
+                                    }
+                                }
                             },
                         }
-                        next = rx.try_recv().ok();
+                        if batch_started.elapsed() >= WAKE_BUDGET {
+                            break;
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -3526,6 +3584,7 @@ impl App {
                 continue;
             }
 
+            let maintenance_started = Instant::now();
             self.reap()?;
 
             // The session's agent, not the current one: this is the exit that
@@ -3569,6 +3628,7 @@ impl App {
             redraw |= self.poll_readiness();
             redraw |= self.tick_panes();
             redraw |= self.pump();
+            self.frames.maintenance = maintenance_started.elapsed();
 
             if redraw {
                 self.draw(terminal)?;
@@ -5916,24 +5976,14 @@ impl App {
     fn draw(&mut self, terminal: &mut Tui) -> Result<()> {
         let began = Instant::now();
 
-        // The frame goes out between a begin/end pair, so a host terminal that
-        // understands DEC 2026 shows all of it or none of it. Without this a
-        // frame is composited whenever the terminal next feels like it, which
-        // for a full-pane repaint means a visible seam partway down — the
-        // half-updated screen that reads as tearing rather than as slowness.
-        //
-        // Queued, not executed: `execute!` would flush here and put the begin
-        // in a syscall of its own. A terminal that does not know the sequence
-        // ignores it, which is the whole reason private modes are shaped this
-        // way.
-        terminal.backend_mut().queue(BeginSynchronizedUpdate)?;
-        terminal.draw(|f| self.ui(f))?;
-        terminal.backend_mut().queue(EndSynchronizedUpdate)?;
-        std::io::Write::flush(terminal.backend_mut())?;
-
+        let parts = crate::term::draw(terminal, |f| self.ui(f))?;
         self.frames.record(began);
+        self.frames.record_parts(parts);
 
-        self.resize_to_frame()
+        let resize_started = Instant::now();
+        let resized = self.resize_to_frame();
+        self.frames.resize = resize_started.elapsed();
+        resized
     }
 
     /// Size every pty to the rect the frame that just went out drew it at.
@@ -6900,11 +6950,24 @@ fn spawn_input(tx: SyncSender<Wake>) {
             // Blocking, unlike the output doorbell: a dropped keystroke is a
             // character missing from what somebody typed. The loop drains this
             // channel on every pass, so the queue is short and the wait is not.
-            if tx.send(Wake::Input(ev)).is_err() {
+            if tx
+                .send(Wake::Input {
+                    event: ev,
+                    at: Instant::now(),
+                })
+                .is_err()
+            {
                 break;
             }
         }
     });
+}
+
+/// Taking only a bounded prefix leaves every later key in the channel.
+fn wake_batch(first: Wake, rx: &mpsc::Receiver<Wake>) -> impl Iterator<Item = Wake> + '_ {
+    std::iter::once(first)
+        .chain(rx.try_iter())
+        .take(MAX_WAKE_BATCH)
 }
 
 fn block<'a>(title: &'a str, focused: bool) -> Block<'a> {
@@ -7625,6 +7688,11 @@ mod tests {
         let mut last_heard = Instant::now();
         while Instant::now() < settled {
             let mut heard = false;
+            // The real loop acknowledges every published screen before
+            // waiting again. Output wakeups coalesce while dirty is set.
+            for agent in &mut fx.app.agents {
+                heard |= agent.pane.tick();
+            }
             while rx.try_recv().is_ok() {
                 heard = true;
             }
@@ -7650,7 +7718,7 @@ mod tests {
         while !rang && Instant::now() < deadline {
             rang = matches!(
                 rx.recv_timeout(Duration::from_millis(100)),
-                Ok(Wake::Output)
+                Ok(Wake::Output { .. })
             );
         }
         assert!(rang, "the second agent's output rang nothing");
@@ -9908,7 +9976,7 @@ mod tests {
         while !rang && Instant::now() < deadline {
             rang = matches!(
                 rx.recv_timeout(Duration::from_millis(100)),
-                Ok(Wake::Output)
+                Ok(Wake::Output { .. })
             );
         }
         assert!(rang, "the pane opened on a keystroke rang nothing");
@@ -15119,6 +15187,95 @@ mod tests {
             "a hidden workspace's child was never polled, so it could never be \
              seen to leave"
         );
+    }
+
+    #[test]
+    fn continuously_refilled_wakes_yield_to_rendering_without_dropping_input() {
+        let (tx, rx) = mpsc::sync_channel(MAX_WAKE_BATCH);
+        let at = Instant::now();
+        tx.send(Wake::Output { at }).unwrap();
+        let first = rx.recv().unwrap();
+        // Refill synchronously after every yielded event: the queue never
+        // becomes empty, even though it has finite capacity.
+        let mut handled = 0;
+        for _ in wake_batch(first, &rx) {
+            handled += 1;
+            tx.send(Wake::Input {
+                event: Event::FocusGained,
+                at,
+            })
+            .unwrap();
+        }
+        assert_eq!(handled, MAX_WAKE_BATCH);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Wake::Input {
+                event: Event::FocusGained,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn coalesced_redraws_preserve_the_oldest_event_latency() {
+        let mut frames = Frames::new();
+        let now = Instant::now();
+        frames.request(now - Duration::from_millis(25));
+        frames.request(now);
+        frames.record(now);
+        assert!(frames.stats().event_ms >= 25.0);
+        assert!(frames.pending.is_none());
+        assert_eq!(frames.recent_latency.len(), 1);
+    }
+
+    #[test]
+    fn latency_percentiles_keep_tail_stalls_visible() {
+        let mut frames = Frames::new();
+        frames
+            .recent_latency
+            .extend((1..=100).map(Duration::from_millis));
+        let stats = frames.stats();
+        assert_eq!(stats.event_p95_ms, 95.0);
+        assert_eq!(stats.event_p99_ms, 99.0);
+    }
+
+    #[test]
+    fn native_cursor_follows_focus_between_rendered_terminal_panes() {
+        let mut fx = app();
+        stays(&mut fx);
+        a_live_shell(&mut fx);
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+        for focus in [Focus::Left, Focus::Right, Focus::Left] {
+            fx.app.set_focus(focus);
+            until("the focused child to render its cursor", || {
+                terminal.draw(|f| fx.app.ui(f)).unwrap();
+                terminal.backend().cursor_visible()
+            });
+            let (inner, cursor) = match focus {
+                Focus::Left => (
+                    fx.app.current().drawn_inner().unwrap(),
+                    fx.app.current().pane.cursor().unwrap(),
+                ),
+                Focus::Right => (
+                    fx.app.right_inner.unwrap(),
+                    fx.app.right_pane_ref().cursor().unwrap(),
+                ),
+            };
+            assert_eq!(
+                terminal.backend().cursor_position(),
+                ratatui::layout::Position::new(inner.x + cursor.0, inner.y + cursor.1),
+                "native cursor did not belong to the focused rendered pane"
+            );
+        }
+
+        fx.app.set_right_view(RightView::Git);
+        fx.app.set_focus(Focus::Right);
+        terminal.draw(|f| fx.app.ui(f)).unwrap();
+        assert!(!terminal.backend().cursor_visible());
+        fx.app.set_focus(Focus::Left);
+        terminal.draw(|f| fx.app.ui(f)).unwrap();
+        assert!(terminal.backend().cursor_visible());
     }
 
     #[test]

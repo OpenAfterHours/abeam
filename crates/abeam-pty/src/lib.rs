@@ -38,6 +38,7 @@
 //! assumes its user already owns the terminal and is already in a draw loop.
 //! See `examples/host.rs` for a complete ratatui host in ~130 lines.
 
+mod frames;
 pub mod input;
 mod session;
 mod tree;

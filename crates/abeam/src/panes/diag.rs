@@ -54,16 +54,27 @@ const LABEL: usize = 16;
 /// question "is abeam keeping up" was, for the whole of its life before this,
 /// answerable only by looking at the screen and forming an opinion.
 ///
-/// Read them together: `fps` is what the last full second managed, and `worst`
-/// is the single slowest frame in it. A healthy left pane under load sits at
-/// the frame floor with a worst well under it. A `worst` that approaches the
-/// gap between frames is the renderer, not the pacing.
+/// Rendering, serialization and output are measured separately. Wake latency
+/// starts at input receipt or published PTY output notification and ends at
+/// the application write. It excludes held child updates and terminal display.
+/// Percentiles cover the last 120 wake-triggered frames; polled-only frames
+/// contribute no samples and report zero for the last wake delay.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
     pub drawn: u64,
     pub last_ms: f32,
     pub worst_ms: f32,
     pub fps: f32,
+    pub ui_ms: f32,
+    pub backend_ms: f32,
+    pub output_ms: f32,
+    pub bytes: usize,
+    pub writes: u64,
+    pub event_ms: f32,
+    pub event_p95_ms: f32,
+    pub event_p99_ms: f32,
+    pub maintenance_ms: f32,
+    pub resize_ms: f32,
 }
 
 pub struct DiagPane {
@@ -213,6 +224,16 @@ fn rows(d: &Diagnostics, f: Option<FrameStats>, width: usize) -> Vec<Line<'stati
     lines.push(row("pty size (set)", Span::raw(pty)));
     lines.push(row("parser size", Span::raw(format!("{pcols}x{prows}"))));
     lines.push(row("bytes read", Span::raw(d.bytes_read.to_string())));
+    lines.push(row(
+        "reader wait",
+        Span::raw(format!("{} us", d.last_lock_wait_us)),
+    ));
+    lines.push(row(
+        "read parse",
+        Span::raw(format!("{} us", d.last_parse_us)),
+    ));
+    lines.push(row("publications", Span::raw(d.publications.to_string())));
+    lines.push(row("sync timeouts", Span::raw(d.sync_timeouts.to_string())));
     // The counter is on both platforms; the alarm is not, and the difference is
     // a fact about ConPTY rather than about abeam.
     //
@@ -273,6 +294,20 @@ fn rows(d: &Diagnostics, f: Option<FrameStats>, width: usize) -> Vec<Line<'stati
                 },
             ),
         ));
+        for (label, value) in [
+            ("pane render", f.ui_ms),
+            ("encode/diff", f.backend_ms),
+            ("output write", f.output_ms),
+            ("maintenance", f.maintenance_ms),
+            ("PTY resize", f.resize_ms),
+            ("wake to write", f.event_ms),
+            ("wake p95/120", f.event_p95_ms),
+            ("wake p99/120", f.event_p99_ms),
+        ] {
+            lines.push(row(label, Span::raw(format!("{value:.2} ms"))));
+        }
+        lines.push(row("frame bytes", Span::raw(f.bytes.to_string())));
+        lines.push(row("frame writes", Span::raw(f.writes.to_string())));
     }
 
     // Windows-only, for the reason the row's colour is, and gated with `cfg!`
@@ -335,6 +370,10 @@ mod tests {
             parser_size: (22, 78),
             pty_size: Some((22, 78)),
             bytes_read: 4096,
+            last_lock_wait_us: 12,
+            last_parse_us: 42,
+            publications: 8,
+            sync_timeouts: 0,
             dsr_replies: 1,
             keys_sent: 17,
             resizes: 2,
@@ -472,7 +511,10 @@ mod tests {
         assert!(pane.scroll.max() > 0, "the sample must overflow six rows");
 
         let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
-        assert_eq!(pane.handle_key(key(KeyCode::Char('G'))).unwrap(), Handled::Yes);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('G'))).unwrap(),
+            Handled::Yes
+        );
         assert_eq!(pane.scroll.offset, pane.scroll.max());
         pane.handle_key(key(KeyCode::Char('g'))).unwrap();
         assert_eq!(pane.scroll.offset, 0);
@@ -505,6 +547,7 @@ mod tests {
             last_ms: 0.71,
             worst_ms: 2.40,
             fps: 118.0,
+            ..FrameStats::default()
         };
         let t = text(healthy);
         assert!(t.contains("118"), "got: {t}");
@@ -550,6 +593,7 @@ mod tests {
             last_ms: 12.345,
             worst_ms: 123.456,
             fps: 125.0,
+            ..FrameStats::default()
         });
         for width in [1usize, 8, 17, 22, 46, 100] {
             for line in rows(&d, f, width) {

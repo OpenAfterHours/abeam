@@ -177,7 +177,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, session: &PtySession)
 
 fn ui(f: &mut Frame, session: &PtySession) {
     let (left, right) = split(f.area());
-    let screen = session.screen();
+    let screen = session.display_screen();
     let stats = session.stats();
 
     let host_block = Block::bordered()
