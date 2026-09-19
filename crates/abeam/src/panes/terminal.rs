@@ -13,7 +13,7 @@ use anyhow::Result;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use tui_term::widget::PseudoTerminal;
+use tui_term::widget::{Cursor, PseudoTerminal, Screen};
 
 use crate::pane::{Handled, Pane};
 
@@ -21,6 +21,7 @@ pub struct TerminalPane {
     session: PtySession,
     title: String,
     exited: Option<ExitStatus>,
+    rendered_cursor: Option<(u16, u16)>,
 }
 
 impl TerminalPane {
@@ -59,6 +60,7 @@ impl TerminalPane {
             session: PtySession::spawn(cfg)?,
             title,
             exited: None,
+            rendered_cursor: None,
         })
     }
 
@@ -136,6 +138,7 @@ impl TerminalPane {
 
     /// How far back through the rows that have scrolled off the view is, in
     /// rows. `0` is the live screen.
+    #[cfg(test)]
     pub fn scrollback(&self) -> usize {
         self.session.scrollback()
     }
@@ -166,6 +169,9 @@ impl TerminalPane {
     /// logical lines and tells you nothing about layout
     /// (`docs/conpty-findings.md`, constraint 5).
     pub fn last_screen(&self) -> Vec<String> {
+        // Exit can be observed just before the reader publishes its last
+        // coalesced update. Preserve every byte already parsed for the final
+        // transcript, even if the last on-screen frame was still held.
         let screen = self.session.screen();
         let (_, cols) = screen.size();
         let mut rows: Vec<String> = screen
@@ -197,7 +203,7 @@ impl TerminalPane {
     /// pane one row taller than its pty for the frame between a resize and the
     /// `ResizePseudoConsole` that follows it is an ordinary state, not an error.
     pub fn rows_text(&self, first: u16, last: u16) -> String {
-        let screen = self.session.screen();
+        let screen = self.session.display_screen();
         let (rows, cols) = screen.size();
         let Some(bottom) = rows.checked_sub(1) else {
             return String::new();
@@ -237,6 +243,10 @@ impl TerminalPane {
             dsr_replies: stats.dsr_replies,
             keys_sent: stats.keys_sent,
             resizes: stats.resizes,
+            last_lock_wait_us: stats.last_lock_wait_us,
+            last_parse_us: stats.last_parse_us,
+            publications: stats.publications,
+            sync_timeouts: stats.sync_timeouts,
             reader_finished: stats.reader_finished,
             exited: self.exited.as_ref().map(|s| format!("{s:?}")),
         }
@@ -264,6 +274,10 @@ pub struct Diagnostics {
     pub dsr_replies: u64,
     pub keys_sent: u64,
     pub resizes: u64,
+    pub last_lock_wait_us: u64,
+    pub last_parse_us: u64,
+    pub publications: u64,
+    pub sync_timeouts: u64,
     pub reader_finished: bool,
     pub exited: Option<String>,
 }
@@ -288,7 +302,8 @@ impl Pane for TerminalPane {
     }
 
     fn render(&mut self, f: &mut Frame, inner: Rect) {
-        f.render_widget(PseudoTerminal::new(&*self.session.screen()), inner);
+        let screen = self.session.display_screen();
+        self.rendered_cursor = render_screen(f, inner, &*screen, screen.scrollback());
     }
 
     fn tick(&mut self) -> bool {
@@ -319,13 +334,9 @@ impl Pane for TerminalPane {
     /// The strongest focus signal available: if the cursor is not blinking in
     /// the agent's prompt, your keys are not going to the agent.
     fn cursor(&self) -> Option<(u16, u16)> {
-        let screen = self.session.screen();
-        if screen.hide_cursor() {
-            return None;
-        }
-        // vt100 reports (row, col); ratatui wants (x, y).
-        let (row, col) = screen.cursor_position();
-        Some((col, row))
+        // The reader may already be parsing the next frame. Focus must use
+        // the cursor belonging to the cells just drawn, without a second lock.
+        self.rendered_cursor
     }
 
     /// The only call into this pty's resize in the whole program. It is a no-op
@@ -339,6 +350,137 @@ impl Pane for TerminalPane {
     fn handle_paste(&mut self, text: &str) -> Result<Handled> {
         self.session.send_paste(text)?;
         Ok(Handled::Yes)
+    }
+}
+
+/// The caller holds one screen guard across both the widget and cursor read.
+/// Only App places a native cursor, after deciding which pane owns focus.
+fn render_screen(
+    f: &mut Frame,
+    inner: Rect,
+    screen: &impl Screen,
+    scrollback: usize,
+) -> Option<(u16, u16)> {
+    f.render_widget(
+        PseudoTerminal::new(screen).cursor(Cursor::default().visibility(false)),
+        inner,
+    );
+    if screen.hide_cursor() || scrollback > 0 || inner.is_empty() {
+        return None;
+    }
+    // Screen and tui-term use (row, col); the Pane contract uses (col, row).
+    // A pending wrap can put the column just past the right edge.
+    let (row, col) = screen.cursor_position();
+    (row < inner.height).then_some((col.min(inner.width - 1), row))
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
+    use tui_term::widget::Cell;
+
+    struct TestCell;
+
+    impl Cell for TestCell {
+        fn has_contents(&self) -> bool {
+            true
+        }
+
+        fn apply(&self, cell: &mut ratatui::buffer::Cell) {
+            cell.set_symbol("x");
+        }
+    }
+
+    struct TestScreen {
+        cursor: (u16, u16),
+        hidden: bool,
+    }
+
+    impl Screen for TestScreen {
+        type C = TestCell;
+
+        fn cell(&self, row: u16, col: u16) -> Option<&TestCell> {
+            (row == 0 && col == 0).then_some(&TestCell)
+        }
+
+        fn hide_cursor(&self) -> bool {
+            self.hidden
+        }
+
+        fn cursor_position(&self) -> (u16, u16) {
+            self.cursor
+        }
+    }
+
+    #[test]
+    fn software_cursor_never_changes_occupied_or_blank_cells() {
+        let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+        for cursor in [(0, 0), (0, 1)] {
+            let screen = TestScreen {
+                cursor,
+                hidden: false,
+            };
+            let mut rendered_cursor = None;
+            terminal
+                .draw(|f| {
+                    rendered_cursor = render_screen(f, f.area(), &screen, 0);
+                })
+                .unwrap();
+            assert_eq!(rendered_cursor, Some((cursor.1, cursor.0)));
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 0)].symbol(), "x");
+            assert!(!buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+            assert_eq!(buffer[(1, 0)].symbol(), " ");
+        }
+    }
+
+    #[test]
+    fn cached_cursor_belongs_to_rendered_screen_and_hides_in_scrollback() {
+        let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+        let mut screen = TestScreen {
+            cursor: (1, 2),
+            hidden: false,
+        };
+        let mut rendered_cursor = None;
+        terminal
+            .draw(|f| {
+                rendered_cursor = render_screen(f, f.area(), &screen, 0);
+            })
+            .unwrap();
+        screen.cursor = (2, 6);
+        assert_eq!(rendered_cursor, Some((2, 1)));
+        for (scrollback, hidden, expected) in
+            [(1, false, None), (0, true, None), (0, false, Some((6, 2)))]
+        {
+            screen.hidden = hidden;
+            terminal
+                .draw(|f| {
+                    rendered_cursor = render_screen(f, f.area(), &screen, scrollback);
+                })
+                .unwrap();
+            assert_eq!(rendered_cursor, expected);
+        }
+    }
+
+    #[test]
+    fn cursor_respects_clipped_pane_and_pending_wrap() {
+        let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+        for (cursor, expected) in [((1, 8), Some((7, 1))), ((3, 0), None)] {
+            let screen = TestScreen {
+                cursor,
+                hidden: false,
+            };
+            let mut rendered_cursor = None;
+            terminal
+                .draw(|f| {
+                    rendered_cursor = render_screen(f, f.area(), &screen, 0);
+                })
+                .unwrap();
+            assert_eq!(rendered_cursor, expected);
+        }
     }
 }
 

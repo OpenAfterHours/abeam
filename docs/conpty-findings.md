@@ -30,9 +30,11 @@ then completes in under half a second.
 
 Three consequences, all still in the code:
 
-- `DsrScanner` in `crates/abeam-pty/src/input.rs` watches the output stream for
-  the query, carrying bytes across read boundaries so a split sequence still
-  matches.
+- The streaming parser in `crates/abeam-pty/src/frames.rs` recognizes the query
+  across read boundaries and records the live cursor at each query. It also
+  tracks synchronized repaints; see [rendering and publication](rendering-performance-plan.md).
+  The original public `DsrScanner` remains in `input.rs` for low-level consumers
+  and the ConPTY probe tests.
 - The pty **writer is shared** between callers and the reader thread, because
   the reader is what has to answer. This is why `PtySession` holds an
   `Arc<Mutex<..>>` writer and exposes no accessor to it.

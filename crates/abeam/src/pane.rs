@@ -180,6 +180,8 @@ pub trait Pane {
     ///
     /// Drawn only while the pane has focus. It is the strongest focus signal
     /// there is, because it is what a typist is already looking at.
+    /// Called after `render`: the position must belong to those rendered cells,
+    /// even if a background reader has already advanced to its next update.
     fn cursor(&self) -> Option<(u16, u16)> {
         None
     }

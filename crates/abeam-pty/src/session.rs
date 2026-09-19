@@ -16,11 +16,13 @@ use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::frames::Screens;
 use crate::input;
 use crate::tree::Tree;
 
@@ -165,12 +167,19 @@ pub struct PtyStats {
     pub resizes: u64,
     /// The reader loop ended. The pty is closed; nothing more will arrive.
     pub reader_finished: bool,
+    /// Time spent waiting for the screen lock on the most recent read.
+    pub last_lock_wait_us: u64,
+    /// Time parsing/scanning the most recent read, including any publication.
+    pub last_parse_us: u64,
+    pub publications: u64,
+    pub sync_timeouts: u64,
 }
 
 struct Shared {
-    parser: Mutex<vt100::Parser>,
+    parser: Mutex<Screens>,
+    publication_changed: Condvar,
     dirty: AtomicBool,
-    /// Rung by the reader thread every time `dirty` goes up. See
+    /// Rung by the reader or publication worker when `dirty` goes up. See
     /// [`PtySession::wake_on_output`] for why a session that is only polled is
     /// a session that renders late.
     ///
@@ -183,24 +192,64 @@ struct Shared {
     dsr_replies: AtomicU64,
     keys_sent: AtomicU64,
     resizes: AtomicU64,
+    last_lock_wait_us: AtomicU64,
+    last_parse_us: AtomicU64,
+    publications: AtomicU64,
+    sync_timeouts: AtomicU64,
 }
 
 impl Shared {
+    fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
+        Self {
+            parser: Mutex::new(Screens::new(rows, cols, scrollback)),
+            publication_changed: Condvar::new(),
+            dirty: AtomicBool::new(true),
+            waker: OnceLock::new(),
+            bytes: AtomicU64::new(0),
+            eof: AtomicBool::new(false),
+            dsr_replies: AtomicU64::new(0),
+            keys_sent: AtomicU64::new(0),
+            resizes: AtomicU64::new(0),
+            last_lock_wait_us: AtomicU64::new(0),
+            last_parse_us: AtomicU64::new(0),
+            publications: AtomicU64::new(0),
+            sync_timeouts: AtomicU64::new(0),
+        }
+    }
+
     /// Marks the screen changed and tells whoever is waiting. Always in that
     /// order: a waker that fires before the flag is set can be answered by a
     /// consumer that then sees nothing to do and goes back to sleep.
     ///
-    /// Only the reader thread calls this. The other two places that dirty the
+    /// Only the background threads call this. The other places that dirty the
     /// screen — a resize and a scrollback move — run on the caller's own thread,
     /// which is by definition already awake, and one of them holds the parser
     /// lock while it does it. Ringing from under that lock would run somebody
     /// else's closure inside our critical section, which is a deadlock waiting
     /// for its first careless waker.
     fn mark_dirty(&self) {
-        self.dirty.store(true, Ordering::Relaxed);
-        if let Some(wake) = self.waker.get() {
+        if !self.dirty.swap(true, Ordering::Relaxed)
+            && let Some(wake) = self.waker.get()
+        {
             wake();
         }
+    }
+
+    fn record_publications(&self, screens: &Screens) {
+        self.publications
+            .store(screens.publications, Ordering::Relaxed);
+        self.sync_timeouts
+            .store(screens.sync_timeouts, Ordering::Relaxed);
+    }
+
+    fn stop_publisher(&self) {
+        // Drop must still kill the child if a renderer panicked while holding
+        // its ScreenGuard. A second panic here would abort before that cleanup.
+        self.parser
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stopped = true;
+        self.publication_changed.notify_one();
     }
 }
 
@@ -208,12 +257,19 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// Borrowed view of the parsed screen. Holds the parser lock, so the reader
 /// thread is blocked for as long as it lives — scope it to a single draw.
-pub struct ScreenGuard<'a>(MutexGuard<'a, vt100::Parser>);
+pub struct ScreenGuard<'a> {
+    screens: MutexGuard<'a, Screens>,
+    display: bool,
+}
 
 impl Deref for ScreenGuard<'_> {
     type Target = vt100::Screen;
     fn deref(&self) -> &vt100::Screen {
-        self.0.screen()
+        if self.display {
+            self.screens.display.screen()
+        } else {
+            self.screens.live.screen()
+        }
     }
 }
 
@@ -288,22 +344,15 @@ impl PtySession {
         let tree = Tree::holding(&*child);
 
         let master = pair.master;
-        let shared = Arc::new(Shared {
-            parser: Mutex::new(vt100::Parser::new(rows, cols, cfg.scrollback)),
-            dirty: AtomicBool::new(true),
-            waker: OnceLock::new(),
-            bytes: AtomicU64::new(0),
-            eof: AtomicBool::new(false),
-            dsr_replies: AtomicU64::new(0),
-            keys_sent: AtomicU64::new(0),
-            resizes: AtomicU64::new(0),
-        });
+        let shared = Arc::new(Shared::new(rows, cols, cfg.scrollback));
 
         // One writer, shared: callers send input through it, and so does the
         // reader thread when it has to answer a DSR query.
-        let writer: SharedWriter = Arc::new(Mutex::new(master.take_writer().map_err(PtyError::Open)?));
+        let writer: SharedWriter =
+            Arc::new(Mutex::new(master.take_writer().map_err(PtyError::Open)?));
         let reader = master.try_clone_reader().map_err(PtyError::Open)?;
 
+        let _ = spawn_publisher(Arc::clone(&shared));
         spawn_reader(reader, Arc::clone(&shared), Arc::clone(&writer));
 
         Ok(Self {
@@ -317,28 +366,44 @@ impl PtySession {
 
     // --- rendering -------------------------------------------------------
 
-    /// The parsed screen, ready to hand to a widget.
+    /// The live parsed screen, including an unfinished synchronized repaint.
+    /// Use [`display_screen`](Self::display_screen) for rendering and selection;
+    /// use this view when inspecting the child's current input modes.
     ///
     /// Note when reading it: `Screen::contents()` rejoins wrapped rows into
     /// logical lines and so tells you nothing about layout. Use
     /// `Screen::rows()` for anything positional.
     pub fn screen(&self) -> ScreenGuard<'_> {
-        ScreenGuard(self.shared.parser.lock().unwrap())
+        ScreenGuard {
+            screens: self.shared.parser.lock().unwrap(),
+            display: false,
+        }
+    }
+
+    /// The last published screen and its matching cursor. An unrelated redraw
+    /// cannot expose an unfinished child repaint through this view.
+    pub fn display_screen(&self) -> ScreenGuard<'_> {
+        ScreenGuard {
+            screens: self.shared.parser.lock().unwrap(),
+            display: true,
+        }
     }
 
     /// Same access, without the guard living across your frame.
     pub fn with_screen<R>(&self, f: impl FnOnce(&vt100::Screen) -> R) -> R {
-        f(self.shared.parser.lock().unwrap().screen())
+        f(self.shared.parser.lock().unwrap().live.screen())
     }
 
-    /// True, once, if output has arrived since the last call. Drives redraws
+    /// True, once, if a screen has been published since the last call. Drives redraws
     /// without polling the screen contents.
     pub fn take_dirty(&self) -> bool {
         self.shared.dirty.swap(false, Ordering::Relaxed)
     }
 
-    /// Called on the reader thread whenever output arrives, so a draw loop can
-    /// wait to be told rather than asking on a timer.
+    /// Called when a completed screen becomes available, so a draw loop can
+    /// wait to be told rather than asking on a timer. Repeated publications
+    /// coalesce while the dirty flag is already set. Installing the first
+    /// callback also rings it if a screen is already waiting.
     ///
     /// This exists because polling sets a floor on latency that has nothing to
     /// do with how fast anything actually is: a loop that asks every 10 ms
@@ -347,7 +412,7 @@ impl PtySession {
     /// grid it has no relationship with, so frames land unevenly. Uneven frames
     /// read as jitter at any rate.
     ///
-    /// `notify` runs **on the reader thread, holding nothing**, so it must not
+    /// `notify` runs **holding nothing**, usually on a background thread, so it must not
     /// block and must not touch the session. Ring a doorbell and return; the
     /// news itself is [`take_dirty`](Self::take_dirty), which is sticky, so a
     /// ring that is dropped costs nothing.
@@ -356,7 +421,12 @@ impl PtySession {
     /// loop, it installs this before the first frame, and a waker that could be
     /// replaced mid-session is a waker that can be replaced mid-ring.
     pub fn wake_on_output(&self, notify: impl Fn() + Send + Sync + 'static) {
-        let _ = self.shared.waker.set(Box::new(notify));
+        if self.shared.waker.set(Box::new(notify)).is_ok()
+            && self.shared.dirty.load(Ordering::Relaxed)
+            && let Some(wake) = self.shared.waker.get()
+        {
+            wake();
+        }
     }
 
     // --- scrollback ------------------------------------------------------
@@ -402,12 +472,11 @@ impl PtySession {
     /// and a frame re-renders the agent's whole screen.
     fn move_view(&self, to: impl FnOnce(usize) -> usize) -> bool {
         let mut parser = self.shared.parser.lock().unwrap();
-        let screen = parser.screen_mut();
-        let before = screen.scrollback();
-        screen.set_scrollback(to(before));
-        let moved = screen.scrollback() != before;
+        let moved = parser.move_view(to);
         if moved {
+            self.shared.record_publications(&parser);
             self.shared.dirty.store(true, Ordering::Relaxed);
+            self.shared.publication_changed.notify_one();
         }
         moved
     }
@@ -442,7 +511,7 @@ impl PtySession {
     pub fn send_mouse(&self, ev: &MouseEvent, col: u16, row: u16) -> io::Result<bool> {
         let (mode, encoding) = {
             let p = self.shared.parser.lock().unwrap();
-            let s = p.screen();
+            let s = p.live.screen();
             (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
         };
         match input::encode_mouse(ev, col, row, mode, encoding) {
@@ -469,13 +538,15 @@ impl PtySession {
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
         let (rows, cols) = (rows.max(1), cols.max(1));
         let mut parser = self.shared.parser.lock().unwrap();
-        if parser.screen().size() == (rows, cols) {
+        if parser.live.screen().size() == (rows, cols) {
             return Ok(());
         }
         self.master
             .resize(pty_size(rows, cols))
             .map_err(PtyError::Resize)?;
-        parser.screen_mut().set_size(rows, cols);
+        parser.resize(rows, cols);
+        self.shared.record_publications(&parser);
+        self.shared.publication_changed.notify_one();
         self.shared.resizes.fetch_add(1, Ordering::Relaxed);
         self.shared.dirty.store(true, Ordering::Relaxed);
         Ok(())
@@ -510,7 +581,16 @@ impl PtySession {
     /// Output may still be in flight when this yields `Some`, so give the
     /// reader a moment before drawing the final frame.
     pub fn try_wait(&mut self) -> Result<Option<portable_pty::ExitStatus>, PtyError> {
-        Ok(self.child.try_wait()?)
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            let mut screens = self.shared.parser.lock().unwrap();
+            if screens.child_exited() {
+                self.shared.record_publications(&screens);
+                self.shared.dirty.store(true, Ordering::Relaxed);
+            }
+            self.shared.publication_changed.notify_one();
+        }
+        Ok(status)
     }
 
     /// The child's process id, when the platform will say.
@@ -535,6 +615,10 @@ impl PtySession {
             keys_sent: self.shared.keys_sent.load(Ordering::Relaxed),
             resizes: self.shared.resizes.load(Ordering::Relaxed),
             reader_finished: self.shared.eof.load(Ordering::Relaxed),
+            last_lock_wait_us: self.shared.last_lock_wait_us.load(Ordering::Relaxed),
+            last_parse_us: self.shared.last_parse_us.load(Ordering::Relaxed),
+            publications: self.shared.publications.load(Ordering::Relaxed),
+            sync_timeouts: self.shared.sync_timeouts.load(Ordering::Relaxed),
         }
     }
 }
@@ -583,6 +667,9 @@ impl Drop for PtySession {
     /// The reader thread is deliberately *not* joined. It has no reliable EOF
     /// to return from and joining it hangs the process — let it die with us.
     fn drop(&mut self) {
+        // ConPTY may never give the reader EOF. The deadline worker has its
+        // own explicit shutdown and is never joined on the UI thread.
+        self.shared.stop_publisher();
         let _ = self.child.kill();
         drop(self.tree.take());
     }
@@ -597,50 +684,207 @@ fn pty_size(rows: u16, cols: u16) -> PtySize {
     }
 }
 
-/// The reader loop, transcribed from the spike that proved it works.
-///
-/// The order here matters: bytes are scanned for DSR queries, then fed to the
-/// parser, and only then is the cursor read — the reply has to report where the
-/// cursor is *after* this chunk, not before it.
+/// A deadline worker independent of the blocking reader. In particular a child
+/// that sends BEGIN and then stops writing must still recover after 100ms.
+/// Only this worker waits: neither the reader nor the UI sleeps to coalesce.
+fn spawn_publisher(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut screens = shared.parser.lock().unwrap();
+        loop {
+            if screens.stopped {
+                break;
+            }
+            let published = screens.publish_due(Instant::now());
+            shared.record_publications(&screens);
+            if published {
+                drop(screens);
+                shared.mark_dirty();
+                screens = shared.parser.lock().unwrap();
+                continue;
+            }
+            // Always recheck under the same lock after waking: a new BEGIN
+            // may have superseded the deadline that originally woke us.
+            screens = match screens.deadline() {
+                Some(deadline) => {
+                    shared
+                        .publication_changed
+                        .wait_timeout(screens, deadline.saturating_duration_since(Instant::now()))
+                        .unwrap()
+                        .0
+                }
+                None => shared.publication_changed.wait(screens).unwrap(),
+            };
+        }
+    })
+}
+
+/// Read and parse continuously, even while presentation is held. DSR replies
+/// use the live cursor at each query and are sent outside the screen lock.
 fn spawn_reader(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>, writer: SharedWriter) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        let mut dsr = input::DsrScanner::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let chunk = &buf[..n];
-                    let queries = dsr.scan(chunk);
-
-                    let cursor = {
+                    let lock_started = Instant::now();
+                    let (queries, published, earlier_deadline) = {
                         let mut p = shared.parser.lock().unwrap();
-                        p.process(chunk);
-                        p.screen().cursor_position()
+                        let parse_started = Instant::now();
+                        shared.last_lock_wait_us.store(
+                            parse_started.duration_since(lock_started).as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
+                        let before = p.publications;
+                        let previous_deadline = p.deadline();
+                        let queries = p.process(chunk, parse_started);
+                        shared.last_parse_us.store(
+                            parse_started.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
+                        shared.record_publications(&p);
+                        let earlier_deadline = p.deadline().is_some_and(|next| {
+                            previous_deadline.is_none_or(|previous| next < previous)
+                        });
+                        (queries, p.publications != before, earlier_deadline)
                     };
+                    // Extending a quiet deadline needs no notification: the
+                    // worker will wake at the earlier deadline and recheck.
+                    // Avoid a lock-contending worker wake for every busy read.
+                    if earlier_deadline {
+                        shared.publication_changed.notify_one();
+                    }
 
                     // Must be answered or the session stalls before the hosted
                     // program produces anything.
-                    if queries > 0 {
-                        let reply = input::dsr_reply(cursor.0, cursor.1);
+                    if !queries.is_empty() {
                         let mut w = writer.lock().unwrap();
-                        for _ in 0..queries {
+                        for cursor in &queries {
+                            let reply = input::dsr_reply(cursor.0, cursor.1);
                             let _ = w.write_all(&reply);
                         }
                         let _ = w.flush();
                         shared
                             .dsr_replies
-                            .fetch_add(queries as u64, Ordering::Relaxed);
+                            .fetch_add(queries.len() as u64, Ordering::Relaxed);
                     }
 
                     shared.bytes.fetch_add(n as u64, Ordering::Relaxed);
-                    shared.mark_dirty();
+                    if published {
+                        shared.mark_dirty();
+                    }
                 }
             }
         }
         shared.eof.store(true, Ordering::Relaxed);
+        {
+            let mut screens = shared.parser.lock().unwrap();
+            screens.child_exited();
+            screens.stopped = true;
+            shared.record_publications(&screens);
+        }
+        shared.publication_changed.notify_one();
         // The last ring, and the one that matters most: the loop has to wake to
         // notice the child has gone rather than finding out on its next tick.
         shared.mark_dirty();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct ChannelReader(mpsc::Receiver<Vec<u8>>);
+
+    impl Read for ChannelReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Ok(bytes) = self.0.recv() else {
+                return Ok(0);
+            };
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    struct ReplyWriter(mpsc::Sender<Vec<u8>>);
+
+    impl Write for ReplyWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.send(bytes.to_vec()).unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn blocked_reader_still_answers_dsr_and_publishes_a_missing_end_on_deadline() {
+        let shared = Arc::new(Shared::new(6, 24, 10));
+        shared.dirty.store(false, Ordering::Relaxed);
+        let (wake_tx, wake_rx) = mpsc::channel();
+        assert!(
+            shared
+                .waker
+                .set(Box::new(move || {
+                    let _ = wake_tx.send(());
+                }))
+                .is_ok()
+        );
+        let (output_tx, output_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let publisher = spawn_publisher(Arc::clone(&shared));
+        spawn_reader(
+            Box::new(ChannelReader(output_rx)),
+            Arc::clone(&shared),
+            Arc::new(Mutex::new(Box::new(ReplyWriter(reply_tx)))),
+        );
+        output_tx
+            .send(b"\x1b[?2026hHELD\x1b[2;3H\x1b[6n".to_vec())
+            .unwrap();
+        assert_eq!(
+            reply_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            b"\x1b[2;3R"
+        );
+
+        // No more output is sent; the reader remains blocked in recv/read.
+        // The only way this completes is the independent publication deadline.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            shared.dirty.swap(false, Ordering::Relaxed);
+            if shared.sync_timeouts.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            wake_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
+        assert_eq!(
+            shared.parser.lock().unwrap().display.screen().contents(),
+            "HELD"
+        );
+        shared.stop_publisher();
+        publisher.join().unwrap();
+        drop(output_tx);
+    }
+
+    #[test]
+    fn shutdown_survives_a_poisoned_render_guard() {
+        let shared = Shared::new(6, 24, 10);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.parser.lock().unwrap();
+            panic!("injected renderer panic");
+        }));
+        shared.stop_publisher();
+        assert!(
+            shared
+                .parser
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .stopped
+        );
+    }
 }

@@ -328,6 +328,7 @@ impl ShellPane {
     // bottom of it.
 
     /// Where the view is, in rows above the live screen.
+    #[cfg(test)]
     fn at(&self) -> usize {
         match &self.state {
             State::Hosted { term, .. } => term.scrollback(),
@@ -562,11 +563,9 @@ impl Pane for ShellPane {
         if term.has_exited() {
             return None;
         }
-        let (col, row) = term.cursor()?;
-        // Scrolled back, the live screen has moved down the pane by exactly
-        // that many rows, and can be off the bottom of it entirely.
-        let row = row.checked_add(u16::try_from(self.at()).ok()?)?;
-        (row < self.drawn.height).then_some((col, row))
+        // TerminalPane caches the viewport-relative cursor while drawing,
+        // including scrollback visibility. Do not read a newer live offset.
+        term.cursor()
     }
 
     /// Remembered whatever the state, so that `Enter` starts the next child at
@@ -1119,13 +1118,16 @@ mod tests {
         // shell's prompt, your keys are not going to the shell.
         let dir = TempDir::new("shell-cursor");
         let mut pane = with_history(&dir);
+        draw(&mut pane, 30, 6);
         assert!(pane.cursor().is_some());
 
-        // Scrolled far enough back, the live screen — and the prompt on it —
-        // is off the bottom of the pane, so there is nothing to point at.
+        // A cursor is a property of the rendered viewport. History browsing
+        // hides it, and returning to the live view restores it on that frame.
         pane.to(usize::MAX);
+        draw(&mut pane, 30, 6);
         assert_eq!(pane.cursor(), None);
         pane.to(0);
+        draw(&mut pane, 30, 6);
         assert!(pane.cursor().is_some());
 
         let mut dead = pane_that_exited(&dir);
@@ -1850,13 +1852,16 @@ mod unix_tests {
         // shell's prompt, your keys are not going to the shell.
         let dir = TempDir::new("shell-cursor");
         let mut pane = with_history(&dir);
+        draw(&mut pane, 30, 6);
         assert!(pane.cursor().is_some());
 
-        // Scrolled far enough back, the live screen — and the prompt on it —
-        // is off the bottom of the pane, so there is nothing to point at.
+        // A cursor is a property of the rendered viewport. History browsing
+        // hides it, and returning to the live view restores it on that frame.
         pane.to(usize::MAX);
+        draw(&mut pane, 30, 6);
         assert_eq!(pane.cursor(), None);
         pane.to(0);
+        draw(&mut pane, 30, 6);
         assert!(pane.cursor().is_some());
 
         let mut dead = pane_that_exited(&dir);
