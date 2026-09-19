@@ -268,6 +268,32 @@ fn rows(d: &Diagnostics, f: Option<FrameStats>, width: usize) -> Vec<Line<'stati
         Span::raw(format!("{},{}", d.cursor.1, d.cursor.0)),
     ));
 
+    lines.push(Line::default());
+    lines.push(heading("publication"));
+    lines.push(Line::default());
+    lines.push(row("tail timeouts", Span::raw(d.tail_timeouts.to_string())));
+    lines.push(row("pending bytes", Span::raw(d.pending_bytes.to_string())));
+    lines.push(row(
+        "publish hold",
+        Span::raw(format!("{} us", d.last_hold_us)),
+    ));
+    lines.push(row(
+        "publish replay",
+        Span::raw(format!("{} us", d.last_replay_us)),
+    ));
+    for (label, value) in [
+        ("read to write", d.presentation.receipt_ms),
+        ("read p95/120", d.presentation.receipt_p95_ms),
+        ("read p99/120", d.presentation.receipt_p99_ms),
+        ("publish to write", d.presentation.published_ms),
+    ] {
+        lines.push(row(label, Span::raw(format!("{value:.2} ms"))));
+    }
+    lines.push(row(
+        "read samples",
+        Span::raw(d.presentation.samples.to_string()),
+    ));
+
     if let Some(f) = f {
         lines.push(Line::default());
         lines.push(heading("drawing"));
@@ -374,6 +400,11 @@ mod tests {
             last_parse_us: 42,
             publications: 8,
             sync_timeouts: 0,
+            tail_timeouts: 0,
+            pending_bytes: 17,
+            last_hold_us: 15000,
+            last_replay_us: 40,
+            presentation: Default::default(),
             dsr_replies: 1,
             keys_sent: 17,
             resizes: 2,

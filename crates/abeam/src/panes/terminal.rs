@@ -16,12 +16,61 @@ use ratatui::layout::Rect;
 use tui_term::widget::{Cursor, PseudoTerminal, Screen};
 
 use crate::pane::{Handled, Pane};
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PresentationStats {
+    pub samples: usize,
+    pub receipt_ms: f32,
+    pub receipt_p95_ms: f32,
+    pub receipt_p99_ms: f32,
+    pub published_ms: f32,
+}
+
+#[derive(Default)]
+struct PresentationTiming {
+    recent: VecDeque<Duration>,
+    published: Duration,
+}
+
+impl PresentationTiming {
+    fn record(&mut self, publication: abeam_pty::Publication, completed: Instant) {
+        if self.recent.len() == 120 {
+            self.recent.pop_front();
+        }
+        self.recent
+            .push_back(completed.saturating_duration_since(publication.received_at));
+        self.published = completed.saturating_duration_since(publication.published_at);
+    }
+
+    fn stats(&self) -> PresentationStats {
+        let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+        let mut sorted: Vec<_> = self.recent.iter().copied().collect();
+        sorted.sort_unstable();
+        let percentile = |percent: usize| {
+            ms(sorted
+                .get((sorted.len() * percent).div_ceil(100).saturating_sub(1))
+                .copied()
+                .unwrap_or_default())
+        };
+        PresentationStats {
+            samples: self.recent.len(),
+            receipt_ms: ms(self.recent.back().copied().unwrap_or_default()),
+            receipt_p95_ms: percentile(95),
+            receipt_p99_ms: percentile(99),
+            published_ms: ms(self.published),
+        }
+    }
+}
 
 pub struct TerminalPane {
     session: PtySession,
     title: String,
     exited: Option<ExitStatus>,
     rendered_cursor: Option<(u16, u16)>,
+    rendered_publication: Option<abeam_pty::Publication>,
+    presentation: PresentationTiming,
 }
 
 impl TerminalPane {
@@ -61,6 +110,8 @@ impl TerminalPane {
             title,
             exited: None,
             rendered_cursor: None,
+            rendered_publication: None,
+            presentation: PresentationTiming::default(),
         })
     }
 
@@ -247,8 +298,21 @@ impl TerminalPane {
             last_parse_us: stats.last_parse_us,
             publications: stats.publications,
             sync_timeouts: stats.sync_timeouts,
+            tail_timeouts: stats.tail_timeouts,
+            pending_bytes: stats.pending_bytes,
+            last_hold_us: stats.last_hold_us,
+            last_replay_us: stats.last_replay_us,
+            presentation: self.presentation.stats(),
             reader_finished: stats.reader_finished,
             exited: self.exited.as_ref().map(|s| format!("{s:?}")),
+        }
+    }
+
+    /// Called after a successful outer frame write. Timing was captured with
+    /// the cells, so an input-triggered redraw cannot count an unrendered echo.
+    pub fn record_presented(&mut self, completed: Instant) {
+        if let Some(publication) = self.rendered_publication.take() {
+            self.presentation.record(publication, completed);
         }
     }
 }
@@ -278,6 +342,11 @@ pub struct Diagnostics {
     pub last_parse_us: u64,
     pub publications: u64,
     pub sync_timeouts: u64,
+    pub tail_timeouts: u64,
+    pub pending_bytes: u64,
+    pub last_hold_us: u64,
+    pub last_replay_us: u64,
+    pub presentation: PresentationStats,
     pub reader_finished: bool,
     pub exited: Option<String>,
 }
@@ -302,8 +371,9 @@ impl Pane for TerminalPane {
     }
 
     fn render(&mut self, f: &mut Frame, inner: Rect) {
-        let screen = self.session.display_screen();
+        let mut screen = self.session.display_screen();
         self.rendered_cursor = render_screen(f, inner, &*screen, screen.scrollback());
+        self.rendered_publication = screen.take_publication();
     }
 
     fn tick(&mut self) -> bool {
@@ -381,6 +451,35 @@ mod rendering_tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
     use tui_term::widget::Cell;
+
+    #[test]
+    fn output_latency_includes_held_time_and_preserves_tail_stalls() {
+        let now = Instant::now();
+        let mut timing = PresentationTiming::default();
+        for ms in 1..=120 {
+            timing.record(
+                abeam_pty::Publication {
+                    received_at: now - Duration::from_millis(ms),
+                    published_at: now - Duration::from_millis(2),
+                },
+                now,
+            );
+        }
+        let stats = timing.stats();
+        assert_eq!(stats.samples, 120);
+        assert!((stats.receipt_p95_ms - 114.0).abs() < 0.01);
+        assert!((stats.receipt_p99_ms - 119.0).abs() < 0.01);
+        assert!((stats.published_ms - 2.0).abs() < 0.01);
+        timing.record(
+            abeam_pty::Publication {
+                received_at: now,
+                published_at: now,
+            },
+            now,
+        );
+        assert_eq!(timing.recent.len(), 120);
+        assert_eq!(timing.recent.front(), Some(&Duration::from_millis(2)));
+    }
 
     struct TestCell;
 
