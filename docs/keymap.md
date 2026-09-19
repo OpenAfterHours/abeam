@@ -24,6 +24,7 @@ to the focused child.
 | `F1, J` / `F1, K` | Scroll the right pane one line | Keep current focus |
 | `F1, PageUp` / `F1, PageDown` | Page the right pane | Keep current focus |
 | `F1, N` | Focus the next agent | Focus left |
+| `F1, O` | Open another agent: the git view's chooser, cursor on the row that re-runs this session's command line | Focus right |
 | `F1, Q` | Quit; enter `F1, Q` again to confirm while a child is live | As confirmed |
 | `F1, Esc` | Dismiss the hub | Unchanged |
 | `F4` / `F5` | Focus the current agent / show and focus the right pane | Left / right respectively |

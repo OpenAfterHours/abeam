@@ -405,6 +405,21 @@ reader thread and a `vt100::Parser` with 5,000 lines of scrollback. Whether a
 collapsed pane should keep 5,000 is a question for a measurement rather than an
 opinion, and nobody has made one.
 
+**`F1, O` and the chooser's as-launched row came after that count, and are in
+the same state: built, tested, never driven by hand.** `F1, O` shows the git
+view, gives it the keys and opens the chooser `A` opens there. The chooser's
+first row is the session's own command line, typed arguments included, and
+`Enter` on it re-runs that line verbatim — `-p` and `--resume` too, never
+filtered — but only if the last frame drew the whole of it: an `Enter` that
+arrives before any frame has, or at a row the pane is too small to show whole,
+runs nothing. That rests on **ten tests** — the `#[test]` attributes this work
+added, counted the same way as the sixty-six above — which read what a pane
+started this way was given back off a shim's own screen, a `.cmd` on Windows.
+Nobody has yet driven `F1, O` by hand: not seen the row wrap a real command
+line in a real terminal, not had an `Enter` refused and seen that it was
+clear why, and not started a second pane from it against a real install of an
+agent.
+
 **Not done, and known.**
 
 - **Two agents that are neither the session's can never be read together.** The

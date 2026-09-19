@@ -1022,10 +1022,31 @@ pub struct Hosted {
     /// **The row's arguments and never the whole line**, which is the same
     /// distinction `Recipe`'s own documentation is written around: `abeam
     /// +fleet -p "fix the tests"` resolves `claude agent -p "fix the tests"`,
-    /// and a later pane may inherit the first two words and must not inherit
+    /// and a pane opened later with `a` inherits the first two words and not
     /// the last two. `line` below is where the two halves are joined; this is
-    /// the half abeam's own table contributed.
+    /// the half abeam's own table contributed, and [`typed`](Self::typed) is
+    /// the other.
     pub args: Vec<String>,
+    /// What was typed after abeam's own token, exactly as it arrived, and
+    /// nothing the table added.
+    ///
+    /// **Kept apart from [`args`](Self::args) rather than joined to it, because
+    /// the two halves have different rules about who may run them again.**
+    /// `args` is the program's own: written in the reader's config file, it
+    /// selects what the session *is*, and every pane `a` opens is started with
+    /// it. This is the person's: `-p` and a prompt, `--resume` and a
+    /// conversation, and `a` — which shows nothing and asks nothing — must not
+    /// re-run a word of it. The one thing that does is the chooser's first row,
+    /// which refuses `Enter` until a frame has drawn the whole line;
+    /// `crate::app::Recipe` is where that rule is written down and
+    /// `docs/multi-agent.md` is where its history is.
+    ///
+    /// `launch` is these two joined and resolved, and nothing else. That is
+    /// the invariant the as-launched row stands on — resolving
+    /// `launch.target` again with `args` followed by this answers `launch`
+    /// itself — and `crate::app`'s tests pin it for the three shapes a session
+    /// can have.
+    pub typed: Vec<String>,
     pub launch: Launch,
 }
 
@@ -1039,12 +1060,16 @@ impl Hosted {
     ///
     /// No arguments either, and that is the same sentence about a third thing:
     /// a program with no row in the table has nothing abeam added to its
-    /// command line, so its whole recipe is the file it resolved to.
-    pub fn plain(name: &str, launch: Launch) -> Self {
+    /// command line, so its whole recipe is the file it resolved to. What was
+    /// typed is still carried, as [`typed`](Self::typed), because it is the
+    /// whole of what the chooser's as-launched row has to add to that file:
+    /// `abeam +pwsh -NoLogo` is `pwsh` plus `-NoLogo`, and nothing else.
+    pub fn plain(name: &str, typed: &[String], launch: Launch) -> Self {
         Self {
             name: name.to_string(),
             agent: name.to_string(),
             args: Vec::new(),
+            typed: typed.to_vec(),
             launch,
         }
     }
@@ -1073,7 +1098,11 @@ pub fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result
     // program: a Windows npm shim is a `.cmd`, and the arguments for one are
     // quoted *into* the command line `cmd.exe` is pointed at — so a list
     // extended after resolution would be a list that never reached the child.
-    let args = &line(agent, args);
+    //
+    // The typed half is named before the join takes the name, because it
+    // leaves this function on its own as well: see [`Hosted::typed`].
+    let typed = args;
+    let args = &line(agent, typed);
 
     for candidate in agent.candidates {
         match launch::resolve(candidate, args) {
@@ -1087,8 +1116,11 @@ pub fn resolve_within(agent: &Agent, args: &[String], table: &[Agent]) -> Result
                     agent: agent.hosts.to_string(),
                     // The row's own, not the line above: `args` there is what
                     // the table added *and* what was typed, and only the first
-                    // half may be given to a pane opened an hour later.
+                    // half may be given to a pane `a` opens an hour later.
                     args: agent.args.iter().map(|arg| (*arg).to_string()).collect(),
+                    // ...and the second half on its own, for the one row that
+                    // shows it before it runs it.
+                    typed: typed.to_vec(),
                     launch,
                 });
             }
@@ -2547,6 +2579,19 @@ mod tests {
             hosted.args,
             "what was typed reached the field a later pane is started from"
         );
+        // **And the typed half is kept too, on its own**, which is the field
+        // the chooser's as-launched row reads and draws. Asserted for the same
+        // reason the line above is: nothing else in this file reads it, so a
+        // `Vec::new()` here would leave the row reading `fleet` and running
+        // `claude agent` for a session somebody started with `--resume`.
+        assert_eq!(hosted.typed, args(&["--resume"]));
+        assert!(
+            resolve_within(&PRESET[0], &[], PRESET)
+                .unwrap()
+                .typed
+                .is_empty(),
+            "something nobody typed arrived in the typed half"
+        );
 
         // A built-in adds nothing and answers both questions with one word,
         // which is the promise `crate::agentstate` reads this file for.
@@ -2558,6 +2603,7 @@ mod tests {
             "a built-in put an argument of abeam's own in front of somebody's \
              agent"
         );
+        assert_eq!(plain.typed, args(&["--resume"]));
     }
 
     #[test]

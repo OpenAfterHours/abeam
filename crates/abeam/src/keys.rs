@@ -237,6 +237,18 @@ pub enum Action {
     /// command rather than F4's second meaning: focus and agent navigation are
     /// separate questions and no direct key answers both depending on state.
     NextAgent,
+    /// Open another agent: show the git view, focus it, and ask which agent —
+    /// the chooser `A` opens in that view, about the checkout it is showing,
+    /// with the cursor on the command line the session was started with.
+    ///
+    /// **A hub command and not a second meaning for a pane key**, and the
+    /// reason is where the reader is. `A` and `a` are pane-local, which is what
+    /// makes a bare letter legal for them, and that is also what makes them
+    /// three keys away from somebody typing at an agent: `F1, G`, then `F5`,
+    /// then the letter. This is the same question asked from anywhere, in two.
+    /// It takes focus for [`ShowShell`](Self::ShowShell)'s reason — a list
+    /// that answers `Enter` is not one you can answer from the other pane.
+    NewAgent,
     /// Scroll the right pane *without focusing it* — glancing at git or at the
     /// markdown the agent just wrote is a read, and a read should not cost a focus
     /// round-trip. Carries the bare key the pane would have seen had it been
@@ -346,6 +358,7 @@ pub fn hub(key: &KeyEvent) -> Option<HubCommand> {
         KeyCode::PageUp => HubCommand::Action(Action::ScrollRight(KeyCode::PageUp)),
         KeyCode::PageDown => HubCommand::Action(Action::ScrollRight(KeyCode::PageDown)),
         KeyCode::Char('n') | KeyCode::Char('N') => HubCommand::Action(Action::NextAgent),
+        KeyCode::Char('o') | KeyCode::Char('O') => HubCommand::Action(Action::NewAgent),
         KeyCode::Char('q') | KeyCode::Char('Q') => HubCommand::Action(Action::Quit),
         _ => return None,
     })
@@ -369,6 +382,7 @@ pub const HUB: &[(&str, &str)] = &[
     ("J / K", "scroll right pane down / up"),
     ("PgDn / PgUp", "page right pane down / up"),
     ("N", "next agent (focuses it)"),
+    ("O", "open another agent (choose; Enter = as launched)"),
     ("Q", "quit (confirm with F1, Q if a child is live)"),
     ("?", "full key reference"),
     ("Esc", "dismiss commands"),
@@ -417,6 +431,17 @@ pub const HELP: &[(&str, &str)] = &[
     ("F1, J / K", "scroll right pane, without focusing it"),
     ("F1, PgDn / PgUp", "page right pane, without focusing it"),
     ("F1, N", "next agent and focus it"),
+    // The row that has to say what `Enter` does, because what it does is the
+    // one thing in this program that re-runs what was typed on abeam's command
+    // line — `-p`, `--resume`, all of it, verbatim. `Enter` there is refused
+    // until a frame has drawn that line whole, which is the whole of its
+    // safety, and this row is what tells a reader to look at it. `a` in the
+    // git view is the key that starts another of the program *without* the
+    // typed line, and it has its own row below.
+    (
+        "F1, O",
+        "open another agent: the git chooser; Enter = the command line you started with",
+    ),
     // "while a child is live", not "while the agent is running": `app::act`
     // quits outright only when the agent has exited *and* no shell is live, so
     // a dead agent with a shell still in the right pane asks twice as well.
@@ -907,6 +932,7 @@ mod tests {
             (KeyCode::Char('t'), Action::ToggleReaderTheme),
             (KeyCode::Char('z'), Action::ToggleZoom),
             (KeyCode::Char('n'), Action::NextAgent),
+            (KeyCode::Char('o'), Action::NewAgent),
             (KeyCode::Char('q'), Action::Quit),
         ];
         for (code, action) in cases {
@@ -1169,6 +1195,7 @@ mod tests {
             "F1, D / T",
             "F1, Z",
             "F1, N",
+            "F1, O",
             "F1, Q",
             "F4 / F5",
             "F7",
