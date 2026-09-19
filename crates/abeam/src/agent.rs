@@ -247,7 +247,7 @@ pub struct Agent {
     /// reading it has abeam in front of them and the agent nowhere.
     ///
     /// A preset whose host is a built-in borrows that built-in's sentence,
-    /// because the thing that is missing really is Claude or Copilot. A preset
+    /// because the thing that is missing really is that built-in. A preset
     /// whose host is an ordinary program has nothing abeam knows how to install,
     /// so its sentence names the config file instead — the reader's next move
     /// there is to open the file and look at what they asked for.
@@ -304,6 +304,43 @@ const COPILOT_INSTALL: &str = "Install it with `npm i -g @github/copilot`, or ru
 const CODEX_INSTALL: &str = "Install it with `npm i -g @openai/codex`, then run \
                             `codex` to sign in.";
 
+/// How to install hailer, which is a Python package rather than a Node one.
+///
+/// One sentence on both platforms, like Codex's: `uv` is spelled the same on
+/// Windows and Linux, and so is the `hailer` it puts on `PATH` — a `.exe`
+/// launcher on one and a script on the other, which `crate::launch` finds
+/// under the one name either way.
+///
+/// Two routes, and the second is the one only abeam's reader would think to
+/// ask for. `uv tool install hailer` gives hailer a tool environment of its
+/// own. `uv tool install abeam --with-executables-from hailer` puts it in
+/// abeam's instead, with its `hailer` on `PATH` beside abeam's own — and does
+/// that to an abeam already installed as a tool, without `--force`.
+///
+/// **Not `abeam[hailer]`, which is what the second route said first.** That
+/// extra carries a Python marker, so below 3.12 — hailer's floor, where
+/// abeam's is 3.9 — it installs no hailer at all; and under `uv tool install`
+/// only the named package's executables reach `PATH`, which here is abeam, so
+/// the extra does not make `hailer` findable there. Both routes here install
+/// hailer by name. The second fails out loud where hailer's Python
+/// requirement cannot be met (shown with stand-ins); the first has not been
+/// tried on an old Python. `pyproject.toml`'s comment is where the packaging
+/// side of that is argued.
+///
+/// Then the two steps after the install. The key, for Codex's reason: every
+/// hailer provider needs one, and a missing one stops hailer at startup. And
+/// `hailer init` in each project, because hailer 0.2.5's `notebook` exits with
+/// an error in a project that has not had it — `abeam +hailer notebook` would
+/// otherwise be the next thing to fail. Every command here is one the reader
+/// runs. abeam names `uv` and never runs it; see the module docs.
+///
+/// **`docs/status.md` quotes this sentence byte for byte**, which is why a
+/// test pins it whole rather than by fragments: a reworded copy here would
+/// leave that page telling people something abeam no longer says.
+const HAILER_INSTALL: &str = "Install it with `uv tool install hailer`, or beside abeam with \
+                              `uv tool install abeam --with-executables-from hailer`, then run \
+                              `hailer login openai` once and `hailer init` in each project.";
+
 /// The agents abeam knows, and the only place their names are written down.
 ///
 /// Half of the table a `+` token is read against, and the only half abeam
@@ -348,6 +385,23 @@ pub const AGENTS: &[Agent] = &[
         hosts: "codex",
         candidates: &["codex"],
         install: CODEX_INSTALL,
+    },
+    // An interactive host and nothing more, like Codex, and for a starker
+    // reason: hailer has no print mode for the ask pane to drive, no `--bg`,
+    // and no session record for `crate::agentstate` to read. Nothing here
+    // says so, because nothing here has to. Each of those is keyed on the
+    // `hosts` below, and `hailer` is on none of their lists: the ask pane asks
+    // `crate::panes::ask`'s own list of agents it has a print mode for, which
+    // is Claude and Copilot; `--bg`, the readiness probe and the roster ask
+    // for `claude` alone. Typing a selection into the agent is the one thing
+    // not keyed on the row at all — it asks the child whether it takes a
+    // bracketed paste, and hailer 0.2.5's plain `input()` prompt does not.
+    Agent {
+        name: "hailer",
+        args: &[],
+        hosts: "hailer",
+        candidates: &["hailer"],
+        install: HAILER_INSTALL,
     },
 ];
 
@@ -740,13 +794,25 @@ fn sigilled(held: &str, word: &str) -> String {
     )
 }
 
-/// What abeam says to a command line that used to mean the other thing.
+/// The built-ins a bare first word selected, before it stopped selecting.
 ///
-/// Both readings by name, because the reader has just typed something that was
-/// correct for years and the failure they are being saved from is one where
-/// nothing on screen would have said abeam's name. The two ways out are the
-/// same line with one token changed, which is why they are spelled out in full
-/// rather than described.
+/// Two, and there can never be a third. The first word stopped being abeam's
+/// at the flip (2eb905d, which handed the command line to the agent), and
+/// these were the whole table then. Every row added since has only ever been
+/// selectable behind a `+`: no abeam with a Codex row ever hosted Codex for
+/// `abeam codex`, and v0.12.0 ran `abeam hailer notebook` as `claude hailer
+/// notebook`. Written out rather than derived, because nothing about a row
+/// says when it arrived — and a row added tomorrow is on the other side of
+/// this list by definition, so the list is finished.
+const SELECTED_BEFORE_THE_SIGIL: &[&str] = &["claude", "copilot"];
+
+/// What abeam says to a command line whose first word names a row of the table.
+///
+/// Both readings by name, because the reader has just typed something that
+/// either was correct for years or looks exactly like it, and the failure they
+/// are being saved from is one where nothing on screen would have said abeam's
+/// name. The two ways out are the same line with one token changed, which is
+/// why they are spelled out in full rather than described.
 ///
 /// **The first token and never the whole line**, which is a correction. This
 /// used to join `args` with single spaces and print the result inside `Write
@@ -774,17 +840,37 @@ fn ambiguous(name: &str, first: &str) -> String {
     // What is true of both is that the first word used to name what to start,
     // and `find` is the question that separates them: it reads the built-in
     // table alone, so a name it does not know is one somebody wrote themselves.
-    let past = match find(name) {
-        Some(_) => format!(
+    //
+    // **And the built-ins do not share one past either**, which is the same
+    // mistake made a second time. The sentence below was written when the
+    // table was Claude and Copilot, and it went on being printed for rows that
+    // arrived after the flip: `abeam hailer notebook` was told it "used to host
+    // hailer", on the release where that line had just sent `hailer notebook`
+    // to Claude. [`SELECTED_BEFORE_THE_SIGIL`] is the two names the history is
+    // true of. Every other built-in gets the reason without the history, which
+    // is the reason that holds for all of them.
+    let past = if SELECTED_BEFORE_THE_SIGIL
+        .iter()
+        .any(|old| old.eq_ignore_ascii_case(name))
+    {
+        format!(
             "`abeam {first}` used to host {name}, which is the whole reason it \
              is refused rather than quietly passed on."
-        ),
-        None => format!(
+        )
+    } else if find(name).is_some() {
+        format!(
+            "`{name}` is one of abeam's own agents, and a first word that names \
+             one is far likelier to be a `+` left off than the start of a \
+             prompt — which is the whole reason it is refused rather than \
+             quietly passed on."
+        )
+    } else {
+        format!(
             "`abeam {first}` used to host whatever `{first}` was on PATH — \
              never your `{first}` preset, which has only ever been selectable \
              behind the sigil. It is refused for the same reason a built-in's \
              name is: the word means something to abeam."
-        ),
+        )
     };
     format!(
         "{past} The command line now belongs to the agent, so this would send \
@@ -1289,6 +1375,7 @@ mod tests {
         assert_eq!(find("claude").expect("claude is known").name, "claude");
         assert_eq!(find("copilot").expect("copilot is known").name, "copilot");
         assert_eq!(find("codex").expect("codex is known").name, "codex");
+        assert_eq!(find("hailer").expect("hailer is known").name, "hailer");
         // A name that is not in the table is not half-matched into one: it is a
         // program, and `abeam +powershell` has to keep meaning what `abeam
         // powershell` meant.
@@ -1302,6 +1389,7 @@ mod tests {
         assert_eq!(find("Claude").expect("Claude is claude").name, "claude");
         assert_eq!(find("COPILOT").expect("COPILOT is copilot").name, "copilot");
         assert_eq!(find("CODEX").expect("CODEX is codex").name, "codex");
+        assert_eq!(find("HAILER").expect("HAILER is hailer").name, "hailer");
 
         // The one invariant a `&'static str` default cannot carry itself.
         assert!(
@@ -1363,6 +1451,61 @@ mod tests {
         let codex = find("codex").unwrap().install;
         assert!(codex.contains("npm i -g @openai/codex"), "got: {codex}");
         assert!(codex.contains("run `codex` to sign in"), "got: {codex}");
+
+        // hailer's sentence is pinned whole, and it is the only one that is.
+        // The others are asserted by fragment because nothing outside this
+        // file repeats them; this one is quoted byte for byte in
+        // `docs/status.md`, so a rewording here is a change to documentation
+        // somebody else wrote and has to fail where the person making it will
+        // see why. The page itself is checked by the test after this one.
+        let hailer = find("hailer").unwrap().install;
+        assert_eq!(
+            hailer,
+            "Install it with `uv tool install hailer`, or beside abeam with `uv tool \
+             install abeam --with-executables-from hailer`, then run `hailer login \
+             openai` once and `hailer init` in each project.",
+            "docs/status.md quotes this sentence byte for byte; change both or neither"
+        );
+        // One sentence on both platforms, like Codex's. The two parts a reader
+        // would get wrong are asserted on their own: the second route installs
+        // hailer by name rather than through the extra, which puts no `hailer`
+        // on `PATH` at any Python and installs none below 3.12; and the `init`
+        // a project needs before `hailer notebook` will run.
+        assert!(!hailer.contains("winget"), "got: {hailer}");
+        assert!(
+            !hailer.contains("abeam[hailer]"),
+            "the extra never puts `hailer` on PATH: {hailer}"
+        );
+        assert!(
+            hailer.contains("uv tool install abeam --with-executables-from hailer"),
+            "got: {hailer}"
+        );
+        assert!(hailer.contains("`hailer init`"), "got: {hailer}");
+    }
+
+    /// The page that quotes hailer's install sentence, as a corpus.
+    ///
+    /// Included at compile time rather than read, for the reason
+    /// `crate::panes::viewer::docs`' own corpus gives: a test that opens a file
+    /// by relative path fails under a different working directory. The path is
+    /// relative to this file. Nothing ships the crate without the repository
+    /// around it — there is no crates.io release and no sdist — so the page is
+    /// always there to include.
+    ///
+    /// Not normalised to LF the way that corpus is. The sentence is one line,
+    /// so the line endings this working tree checks out are never inside it.
+    const STATUS: &str = include_str!("../../../docs/status.md");
+
+    #[test]
+    fn the_install_sentence_docs_status_md_quotes_is_the_one_a_missing_hailer_prints() {
+        // "Byte for byte" as a check rather than a promise. The pin above
+        // fails when this sentence is reworded; this fails when the page's copy
+        // drifts from it, which nothing on this side would otherwise notice.
+        let hailer = find("hailer").expect("hailer is a built-in").install;
+        assert!(
+            STATUS.contains(hailer),
+            "docs/status.md no longer quotes the sentence a missing hailer prints: {hailer}"
+        );
     }
 
     // --- the flip ---------------------------------------------------------
@@ -1429,6 +1572,7 @@ mod tests {
         // A name in the table picks that agent...
         assert_eq!(chose(&["+copilot"], None), ("agent:copilot".into(), vec![]));
         assert_eq!(chose(&["+codex"], None), ("agent:codex".into(), vec![]));
+        assert_eq!(chose(&["+hailer"], None), ("agent:hailer".into(), vec![]));
         // ...and one that is not is a program, which is the whole of what the
         // positional used to do and all that moved.
         assert_eq!(chose(&["+pwsh"], None), ("program:pwsh".into(), vec![]));
@@ -1449,6 +1593,13 @@ mod tests {
             chose(&["+codex", "--search"], None),
             ("agent:codex".into(), args(&["--search"]))
         );
+        // A subcommand as much as a flag: `abeam +hailer notebook` is `hailer
+        // notebook`, the command hailer's own documentation leads with, and
+        // the reason its row needs no `args` of its own.
+        assert_eq!(
+            chose(&["+hailer", "notebook", "--no-browser"], None),
+            ("agent:hailer".into(), args(&["notebook", "--no-browser"]))
+        );
         assert_eq!(
             chose(&["+claude", "--help"], None),
             ("agent:claude".into(), args(&["--help"])),
@@ -1458,6 +1609,7 @@ mod tests {
         // Folded, like the table it is read against.
         assert_eq!(chose(&["+COPILOT"], None), ("agent:copilot".into(), vec![]));
         assert_eq!(chose(&["+CODEX"], None), ("agent:codex".into(), vec![]));
+        assert_eq!(chose(&["+Hailer"], None), ("agent:hailer".into(), vec![]));
         assert_eq!(chose(&["+Claude"], None), ("agent:claude".into(), vec![]));
 
         // ...and trimmed, which the table lookup itself is not: it folds case
@@ -1720,10 +1872,10 @@ mod tests {
                 .expect_err("a name that used to select is not silently rewritten");
 
             // Both readings, named. Somebody has just typed a line that was
-            // right for years, and without this they would be reading the
-            // agent's complaint about an argument on a screen that never
-            // mentions abeam.
-            assert!(refused.contains("used to host"), "got: {refused}");
+            // right for years, or that looks exactly like one, and without this
+            // they would be reading the agent's complaint about an argument on
+            // a screen that never mentions abeam. Which of the two it was is
+            // the next test's subject; that the agent is named is this one's.
             assert!(refused.contains(agent.name), "got: {refused}");
 
             // ...and both ways out, each of them this line with its first token
@@ -1749,6 +1901,21 @@ mod tests {
             // rather than a question about what would otherwise have run.
             assert!(parse_with(&args(&[agent.name]), Some("pwsh".into()), AGENTS).is_err());
         }
+
+        // The loop above reaches hailer because hailer is a row, and this is
+        // the line a hailer user is likeliest to arrive here with: its own
+        // documentation says `hailer notebook`, and putting `abeam` in front
+        // of that is the obvious guess. From v0.0.4, when the first word
+        // stopped selecting, until hailer was a row, it started `claude hailer
+        // notebook`, on a screen that never said why. (Up to v0.0.3 it hosted
+        // whatever `hailer` was on `PATH`, like any other first word.)
+        let refused = parse_with(&args(&["hailer", "notebook"]), None, AGENTS)
+            .expect_err("`abeam hailer notebook` is a selection typed without its sigil");
+        assert!(refused.contains("`abeam +hailer`"), "got: {refused}");
+        assert!(refused.contains("`abeam -- hailer`"), "got: {refused}");
+        // ...and it is not told the line used to host hailer, which it never
+        // did under any abeam that knew the name.
+        assert!(!refused.contains("used to host"), "got: {refused}");
 
         // Only the table, and never `PATH`. A word that is not in it is an
         // argument like any other however much it looks like a program, which
@@ -1776,6 +1943,57 @@ mod tests {
             chose(&["--", "claude", "agent"], None),
             ("agent:claude".into(), args(&["--", "claude", "agent"]))
         );
+    }
+
+    #[test]
+    fn the_refusal_claims_a_past_only_for_the_names_that_had_one() {
+        // Claude and Copilot were the table when the first word stopped
+        // selecting, so `abeam claude` really did host Claude, and saying so is
+        // the most persuasive sentence abeam has for the refusal.
+        for name in ["claude", "copilot"] {
+            let refused = parse_with(&args(&[name, "agent"]), None, AGENTS)
+                .expect_err("a built-in's name in front of the sigil");
+            assert!(
+                refused.contains(&format!("`abeam {name}` used to host {name}")),
+                "the history that is true was dropped: {refused}"
+            );
+        }
+
+        // Codex and hailer arrived after it. Neither was ever hosted by its
+        // name in first position under an abeam that knew the name, so the
+        // history would be abeam being wrong about the one thing the reader
+        // can check — they may have typed this line yesterday and watched it
+        // reach Claude. What they get instead is the reason, which is true of
+        // every built-in, with both ways out still spelled for the name.
+        for name in ["codex", "hailer", "HAILER"] {
+            let refused = parse_with(&args(&[name, "notebook"]), None, AGENTS)
+                .expect_err("a built-in's name in front of the sigil");
+            let row = find(name).expect("a built-in").name;
+            assert!(
+                !refused.contains("used to host"),
+                "{row} was given a past it never had: {refused}"
+            );
+            assert!(
+                refused.contains(&format!("`{row}` is one of abeam's own agents")),
+                "got: {refused}"
+            );
+            assert!(
+                refused.contains(&format!("`abeam +{name}`")),
+                "got: {refused}"
+            );
+            assert!(
+                refused.contains(&format!("`abeam -- {name}`")),
+                "got: {refused}"
+            );
+        }
+
+        // Every built-in is on one side or the other, and the history side is
+        // the two names above and never grows: a row added tomorrow is one the
+        // first word never selected.
+        assert_eq!(SELECTED_BEFORE_THE_SIGIL, ["claude", "copilot"]);
+        for old in SELECTED_BEFORE_THE_SIGIL {
+            assert!(find(old).is_some(), "{old} is no longer a built-in");
+        }
     }
 
     #[test]
@@ -1859,6 +2077,12 @@ mod tests {
             ("agent:copilot".into(), vec![])
         );
         assert_eq!(chose(&[], Some("codex")), ("agent:codex".into(), vec![]));
+        assert_eq!(chose(&[], Some("hailer")), ("agent:hailer".into(), vec![]));
+        assert_eq!(
+            chose(&["notebook"], Some("hailer")),
+            ("agent:hailer".into(), args(&["notebook"])),
+            "`ABEAM_AGENT=hailer abeam notebook` is `hailer notebook`"
+        );
         // ...or any program, exactly as ABEAM_SHELL may — including one named
         // as a path, which is passed on as it was written.
         assert_eq!(
@@ -1989,7 +2213,7 @@ mod tests {
         // Two halves do that. The exact line, which fails if the separator, the
         // order or the label changes and if a name is dropped from `AGENTS`...
         assert!(
-            help.contains("Agents: claude, copilot, codex"),
+            help.contains("Agents: claude, copilot, codex, hailer"),
             "the agents line is not what a reader was promised: {help}"
         );
         // ...and the same function over a table that is *not* `AGENTS`, which
@@ -2193,6 +2417,76 @@ mod tests {
             refused.contains("`abeam +abeam-test-two` would host it"),
             "the sentence has to be the command to type: {refused}"
         );
+    }
+
+    #[test]
+    fn a_missing_hailer_prints_the_sentence_status_md_quotes_and_an_installed_one_is_offered() {
+        // hailer's own row, with the one field that would make this depend on
+        // the machine swapped out. Whether `hailer` is on *this* `PATH` is not
+        // a fact a test may have, so the candidate is a name on no machine and
+        // every word a reader sees — the name and the install sentence — is the
+        // row's own. The two tests above prove the mechanism over a table of
+        // strangers; this one proves what it says for the row that is new.
+        let hailer = find("hailer").expect("hailer is a built-in");
+        let absent = Agent {
+            candidates: &["abeam-no-such-hailer"],
+            ..*hailer
+        };
+        let refused = resolve_within(&absent, &[], &[absent]).expect_err("nothing is installed");
+
+        assert!(
+            refused.contains("abeam could not start `hailer`."),
+            "got: {refused}"
+        );
+        // The sentence, whole and on its own line, as the last piece of advice
+        // — where every agent's goes. Composed with nothing around it, so the
+        // copy `docs/status.md` quotes is exactly what a reader is shown: no
+        // punctuation added at either end and no second full stop.
+        let lines: Vec<&str> = refused.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            lines[lines.len() - 2],
+            hailer.install,
+            "the install sentence is not the last advice: {refused}"
+        );
+        // A row and not a program. `nowhere` is what a name outside the table
+        // is answered with, and its paragraph about the sigil would be telling
+        // somebody who asked for hailer by name that they might have meant a
+        // prompt.
+        assert!(
+            !refused.contains("as the program to host"),
+            "hailer was answered as a program abeam knows nothing about: {refused}"
+        );
+
+        // And the hint that saves the ten minutes, both ways round. The default
+        // agent missing on a machine where hailer is installed names hailer as
+        // the one word away...
+        let installed = Agent {
+            candidates: &[EVERY_MACHINE],
+            ..*hailer
+        };
+        let claude = Agent {
+            candidates: &["abeam-no-such-claude"],
+            ..*find("claude").expect("claude is a built-in")
+        };
+        let offered = resolve_within(&claude, &[], &[claude, installed])
+            .expect_err("claude is not installed");
+        assert!(
+            offered.contains("`hailer` is installed; `abeam +hailer` would host it."),
+            "an installed hailer was not offered: {offered}"
+        );
+
+        // ...and a missing hailer offers whatever else is there, above its own
+        // install sentence rather than in place of it.
+        let other = Agent {
+            candidates: &[EVERY_MACHINE],
+            ..*find("claude").expect("claude is a built-in")
+        };
+        let offered = resolve_within(&absent, &[], &[absent, other]).expect_err("hailer is absent");
+        assert!(
+            offered.contains("`claude` is installed; `abeam +claude` would host it."),
+            "got: {offered}"
+        );
+        assert!(offered.contains(hailer.install), "got: {offered}");
     }
 
     // --- a row somebody else wrote ----------------------------------------

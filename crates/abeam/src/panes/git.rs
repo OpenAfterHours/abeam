@@ -373,7 +373,7 @@ pub struct GitPane {
     /// kill a running session. Neither is a program anybody can type at. There
     /// is no global left to spend either; `docs/keymap.md` records the `Alt`
     /// namespace as close to spent and a new letter would need an audit of
-    /// three agents' shipped defaults, which is a claim nobody can make on an
+    /// four agents' shipped defaults, which is a claim nobody can make on an
     /// afternoon.
     ///
     /// This list is where the key can be claimed, and it is also where it
@@ -2215,7 +2215,7 @@ fn cells(text: &str) -> usize {
 /// it exists.**
 ///
 /// A built-in says nothing here, because `claude → claude` is a column of noise
-/// on the three rows a machine with no presets has.
+/// on every row a machine with no presets has.
 fn agent_note(row: &crate::agent::Agent, mine: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     if mine {

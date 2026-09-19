@@ -82,7 +82,9 @@ pub fn inner(pane: Rect) -> Rect {
 /// `abeam +pwsh` hosts a shell: no composer, no hint line, and a prompt that is
 /// useful in four rows. The number is set by the agents this program exists for
 /// rather than by everything it can host, and a shell in a collapsed pane loses
-/// less than a permission dialog would.
+/// less than a permission dialog would. hailer is the same case from inside the
+/// table: a built-in whose 0.2.5 prompt is one plain line with no box around
+/// it, which loses no more to this floor than the shell does.
 pub const MIN_AGENT_ROWS: u16 = 12;
 
 /// Where the agents go down the left column: one rect each, in list order.

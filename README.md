@@ -59,7 +59,9 @@ uv tool install abeam     # or keep it on PATH
 
 There is no Python in abeam. PyPI is the delivery van: the wheel's whole payload
 is a compiled binary, so `uvx` fetches a few hundred kilobytes and runs it — no
-Rust toolchain, no build step, nothing to compile.
+Rust toolchain, no build step, nothing to compile. Asking for hailer as well
+changes what is fetched, by about 480 MB of Python, none of it in abeam's
+wheel, which is the same binary either way.
 
 You also need:
 
@@ -78,6 +80,27 @@ You also need:
     sign in with ChatGPT or an API key. See OpenAI's [CLI
     setup](https://learn.chatgpt.com/docs/codex/cli) and [authentication
     guide](https://learn.chatgpt.com/docs/auth).
+  - **[hailer](https://pypi.org/project/hailer/)** — an agent for exploring
+    and charting local data in a marimo notebook: a Python package, about
+    480 MB installed, wanting Python 3.12 or newer. Name it directly — `uv
+    tool install hailer`, or beside abeam with `uv tool install abeam
+    --with-executables-from hailer` (an abeam you already installed is fine),
+    or for one run `uvx --with hailer abeam +hailer notebook`. A route that
+    reports hailer's Python requirement unsatisfiable wants `--python 3.12`.
+    Then store an API key once with `hailer login openai`, which puts it in
+    the OS credential store, or set `OPENAI_API_KEY` — it speaks to
+    OpenAI-compatible providers only — and run `hailer init` in each project,
+    in the directory you start abeam in. That writes `hailer.toml`,
+    `.config/hailer/`, `notebooks/` and `data/` there, and until it has,
+    `hailer notebook` lists what is missing and exits. On the one-run route
+    those two are `uvx hailer login openai` and `uvx hailer init`. hailer also
+    keeps its own state in a `.hailer/` directory in the project, which the
+    git pane will show as untracked until you ignore it. The `abeam[hailer]`
+    extra is for an environment already on Python 3.12 or newer: on an older
+    one it installs the newest abeam and no hailer, without a word, and
+    `+hailer` then says what to run. [pyproject.toml](pyproject.toml) argues
+    the routes, and [status](docs/status.md#status) says what has been run —
+    none of them as written.
 
 ## Run it
 
@@ -100,6 +123,7 @@ abeam agent               # ...and `claude agent`, subcommands included
 
 abeam +copilot --resume   # GitHub Copilot CLI, with its own --resume
 abeam +codex [args]       # OpenAI Codex CLI; every argument is forwarded
+abeam +hailer notebook    # hailer, with marimo started for it (see below)
 abeam +bash               # anything else on PATH
 abeam +help               # abeam's own help; `--help` is the agent's
 abeam -- +1 more thing    # `--` stops abeam reading, and goes to the agent too
@@ -108,18 +132,48 @@ abeam -- +1 more thing    # `--` stops abeam reading, and goes to the agent too
 A `+` token is read only in first position, and there is at most one — so a
 prompt may begin with a `+`, and `abeam config set +x` is a real command line.
 Behind the sigil you can write an agent abeam knows (`claude`, `copilot`,
-`codex`), a preset from your config file, or any program on `PATH`. Case does
-not matter. Two names are reserved: `+help` and `+version`.
+`codex`, `hailer`), a preset from your config file, or any program on `PATH`.
+Case does not matter. Two names are reserved: `+help` and `+version`.
 
-`abeam claude`, `abeam copilot` and `abeam codex` — without the sigil — are
-**refused** with a message naming both readings, rather than being
-reinterpreted. Use the corresponding `+name` form to select an agent.
+`abeam claude`, `abeam copilot`, `abeam codex` and `abeam hailer` — without the
+sigil — are **refused** with a message naming both readings, rather than being
+reinterpreted. Use the corresponding `+name` form to select an agent, or put a
+prompt that happens to start with one of those words behind `--`:
+`abeam -- hailer …`.
 
 Codex support is deliberately narrow: `abeam +codex [args]` hosts the ordinary
 interactive Codex TUI in the left pty. Ask is unavailable. Claude's readiness
 record cannot establish whether Codex is idle, so queue **send** items are
 blocked both automatically and when you press `Enter`; type the item in the
 left pane instead. Background dispatch is Claude-only and is unavailable too.
+
+hailer support is Codex's, then narrowed twice more by hailer itself. Ask and
+background dispatch are unavailable, as they are for Codex, and queue **send**
+items are blocked for Codex's reason — nothing tells abeam when hailer is idle
+— so type the item in the left pane. The first further narrowing is marimo.
+hailer works in a marimo notebook open in a browser tab, and in 0.2.5 plain
+`hailer` fails unless a marimo server is already running; `hailer notebook`
+starts one or reuses one, opens the tab, runs the chat, and stops the marimo
+it started when the chat ends. So **`abeam +hailer notebook` is the line to
+type** — after `hailer init`, above — and a preset (below) can type it for
+you. The second is the hand-off out of the right pane. A drag there still
+copies, but `Enter` will not hand the rows to hailer's prompt — the border
+says `the agent is not taking pastes` instead. That hand-off is a bracketed
+paste, hailer 0.2.5 reads a plain line and never asks for the mode, and
+without it a newline in the rows would submit them. The check is abeam's
+general rule and not a hailer exception, so a hailer release that turns
+bracketed paste on gets `Enter` with no change to abeam.
+
+What happens to marimo when hailer's pane closes is less settled than it
+looks. A marimo that `hailer notebook` reused was never hailer's child, and
+hailer leaves it running on purpose. One it started is its child, and on
+Linux it stays in hailer's process group — which, inside abeam, is the one
+the terminal hangs up the moment hailer exits, even at an ordinary quit. So
+on Linux `--keep-marimo` is not expected to keep anything, pane closed or
+not. On Windows it is unverified whether abeam's kill reaches marimo at all:
+`hailer.exe` is uv's launcher and starts Python at once, and abeam adopts a
+child into its job only after the child is running. Nobody has watched
+either; [status](docs/status.md#status) has the detail.
 
 `ABEAM_AGENT` names what to host when no `+` token did, and a `+` overrides it
 for one run. It holds a **name**, not a command line, so `ABEAM_AGENT=copilot`
@@ -289,8 +343,9 @@ other tool exists for that session — and the pane draws the list the child
 reports back, so what is on screen is what it actually got. Under Copilot the
 guarantee is weaker and made the other way round, with `--deny-tool`; that half
 has never been run by anyone, the pane says so on its opening screen, and
-[status](docs/status.md) has the detail. Under Codex, Ask is unavailable rather
-than starting a different provider or guessing at a safe non-interactive mode.
+[status](docs/status.md) has the detail. Under Codex and under hailer, Ask is
+unavailable rather than starting a different provider or guessing at a safe
+non-interactive mode.
 
 **pty diagnostics** (`F1, D`) — what the emulation layer is doing: alt-screen,
 application cursor, bracketed paste, mouse mode, byte counts, sizes, and the
@@ -437,7 +492,7 @@ goes up on the frame you pressed it.
 ever *which one*. It opens a list over whichever of the two you pressed it in.
 The first row is the command line this session was started with, everything
 you typed included, and the cursor starts there; below it are the names `+`
-already takes, which is `claude`, `copilot`, `codex` and any `[preset.*]`
+already takes, which is `claude`, `copilot`, `codex`, `hailer` and any `[preset.*]`
 blocks of your own, in that order, with the one this session was started as
 marked `session`. So `A` `Enter` is an exact copy of the session: `uvx abeam
 agents --cwd "."` reads `claude agents --cwd .` and starts that, `abeam +fleet
@@ -496,8 +551,9 @@ once.
 **And a pane that is not Claude does not follow its agent at all.** Following is
 built on the agent writing its own working directory into a session record abeam
 can read and check the identity of, and Claude is the only one that writes such
-a record — abeam knows of none for Codex or Copilot, and it will not guess one
-out of `git worktree list`, which would name directories nothing is standing in.
+a record — abeam knows of none for Codex, Copilot or hailer, and it will not
+guess one out of `git worktree list`, which would name directories nothing is
+standing in.
 So a Codex pane that makes itself a worktree and moves in keeps the border and
 the occupancy count of the checkout it was *started* in, for as long as it runs.
 The row is still there and `x` `x` on it still ends the pane. The same
@@ -567,19 +623,33 @@ theme = "dark"
 [preset.openai]
 host  = "codex"
 view  = "files"
+
+[preset.data]
+host  = "hailer"
+args  = ["notebook"]
 ```
 
 `[defaults]` is how every session on the machine opens. A **preset** is a name
 behind the sigil that behaves exactly like a built-in agent: `abeam +fleet
 --resume` starts `claude agent --resume` with the queue showing, and `+help`
-lists `fleet` and `openai` beside `claude`, `copilot` and `codex`. `abeam
-+openai [args]` resolves the preset to the built-in Codex host and forwards the
-typed arguments after any preset `args`. A preset's own `args` go in *front* of
-what you typed, because a subcommand is the first word of its line.
+lists `fleet`, `openai` and `data` beside `claude`, `copilot`, `codex` and
+`hailer`. `abeam +openai [args]` resolves the preset to the built-in Codex host
+and forwards the typed arguments after any preset `args`. A preset's own `args`
+go in *front* of what you typed, because a subcommand is the first word of its
+line — which is what makes `abeam +data` the `hailer notebook` that hailer
+0.2.5 needs, without typing the subcommand each time.
 
 **Migration:** `codex` is now a built-in, so an existing `[preset.codex]` is
 reserved and the configuration is refused. Rename that preset (for example to
 `[preset.openai]`) and invoke the new name behind `+`.
+
+**And again for `hailer`**, which joined the built-ins the same way, so a
+`[preset.hailer]` — the obvious thing to have written to reach it before — is
+now refused too, and the refusal says which fix it needs. One that sets
+nothing but `host = "hailer"` only repeats the built-in, and can be deleted.
+Any other wants a new name, such as `[preset.my-hailer]`, with its `host` line
+left as it is — where that line is `host = "hailer"`, it now names the
+built-in.
 
 Three things are refused rather than quietly worked around: a preset whose
 `host` names another preset (there is no chaining, so there is no cycle to
@@ -611,6 +681,11 @@ before you install it.
 - **Codex 0.149.0 has been hosted through abeam on Windows without signing
   in.** Its welcome/sign-in screen, navigation, resize and quit path worked.
   Authenticated modes and every Linux path remain untested.
+- **abeam has never hosted hailer.** Not once, on either platform, signed in
+  or not. What has been exercised is uv's packaging machinery, on Windows,
+  with a stand-in for hailer — and for abeam too wherever the extra was
+  involved. None of the install routes above has been run as written, and
+  abeam has never been pointed at an installed `hailer` at all.
 - **Nobody has typed a question into the ask pane**, and the Copilot half of it
   has never been run by any process at all. What comes back from it is a model's
   answer, which can be fluent, specific and wrong about the file it read.
@@ -684,7 +759,7 @@ each decision, rather than in this README.
 | Document | |
 | --- | --- |
 | [docs/status.md](docs/status.md) | what is done, what is not, and what nobody has watched work |
-| [docs/keymap.md](docs/keymap.md) | the keyboard audit against Claude, Copilot and Codex, including custom-map gaps |
+| [docs/keymap.md](docs/keymap.md) | the keyboard audit against Claude, Copilot, Codex and hailer, including custom-map gaps |
 | [docs/design.md](docs/design.md) | worktree routing, the draw loop, the layout |
 | [docs/conpty-findings.md](docs/conpty-findings.md) | **read before touching the pty layer.** Five constraints that look like things to tidy up and are not |
 

@@ -6,6 +6,12 @@
 # platform, valid for every Python 3. `uvx abeam` then downloads a few hundred
 # kilobytes and runs it. PyO3 is not involved and there is no importable module;
 # if a Python API is ever wanted, that is the day to add it.
+#
+# The one optional extra, under `[project.optional-dependencies]` below, puts no
+# Python in the wheel either. It is a line of metadata naming another package —
+# hailer, a sibling OpenAfterHours project — and nothing is fetched on its
+# account unless somebody asks for it. What is fetched then is not a few hundred
+# kilobytes, and the comment beside it says why it is an extra at all.
 
 [build-system]
 requires = ["maturin>=1.9,<2.0"]
@@ -14,16 +20,23 @@ build-backend = "maturin"
 [project]
 name = "abeam"
 # This is the storefront copy, and it is read before the README rather than
-# after it — so the Copilot caveat belongs here too, not only in the README's
-# "Not done, and known". Claude Code is what abeam is used with daily; Copilot
-# CLI is supported and has never been run. Saying so costs a clause and buys the
-# reader the thing they would otherwise find out by installing it.
+# after it — so the caveats belong here too, not only in the README's "Not
+# done, and known". Claude Code is what abeam is used with daily. Codex has been
+# hosted on Windows, signed out: a smoke test, not use. Copilot CLI and
+# hailer are supported and have never been run in it at all — for hailer, uv's
+# packaging mechanism has been exercised with stand-in packages, and no route
+# the documentation gives has been run as written. Saying so costs a clause and
+# buys the reader the thing they would otherwise find out by installing it.
+#
+# "the hailer data agent" rather than the bare name, because nobody reading a
+# PyPI summary can be expected to know what hailer is, and "data" is the one
+# word that says why it is on a list of coding agents at all.
 #
 # Naming the two platforms is not padding either. Every wheel here is
 # platform-tagged, so for anyone on a third one the install fails in the
 # resolver with a sentence about platform tags, and this line is the last place
 # before that where they could have read which platforms there are.
-description = "One window for an AI coding session on Windows or Linux: your agent hosted in a pty pane, with git, a file viewer and a shell beside it. Built on Claude Code; GitHub Copilot CLI is supported but not yet exercised."
+description = "One window for an AI coding session on Windows or Linux: your agent hosted in a pty pane, with git, a file viewer and a shell beside it. Built on Claude Code; OpenAI Codex CLI has had a signed-out smoke test, and GitHub Copilot CLI and the hailer data agent are supported but not yet exercised."
 readme = "README.md"
 requires-python = ">=3.9"
 # PEP 639: an SPDX expression rather than the old free-text table or a
@@ -35,11 +48,17 @@ license-files = ["LICENSE"]
 # and the wheel, and the release workflow refuses to run if the tag disagrees
 # with it.
 dynamic = ["version"]
+# Every agent abeam hosts by name, under each spelling somebody would search
+# for, and no `marimo`: abeam never starts marimo or speaks to it — hailer does
+# both — and a keyword here is a claim about what this package does, not about
+# what the agents it hosts do.
 keywords = [
     "claude",
     "claude-code",
     "copilot",
     "github-copilot",
+    "codex",
+    "hailer",
     "coding-agent",
     "terminal",
     "tui",
@@ -61,6 +80,71 @@ classifiers = [
     "Topic :: Software Development",
     "Topic :: Terminals :: Terminal Emulators/X Terminals",
 ]
+
+# hailer as something to ask for rather than something everybody gets. It is
+# about 480 MB installed — polars, duckdb and a pinned marimo among it — and as
+# a dependency that would land on every Claude-only user, turn the "few hundred
+# kilobytes" above into a false sentence, and tie abeam to hailer's Python
+# floor and its marimo pin. Nor does the extra bend "a missing agent is a
+# sentence and never a download" (`crates/abeam/src/agent.rs`): abeam still
+# installs nothing, and the fetch is the installer's, made because somebody
+# asked for hailer.
+#
+# **This is the one place the install routes are argued.** `docs/status.md`
+# records what was actually run, and what was run was stand-in packages in
+# uv's machinery, not these packages along these routes.
+#
+# The routes the documentation gives name hailer directly, and for uv the
+# extra is not one of them:
+#
+#   uv tool install hailer                                 its own environment
+#   uv tool install abeam --with-executables-from hailer   beside abeam
+#   uvx --with hailer abeam +hailer notebook               one run
+#
+# Naming hailer beside abeam makes an old Python fail out loud. With stand-ins
+# on 3.11, both `--with-executables-from` and `uvx --with` had hailer's 3.12
+# floor reported unsatisfiable, and any route that says so wants
+# `--python 3.12`. `uv tool install hailer` on its own has not been tried on an
+# old default Python; hailer's own README says uv fetches 3.12 or newer there.
+#
+# The extra is for an environment already on 3.12 or newer, and it carries a
+# marker because of what it does on an older one — stand-ins again. Without the
+# marker, uv met the stand-in's extra on 3.11 by backing off to a version from
+# before the extra existed, with only a warning — which for abeam would be
+# 0.12.0, and that abeam does not know hailer at all: it sends `abeam hailer
+# notebook` to Claude as a prompt and looks for `+hailer` as an unknown program
+# on PATH. With the marker, the extra
+# contributes nothing on 3.11 and says nothing, but uv installs the newest
+# abeam, and that abeam's `+hailer`, finding no hailer, prints the sentence
+# naming the routes above. Neither is a loud failure; the second leaves the
+# user holding an abeam that can tell them what to run, which is why it won.
+# On 3.12 and newer the marker is true and the extra installs hailer.
+#
+# **The extra would not put `hailer` on PATH in any case, and PATH is the only
+# place abeam looks.** `uv tool install` exposes the executables of the package
+# it was named for and no others: a stand-in installed `--with` abeam left its
+# `hailer.exe` in the tool environment's `Scripts\`, off PATH, which is where
+# hailer arriving through the extra would sit too, reported missing.
+# `--with-executables-from` is the flag that exposes it, and it works on an
+# existing abeam tool install as well as a fresh one (shown with a stand-in
+# abeam). `uvx` is different — it puts its environment's scripts directory
+# first on the child's PATH — which is why the one-run route needs no flag.
+# abeam will not look beside its own executable instead: on Windows uv's
+# bin-directory `abeam.exe` is a byte-identical copy, not a link, so "beside
+# abeam" there is uv's bin directory and not the environment behind it, and a
+# rule whose answer turns on how uv lays out each platform is not one to start
+# programs by. The launch rule stays the one it was: PATH, absolute entries
+# only.
+#
+# The floor is the release abeam's documentation describes, and that is all it
+# is. abeam depends on nothing of hailer's but a program called `hailer` on
+# PATH, so 0.2.5 guarantees a version whose behaviour somebody has written
+# down — a plain line prompt, and `hailer notebook` to start marimo — not one
+# that has been hosted, because none has. No ceiling either, for a reason of
+# its own: a later hailer that turns bracketed paste on gets `Enter` from the
+# right pane with no abeam release, and a cap would only withhold that.
+[project.optional-dependencies]
+hailer = ["hailer>=0.2.5; python_version >= '3.12'"]
 
 [project.urls]
 Homepage = "https://github.com/OpenAfterHours/abeam"

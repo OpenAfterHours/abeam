@@ -258,7 +258,7 @@ fn read(text: &str) -> Result<Config, String> {
             return Err(nameless());
         }
         if crate::agent::find(&name).is_some() {
-            return Err(shadowed(&name));
+            return Err(shadowed(&name, &wire));
         }
         if RESERVED.iter().any(|word| word.eq_ignore_ascii_case(&name)) {
             return Err(sigil(&name));
@@ -337,8 +337,8 @@ impl Config {
     /// is `crate::agent::find`, which reads the built-in table and nothing
     /// else, and it runs before any preset row exists. A preset that names a
     /// built-in *becomes* that built-in's candidates and inherits its install
-    /// sentence, because the thing that would be missing really is Claude or
-    /// Copilot. A preset that names anything else is one candidate — the word
+    /// sentence, because the thing that would be missing really is that
+    /// built-in. A preset that names anything else is one candidate — the word
     /// as written — for `crate::launch` to look up on `PATH`, exactly as
     /// `abeam +pwsh` would.
     fn row(&self, preset: &Preset) -> Agent {
@@ -702,14 +702,67 @@ fn unparsed(why: &str) -> String {
 }
 
 /// A preset that has taken one of abeam's own agents' names.
-fn shadowed(name: &str) -> String {
-    format!(
+///
+/// **One shape of it is a file abeam made invalid rather than one somebody got
+/// wrong**, and it is told so. A preset whose `host` is its own name was the
+/// ordinary way to give an agent abeam did not yet know some arguments —
+/// `[preset.hailer]` with `host = "hailer"`, back when that host was a program
+/// on `PATH` and the name was free. The name became a built-in's under it, and
+/// because a config file that is refused stops every `abeam` on the machine,
+/// the sentence has to be the whole of the way back. If the preset said
+/// nothing but its host, the built-in is now exactly it: delete it. If it says
+/// more — `args`, or how the session opens — renaming keeps that, and the host
+/// line it already has is the right one.
+///
+/// Every other shape is a preset that took the name to start something else,
+/// and it is told to rename and to leave its `host` alone. It used to be told
+/// to write `host = "<name>"` as well, which was right only for the shape above
+/// and, once that shape had its own sentence, wrong for every preset that still
+/// got it: `[preset.hailer]` with `host = "pwsh"` was advised to become a
+/// hailer preset, and to drop the `pwsh` it was written for.
+///
+/// Nothing here names an agent: which names became built-ins, and when, is
+/// `crate::agent`'s table.
+fn shadowed(name: &str, wire: &Wire) -> String {
+    let conflict = format!(
         "`[preset.{name}]` takes the name of an agent abeam already knows, so \
          `+{name}` would mean two things and one of them would be unreachable \
-         with nothing on screen saying why. Rename the preset — \
-         `[preset.my-{name}]` — and say `host = \"{name}\"` inside it, which \
-         is how a preset names the agent it starts."
-    )
+         with nothing on screen saying why."
+    );
+    // Every field by name and no `..`, so that a field added to `Wire` is a
+    // compile error here rather than a preset that says something and is told
+    // it has nothing left to add.
+    let Wire {
+        host,
+        args,
+        view,
+        focus,
+        zoom,
+        theme,
+    } = wire;
+    let hosts_itself = host.trim().eq_ignore_ascii_case(name);
+    let says_more = !args.is_empty()
+        || view.is_some()
+        || focus.is_some()
+        || zoom.is_some()
+        || theme.is_some();
+    match (hosts_itself, says_more) {
+        (true, false) => format!(
+            "{conflict} Its `host` is `{name}` as well, and `{name}` is built \
+             into abeam now, so this preset has nothing left to add: delete \
+             it, and `+{name}` starts `{name}` without it."
+        ),
+        (true, true) => format!(
+            "{conflict} Its `host` is `{name}` as well, and `{name}` is built \
+             into abeam now, so `+{name}` starts it without this preset. To \
+             keep what else the preset sets, rename it to \
+             `[preset.my-{name}]` and leave `host = \"{name}\"` as it is."
+        ),
+        (false, _) => format!(
+            "{conflict} Rename the preset — `[preset.my-{name}]` — and leave \
+             its `host` line as it is."
+        ),
+    }
 }
 
 /// ...or one of the two words the sigil answers itself.
@@ -1001,7 +1054,10 @@ mod tests {
 
         // Appended rather than merged: abeam's own agents keep their places, so
         // nothing a user writes can change what `+claude` means.
-        assert_eq!(names(table), vec!["claude", "copilot", "codex", "fleet"]);
+        assert_eq!(
+            names(table),
+            vec!["claude", "copilot", "codex", "hailer", "fleet"]
+        );
 
         let fleet = crate::agent::find_within("fleet", table).expect("the preset is in the table");
         // The host's candidates, because the thing that would be missing really
@@ -1038,6 +1094,28 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_can_host_hailer_and_inherits_the_hailer_launch_contract() {
+        // The preset hailer invites: a subcommand in front of the line, which
+        // is what `args` is for. `abeam +charts` is `hailer notebook
+        // --no-browser`, and a missing hailer is hailer's own sentence.
+        let table = config(
+            "[preset.charts]\nhost = \"hailer\"\nargs = [\"notebook\", \"--no-browser\"]\n",
+        )
+        .table();
+        let charts =
+            crate::agent::find_within("charts", table).expect("the preset is in the table");
+        let hailer = crate::agent::find("hailer").expect("hailer is a built-in");
+
+        // `hosts` is the field every Claude-only feature reads, so this is the
+        // assertion that keeps a preset from smuggling hailer past them: the
+        // pane it starts is a hailer pane whatever the preset is called.
+        assert_eq!(charts.hosts, "hailer");
+        assert_eq!(charts.candidates, hailer.candidates);
+        assert_eq!(charts.install, hailer.install);
+        assert_eq!(charts.args, ["notebook", "--no-browser"]);
+    }
+
+    #[test]
     fn a_preset_whose_host_is_a_program_is_a_path_lookup_and_says_where_it_came_from() {
         let mut config = config("[preset.nu]\nhost = \"nu\"\n");
         config.path = Some(PathBuf::from("/home/philm/.config/abeam/abeam.toml"));
@@ -1059,15 +1137,98 @@ mod tests {
     fn a_preset_may_not_take_a_name_abeam_already_answers() {
         // A built-in, which is the case that matters: `[preset.claude]` would
         // make the real Claude unreachable and nothing on screen would say so.
-        for name in ["claude", "Claude", "COPILOT", "codex", "CODEX"] {
-            let refused = read(&format!("[preset.{name}]\nhost = \"claude\"\n"))
+        //
+        // Each hosting a program that is none of their names, which is the
+        // shape of a preset that took the name to start something else. A
+        // preset hosting its own name is a sentence of its own, and is the
+        // next block.
+        for name in [
+            "claude", "Claude", "COPILOT", "codex", "CODEX", "hailer", "HAILER",
+        ] {
+            let refused = read(&format!("[preset.{name}]\nhost = \"pwsh\"\n"))
                 .expect_err("a built-in's name is not a preset's to take");
             assert!(refused.contains(name), "the conflict is named: {refused}");
             assert!(refused.contains("already knows"), "got: {refused}");
-            // With the way out, which is a rename plus the `host` line that
-            // says what they were actually asking for.
-            assert!(refused.contains("host = "), "got: {refused}");
+            // With the way out, which is a rename that keeps what the preset
+            // was written to start...
+            assert!(
+                refused.contains(&format!("`[preset.my-{name}]`")),
+                "got: {refused}"
+            );
+            assert!(
+                refused.contains("leave its `host` line as it is"),
+                "got: {refused}"
+            );
+            // ...and never the advice this sentence used to give, which was
+            // to point the renamed preset at the built-in it had been named
+            // after — throwing away the `pwsh` it was written for.
+            assert!(
+                !refused.contains(&format!("host = \"{name}\"")),
+                "a preset for pwsh was told to host {name} instead: {refused}"
+            );
         }
+        // The same for a built-in's name hosting a different built-in: the
+        // host is still the preset's business, whoever it names.
+        let refused = read("[preset.codex]\nhost = \"claude\"\n")
+            .expect_err("a built-in's name, hosting another built-in");
+        assert!(refused.contains("`[preset.my-codex]`"), "got: {refused}");
+        assert!(!refused.contains("host = \"codex\""), "got: {refused}");
+        assert!(!refused.contains("built into abeam now"), "got: {refused}");
+
+        // **The one that is a behaviour change rather than a rule restated.**
+        // Before hailer was a built-in, `[preset.hailer]` was the obvious way
+        // to give it arguments — its `host` was a program on `PATH` then, and
+        // the name was free. That file is refused now, and a config file that
+        // is refused stops every `abeam` on the machine, so the sentence has to
+        // be the whole migration: the new name, and the `host` line that keeps
+        // the preset starting what it started before.
+        //
+        // The commonest form said nothing but its host, and for that one the
+        // built-in *is* the preset now: the way back is to delete it, and a
+        // rename would be advice to keep a second name for the same thing.
+        let refused = read("[preset.hailer]\nhost = \"hailer\"\n")
+            .expect_err("a preset written before hailer was a built-in");
+        assert!(refused.contains("already knows"), "got: {refused}");
+        assert!(
+            refused.contains("built into abeam now"),
+            "the reader is not told what changed under their file: {refused}"
+        );
+        assert!(
+            refused.contains("delete it, and `+hailer` starts `hailer` without it"),
+            "got: {refused}"
+        );
+        assert!(
+            !refused.contains("my-hailer"),
+            "a preset with nothing to keep was told to keep it: {refused}"
+        );
+
+        // One that says more keeps it by being renamed, with the host line it
+        // already has — whichever of the things a preset can say it says.
+        for more in ["args = [\"notebook\"]\n", "view = \"git\"\n", "zoom = true\n"] {
+            let refused = read(&format!("[preset.hailer]\nhost = \"hailer\"\n{more}"))
+                .expect_err("a preset written before hailer was a built-in");
+            assert!(refused.contains("built into abeam now"), "got: {refused}");
+            assert!(refused.contains("`[preset.my-hailer]`"), "got: {refused}");
+            assert!(refused.contains("`host = \"hailer\"`"), "got: {refused}");
+            assert!(!refused.contains("delete it"), "{more}: {refused}");
+        }
+
+        // Nothing in that is hailer's: it is any built-in whose name a preset
+        // also hosts, matched the way names are, without regard to case.
+        let refused = read("[preset.codex]\nhost = \"Codex\"\n")
+            .expect_err("the same shape, one built-in along");
+        assert!(
+            refused.contains("delete it, and `+codex` starts `codex` without it"),
+            "got: {refused}"
+        );
+        // ...and a preset that took the name to start something else is not
+        // told the built-in would do: it is told to rename, and to keep the
+        // `pwsh` it was written for.
+        let refused = read("[preset.hailer]\nhost = \"pwsh\"\n")
+            .expect_err("a built-in's name, hosting something else");
+        assert!(!refused.contains("built into abeam now"), "got: {refused}");
+        assert!(refused.contains("`[preset.my-hailer]`"), "got: {refused}");
+        assert!(!refused.contains("host = \"hailer\""), "got: {refused}");
 
         // abeam's own two words, which are answered before the table is
         // consulted at all — so a preset called `help` would simply never run.

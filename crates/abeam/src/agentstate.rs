@@ -73,11 +73,11 @@
 //! is a false `idle`. [`Readiness::Unknown`] is always available and always
 //! cheap, and it is the right answer to every one of them.
 //!
-//! None of this is true of any other agent. Copilot and Codex publish nothing
-//! like it, so those sessions report `Unknown` forever and queued Send items
-//! remain blocked. That is why readiness is asked of *this* module rather than
-//! of `Pane`: it is knowledge about one agent, and the app/provider boundary is
-//! where that per-agent knowledge belongs.
+//! None of this is true of any other agent. Copilot, Codex and hailer publish
+//! nothing like it, so those sessions report `Unknown` forever and queued Send
+//! items remain blocked. That is why readiness is asked of *this* module rather
+//! than of `Pane`: it is knowledge about one agent, and the app/provider
+//! boundary is where that per-agent knowledge belongs.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2639,10 +2639,11 @@ mod tests {
 
     #[test]
     fn a_probe_with_nowhere_to_look_answers_unknown_rather_than_guessing() {
-        // The ordinary state on a machine hosting some other agent: Copilot and
-        // Codex publish nothing in Claude's session directory, so there is no
-        // record abeam may use. Queue Send items remain blocked in both
-        // automatic and Enter-triggered modes; the user types in the left pane.
+        // The ordinary state on a machine hosting some other agent: Copilot,
+        // Codex and hailer publish nothing in Claude's session directory, so
+        // there is no record abeam may use. Queue Send items remain blocked in
+        // both automatic and Enter-triggered modes; the user types in the left
+        // pane.
         //
         // Built by hand rather than through [`Probe::over`], and this is the
         // one test that has to be: `over` takes a directory, and what is being

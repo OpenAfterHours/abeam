@@ -36,7 +36,7 @@
 //! process startup. They earn it by being the only tests that would notice
 //! abeam failing to start at all.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use abeam_pty::{PtyConfig, PtySession};
@@ -171,6 +171,28 @@ fn plant_codex(dir: &Dir) {
     );
 }
 
+/// Plant a stand-in for hailer on Windows, and it is not hailer's own shape.
+///
+/// `uv tool install hailer` puts a `.exe` launcher on `PATH`, which
+/// `crate::launch` hands to `CreateProcessW` as it is — the plain route every
+/// `cmd.exe` in this suite already takes. A `.cmd` is what can be written
+/// without a compiler, and it is the harder of the two: its arguments have to
+/// survive `cmd.exe` reading them a second time. The live test below is where
+/// the real launcher is started.
+///
+/// What it does share with hailer is the half after the launch. `set /p` reads
+/// a line through the console's own line input, the way hailer 0.2.5's plain
+/// `input()` does — no bracketed paste, no key-by-key reading — so the reply
+/// to a line typed through abeam is the same path a prompt typed at hailer
+/// takes.
+#[cfg(windows)]
+fn plant_hailer(dir: &Dir) {
+    dir.write(
+        "hailer.cmd",
+        "@echo off\r\necho hailer-pty-ready\r\necho arg1=[%~1]\r\necho arg2=[%~2]\r\n:wait\r\nset /p line=\r\necho hailer-input=[%line%]\r\ngoto wait\r\n",
+    );
+}
+
 /// See the Windows twin above. The mode is set outright rather than left to
 /// `fs::copy`, which does carry it across on this platform: the premise of the
 /// test is that *nothing but abeam's resolver* stands between this file and a
@@ -204,6 +226,26 @@ fn plant_codex(dir: &Dir) {
         .permissions();
     mode.set_mode(0o755);
     std::fs::set_permissions(&planted, mode).expect("make the Codex shim executable");
+}
+
+/// Plant the extensionless executable shape `uv tool install` gives hailer on
+/// Unix: a script run through its shebang. hailer's names a virtualenv's
+/// Python rather than `/bin/sh`, which is the one liberty taken. `read -r`
+/// takes a line from the terminal in canonical mode, as a plain `input()` does.
+#[cfg(unix)]
+fn plant_hailer(dir: &Dir) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let planted = dir.0.join("hailer");
+    dir.write(
+        "hailer",
+        "#!/bin/sh\nprintf 'hailer-pty-ready\\n'\nprintf 'arg1=[%s]\\n' \"$1\"\nprintf 'arg2=[%s]\\n' \"$2\"\nwhile IFS= read -r line; do printf 'hailer-input=[%s]\\n' \"$line\"; done\n",
+    );
+    let mut mode = std::fs::metadata(&planted)
+        .expect("stat the planted hailer shim")
+        .permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&planted, mode).expect("make the hailer shim executable");
 }
 
 /// The `PATH` abeam is given while a shell is planted in the repository, or
@@ -317,17 +359,62 @@ fn abeam(dir: &Dir) -> PtySession {
     .expect("spawn abeam in a pty")
 }
 
+/// The inherited `PATH` with `dir` searched first: where a planted shim, or an
+/// agent a live test was pointed at, is found ahead of anything else of the
+/// same name.
+fn path_led_by(dir: &Path) -> String {
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("construct a PATH led by one directory")
+    .to_string_lossy()
+    .into_owned()
+}
+
+/// The executable a live test was pointed at, by the variable that names it.
+///
+/// Relative to where `cargo test` was run, or failing that to the workspace
+/// root, so that one spelling works from either — and then made absolute by
+/// `std::path::absolute`, which resolves nothing it does not have to. That is
+/// two properties, and each has a failure behind it.
+///
+/// - **No link is followed.** npm commonly exposes `codex` as a link and
+///   `uv tool` exposes `hailer` as one on Unix, and following it could move
+///   `PATH` to a directory that holds the target but no executable under the
+///   agent's own name.
+/// - **No `\\?\` is put on.** `canonicalize` spells every Windows path that
+///   way, and `cmd.exe` cannot run a batch file from a directory so spelled:
+///   the npm `codex.cmd` answered "The system cannot find the path specified."
+///   and exited, and the Codex test below waited out its deadline for a
+///   welcome that was never coming. Taking the prefix off afterwards was the
+///   first fix, and it was wrong twice over — a `\\?\UNC\` share kept it, and
+///   a `\\?\Volume{…}\` path came out relative — so now it is never put on.
+fn named_by(var: &str, what: &str) -> PathBuf {
+    let named = PathBuf::from(
+        std::env::var_os(var).unwrap_or_else(|| panic!("set {var} to {what}")),
+    );
+    let located = if named.is_absolute() {
+        named.clone()
+    } else {
+        let here = std::env::current_dir()
+            .expect("read the test working directory")
+            .join(&named);
+        if here.is_file() {
+            here
+        } else {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join(&named)
+        }
+    };
+    assert!(located.is_file(), "{var} is not a file: {located:?}");
+    std::path::absolute(&located).expect("make the executable's path absolute")
+}
+
 /// Start the real abeam binary through its first-class Codex selection.
 fn abeam_with_codex(dir: &Dir) -> PtySession {
     plant_codex(dir);
-    let path = std::env::join_paths(
-        std::iter::once(dir.0.clone()).chain(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        )),
-    )
-    .expect("construct an absolute PATH for the Codex shim")
-    .to_string_lossy()
-    .into_owned();
 
     PtySession::spawn(
         PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
@@ -335,11 +422,31 @@ fn abeam_with_codex(dir: &Dir) -> PtySession {
             .arg("--search")
             .arg("a prompt with spaces")
             .cwd(&dir.0)
-            .env("PATH", path)
+            .env("PATH", path_led_by(&dir.0))
             .env("ABEAM_SHELL", SHELL)
             .size(40, 120),
     )
     .expect("spawn abeam with Codex in a pty")
+}
+
+/// Start the real abeam binary through its first-class hailer selection, with
+/// a subcommand and a spaced argument behind the sigil — `abeam +hailer
+/// notebook` is the line a hailer user types, and the space is the argument a
+/// `.cmd` route is likeliest to split.
+fn abeam_with_hailer(dir: &Dir) -> PtySession {
+    plant_hailer(dir);
+
+    PtySession::spawn(
+        PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
+            .arg("+hailer")
+            .arg("notebook")
+            .arg("a value with spaces")
+            .cwd(&dir.0)
+            .env("PATH", path_led_by(&dir.0))
+            .env("ABEAM_SHELL", SHELL)
+            .size(40, 120),
+    )
+    .expect("spawn abeam with hailer in a pty")
 }
 
 /// Everything currently on screen, wrapped rows rejoined.
@@ -417,64 +524,20 @@ fn the_codex_executable_shape_and_arguments_survive_the_real_binary_and_pty() {
 #[test]
 #[ignore = "requires ABEAM_TEST_CODEX pointing at an official Codex CLI binary"]
 fn an_official_codex_reaches_its_auth_ui_resizes_and_quits_cleanly() {
-    let named = PathBuf::from(
-        std::env::var_os("ABEAM_TEST_CODEX")
-            .expect("set ABEAM_TEST_CODEX to an official Codex CLI executable"),
-    );
-    let located = if named.is_absolute() {
-        named.clone()
-    } else {
-        let here = std::env::current_dir()
-            .expect("read the test working directory")
-            .join(&named);
-        if here.is_file() {
-            here
-        } else {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join(&named)
-        }
-    };
-    assert!(
-        located.is_file(),
-        "ABEAM_TEST_CODEX is not a file: {located:?}"
-    );
-    // Preserve the final filename and symlink: npm commonly exposes `codex` as
-    // a link, and resolving the file itself could move PATH to a vendor
-    // directory that has the target binary but no executable named `codex`.
-    let executable = std::fs::canonicalize(
-        located
-            .parent()
-            .expect("the Codex executable has a parent directory"),
-    )
-    .expect("resolve the Codex executable's parent")
-    .join(
-        located
-            .file_name()
-            .expect("the Codex executable has a filename"),
-    );
+    let executable = named_by("ABEAM_TEST_CODEX", "an official Codex CLI executable");
     let bin = executable
         .parent()
         .expect("the Codex executable has a parent directory");
     let dir = Dir::new("codex-live");
     let codex_home = dir.0.join("codex-home");
     std::fs::create_dir_all(&codex_home).expect("create an isolated Codex home");
-    let path = std::env::join_paths(
-        std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        )),
-    )
-    .expect("construct PATH for the official Codex binary")
-    .to_string_lossy()
-    .into_owned();
 
     let mut session = PtySession::spawn(
         PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
             .arg("+codex")
             .arg("--no-alt-screen")
             .cwd(&dir.0)
-            .env("PATH", path)
+            .env("PATH", path_led_by(bin))
             .env("CODEX_HOME", codex_home.to_string_lossy())
             .env("ABEAM_SHELL", SHELL)
             .size(40, 120),
@@ -502,6 +565,208 @@ fn an_official_codex_reaches_its_auth_ui_resizes_and_quits_cleanly() {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("abeam did not exit after the confirmed quit");
+}
+
+/// Wait for abeam itself to leave, and say how it left.
+fn exit_of(session: &mut PtySession) -> abeam_pty::ExitStatus {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if let Some(status) = session.try_wait().expect("poll abeam") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            panic!("abeam did not exit; the screen said:\n{}", screen(session));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn the_hailer_executable_shape_and_arguments_survive_the_real_binary_and_pty() {
+    let dir = Dir::new("hailer");
+    let session = abeam_with_hailer(&dir);
+
+    let text = wait_for(&session, "arg2=[a value with spaces]");
+    assert!(
+        text.contains("arg1=[notebook]"),
+        "the subcommand did not arrive first: {text}"
+    );
+    assert!(
+        text.contains("arg2=[a value with spaces]"),
+        "a spaced hailer argument did not survive the launch: {text}"
+    );
+
+    // As for Codex: a ready line alone could have come from a child that
+    // exited at once, and the reply is what proves it is still hosted — and
+    // that a line typed through abeam reaches a line-mode prompt whole.
+    send(&session, b"still-hosted\r");
+    wait_for(&session, "hailer-input=[still-hosted]");
+}
+
+/// `+hailer` on a machine with no hailer, through the real binary — the one
+/// test here that can tell a row from a program.
+///
+/// **The shim test above cannot, and neither can Codex's.** Before hailer was a
+/// row, `abeam +hailer` hosted a `hailer` found on `PATH` as a program named
+/// outright, and it would start the shim just the same with the row deleted.
+/// What differs is the failure. A row that finds nothing is answered by
+/// `crate::agent::missing` — the name, the candidates, the install sentence —
+/// and a program that finds nothing by `crate::agent::nowhere`, which explains
+/// the sigil to somebody who may have meant a prompt. So this asks for hailer
+/// where nothing can be found and reads which of the two came back: printed
+/// before `term::setup`, onto the same pty a reader's terminal would be.
+///
+/// `PATH` is an empty directory, so neither hailer nor anything the install
+/// hint could offer instead is on it, and the answer is the same on every
+/// machine. abeam's own config file is moved out of the way for the same
+/// reason: a `[preset.hailer]` written before hailer was a row is refused now,
+/// and would answer this in the row's place.
+#[test]
+fn a_missing_hailer_is_answered_by_its_row_with_the_sentence_status_md_quotes() {
+    let dir = Dir::new("hailer-missing");
+    let empty = dir.0.join("empty");
+    std::fs::create_dir_all(&empty).expect("create an empty PATH directory");
+    let profile = dir.0.to_string_lossy().into_owned();
+
+    let mut session = PtySession::spawn(
+        PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
+            .arg("+hailer")
+            .cwd(&dir.0)
+            .env("PATH", empty.to_string_lossy())
+            // Both, on both platforms: each is ignored where it is not the one
+            // `crate::config` reads, and neither names a file that exists.
+            .env("APPDATA", profile.clone())
+            .env("XDG_CONFIG_HOME", profile)
+            // Wide enough for the install sentence to be one row, so that the
+            // whole of it can be looked for.
+            .size(40, 240),
+    )
+    .expect("spawn abeam with nothing on PATH");
+
+    let text = wait_for(&session, "in each project.");
+    assert!(
+        text.contains("abeam could not start `hailer`."),
+        "hailer was not answered as an agent abeam knows: {text}"
+    );
+    // Byte for byte what `docs/status.md` quotes, as it reaches a terminal.
+    assert!(
+        text.contains(
+            "Install it with `uv tool install hailer`, or beside abeam with `uv tool install \
+             abeam --with-executables-from hailer`, then run `hailer login openai` once and \
+             `hailer init` in each project."
+        ),
+        "the install sentence did not reach the screen whole: {text}"
+    );
+    assert!(
+        !text.contains("as the program to host"),
+        "hailer was answered as a program abeam knows nothing about: {text}"
+    );
+
+    // `main::REFUSED`, which is what anything scripting abeam reads.
+    let status = exit_of(&mut session);
+    assert_eq!(status.exit_code(), 2, "abeam left with {status:?}");
+}
+
+/// The real hailer, through the real binary and a real pty — as far as that
+/// goes without an API key.
+///
+/// **Its version, and deliberately nothing more.** Everything past the version
+/// needs a key: a missing one stops hailer at startup, and a present one is
+/// where this stops being hermetic. `HAILER_CONFIG`, `HAILER_DATA_DIR` and
+/// `HAILER_WORKSPACE` move hailer's files into the scratch directory, but its
+/// keys live in the operating system's credential store, which no variable
+/// here moves — so a test that started the chat would be offline on one
+/// machine and a paid session on the next. Codex's twin reaches a sign-in
+/// screen because Codex draws one before it needs anything; hailer prints a
+/// sentence and leaves.
+///
+/// What `--version` does prove is the half the shim cannot: that the launcher
+/// `uv` really installs — a `.exe` that starts a Python on Windows, a script
+/// through a virtualenv's shebang on Unix — starts under abeam's resolver and
+/// abeam's pty, that what it prints reaches the pane, and that abeam leaves
+/// with hailer's status when hailer leaves. Typing at a live line-mode prompt
+/// is the shim's half.
+///
+/// **The expected line is hailer's own**, read from the same executable run
+/// directly in the same environment, rather than a guess at its format written
+/// down here. One line is compared, so that neither side's wrapping matters.
+#[test]
+#[ignore = "requires ABEAM_TEST_HAILER pointing at an installed hailer executable"]
+fn an_installed_hailer_reports_its_version_through_abeam_and_abeam_leaves_with_it() {
+    let executable = named_by(
+        "ABEAM_TEST_HAILER",
+        "an installed hailer executable (hailer.exe on Windows)",
+    );
+    let bin = executable
+        .parent()
+        .expect("the hailer executable has a parent directory");
+    let dir = Dir::new("hailer-live");
+    let workspace = dir.0.join("workspace");
+    let data = dir.0.join("data");
+    std::fs::create_dir_all(&workspace).expect("create an isolated hailer workspace");
+    std::fs::create_dir_all(&data).expect("create an isolated hailer data directory");
+    // An empty file rather than a missing one: empty TOML is a config with
+    // nothing in it, where a path to nothing is a question hailer is free to
+    // answer by refusing to start.
+    dir.write("hailer.toml", "");
+    let isolated = [
+        (
+            "HAILER_CONFIG",
+            dir.0.join("hailer.toml").to_string_lossy().into_owned(),
+        ),
+        ("HAILER_DATA_DIR", data.to_string_lossy().into_owned()),
+        ("HAILER_WORKSPACE", workspace.to_string_lossy().into_owned()),
+    ];
+
+    let mut direct = std::process::Command::new(&executable);
+    direct
+        .arg("--version")
+        .current_dir(&dir.0)
+        .stdin(std::process::Stdio::null());
+    for (key, value) in &isolated {
+        direct.env(key, value);
+    }
+    let direct = direct.output().expect("run hailer --version directly");
+    assert!(
+        direct.status.success(),
+        "hailer --version failed with nothing in its way: {direct:?}"
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&direct.stdout),
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let expected = said
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .expect("hailer --version printed nothing")
+        .to_string();
+
+    let mut config = PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
+        .arg("+hailer")
+        .arg("--version")
+        .cwd(&dir.0)
+        .env("PATH", path_led_by(bin))
+        .env("ABEAM_SHELL", SHELL)
+        .size(40, 120);
+    for (key, value) in &isolated {
+        config = config.env(*key, value.clone());
+    }
+    let mut session = PtySession::spawn(config).expect("spawn abeam with the installed hailer");
+
+    // abeam leaves with the agent it was started for and prints that agent's
+    // screen on the way out, so both halves of the answer land on this one.
+    let text = wait_for(&session, "hailer exited");
+    assert!(
+        text.contains(&expected),
+        "hailer's own `{expected}` never reached the screen: {text}"
+    );
+    let status = exit_of(&mut session);
+    assert!(
+        status.success(),
+        "abeam did not leave with hailer's status: {status:?}"
+    );
 }
 
 #[test]
