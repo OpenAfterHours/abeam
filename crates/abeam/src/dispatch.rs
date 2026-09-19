@@ -969,6 +969,7 @@ mod tests {
 
         for hosting in [
             "copilot", "Copilot", "COPILOT", "codex", "Codex", "CODEX",
+            "hailer", "Hailer", "HAILER",
         ] {
             let Unavailable(why) =
                 Dispatcher::new(root.clone(), hosting).expect_err("`--bg` is Claude's");

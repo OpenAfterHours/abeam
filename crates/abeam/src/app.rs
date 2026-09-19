@@ -1055,9 +1055,13 @@ impl Agent {
     /// that a send would be safe", which is a sentence about typing rather than
     /// about working — so a busy agent that never asked for bracketed paste has
     /// a collapsed row that says nothing instead of `busy`. Two calculations
-    /// that must agree is the more expensive mistake, and every agent abeam
-    /// hosts enables the mode, so the divergence is a floor rather than a case
-    /// anybody meets.
+    /// that must agree is the more expensive mistake, and the divergence is a
+    /// floor rather than a case anybody meets. It can only cost a word on a
+    /// pane whose probe would otherwise be read, which is a Claude pane, and
+    /// Claude enables the mode. This used to say *every* agent abeam hosts
+    /// does, and hailer is the built-in that made it false: its 0.2.5 prompt
+    /// is a plain line-mode `input()` that never asks. Its row says nothing
+    /// either way, because it is not Claude.
     ///
     /// **The three are asked before the probe rather than downgrading its
     /// answer afterwards, which is the same result and not the same cost.** The
@@ -9027,6 +9031,29 @@ mod tests {
             !fx.app.agents[1].pane.has_exited(),
             "the pane was written off for having exited rather than for its kind"
         );
+
+        // hailer, the same way, and with the control taken first rather than
+        // argued. The pane arrives as the session's kind, `claude`, and is
+        // offered; the only line between that and the refusal is the kind its
+        // row carries — so nothing but the row can be what turned it away. A
+        // queued Send aimed here is drawn `cannot receive` from this flag,
+        // which is how the queue tells a reader hailer will never take one.
+        second_agent(&mut fx);
+        let hailer = fx.app.agents[2].id;
+        fx.app.sync_queue_targets();
+        assert!(
+            fx.app.queue.can_receive(hailer),
+            "a live pane of the session's own kind was refused before hailer came into it"
+        );
+        fx.app.agents[2].kind = crate::agent::find("hailer")
+            .expect("hailer is a built-in")
+            .hosts
+            .to_string();
+        fx.app.sync_queue_targets();
+        assert!(
+            !fx.app.queue.can_receive(hailer),
+            "a hailer pane is offered to the queue as one it may type at"
+        );
     }
 
     /// A pane opened on a keystroke is armed, seeded and told what the session
@@ -11171,8 +11198,33 @@ mod tests {
 
     #[test]
     fn claude_readiness_never_arms_the_queue_for_codex() {
+        claude_records_never_arm_the_queue_for("codex");
+    }
+
+    /// The same refusal for hailer, and it is the kind that refuses, not the
+    /// missing paste mode.
+    ///
+    /// **hailer 0.2.5 would be refused without this gate, and that is why the
+    /// test does not use a hailer-shaped child.** Its prompt is a line-mode
+    /// `input()` that never asks for bracketed paste, so `send_readiness` turns
+    /// it away one check earlier — and a test built on that child would pass
+    /// with [`Agent::is_claude`] deleted. That shape is hailer's to change, not
+    /// abeam's: if a later hailer asks for the mode, the kind is the only thing
+    /// standing between a neighbouring Claude's `idle` and a prompt typed into
+    /// hailer mid-turn. This child asks for the mode, which is that hailer; the
+    /// row's own `hosts` is the kind.
+    #[test]
+    fn claude_readiness_never_arms_the_queue_for_hailer() {
+        claude_records_never_arm_the_queue_for("hailer");
+    }
+
+    /// A Claude record saying `idle`, a live pane that asked for bracketed
+    /// paste, and a kind read off the named built-in's own row — so that the
+    /// row, and not a string this test chose, is what is under test.
+    fn claude_records_never_arm_the_queue_for(name: &str) {
+        let kind = crate::agent::find(name).expect("a built-in").hosts;
         // A Claude record in this repository is a plausible neighbour, not a
-        // readiness signal for the Codex in the hosted pty. This is the
+        // readiness signal for the agent in the hosted pty. This is the
         // dangerous answer: `Idle` is the only state that lets a send leave.
         let mut fx = app();
         let _records = records(&mut fx, "idle");
@@ -11198,16 +11250,22 @@ mod tests {
         // session's, and the two were the same string; they still are in any
         // session abeam can start, which is exactly why this has to be written
         // where the answer is now read from rather than where it used to be.
-        fx.app.agents[0].kind = "codex".to_string();
+        fx.app.agents[0].kind = kind.to_string();
+        assert!(!fx.app.agents[0].is_claude(), "{name}'s row claims to be Claude");
         assert_eq!(fx.app.agents[0].probe.readiness(), Readiness::Idle);
 
-        fx.app.queue.stub_item("never sent to codex", Mode::Send);
+        fx.app.queue.stub_item(&format!("never sent to {name}"), Mode::Send);
         fx.app.queue.handle_key(key(KeyCode::Char('a'))).unwrap();
         polled(&mut fx);
         assert_eq!(
+            fx.app.agents[0].readiness,
+            Readiness::Unknown,
+            "a {name} pane reported the idle a Claude record wrote"
+        );
+        assert_eq!(
             fx.app.queue.due_note(),
             None,
-            "Claude's idle record announced an automatic Codex send"
+            "Claude's idle record announced an automatic {name} send"
         );
         assert_eq!(
             fx.app.queue.queued_note().as_deref(),
@@ -11217,7 +11275,7 @@ mod tests {
         assert_eq!(
             take_send(&mut fx.app),
             None,
-            "Codex produced an automatic send request"
+            "{name} produced an automatic send request"
         );
 
         // The manual route reads the same readiness and must stay closed too.
@@ -11228,7 +11286,7 @@ mod tests {
         assert_eq!(
             take_send(&mut fx.app),
             None,
-            "Codex produced a manually requested send"
+            "{name} produced a manually requested send"
         );
     }
 
@@ -11242,9 +11300,10 @@ mod tests {
     /// only thing that separates the two answers below is
     /// [`Agent::kind`].
     ///
-    /// The last assertion is the one that stops this passing for the wrong
-    /// reason: the Codex pane's probe is holding the same `idle` its neighbour
-    /// acted on, so what refused was the gate and not a search that failed.
+    /// The probe assertions are the ones that stop this passing for the wrong
+    /// reason: the Codex and hailer panes' probes are holding the same `idle`
+    /// their neighbour acted on, so what refused was the gate and not a search
+    /// that failed.
     #[test]
     fn a_pane_that_is_not_claude_never_reads_a_session_record() {
         let mut fx = app();
@@ -11261,6 +11320,17 @@ mod tests {
         let _left = records_at(&mut fx, 0, "idle");
         let _right = records_at(&mut fx, 1, "idle");
         fx.app.agents[1].kind = "codex".to_string();
+        // And a third, hosting hailer under its row's own kind and holding the
+        // same evidence as the other two. Beside rather than instead of Codex:
+        // what is under test is a rule about every pane that is not Claude,
+        // and one window holding two of them is the case that says so.
+        second_agent(&mut fx);
+        stays_at(&mut fx, 2);
+        let _third = records_at(&mut fx, 2, "idle");
+        fx.app.agents[2].kind = crate::agent::find("hailer")
+            .expect("hailer is a built-in")
+            .hosts
+            .to_string();
 
         polled(&mut fx);
 
@@ -11278,6 +11348,16 @@ mod tests {
             fx.app.agents[1].probe.readiness(),
             Readiness::Idle,
             "the record was unreadable anyway, so the gate was never what refused"
+        );
+        assert_eq!(
+            fx.app.agents[2].readiness,
+            Readiness::Unknown,
+            "a hailer pane reported the idle a Claude beside it wrote"
+        );
+        assert_eq!(
+            fx.app.agents[2].probe.readiness(),
+            Readiness::Idle,
+            "the hailer pane's record was unreadable, so its gate never refused"
         );
     }
 
@@ -11567,9 +11647,14 @@ mod tests {
     fn readiness_is_unknown_while_the_agent_has_not_asked_for_bracketed_paste() {
         // Without the mode every newline in a sent block is a submit, so a
         // three-line prompt arrives as three — the second and third typed at an
-        // agent already busy with the first. Every agent abeam hosts enables
-        // it, so this is a floor rather than a case anyone will meet, and a
+        // agent already busy with the first. Claude enables it, and Claude is
+        // the only agent whose record this gate would otherwise read, so on
+        // this path it is a floor rather than a case anyone will meet — and a
         // floor with nothing standing on it is one that quietly goes away.
+        // hailer is a built-in that never asks, and on this path it is refused
+        // twice over — here, and for not being Claude. The selection hand-off
+        // is where the mode is the only thing refusing it, and that has a test
+        // of its own.
         let mut fx = app();
         let _records = records(&mut fx, "idle");
 
@@ -12672,8 +12757,11 @@ mod tests {
         assert_eq!(app.focus, Focus::Left);
 
         // ...and now Esc is the agent's, as it must be: it is how you leave a
-        // prompt in both the agents abeam knows, and abeam stealing it would be
-        // unusable.
+        // prompt in Claude, Copilot and Codex. At hailer's plain `input()`
+        // prompt it belongs to the line editing underneath rather than to
+        // hailer — on Windows the console's cooked read clears the line with
+        // it, which is its documented `doskey` meaning. Either way the key is
+        // the child's, and abeam stealing it would be unusable.
         app.handle_key(key(KeyCode::Esc)).unwrap();
         assert_eq!(app.focus, Focus::Left);
     }
@@ -13795,7 +13883,7 @@ mod tests {
         // was not started as one — is the half that changed behaviour, and is
         // `a_claude_pane_makes_the_roster_wanted_whatever_the_session_was_started_as`
         // below.
-        for agent in ["codex", "copilot", "some-program"] {
+        for agent in ["codex", "copilot", "hailer", "some-program"] {
             let mut fx = app();
             fx.app.agents[0].kind = agent.to_string();
             fx.app.dispatched_any = true;
@@ -15751,6 +15839,82 @@ mod tests {
         assert_eq!(fx.app.focus, Focus::Right);
         // And the border is where it says so.
         assert!(screen(&mut fx.app, 120, 24).contains("agent"));
+    }
+
+    /// The same refusal for an agent that is **alive** and has simply never
+    /// asked for bracketed paste — which is hailer, as it ships.
+    ///
+    /// **The other half of the note, which the test above does not pin.** Its
+    /// child has gone, but `has_exited` reads a cache only
+    /// [`App::reap`] fills, so which of the two sentences it gets is not a
+    /// property of that test; it asserts that one arrived. This one refreshes
+    /// the cache over a child that stays, so the sentence is the one a hailer
+    /// user reads.
+    ///
+    /// **The gate is the mode and not the kind, and that is the right way
+    /// round.** hailer 0.2.5's prompt is a line-mode `input()`: a twelve-row
+    /// selection typed into it is twelve submitted lines, eleven of them
+    /// arriving while hailer works on the first. If a later hailer asks for
+    /// bracketed paste, this hand-off starts working for it with nothing
+    /// changed here — which is correct, because a paste into a composer that
+    /// asked for pastes is safe whoever the composer belongs to. The queue is
+    /// gated on the kind instead, because what it needs and hailer cannot give
+    /// is a readiness signal.
+    #[test]
+    fn a_live_agent_that_never_asked_for_bracketed_paste_keeps_the_selection_as_hailer_does() {
+        let mut fx = app();
+        fx.app.agents[0].kind = crate::agent::find("hailer")
+            .expect("hailer is a built-in")
+            .hosts
+            .to_string();
+        // [`never_asks`], for its own reason: a readline shell asks for the
+        // mode on some machines and not on others, and a child that asked would
+        // take the paste and make this test about nothing.
+        let config = never_asks(&fx.dir);
+        fx.app.agents[0].pane = TerminalPane::spawn_with(config).expect("a child in a pty");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fx.app.agents[0].pane.diagnostics().bytes_read == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Asked of the operating system rather than of the cache, because the
+        // sentence below is chosen by `has_exited`, and a cache nobody has
+        // refreshed says "alive" about a child that has gone.
+        fx.app.reap().expect("try_wait on a child that exists");
+        assert!(
+            !fx.app.agents[0].pane.has_exited(),
+            "this child stays at its prompt"
+        );
+        assert!(
+            fx.app.agents[0].pane.diagnostics().bytes_read > 0,
+            "the child never produced anything, so it was never really up"
+        );
+        assert!(
+            !fx.app.agents[0].pane.bracketed_paste(),
+            "the child asked for bracketed paste, so this test proves nothing"
+        );
+
+        hub(&mut fx.app, KeyCode::Char('d'));
+        selecting(&mut fx.app);
+        fx.app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        let sel = fx
+            .app
+            .select
+            .as_ref()
+            .expect("the selection was thrown away");
+        assert_eq!(
+            sel.note(),
+            Some("the agent is not taking pastes"),
+            "a live agent without the mode was told something else, or nothing"
+        );
+        assert_eq!(fx.app.focus, Focus::Right, "the rows are still wanted here");
+        // Nothing reached the composer, so nothing opened a draft: a draft the
+        // queue waits behind, over a composer that is empty, would be a stall
+        // with nothing on screen to explain it.
+        assert!(
+            !fx.app.agents[0].draft_open && !fx.app.queue.is_draft_open(fx.app.agents[0].id),
+            "a refused hand-off opened a draft"
+        );
     }
 
     #[test]

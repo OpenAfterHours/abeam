@@ -36,9 +36,9 @@
 //!
 //! Every binding below was checked against Claude Code's own keymap, read
 //! out of its binary, against GitHub Copilot CLI's, read from GitHub's
-//! published tables and from Ink's source, and against Codex CLI's defaults.
-//! See `docs/keymap.md` for all three inventories, and for the different
-//! confidence each one earns.
+//! published tables and from Ink's source, against Codex CLI's defaults, and
+//! against hailer's source at 0.2.5. See `docs/keymap.md` for all four
+//! inventories, and for the different confidence each one earns.
 //!
 //! Weaker in one way that belongs here rather than only there, because this is
 //! the file that claims the keys: `Alt+G`, `Alt+S`, `Alt+J`, `Alt+K`,
@@ -53,6 +53,18 @@
 //! of every user configuration. `Alt+A` is not clear even by that standard:
 //! Codex uses it to open its agent-session overview, so abeam yielded it and
 //! moved the queue to `F8`.
+//!
+//! hailer has nothing of its own to clear, and that is a finding rather than a
+//! skipped audit. 0.2.5 reads its prompt with Python's builtin `input()`, with
+//! no prompt_toolkit and no `import readline` in its source, so the keys at
+//! that prompt are whatever edits a line on the platform underneath. On
+//! Windows that is the console's cooked read, which gives `F1`–`F9` their
+//! `doskey` meanings: abeam takes `F1`, `F4`, `F5` and `F7` of those first,
+//! exactly as it already does from a `cmd.exe`, and each is one literal-next
+//! away. If a later hailer moves its prompt to prompt_toolkit, that library's
+//! default emacs table ignores every key abeam intercepts — checked in case,
+//! not on the strength of any plan of hailer's. `docs/keymap.md`'s "hailer's
+//! bindings, as of 0.2.5" has the tables, the Linux half and the gaps.
 //!
 //! The short version of why the namespace is `Alt`:
 //!
@@ -799,8 +811,9 @@ mod tests {
 
     #[test]
     fn the_agents_alt_bindings_are_left_alone() {
-        // Plural because Alt is claimed by all three agents in different
-        // places, and abeam has to clear every one.
+        // Plural because Alt is claimed by three of the four agents, in
+        // different places, and abeam has to clear every one. hailer is the
+        // fourth and claims none: its 0.2.5 prompt is a plain `input()`.
 
         // `b f d y v m p o t w` and Alt+arrows-up/down are Claude's, several of
         // them undeclared readline bindings in its prompt editor.
@@ -1072,9 +1085,9 @@ mod tests {
         assert_eq!(global(&k(KeyCode::Char('?'), KeyModifiers::NONE)), None);
         assert_eq!(global(&k(KeyCode::Char('?'), KeyModifiers::SHIFT)), None);
         // And `Alt+?` is not it either. It is a shifted key under `Alt`, which
-        // is a shape neither agent's keymap has been audited against — and `Alt`
-        // is the namespace all of them actually use. The default keymaps leave
-        // F6 alone; Codex's remapping support is documented separately.
+        // is a shape no agent's keymap has been audited against — and `Alt` is
+        // the namespace Claude, Copilot and Codex all use. The default keymaps
+        // leave F6 alone; Codex's remapping support is documented separately.
         assert_eq!(global(&k(KeyCode::Char('?'), KeyModifiers::ALT)), None);
         assert_eq!(
             global(&k(
@@ -1109,8 +1122,11 @@ mod tests {
         // Not "to Claude" any more: the bare F-keys are cleared against every
         // agent's default keymap, by different arguments — absent from Claude's
         // binary, beyond what Ink's `useInput` can describe to a Copilot
-        // handler, and unbound by default in Codex. None of those audits cleared
-        // a *modified* F-key, so those stay the agent's, whichever agent it is.
+        // handler, unbound by default in Codex, and bound by nothing in hailer,
+        // whose line on Windows is edited by the console's cooked read (four of
+        // its `doskey` keys abeam already took from every console program; see
+        // the module docs). None of those audits cleared a *modified* F-key,
+        // so those stay the agent's, whichever agent it is.
         //
         // Ctrl+F12 is the one that shows what the cost of guessing would be:
         // swallowing it would arm literal-next with nothing on screen to say so,

@@ -56,6 +56,7 @@ abeam agent               # ...and `claude agent`, subcommands included
 
 abeam +copilot --resume   # GitHub Copilot CLI, with its own --resume
 abeam +codex [args]       # OpenAI Codex CLI; every argument is forwarded
+abeam +hailer notebook    # hailer; `notebook` is its subcommand, not abeam's
 abeam +bash               # anything else on PATH
 abeam +help               # abeam's own help; `--help` is the agent's
 abeam -- +1 more thing    # `--` stops abeam reading, and goes to the agent too
@@ -69,17 +70,17 @@ next section says what those lines do without one.
 A `+` token is read only in the first position and there is at most one: a
 prompt may begin with a `+`, and `abeam config set +x` is a real command line.
 `+name` is resolved exactly as the old positional was — if it names an agent
-abeam knows, `claude`, `copilot` or `codex`, or a preset out of your config
-file, matched without regard to case, abeam looks that entry's executables up
-on `PATH`; anything else is a program name and means what `abeam bash` used to
-mean. Spaces
-around the name are trimmed, so `abeam "+claude "` is `abeam +claude` rather
-than a hunt for a program with a space on the end of it. Two words behind the
-sigil are reserved and only two, `+help` and `+version`, and like every other
-name behind a `+` they are matched without regard to case: `+HELP` and
-`+Version` are abeam's too. There are no `+h`/`+V` short forms, deliberately: a
-short form is one more word that can never be a program name, and `-h`, `-V`,
-`--help` and `--version` all go to the agent now, which is the help you wanted.
+abeam knows, `claude`, `copilot`, `codex` or `hailer`, or a preset out of your
+config file, matched without regard to case, abeam looks that entry's
+executables up on `PATH`; anything else is a program name and means what `abeam
+bash` used to mean. Spaces around the name are trimmed, so `abeam "+claude "`
+is `abeam +claude` rather than a hunt for a program with a space on the end of
+it. Two words behind the sigil are reserved and only two, `+help` and
+`+version`, and like every other name behind a `+` they are matched without
+regard to case: `+HELP` and `+Version` are abeam's too. There are no
+`+h`/`+V` short forms, deliberately: a short form is one more word that can
+never be a program name, and `-h`, `-V`, `--help` and `--version` all go to the
+agent now, which is the help you wanted.
 
 **`--` is not a second exception, and it used to be one.** A leading `--` stops
 abeam reading the line — so a first argument beginning with `+` is safe behind
@@ -116,12 +117,12 @@ spelling every other line here teaches — is refused with the correction printe
 rather than accepted with the `+` quietly dropped. The sigil says which token on
 a command line is abeam's, and there is no token to mark inside a variable.
 
-**`abeam claude`, `abeam copilot` and `abeam codex` are refused rather than
-reinterpreted**, with exit code 2 and a message naming both readings and both
-ways out. That refusal is permanent, not a migration aid, and it is a fixed
-lookup in abeam's own table rather than a `PATH` probe: a refusal that depended
-on what happened to be installed would accept a command line on your machine
-and reject it on a build server.
+**`abeam claude`, `abeam copilot`, `abeam codex` and `abeam hailer` are refused
+rather than reinterpreted**, with exit code 2 and a message naming both
+readings and both ways out. That refusal is permanent, not a migration aid,
+and it is a fixed lookup in abeam's own table rather than a `PATH` probe: a
+refusal that depended on what happened to be installed would accept a command
+line on your machine and reject it on a build server.
 
 Codex is a first-class **interactive host**, not a claim that Claude-specific
 side channels generalise. `abeam +codex [args]` forwards the line unchanged to
@@ -156,6 +157,30 @@ and a direct `codex` run signed in with ChatGPT or an API key. abeam neither
 installs Codex nor owns its credentials; OpenAI's [CLI
 setup](https://learn.chatgpt.com/docs/codex/cli) and [authentication
 guide](https://learn.chatgpt.com/docs/auth) are authoritative for both.
+
+**hailer is the second interactive host of that kind**, and everything above
+about Codex carries over unchanged: the line forwarded as typed, Ask
+unavailable, a pane that reports `Unknown` so the queue will not type at it,
+dispatch kept for Claude. What differs is hailer's rather than abeam's. hailer
+0.2.5 needs a marimo server and the notebook open in a browser tab, and bare
+`hailer` will not start either, so the working line is `abeam +hailer
+notebook` — a subcommand abeam forwards like any other argument, knowing
+nothing of marimo; hailer starts marimo, or reuses one, and stops the marimo
+it started when the chat ends. And its prompt is a plain line read with
+`input()`, with no bracketed paste. A drag over the right pane still copies,
+but `Enter`, which hands the rows to the agent, is refused by the same rule
+that refuses the ask's command to `cmd.exe`. The rule is about the mode rather
+than the program, which is why there is no hailer exception in it: a hailer
+that asks for the mode gets the hand-off without a change here.
+
+Its prerequisites are a `hailer` on `PATH`, an API key stored with `hailer
+login openai`, and `hailer init` run in the project. The install routes, and
+why the `abeam[hailer]` extra is not the one uv users are pointed at, are
+argued once, beside the extra in [`pyproject.toml`](../pyproject.toml); what
+has actually been run is recorded in [status](status.md). None of it bends the
+rule a few paragraphs down, that a missing agent is a sentence and never a
+download: abeam starts no installer, and `PATH` — absolute entries only — stays
+the one place a program is found.
 
 The message rewrites the **first token** and leaves the rest of your line
 described rather than quoted, which is a correction: it used to print your whole
@@ -303,19 +328,24 @@ view  = "files"
 behind the sigil that behaves exactly like a built-in agent: `abeam +fleet
 --resume` starts `claude agent --resume` with the queue showing,
 `ABEAM_AGENT=fleet abeam` does the same, and `+help` lists `fleet` beside
-`claude`, `copilot` and `codex`. The `openai` example resolves to the built-in
-Codex host: `abeam +openai [args]` starts Codex and forwards those arguments
-after any preset `args`. A preset's own `args` go in *front* of what you typed,
-because a subcommand is the first word of the line it belongs to — behind them,
-`abeam +fleet --resume` would be `claude --resume agent`, which is a different
-command in every agent abeam hosts. Its four opening keys override `[defaults]`
-field by field, so the preset above moves the view and leaves the rest where the
-defaults put them.
+`claude`, `copilot`, `codex` and `hailer`. The `openai` example resolves to the
+built-in Codex host: `abeam +openai [args]` starts Codex and forwards those
+arguments after any preset `args`. A preset's own `args` go in *front* of what
+you typed, because a subcommand is the first word of the line it belongs to —
+behind them, `abeam +fleet --resume` would be `claude --resume agent`, which is
+a different command in every agent abeam hosts. Its four opening keys override
+`[defaults]` field by field, so the preset above moves the view and leaves the
+rest where the defaults put them.
 
 `codex` joining the built-in table reserves that name. An existing
 `[preset.codex]` is now refused as ambiguous and must be renamed —
 `[preset.openai]` above is one possible migration — with callers changed to the
-new `+name`.
+new `+name`. `hailer` joined the same way, and a `[preset.hailer]` — exactly
+what somebody reaching hailer through a preset would have called it — is
+refused now too. One that set nothing but `host = "hailer"` was only ever the
+built-in under its own name and can be deleted; any other wants a new name with
+its `host` line left as it is, and a `host = "hailer"` there then resolves to
+the built-in.
 
 Three rules, each of them a refusal you will see rather than a surprise you
 will not:
@@ -328,10 +358,10 @@ will not:
   config file — bought, otherwise, with a cycle check on the path that decides
   which program starts.
 - **A preset may not take a name abeam already answers** — `claude`, `copilot`,
-  `codex`, `help` or `version`. It would be a name with two meanings and one of
-  them unreachable, with nothing on screen saying which of the two ran. Two presets
-  whose names differ only in case are refused for the same reason, since every
-  name behind a `+` is matched without regard to case.
+  `codex`, `hailer`, `help` or `version`. It would be a name with two meanings
+  and one of them unreachable, with nothing on screen saying which of the two
+  ran. Two presets whose names differ only in case are refused for the same
+  reason, since every name behind a `+` is matched without regard to case.
 - **A preset name is refused in front of the sigil too.** `abeam fleet` gets the
   same both-readings refusal `abeam claude` gets, because it is the same
   mistake — made, this time, by the one person on the machine most likely to

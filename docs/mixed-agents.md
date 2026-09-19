@@ -824,9 +824,10 @@ Four things landed differently from the sketch above.
   is `crate::scroll`'s shared vocabulary" is right about the letters and wrong
   about the mechanism: a `Scroll` moves an *offset*, and what this list needs
   moved is a selection. `j`/`k`, the arrows and `Tab` are matched by the pane,
-  wrapping as both lists do, and there is no scrollbar — the table is three rows
-  on a machine with no presets, and a list somebody has to scroll to see is one
-  they would rather not have opened.
+  wrapping as both lists do, and there is no scrollbar — the table is four rows
+  on a machine with no presets (three when this landed; `hailer` is the
+  fourth), and a list somebody has to scroll to see is one they would rather
+  not have opened.
 - **The mouse branch answers `Handled::Yes` to everything, which costs one
   affordance.** `crate::app` turns what a pane declines into a text selection,
   so while the question stands its rows cannot be dragged over and copied. Named
