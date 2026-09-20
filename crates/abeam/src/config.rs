@@ -85,6 +85,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::agent::{AGENTS, Agent, RESERVED};
+use crate::layout::AgentLayout;
 use crate::pane::Focus;
 use crate::panes::RightView;
 
@@ -286,6 +287,7 @@ fn read(text: &str) -> Result<Config, String> {
                 focus: wire.focus,
                 zoom: wire.zoom,
                 theme: wire.theme,
+                agent_layout: wire.agent_layout,
             },
             name,
         });
@@ -409,21 +411,18 @@ struct Preset {
 
 /// What `App::new` is told to open with.
 ///
-/// Four fields that were four literals inside `App::new` until there was
-/// somewhere to write an answer down. They are one struct rather than four
-/// arguments because they are one idea — *how this session starts* — and
-/// because four `bool`s and two enums in a row is a call nobody can read.
+/// Views, focus, appearance and layout are one opening preference, shared by
+/// the defaults and presets rather than passed separately to `App::new`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Opening {
     pub view: RightView,
     pub focus: Focus,
     pub zoom: bool,
     pub theme: Theme,
+    pub agent_layout: AgentLayout,
 }
 
-/// abeam's behaviour before anybody configured anything, which is what every
-/// session did until this module existed and what every session without a
-/// config file still does.
+/// Opening preferences for sessions without a configuration file.
 impl Default for Opening {
     fn default() -> Self {
         Self {
@@ -431,6 +430,7 @@ impl Default for Opening {
             focus: Focus::Left,
             zoom: false,
             theme: Theme::Dark,
+            agent_layout: AgentLayout::Auto,
         }
     }
 }
@@ -487,9 +487,9 @@ struct File {
     preset: BTreeMap<String, Wire>,
 }
 
-/// The four opening fields, each of them absent until somebody says otherwise.
+/// The opening fields, each of them absent until somebody says otherwise.
 ///
-/// One type for `[defaults]` and for the same four keys inside a preset, which
+/// One type for `[defaults]` and for the same keys inside a preset, which
 /// is what makes "a preset overrides the defaults field by field" a three-line
 /// function rather than a rule to remember. Absence is what carries the
 /// override: a preset that sets `view` and nothing else changes the view and
@@ -501,6 +501,8 @@ struct Wanted {
     focus: Option<Side>,
     zoom: Option<bool>,
     theme: Option<Theme>,
+    #[serde(rename = "agent-layout")]
+    agent_layout: Option<AgentLayout>,
 }
 
 impl Wanted {
@@ -511,6 +513,7 @@ impl Wanted {
             focus: over.focus.or(self.focus),
             zoom: over.zoom.or(self.zoom),
             theme: over.theme.or(self.theme),
+            agent_layout: over.agent_layout.or(self.agent_layout),
         }
     }
 
@@ -522,6 +525,7 @@ impl Wanted {
             focus: self.focus.map_or(fallback.focus, Side::focus),
             zoom: self.zoom.unwrap_or(fallback.zoom),
             theme: self.theme.unwrap_or(fallback.theme),
+            agent_layout: self.agent_layout.unwrap_or(fallback.agent_layout),
         }
     }
 }
@@ -537,6 +541,8 @@ struct Wire {
     focus: Option<Side>,
     zoom: Option<bool>,
     theme: Option<Theme>,
+    #[serde(rename = "agent-layout")]
+    agent_layout: Option<AgentLayout>,
 }
 
 /// Which right-hand view opens.
@@ -739,13 +745,15 @@ fn shadowed(name: &str, wire: &Wire) -> String {
         focus,
         zoom,
         theme,
+        agent_layout,
     } = wire;
     let hosts_itself = host.trim().eq_ignore_ascii_case(name);
     let says_more = !args.is_empty()
         || view.is_some()
         || focus.is_some()
         || zoom.is_some()
-        || theme.is_some();
+        || theme.is_some()
+        || agent_layout.is_some();
     match (hosts_itself, says_more) {
         (true, false) => format!(
             "{conflict} Its `host` is `{name}` as well, and `{name}` is built \
@@ -1098,10 +1106,9 @@ mod tests {
         // The preset hailer invites: a subcommand in front of the line, which
         // is what `args` is for. `abeam +charts` is `hailer notebook
         // --no-browser`, and a missing hailer is hailer's own sentence.
-        let table = config(
-            "[preset.charts]\nhost = \"hailer\"\nargs = [\"notebook\", \"--no-browser\"]\n",
-        )
-        .table();
+        let table =
+            config("[preset.charts]\nhost = \"hailer\"\nargs = [\"notebook\", \"--no-browser\"]\n")
+                .table();
         let charts =
             crate::agent::find_within("charts", table).expect("the preset is in the table");
         let hailer = crate::agent::find("hailer").expect("hailer is a built-in");
@@ -1204,7 +1211,11 @@ mod tests {
 
         // One that says more keeps it by being renamed, with the host line it
         // already has — whichever of the things a preset can say it says.
-        for more in ["args = [\"notebook\"]\n", "view = \"git\"\n", "zoom = true\n"] {
+        for more in [
+            "args = [\"notebook\"]\n",
+            "view = \"git\"\n",
+            "zoom = true\n",
+        ] {
             let refused = read(&format!("[preset.hailer]\nhost = \"hailer\"\n{more}"))
                 .expect_err("a preset written before hailer was a built-in");
             assert!(refused.contains("built into abeam now"), "got: {refused}");
@@ -1337,10 +1348,11 @@ mod tests {
                 focus: Focus::Left,
                 zoom: false,
                 theme: Theme::Light,
+                agent_layout: AgentLayout::Auto,
             }
         );
 
-        // ...and the preset says two of the four differently, which is what
+        // ...and the preset changes two fields, which is what
         // "field by field" means: `view` and `theme` move, `focus` and `zoom`
         // are the preset agreeing with the defaults rather than silently
         // resetting them.
@@ -1351,6 +1363,7 @@ mod tests {
                 focus: Focus::Left,
                 zoom: false,
                 theme: Theme::Dark,
+                agent_layout: AgentLayout::Auto,
             }
         );
         // Folded, like every other name behind a `+`.
@@ -1370,6 +1383,7 @@ mod tests {
                 focus: Focus::Left,
                 zoom: true,
                 theme: Theme::Light,
+                agent_layout: AgentLayout::Auto,
             }
         );
 
@@ -1381,6 +1395,40 @@ mod tests {
         assert_eq!(Config::default().opening(None), Opening::default());
         assert_eq!(Opening::default().theme, Theme::Dark);
         assert_eq!(Opening::default().view, RightView::Git);
+    }
+
+    #[test]
+    fn agent_layout_defaults_and_preset_overrides_are_validated() {
+        assert_eq!(
+            Config::default().opening(None).agent_layout,
+            AgentLayout::Auto
+        );
+        let config = config(
+            "[defaults]\nagent-layout = \"one-column\"\n\
+             [preset.inherit]\nhost = \"claude\"\n\
+             [preset.wide]\nhost = \"claude\"\nagent-layout = \"two-columns\"\n\
+             [preset.adaptive]\nhost = \"claude\"\nagent-layout = \"auto\"\n",
+        );
+        assert_eq!(config.opening(None).agent_layout, AgentLayout::OneColumn);
+        assert_eq!(
+            config.opening(Some("inherit")).agent_layout,
+            AgentLayout::OneColumn
+        );
+        assert_eq!(
+            config.opening(Some("wide")).agent_layout,
+            AgentLayout::TwoColumns
+        );
+        assert_eq!(
+            config.opening(Some("adaptive")).agent_layout,
+            AgentLayout::Auto
+        );
+        for bad in [
+            "[defaults]\nagent-layout = \"three-columns\"\n",
+            "[preset.wide]\nhost = \"claude\"\nagent-layout = \"wide\"\n",
+            "[defaults]\nagent-layout = 2\n",
+        ] {
+            assert!(read(bad).is_err(), "invalid layout was accepted: {bad}");
+        }
     }
 
     #[test]

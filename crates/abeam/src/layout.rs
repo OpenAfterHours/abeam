@@ -8,11 +8,64 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Block;
+use serde::Deserialize;
 
-/// Below this, a 40% right pane is too narrow to be worth anything while the
-/// remaining 60% is actively bad for the agent. Collapsing is the right
-/// degradation; squeezing is not.
+/// Minimum usable width for each agent when placing two columns side by side.
+pub const MIN_AGENT_COLS: u16 = 80;
+
+/// Preferred agent arrangement. Two columns always fall back to one when the
+/// available width cannot give both agents [`MIN_AGENT_COLS`] inside the border.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentLayout {
+    #[default]
+    Auto,
+    OneColumn,
+    TwoColumns,
+}
+
+impl AgentLayout {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::OneColumn,
+            Self::OneColumn => Self::TwoColumns,
+            Self::TwoColumns => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::OneColumn => "One column",
+            Self::TwoColumns => "Two columns",
+        }
+    }
+
+    /// Actual column count for this terminal area and roster. A single agent
+    /// keeps the full width even when two columns are preferred.
+    pub fn columns(self, area: Rect, n: usize) -> usize {
+        let half = Rect::new(area.x, area.y, area.width / 2, area.height);
+        if self != Self::OneColumn && n >= 2 && inner(half).width >= MIN_AGENT_COLS {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// Below this, neither a readable sidebar nor a useful agent can fit.
 pub const MIN_SPLIT_COLS: u16 = 60;
+
+/// Code cells reserved in the right pane when terminal width permits it.
+pub const MIN_RIGHT_CODE_COLS: u16 = 120;
+
+/// The file loader caps files at 512 KiB: even a file of one-byte lines needs
+/// at most six line-number digits, plus one space before the code.
+pub const RIGHT_GUTTER_COLS: u16 = 7;
+pub const RIGHT_SCROLLBAR_COLS: u16 = 1;
+
+/// Outer width, including source line numbers, scrollbar and both borders.
+pub const MIN_RIGHT_COLS: u16 = MIN_RIGHT_CODE_COLS + RIGHT_GUTTER_COLS + RIGHT_SCROLLBAR_COLS + 2;
 
 /// Outer rects, borders included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,8 +82,16 @@ pub fn split(area: Rect, zoom: bool) -> Split {
             right: None,
         };
     }
+    // Preserve the familiar 60/40 split on small terminals, then spend added
+    // width on the sidebar until it can show 120 code cells. Holding one agent
+    // at 80 usable cells during that transition avoids an abrupt resize at the
+    // full-width breakpoint. Above it, every extra column goes to the agents.
+    let small_right = ((u32::from(area.width) * 2 + 2) / 5) as u16;
+    let right_width = small_right
+        .max(area.width.saturating_sub(MIN_AGENT_COLS + 2))
+        .min(MIN_RIGHT_COLS);
     let parts =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).split(area);
     Split {
         left: parts[0],
         right: Some(parts[1]),
@@ -65,11 +126,11 @@ pub fn inner(pane: Rect) -> Rect {
 ///
 /// **The arithmetic this implies, said out loud, because it decides who ever
 /// sees two agents at once.** A whole pane is this plus its border, so two of
-/// them want 28 rows and three want 42. A 24-row terminal — the default on a
-/// great many machines — therefore never draws two agents whole, whatever the
-/// user does: it draws one and a title row. That is the floor working rather
-/// than failing, and it is the number to argue with if the feature feels
-/// smaller than it sounded.
+/// them want 28 rows and three want 42. A 24-row column therefore cannot draw
+/// two agents whole: it draws one and a title row. A second column can show
+/// another agent at full height. That is the floor working rather than failing,
+/// and it is the number to argue with if the feature feels smaller than it
+/// sounded.
 ///
 /// **What would make it wrong is a measurement nobody has made.** It is
 /// reasoned from the layout these agents draw rather than timed against them,
@@ -87,14 +148,31 @@ pub fn inner(pane: Rect) -> Rect {
 /// it, which loses no more to this floor than the shell does.
 pub const MIN_AGENT_ROWS: u16 = 12;
 
-/// Where the agents go down the left column: one rect each, in list order.
+/// Agent rectangles in roster order, arranged left to right, then downward.
+/// Each column applies [`stack`]'s height floor independently, so an odd final
+/// agent does not leave unused space in the shorter column. Focus gets priority
+/// within its own column; the other column prioritises its first agent.
+pub fn agents(area: Rect, n: usize, at: usize, mode: AgentLayout) -> Vec<Rect> {
+    if mode.columns(area, n) == 1 {
+        return stack(area, n, at);
+    }
+
+    let columns = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(area);
+    let at = at.min(n - 1);
+    let mut out = vec![Rect::default(); n];
+    for (column, &area) in columns.iter().enumerate() {
+        let count = n / 2 + usize::from(column == 0 && !n.is_multiple_of(2));
+        let focused = if at % 2 == column { at / 2 } else { 0 };
+        for (row, rect) in stack(area, count, focused).into_iter().enumerate() {
+            out[row * 2 + column] = rect;
+        }
+    }
+    out
+}
+
+/// Where agents go down one column: one rect each, in list order.
 ///
-/// **Vertical, because the other axis has nothing to give.** At 120 columns
-/// [`split`] leaves 72 on the left, and two agents abreast is 36 each — below
-/// what any of these agents can draw. A 40-row window gives two agents about
-/// nineteen rows apiece, which is a pane. Rows are the cheaper axis.
-///
-/// **A third function in this module, under this module's own rule.** Each pty
+/// **Shared geometry for drawing and resizing.** Each pty
 /// is sized from the rect that drew it, so a stack worked out a second time on
 /// the way to a resize is a resize that disagrees with the frame — which is
 /// "off-by-one here is what makes hosted apps wrap strangely" one pane along.
@@ -284,6 +362,181 @@ mod tests {
         let s = split(Rect::new(0, 0, 200, 24), true);
         assert!(s.right.is_none());
         assert_eq!(s.left.width, 200);
+    }
+
+    #[test]
+    fn a_full_size_sidebar_reserves_one_hundred_twenty_code_cells() {
+        for width in [212, 250, 293, 294, 400, 1000] {
+            let area = Rect::new(7, 3, width, 40);
+            let panes = split(area, false);
+            let right = panes.right.expect("wide enough for a sidebar");
+            assert_eq!(right.width, 130);
+            assert_eq!(
+                inner(right).width - RIGHT_GUTTER_COLS - RIGHT_SCROLLBAR_COLS,
+                120
+            );
+            assert_eq!(panes.left.width, width - 130);
+            assert_eq!(panes.left.x, area.x);
+            assert_eq!(panes.left.right(), right.x);
+            assert_eq!(right.right(), area.right());
+        }
+    }
+
+    #[test]
+    fn smaller_terminals_shrink_the_sidebar_without_a_sudden_width_change() {
+        assert_eq!(
+            split(Rect::new(0, 0, 120, 40), false).right.unwrap().width,
+            48
+        );
+        assert_eq!(
+            split(Rect::new(0, 0, 200, 40), false).right.unwrap().width,
+            118
+        );
+        let mut previous = split(Rect::new(7, 3, MIN_SPLIT_COLS, 40), false);
+        for width in MIN_SPLIT_COLS + 1..=400 {
+            let current = split(Rect::new(7, 3, width, 40), false);
+            let right = current.right.unwrap();
+            let previous_right = previous.right.unwrap();
+            assert!(right.width >= previous_right.width);
+            assert!(right.width <= previous_right.width + 1);
+            assert!(current.left.width >= previous.left.width);
+            assert!(current.left.width <= previous.left.width + 1);
+            assert_eq!(current.left.right(), right.x);
+            assert_eq!(right.right(), 7 + width);
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn hiding_the_sidebar_makes_its_width_available_to_two_agent_columns() {
+        for (width, visible_columns, hidden_columns) in
+            [(163, 1, 1), (164, 1, 2), (293, 1, 2), (294, 2, 2)]
+        {
+            let area = Rect::new(0, 0, width, 40);
+            assert_eq!(
+                AgentLayout::Auto.columns(split(area, false).left, 2),
+                visible_columns
+            );
+            assert_eq!(
+                AgentLayout::Auto.columns(split(area, true).left, 2),
+                hidden_columns
+            );
+        }
+    }
+
+    #[test]
+    fn two_columns_require_eighty_usable_cells_per_agent() {
+        for mode in [AgentLayout::Auto, AgentLayout::TwoColumns] {
+            for width in [0, 80, 162, 163] {
+                let area = Rect::new(7, 3, width, 40);
+                assert_eq!(mode.columns(area, 2), 1);
+                assert_eq!(agents(area, 2, 1, mode), stack(area, 2, 1));
+            }
+            for width in [164, 165, 200, 401] {
+                let area = Rect::new(7, 3, width, 40);
+                let rects = agents(area, 2, 1, mode);
+                assert_eq!(mode.columns(area, 2), 2);
+                assert_eq!(rects[0].y, rects[1].y);
+                assert_eq!(rects[0].height, area.height);
+                assert_eq!(rects[1].height, area.height);
+                assert_eq!(rects[0].right(), rects[1].x);
+                assert!(rects.iter().all(|rect| inner(*rect).width >= 80));
+            }
+        }
+    }
+
+    #[test]
+    fn the_one_column_preference_and_single_agent_keep_the_whole_width() {
+        let area = Rect::new(7, 3, 400, 40);
+        assert_eq!(AgentLayout::OneColumn.columns(area, 4), 1);
+        assert_eq!(
+            agents(area, 4, 3, AgentLayout::OneColumn),
+            stack(area, 4, 3)
+        );
+        for mode in [
+            AgentLayout::Auto,
+            AgentLayout::OneColumn,
+            AgentLayout::TwoColumns,
+        ] {
+            assert_eq!(mode.columns(area, 1), 1);
+            assert_eq!(agents(area, 1, 0, mode), vec![area]);
+            assert!(agents(area, 0, 0, mode).is_empty());
+        }
+    }
+
+    #[test]
+    fn agent_indices_run_left_to_right_and_an_odd_roster_uses_both_columns() {
+        let area = Rect::new(7, 3, 164, 28);
+        assert_eq!(
+            agents(area, 3, 0, AgentLayout::Auto),
+            vec![
+                Rect::new(7, 3, 82, 14),
+                Rect::new(89, 3, 82, 28),
+                Rect::new(7, 17, 82, 14),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_column_collapses_independently_and_keeps_the_focused_agent_visible() {
+        let area = Rect::new(7, 3, 164, 20);
+        let rects = agents(area, 6, 5, AgentLayout::Auto);
+        assert_eq!(
+            rects.iter().map(|rect| rect.height).collect::<Vec<_>>(),
+            vec![18, 1, 1, 1, 1, 18]
+        );
+        assert!(inner(rects[5]).height >= MIN_AGENT_ROWS);
+        assert_eq!(
+            agents(area, 6, usize::MAX, AgentLayout::Auto),
+            rects,
+            "an invalid focus falls back to the last agent"
+        );
+
+        for n in 2..=8usize {
+            for at in 0..n {
+                let column_count =
+                    n / 2 + usize::from(at.is_multiple_of(2) && !n.is_multiple_of(2));
+                for height in 0..=30 {
+                    let rects = agents(Rect::new(7, 3, 164, height), n, at, AgentLayout::Auto);
+                    assert_eq!(
+                        inner(rects[at]).height > 0,
+                        usize::from(height) >= column_count + 2,
+                        "{n}/{at}/{height}: {rects:?}"
+                    );
+                    assert!(height == 0 || rects[at].height > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_agent_grid_tiles_the_area_at_every_roster_size_and_height() {
+        for width in [0, 80, 163, 164, 165, 201] {
+            for height in [0, 1, 2, 3, 13, 14, 15, 24, 28, 40, 41, 97] {
+                for n in 1..=8 {
+                    for at in 0..n {
+                        let area = Rect::new(7, 3, width, height);
+                        let rects = agents(area, n, at, AgentLayout::Auto);
+                        let column_count = if n >= 2 && width >= 164 { 2 } else { 1 };
+                        assert_eq!(rects.len(), n);
+                        let mut x = area.x;
+                        for column in 0..column_count {
+                            let column_width = rects[column].width;
+                            let mut y = area.y;
+                            for rect in rects.iter().skip(column).step_by(column_count) {
+                                assert_eq!(rect.x, x, "{width}/{height}/{n}/{at}: {rects:?}");
+                                assert_eq!(rect.y, y, "{width}/{height}/{n}/{at}: {rects:?}");
+                                assert_eq!(rect.width, column_width);
+                                y += rect.height;
+                            }
+                            assert_eq!(y, area.bottom());
+                            x += column_width;
+                        }
+                        assert_eq!(x, area.right());
+                    }
+                }
+            }
+        }
     }
 
     /// Every row of the column belongs to exactly one pane.

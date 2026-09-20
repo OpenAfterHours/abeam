@@ -1,5 +1,14 @@
 # More than one agent in the window
 
+> **Layout update (2026-09-20):** the vertical-stack design recorded below now
+> applies within each agent column. Auto uses two columns when each has 80
+> usable characters; `F1, L` chooses Auto / One column / Two columns, and
+> `agent-layout` sets the opening preference. The right pane keeps room for
+> 120 characters of code plus line numbers, scrollbar and borders when the
+> terminal permits it, shrinking only on smaller terminals. Two agent columns
+> fit at 294 terminal columns, or 164 with the right pane hidden by `F1, Z`.
+> See the current [README](../README.md#more-than-one-agent) for behaviour.
+
 > **All four phases are built. This is a record, not a proposal.** It began as
 > one, and the tense of a paragraph is not a safe way to date it, so: nothing
 > below is waiting to be done. The argument is why the code is the shape it is;

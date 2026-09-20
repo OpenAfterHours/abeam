@@ -11,9 +11,9 @@ provider is supported, a second copy you
 can ask about the file in front of you. A file watcher drives the first two, so
 neither has to be asked.
 
-The left column holds **more than one agent** when you want it to: start another
-in a second worktree and they stack, whole where there are rows for them and a
-title row each where there are not. See [More than one
+The agent area holds **more than one agent** when you want it to: start another
+in a second worktree and they use two columns on wide terminals, stacking on
+smaller ones. Panes without enough height keep a title row. See [More than one
 agent](#more-than-one-agent) below — and read `docs/status.md` first, because
 nobody has yet driven that part by hand.
 
@@ -374,6 +374,7 @@ into the focused child.
 | `F1, W` / `F1, P` / `F1, A` | Queue / scratch pad / ask without an attachment | Queue keeps focus; pad and ask focus right |
 | `F1, D` / `F1, T` | Diagnostics / reader theme | Keep current focus |
 | `F1, Z` | Hide or show the right pane | Keep focus on the meaningful pane |
+| `F1, L` | Cycle agent layout: Auto / One column / Two columns | Keep current focus |
 | `F1, J` / `F1, K` | Scroll the right pane one line | Keep current focus |
 | `F1, PageUp` / `F1, PageDown` | Page the right pane | Keep current focus |
 | `F1, N` | Focus the next agent | Focus left |
@@ -566,13 +567,30 @@ border of the pane that has them is highlighted and reads
 `claude · 2/3`, which is the only thing on screen that says which session your
 next sentence is going to.
 
-They **stack**, top to bottom in the order you started them. A pane that will
-not fit whole shrinks to its title row rather than disappearing, so the roster
-and the busy / idle / waiting-on-you word stay on screen for every agent. A
-whole pane wants twelve rows and a border, so two agents want about 28 rows of
-terminal and three want 42; below that you get one pane and title rows. The
-right pane does **not** follow the agent cursor: moving between agents never
-costs you the thing you were reading.
+The default **Auto** layout uses two agent columns when each can have at least
+80 characters inside its border. Agents fill left to right, then downward, in
+the order you started them. With three agents, the second uses the full height
+of its column. Smaller terminals use one column.
+
+The right pane reserves room for **120 characters of code**, plus line numbers,
+a scrollbar and borders (130 terminal columns altogether). It shrinks only on
+small terminals where that width and a readable agent cannot fit together.
+The full reading width fits from 212 terminal columns; two agent columns fit
+from 294. `F1, Z` hides the right pane and lowers the two-column threshold to
+164. These are terminal character columns, not monitor pixels.
+
+`F1, L` cycles **Auto**, **One column**, and **Two columns**. The hub shows the
+preference and the actual column count. Two columns falls back to one when
+there is insufficient width; Auto currently uses the same width rule. This
+choice lasts for the current session; set `agent-layout` in your configuration
+to choose how new sessions open.
+
+Within each column, a pane that will not fit whole shrinks to its title row,
+keeping its busy / idle / waiting-on-you word visible where height permits.
+The focused agent gets priority in its column. A whole pane wants twelve rows
+and a border, so two agents in the same column want 28 rows. The right pane
+does **not** follow the agent cursor: moving between agents keeps your place
+in the file you were reading.
 
 The **queue** (`F1, W`) aims each item at the agent that had your keys when you
 wrote it, and it stays aimed there — moving the cursor afterwards does not move
@@ -613,6 +631,7 @@ view  = "git"    # git | files | shell | queue | pad | ask
 focus = "left"   # left | right               — which pane has the keyboard
 zoom  = false
 theme = "dark"   # light | dark               — the reader's page
+agent-layout = "auto" # auto | one-column | two-columns
 
 [preset.fleet]
 host  = "claude"     # an agent abeam knows, or any program on PATH
