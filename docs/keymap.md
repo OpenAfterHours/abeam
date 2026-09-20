@@ -21,6 +21,7 @@ to the focused child.
 | `F1, W` / `F1, P` / `F1, A` | Queue / scratch pad / ask without an attachment | Queue keeps focus; pad and ask focus right |
 | `F1, D` / `F1, T` | Diagnostics / reader theme | Keep current focus |
 | `F1, Z` | Hide or show the right pane | Keep focus on the meaningful pane |
+| `F1, L` | Cycle agent layout: Auto / One column / Two columns | Keep current focus |
 | `F1, J` / `F1, K` | Scroll the right pane one line | Keep current focus |
 | `F1, PageUp` / `F1, PageDown` | Page the right pane | Keep current focus |
 | `F1, N` | Focus the next agent | Focus left |

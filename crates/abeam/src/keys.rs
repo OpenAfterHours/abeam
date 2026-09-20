@@ -255,6 +255,8 @@ pub enum Action {
     /// focused, so there is one scroll vocabulary rather than two.
     ScrollRight(KeyCode),
     ToggleZoom,
+    /// Cycle automatic, one-column, and two-column agent layouts.
+    CycleAgentLayout,
     /// Show the pty instrument, or put back whatever it displaced.
     ToggleDiag,
     /// Show the ask with **nothing attached**, or put back whatever it
@@ -349,6 +351,7 @@ pub fn hub(key: &KeyEvent) -> Option<HubCommand> {
         KeyCode::Char('d') | KeyCode::Char('D') => HubCommand::Action(Action::ToggleDiag),
         KeyCode::Char('t') | KeyCode::Char('T') => HubCommand::Action(Action::ToggleReaderTheme),
         KeyCode::Char('z') | KeyCode::Char('Z') => HubCommand::Action(Action::ToggleZoom),
+        KeyCode::Char('l') | KeyCode::Char('L') => HubCommand::Action(Action::CycleAgentLayout),
         KeyCode::Char('j') | KeyCode::Char('J') => {
             HubCommand::Action(Action::ScrollRight(KeyCode::Down))
         }
@@ -379,6 +382,7 @@ pub const HUB: &[(&str, &str)] = &[
     ("D", "diagnostics (keeps current focus)"),
     ("T", "reader theme (keeps current focus)"),
     ("Z", "hide / show right pane"),
+    ("L", "agent layout: auto / one column / two columns"),
     ("J / K", "scroll right pane down / up"),
     ("PgDn / PgUp", "page right pane down / up"),
     ("N", "next agent (focuses it)"),
@@ -421,6 +425,7 @@ pub const HELP: &[(&str, &str)] = &[
         "toggle diagnostics / reader theme, keeping current focus",
     ),
     ("F1, Z", "hide / show the right pane"),
+    ("F1, L", "agent layout: auto / one column / two columns"),
     // The parenthetical is the whole of what a second agent costs this table.
     // `F4` has always meant "give the keys to the left" and a second press did
     // nothing at all, so "again" is a meaning added to a dead press rather than
@@ -931,6 +936,7 @@ mod tests {
             (KeyCode::Char('d'), Action::ToggleDiag),
             (KeyCode::Char('t'), Action::ToggleReaderTheme),
             (KeyCode::Char('z'), Action::ToggleZoom),
+            (KeyCode::Char('l'), Action::CycleAgentLayout),
             (KeyCode::Char('n'), Action::NextAgent),
             (KeyCode::Char('o'), Action::NewAgent),
             (KeyCode::Char('q'), Action::Quit),
@@ -1194,6 +1200,7 @@ mod tests {
             "F1, P / A",
             "F1, D / T",
             "F1, Z",
+            "F1, L",
             "F1, N",
             "F1, O",
             "F1, Q",

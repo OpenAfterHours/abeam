@@ -229,7 +229,7 @@ fn main() -> Result<()> {
         // A first guess only. The first frame re-sizes the pty from the rect it
         // actually drew, so this just avoids spawning the agent at 24x80 and
         // making it reflow immediately.
-        let inner = layout::inner(layout::split(full, false).left);
+        let inner = layout::inner(layout::split(full, opening.zoom).left);
 
         let left = TerminalPane::spawn_with(
             hosted

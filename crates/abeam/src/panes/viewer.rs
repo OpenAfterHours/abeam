@@ -2940,6 +2940,30 @@ mod tests {
     }
 
     #[test]
+    fn the_right_pane_fits_120_code_columns_with_line_numbers_and_scrollbar() {
+        let dir = TempDir::new("view-reading-width");
+        let code = format!("value = \"{}\"", "x".repeat(110));
+        assert_eq!(code.len(), 120);
+        // Six-digit line numbers exercise the largest gutter supported by the
+        // reader's file-size limit. A short fixture would miss that extra space.
+        let source = format!("{code}{}", "\n".repeat(100_000));
+        let path = dir.write("wide.py", source.as_bytes());
+        let mut pane = quiet(dir.path());
+        pane.show(&path);
+        let outer = crate::layout::split(Rect::new(0, 0, 212, 20), false)
+            .right
+            .expect("room for both panes");
+        let inner = crate::layout::inner(outer);
+        let terminal = draw(&mut pane, inner.width, inner.height);
+        assert_eq!(pane.margin.width, 7);
+        assert_eq!(pane.lines.len(), 100_001, "a code line was wrapped");
+        let visible: String = (0..127)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert_eq!(visible, format!("     1 {code}"));
+    }
+
+    #[test]
     fn a_narrow_pane_drops_the_line_numbers_rather_than_the_code() {
         let dir = TempDir::new("view-narrow");
         let path = dir.write("a.rs", b"let x = 1;\n");

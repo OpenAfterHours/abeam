@@ -308,8 +308,8 @@ work, on either platform.
 That sentence is the whole entry and the rest of this paragraph is detail. `a`
 in the git view (`F1, G`) starts another agent in the checkout on screen, and
 `a` on a row of the worktree list (`F1, G`, `w`) starts one in that checkout;
-`F1, N` moves along them; they are stacked vertically, one title row
-each for the ones there is no room to draw whole; the queue's `Send` items carry
+`F1, N` moves along them; wide terminals use two agent columns and smaller ones
+stack them vertically, with title rows for panes that cannot fit whole; the queue's `Send` items carry
 the pane they were written for and are typed there and nowhere else; `x` twice
 at a pane whose child has exited closes it, and `x` twice on a worktree row ends
 a live one. An agent that goes on to make itself a git worktree and move into it
@@ -319,6 +319,25 @@ against the directory the pane was spawned in, which is the one thing that must
 not move. The agent abeam was started with is still the session: its exit is
 abeam's exit code, and it cannot be closed. `docs/multi-agent.md` is the design
 and the record of what each phase cost.
+
+**Responsive layout (2026-09-20).** `F1, L` cycles Auto / One column / Two
+columns, also set by `agent-layout` in defaults or a preset. Two columns need
+80 usable characters per agent. The right pane reserves 120 code characters
+plus seven for line numbers, one for the scrollbar and two borders. It reaches
+that width at 212 terminal columns and shrinks on smaller terminals. Two agent
+columns fit from 294 columns with the right pane shown, or 164 after `F1, Z`.
+Agents fill left to right, then downward; height collapse applies separately
+to each column. Layout changes invalidate old mouse coordinates and visible
+close confirmations. Automated geometry and app tests cover these behaviours;
+live use with the hosted agents remains unverified.
+
+Verified on Windows for this change: `cargo build --workspace --all-targets`,
+`cargo test --workspace -- --test-threads=2` (1,220 passed, four existing manual
+or optional tests ignored), and `cargo clippy --workspace --all-targets -- -D
+warnings`. The source-reader regression renders all 120 code characters with
+six-digit line numbers and the scrollbar. Process-lifetime tests required
+Windows process-enumeration access outside the restricted sandbox. Linux and
+manual sessions with the hosted agents were not exercised in this change.
 
 What that is built on is **sixty-six tests** — the number of `#[test]`
 attributes this work added, so it can be checked rather than taken — some
@@ -335,9 +354,10 @@ measurement.
 Seven specific things to expect, in the order they are likely to bite.
 
 - **The rows are tight, and the arithmetic is unmeasured.** A whole pane is
-  `MIN_AGENT_ROWS` — twelve — plus its border, so two agents want 28 rows and
-  three want 42. A 24-row terminal draws one agent and a title row whatever you
-  do. Twelve is an argument (five rows of permanent furniture, seven of
+  `MIN_AGENT_ROWS` — twelve — plus its border, so two agents in one column want
+  28 rows and three want 42. A 24-row terminal can show two whole agents when
+  they fit in separate columns; one column shows one agent and title rows.
+  Twelve is an argument (five rows of permanent furniture, seven of
   transcript, which is what a permission prompt needs to be on screen at all)
   rather than a number anybody has watched an agent use, and it is the first
   thing to change if a real session says otherwise.

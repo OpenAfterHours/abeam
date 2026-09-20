@@ -1570,6 +1570,7 @@ pub struct App {
     watch: Option<Watch>,
     focus: Focus,
     zoom: bool,
+    agent_layout: abeam_layout::AgentLayout,
     hub: Option<Hub>,
     /// The next keystroke bypasses every abeam binding. See `keys::Action`.
     literal_next: bool,
@@ -2081,6 +2082,7 @@ impl App {
             watch,
             focus: opening.focus,
             zoom: opening.zoom,
+            agent_layout: opening.agent_layout,
             hub: None,
             literal_next: false,
             pending_quit: false,
@@ -2429,6 +2431,26 @@ impl App {
         true
     }
 
+    /// Layout changes revoke mouse coordinates and confirmations from the old
+    /// frame. Keep each child's last usable size until the next frame draws it.
+    fn invalidate_agent_hitboxes(&mut self) {
+        for agent in &mut self.agents {
+            agent.outer = Rect::ZERO;
+        }
+        self.mouse_owner = None;
+        self.drag = None;
+        self.close_drawn = None;
+        self.shell_close_drawn = None;
+    }
+
+    fn set_zoom(&mut self, zoom: bool) {
+        if self.zoom != zoom {
+            self.zoom = zoom;
+            self.right_inner = None;
+            self.invalidate_agent_hitboxes();
+        }
+    }
+
     /// Start another agent, standing in `root`, and switch the left column to
     /// it.
     ///
@@ -2557,12 +2579,18 @@ impl App {
         // `Agent::resize_to_drawn` would never correct it, because a collapsed
         // pane is the case that deliberately does not.
         let column = abeam_layout::split(self.area, self.zoom).left;
-        let rects = abeam_layout::stack(column, self.agents.len() + 1, self.agents.len());
-        let inner = rects
-            .last()
-            .copied()
-            .and_then(Agent::inside)
-            .unwrap_or_else(|| abeam_layout::inner(column));
+        let rects = abeam_layout::agents(
+            column,
+            self.agents.len() + 1,
+            self.agents.len(),
+            self.agent_layout,
+        );
+        let outer = *rects.last().expect("the new agent has a rectangle");
+        let inner = Agent::inside(outer).unwrap_or_else(|| {
+            // A collapsed child keeps its spawn size. Keep the width of its
+            // actual column even when the terminal has no rows to draw it yet.
+            abeam_layout::inner(Rect::new(outer.x, column.y, outer.width, column.height))
+        });
         let started = TerminalPane::spawn_with(
             launch
                 .config()
@@ -2637,6 +2665,7 @@ impl App {
             agent.probe.disown(id);
         }
         self.agents.push(agent);
+        self.invalidate_agent_hitboxes();
 
         // Here rather than at the caller, because the count in the occupancy
         // column is the only thing on screen that reports this key at all and a
@@ -2734,6 +2763,7 @@ impl App {
         // it points into changing length.
         let keeping = self.current().id;
         self.agents.remove(ix);
+        self.invalidate_agent_hitboxes();
         // After the removal, so the pane being destroyed is not among the
         // probes told — it has no more questions to answer — and so that
         // `disowned` carries it for every pane opened later, which is the half
@@ -5016,8 +5046,7 @@ impl App {
                 // An event already queued behind this resize must not be
                 // delivered to a pane at stale coordinates.
                 self.right_inner = None;
-                self.mouse_owner = None;
-                self.drag = None;
+                self.invalidate_agent_hitboxes();
                 if abeam_layout::split(self.area, self.zoom).right.is_none() {
                     self.set_focus(Focus::Left);
                 }
@@ -5399,7 +5428,7 @@ impl App {
                     // un-zooming — and asked of the layout rather than of the
                     // last frame, because `right_inner` is a frame behind and
                     // this key has just changed the answer.
-                    self.zoom = false;
+                    self.set_zoom(false);
                     if abeam_layout::split(self.area, self.zoom).right.is_some() {
                         self.select = Some(Select::new());
                         // The one write that records the memo instead of
@@ -5435,7 +5464,7 @@ impl App {
             // removed.
             Action::FocusLeft => self.set_focus(Focus::Left),
             Action::FocusRight => {
-                self.zoom = false;
+                self.set_zoom(false);
                 if abeam_layout::split(self.area, self.zoom).right.is_some() {
                     self.set_focus(Focus::Right);
                 }
@@ -5476,19 +5505,16 @@ impl App {
                 let key = KeyEvent::new(code, KeyModifiers::NONE);
                 self.right_pane().scroll_key(key)?;
             }
-            // **This key is about the divider and has nothing to do with the
-            // stack**, which is worth one line here because somebody reading
-            // "zoom" will wonder. `F1, Z` buys the left column *columns*, and a
-            // stack is short of rows; hiding the right pane makes every agent
-            // wider and not one of them taller. The different question a stack
-            // raises — "show me only this agent" — was asked and declined, and
-            // the argument is in `docs/multi-agent.md` where rejected options
-            // belong rather than in a comment beside the key it is not about.
+            // Hiding the right pane may also make room for another column.
             Action::ToggleZoom => {
-                self.zoom = !self.zoom;
+                self.set_zoom(!self.zoom);
                 if self.zoom {
                     self.set_focus(Focus::Left);
                 }
+            }
+            Action::CycleAgentLayout => {
+                self.agent_layout = self.agent_layout.cycle();
+                self.invalidate_agent_hitboxes();
             }
             Action::OpenHub => self.hub = Some(Hub::Commands),
             Action::LiteralNext => self.literal_next = true,
@@ -6142,7 +6168,12 @@ impl App {
         // rule, and the reason [`crate::layout::stack`] exists rather than the
         // rects being worked out here and again on the way to a resize. Each
         // pty is sized from the rect that drew it, and these are the rects.
-        let rects = abeam_layout::stack(split.left, self.agents.len(), self.at_agent);
+        let rects = abeam_layout::agents(
+            split.left,
+            self.agents.len(),
+            self.at_agent,
+            self.agent_layout,
+        );
         // A name and a tag per pane, kept apart rather than joined, because the
         // announcement goes *between* them on one of them and nowhere else.
         // Built before the refusal, which is fitted to what the rest of that
@@ -6501,7 +6532,7 @@ impl App {
         }
 
         if let Some(hub) = self.hub {
-            hub_overlay(f, hub);
+            hub_overlay(f, hub, self.agent_layout, split.left, self.agents.len());
             // Painted over whatever the right pane drew, the chooser's
             // as-launched row included — so that row was not on screen this
             // frame, however whole the pane drew it underneath. `Esc` and
@@ -6862,7 +6893,7 @@ impl App {
         // Asking for a view is asking to see it. Without this, every view key
         // is a dead key while zoomed, which is a worse surprise than the pane
         // reappearing — that at least is visible and one keystroke to undo.
-        self.zoom = false;
+        self.set_zoom(false);
         // A selection names rows of the pane that drew them, so it does not
         // survive another pane taking those rows. Silently keeping it would be
         // the worst version of this feature: the same highlight over different
@@ -7106,7 +7137,13 @@ fn relative(ev: &MouseEvent, r: Rect) -> MouseEvent {
 /// Width of the key column in the command hub and full reference.
 const HELP_KEYS: usize = 24;
 
-fn hub_overlay(f: &mut Frame, hub: Hub) {
+fn hub_overlay(
+    f: &mut Frame,
+    hub: Hub,
+    mode: abeam_layout::AgentLayout,
+    agent_area: Rect,
+    agent_count: usize,
+) {
     let entries = match hub {
         Hub::Commands => keys::HUB,
         Hub::Reference => keys::HELP,
@@ -7114,6 +7151,21 @@ fn hub_overlay(f: &mut Frame, hub: Hub) {
     let lines: Vec<Line> = entries
         .iter()
         .map(|(k, what)| {
+            let description = if matches!(*k, "L" | "F1, L") {
+                let columns = mode.columns(agent_area, agent_count);
+                let detail = if columns == 2 {
+                    "2 columns"
+                } else if agent_count < 2 {
+                    "1 column; one agent"
+                } else if mode == abeam_layout::AgentLayout::TwoColumns {
+                    "1 column; too narrow"
+                } else {
+                    "1 column"
+                };
+                format!("layout: {} ({detail}); cycle", mode.label())
+            } else {
+                (*what).to_string()
+            };
             Line::from(vec![
                 Span::styled(
                     format!("{k:<HELP_KEYS$}"),
@@ -7121,7 +7173,7 @@ fn hub_overlay(f: &mut Frame, hub: Hub) {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(*what, Style::default().fg(Color::Gray)),
+                Span::styled(description, Style::default().fg(Color::Gray)),
             ])
         })
         .collect();
@@ -9580,14 +9632,20 @@ mod tests {
         );
 
         let drawn = rows(&mut fx.app, 300, 40);
-        let first = drawn
-            .iter()
-            .find(|row| row.contains("1/2"))
-            .expect("agents[0] has no border");
-        let second = drawn
-            .iter()
-            .find(|row| row.contains("2/2"))
-            .expect("the second agent has no border");
+        let title = |agent: &Agent| -> String {
+            drawn[usize::from(agent.outer.y)]
+                .chars()
+                .skip(usize::from(agent.outer.x))
+                .take(usize::from(agent.outer.width))
+                .collect()
+        };
+        let first = title(&fx.app.agents[0]);
+        let second = title(&fx.app.agents[1]);
+        assert!(first.contains("1/2"), "agents[0] has no border: {first}");
+        assert!(
+            second.contains("2/2"),
+            "the second agent has no border: {second}"
+        );
         assert!(
             second.contains("sending in"),
             "the countdown is not on the border of the pane the send is going \
@@ -10007,7 +10065,10 @@ mod tests {
     /// claim about which row it is on and a flat string cannot tell.
     #[test]
     fn the_stack_draws_a_border_each_and_the_session_speaks_through_agents_zero() {
-        let mut fx = app();
+        let mut fx = app_opening(Opening {
+            agent_layout: abeam_layout::AgentLayout::OneColumn,
+            ..Opening::default()
+        });
         second_agent(&mut fx);
 
         // Armed rather than polled: which of the four conditions hold is
@@ -10060,6 +10121,162 @@ mod tests {
             "the countdown followed the cursor onto a pane it is not about: {:?}",
             drawn[second]
         );
+    }
+
+    #[test]
+    fn agent_layout_reflows_existing_sessions_and_routes_mouse_by_rectangle() {
+        let mut fx = app();
+        second_agent_that_stays(&mut fx);
+        second_agent(&mut fx);
+        fx.app.set_right_view(RightView::Viewer);
+        let workspace = fx.app.at;
+        let identities: Vec<_> = fx.app.agents.iter().map(|agent| agent.id).collect();
+
+        // Three agents: first and third in the left column, second on the right.
+        screen(&mut fx.app, 320, 40);
+        fx.app.resize_to_frame().expect("resize existing sessions");
+        let first = fx.app.agents[0].outer;
+        let second = fx.app.agents[1].outer;
+        let third = fx.app.agents[2].outer;
+        assert_eq!(first.y, second.y);
+        assert_eq!(first.right(), second.x);
+        assert_eq!(first.x, third.x);
+        assert_eq!(first.bottom(), third.y);
+        assert_eq!(second.height, 40);
+        assert_eq!(fx.app.right_inner.expect("right pane").width, 128);
+        let second_inner = fx.app.agents[1].inner;
+        assert_eq!(
+            fx.app.agents[1].pane.diagnostics().parser_size,
+            (second_inner.height, second_inner.width),
+            "the unfocused session was not resized to its drawn rectangle"
+        );
+
+        clicks_at(&mut fx.app, second.x + 3, second.y + 3);
+        assert_eq!(fx.app.at_agent, 1);
+        assert_eq!(fx.app.focus, Focus::Left);
+        assert_eq!(fx.app.at, workspace);
+        assert_eq!(fx.app.right_view, RightView::Viewer);
+
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: first.x + 3,
+            row: first.y + 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            fx.app.aim_at(&wheel),
+            Some(Aim::Agent { id, to_child: true }) if id == identities[0]
+        ));
+        fx.app.handle_mouse(wheel).unwrap();
+        assert_eq!(fx.app.at_agent, 1, "scrolling stole keyboard focus");
+
+        fx.app.handle_event(Event::Resize(293, 40)).unwrap();
+        assert!(fx.app.agents.iter().all(|agent| agent.outer == Rect::ZERO));
+        assert!(fx.app.aim_at(&wheel).is_none(), "stale hit after resize");
+        screen(&mut fx.app, 293, 40);
+        fx.app.resize_to_frame().expect("resize after falling back");
+        assert!(fx.app.agents.iter().all(|agent| agent.outer.x == 0));
+        let inner = fx.app.agents[1].inner;
+        assert_eq!(
+            fx.app.agents[1].pane.diagnostics().parser_size,
+            (inner.height, inner.width)
+        );
+        assert_eq!(fx.app.at_agent, 1);
+        assert_eq!(
+            fx.app
+                .agents
+                .iter()
+                .map(|agent| agent.id)
+                .collect::<Vec<_>>(),
+            identities
+        );
+
+        hub(&mut fx.app, KeyCode::Char('z'));
+        screen(&mut fx.app, 293, 40);
+        assert!(fx.app.right_inner.is_none());
+        assert!(
+            fx.app.agents[1].outer.x > 0,
+            "hiding the right pane did not restore two columns"
+        );
+        let removed = fx.app.agents[2].id;
+        fx.app.close_agent(removed).expect("close the extra pane");
+        screen(&mut fx.app, 293, 40);
+        assert_eq!(fx.app.agents[0].outer.height, 40);
+        assert_eq!(fx.app.agents[1].outer.height, 40);
+        assert_eq!(fx.app.current().id, identities[1]);
+    }
+
+    #[test]
+    fn agent_layout_command_cycles_preferences_and_describes_narrow_fallback() {
+        let mut fx = app_opening(Opening {
+            agent_layout: abeam_layout::AgentLayout::TwoColumns,
+            ..Opening::default()
+        });
+        second_agent(&mut fx);
+        screen(&mut fx.app, 280, 40);
+        fx.app.set_focus(Focus::Right);
+        let focus = fx.app.focus;
+        let workspace = fx.app.at;
+        let right = fx.app.right_inner;
+        fx.app.handle_key(key(KeyCode::F(1))).unwrap();
+        let shown = screen(&mut fx.app, 80, 40);
+        assert!(shown.contains("Two columns (1 column; too narrow); cycle"));
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        screen(&mut fx.app, 280, 40);
+
+        for mode in [
+            abeam_layout::AgentLayout::Auto,
+            abeam_layout::AgentLayout::OneColumn,
+            abeam_layout::AgentLayout::TwoColumns,
+        ] {
+            fx.app.close_drawn = Some(fx.app.agents[0].id);
+            hub(&mut fx.app, KeyCode::Char('l'));
+            assert_eq!(fx.app.agent_layout, mode);
+            assert_eq!(fx.app.focus, focus);
+            assert_eq!(fx.app.at, workspace);
+            assert_eq!(fx.app.right_inner, right);
+            assert!(fx.app.agents.iter().all(|agent| agent.outer == Rect::ZERO));
+            assert!(fx.app.close_drawn.is_none());
+            screen(&mut fx.app, 280, 40);
+        }
+
+        screen(&mut fx.app, 320, 40);
+        assert!(fx.app.agents[1].outer.x > 0);
+        hub(&mut fx.app, KeyCode::Char('l'));
+        hub(&mut fx.app, KeyCode::Char('l'));
+        assert_eq!(fx.app.agent_layout, abeam_layout::AgentLayout::OneColumn);
+        screen(&mut fx.app, 320, 40);
+        assert_eq!(fx.app.agents[1].outer.x, 0);
+        fx.app.handle_key(key(KeyCode::F(1))).unwrap();
+        assert!(screen(&mut fx.app, 320, 40).contains("One column (1 column)"));
+    }
+
+    #[test]
+    fn agent_layout_sizes_new_sessions_from_their_column_even_when_collapsed() {
+        let mut fx = app();
+        a_startable_recipe(&mut fx);
+        fx.app.set_zoom(true);
+        let root = fx.dir.path().to_path_buf();
+        for height in [40, 1] {
+            screen(&mut fx.app, 164, height);
+            assert!(fx.app.start_agent(&root, Pick::Session));
+            let new = fx.app.agents.last().expect("new session");
+            assert_eq!(new.pane.diagnostics().parser_size.1, 80);
+            assert!(fx.app.agents.iter().all(|agent| agent.outer == Rect::ZERO));
+            screen(&mut fx.app, 164, height);
+            fx.app.resize_to_frame().unwrap();
+            assert_eq!(
+                fx.app
+                    .agents
+                    .last()
+                    .unwrap()
+                    .pane
+                    .diagnostics()
+                    .parser_size
+                    .1,
+                80
+            );
+        }
     }
 
     /// A neighbour's readiness cannot reach the gate in front of another pane.
@@ -13764,6 +13981,11 @@ mod tests {
                 continue;
             }
             assert!(text.contains(k), "{k} is missing from the overlay");
+            let what = if *k == "L" {
+                "layout: Auto (1 column; one agent); cycle"
+            } else {
+                what
+            };
             assert!(text.contains(what), "'{what}' was clipped off the overlay");
         }
 
@@ -13776,7 +13998,15 @@ mod tests {
                 continue;
             }
             assert!(text.contains(k), "{k} is missing from the reference");
-            assert!(text.contains(what), "'{what}' was clipped off the reference");
+            let what = if *k == "F1, L" {
+                "layout: Auto (1 column; one agent); cycle"
+            } else {
+                what
+            };
+            assert!(
+                text.contains(what),
+                "'{what}' was clipped off the reference"
+            );
         }
         app.handle_key(key(KeyCode::Esc)).unwrap();
         assert!(app.hub.is_none());

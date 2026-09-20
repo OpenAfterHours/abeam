@@ -312,6 +312,7 @@ view  = "git"    # git | files | shell | queue | pad | ask
 focus = "left"   # left | right               — which pane has the keyboard
 zoom  = false
 theme = "dark"   # light | dark               — the reader's page
+agent-layout = "auto" # auto | one-column | two-columns
 
 [preset.fleet]
 host  = "claude"     # an agent abeam knows, or any program on PATH
@@ -333,7 +334,7 @@ built-in Codex host: `abeam +openai [args]` starts Codex and forwards those
 arguments after any preset `args`. A preset's own `args` go in *front* of what
 you typed, because a subcommand is the first word of the line it belongs to —
 behind them, `abeam +fleet --resume` would be `claude --resume agent`, which is
-a different command in every agent abeam hosts. Its four opening keys override
+a different command in every agent abeam hosts. Its opening keys override
 `[defaults]` field by field, so the preset above moves the view and leaves the
 rest where the defaults put them.
 
@@ -1247,7 +1248,18 @@ sequence ignores it.
 
 ## Layout
 
-60/40 split, and below 60 columns the right pane collapses entirely rather than
-squeezing the agent into 36. The pty is sized from exactly the rect that was
-drawn, once per frame, which is also what coalesces a window drag into a single
-pty resize.
+The right pane reserves 120 code characters plus seven line-number columns,
+one scrollbar column and two borders. Above 212 terminal columns it keeps that
+130-column width and the agent area receives the remainder. Smaller terminals
+grow the right pane smoothly from the former 60/40 split; below 60 columns the
+right pane collapses entirely.
+
+`agent-layout` chooses Auto, One column or Two columns; `F1, L` cycles the
+session's preference. Auto and Two columns use two when each agent column can
+have 80 characters inside its borders. This requires 294 terminal columns
+with the right pane shown, or 164 after `F1, Z` hides it. Agents fill left to
+right, then downward, and each column applies the existing height-collapse
+rule independently. Rendering and new-agent sizing use the same geometry.
+Every pty is resized from the rectangle actually drawn, once per frame, which
+also coalesces a window drag into a single pty resize. Layout changes discard
+old mouse coordinates and close confirmations before another frame is drawn.
