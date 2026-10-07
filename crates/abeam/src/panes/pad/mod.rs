@@ -4,10 +4,12 @@
 //! Every other right-hand view reports something — a repository, a file tree, a
 //! queue, a second agent. This one holds the sentence you had while the agent
 //! was mid-task, and it holds it in markdown because that is the shape a note
-//! about code takes on its own. [`buffer`] is the text and the caret in it,
-//! [`store`] is where the text goes between sessions, and this file is the pane
-//! around them: the two forms, the keys, and the single layout that both the
-//! drawing and the cursor are read out of.
+//! about code takes on its own. [`crate::editor`] is the text, the caret in it,
+//! undo, and the single layout that both the drawing and the cursor are read
+//! out of — all of it the pad's own until the files view needed the same
+//! things — and [`store`] is where the text goes between sessions. This file is
+//! the pane around them: the two forms, the keys, the pad's [`PAD`] policy, and
+//! when the text is written.
 //!
 //! ## Two forms, and two different toggles
 //!
@@ -60,64 +62,48 @@
 //! the pad has focus. That condition matters: with focus on the agent, `Alt+T`
 //! belongs to the agent and advertising it over the pad would be a lie.
 //!
-//! ## One layout, read forwards and backwards
+//! ## Undo, redo, and saving now
 //!
-//! `crate::layout`'s module doc states the principle for the pane split and
-//! says what it prevents: "two calculations that must agree is where off-by-one
-//! here is what makes hosted apps wrap strangely". Here the two are the row a
-//! character is *drawn* on and the row [`Pane::cursor`] *reports*, and a pane
-//! whose caret sits one row from the text it is in is unusable in a way that
-//! looks like a rendering bug rather than a caret bug.
+//! `Ctrl+Z` and `Ctrl+Y` undo and redo in the edit form — `Ctrl+Shift+Z` too,
+//! where the terminal reports the Shift — and `Ctrl+S` saves now in either. A
+//! Ctrl chord pressed into a focused right pane is that pane's to answer;
+//! `crate::keys::ctrl_chord` states the rule once. The pad answers these three
+//! and declines the rest, which therefore do nothing at all — the
+//! `(in the pad, editing)` row in `F1, ?` says so out loud about
+//! `Ctrl+D`/`Ctrl+U`, the two a reader who has learned the read-only panes is
+//! most likely to try.
 //!
-//! So there is one function. [`breaks`] hard-wraps a logical line to the pane's
-//! width and returns the char index each visual row begins at, and everything
-//! else is that table read in one direction or the other: [`into_rows`] cuts
-//! the styled spans at those indices to draw them, [`PadPane::caret_cell`]
-//! looks a char index up in them to place the cursor, and [`char_at`] reads
-//! them backwards to turn a click into a [`buffer::Buffer::set_caret`]. The
-//! table is cached per width, so a frame that changed nothing does not rebuild
-//! it, and the cache is keyed by everything it was built from — see [`For`].
+//! Undo and redo are the editor's keys, with everything else it types: what
+//! one undo takes back is `crate::editor`'s answer — a word and what followed
+//! it, a run of backspaces or of deletes, or a whole paste, with the caret put
+//! back where it was. To the autosave an undo is an edit like any other, with
+//! one difference the editor's saved point makes possible: an undo that lands
+//! back on what was last written leaves nothing owed, so nothing is written.
 //!
-//! Reading it backwards carries an invariant of its own, and a pointer is what
-//! makes it visible: **a click on a row yields a caret the same table draws
-//! back on that row.** Without it a click inside a wrapped row's rectangle can
-//! answer with the index the *next* row begins at, which the forward reading
-//! then draws — correctly, by its own rule — at the start of that next row, so
-//! the caret appears one line below the cell the pointer was over. `abc日def`
-//! at four columns is enough to show it. [`char_at`] spends one subtraction on
-//! this.
+//! `Ctrl+S` is the autosave without the two seconds. It is in both forms
+//! because saving is not typing, and somebody who turned the pad over to read
+//! what they wrote should not have to turn it back to keep it. It also ends the
+//! undo step being typed, saved or not: the key says "this is a point I might
+//! come back to". Undo is in the edit form only: the rendering is read-only,
+//! and a change made there would happen to a text with no caret on screen to
+//! say where.
 //!
-//! There is one seam in all of it, and it is [`Pane::handle_mouse`]: the table
-//! it reads was built by the last frame, and `App::run` drains every queued
-//! input event before drawing another. A keystroke and a click arriving
-//! together therefore put the pointer's question to a layout the keystroke has
-//! already invalidated — press `Enter` at the top of three lines and click the
-//! third row, and the caret lands on the second. So a click whose table is out
-//! of date is declined rather than answered wrongly, and the frame the
-//! keystroke already asked for makes the next one right.
+//! ## Drawing
 //!
-//! Hard-wrapped, with no horizontal scrolling. A pad is prose and a pane is
-//! forty-odd columns; a horizontal offset would mean a second scroll
-//! vocabulary, a second thing for `G` to mean, and text the user wrote sitting
-//! off the side of the pane with nothing saying so.
+//! The edit form is the editor's layout, drawn as it comes through the editor's
+//! `View`: one wrap table that the rows, the cursor and a click are all read
+//! from, mended a line at a time as the text changes and coloured only as far
+//! as the screen. `crate::editor`'s module doc has the invariants that table
+//! keeps — a click lands on the row it was made on, a click against a table a
+//! keystroke has invalidated is declined — and what an edit costs. What this
+//! file adds is what stands between the pane's rect and that table: the notices
+//! drawn above the text, which a click steps over by the number the same frame
+//! drew them with, and the column `scroll::bar_width` keeps back. The source is
+//! coloured as markdown; the guard that draws a line plain rather than let its
+//! colours slide off its words is the editor's `faithful`.
 //!
-//! Columns are **cells**, never chars and never bytes. [`buffer::Buffer::caret`]
-//! hands back a char index, and the width of the prefix in front of it is what
-//! the cursor column is: `設計ab` is four characters and six cells, and a pane
-//! that confused the two would put the caret two columns short of the letter it
-//! is in front of on the first CJK line anybody wrote.
-//!
-//! ## Colour in the edit form
-//!
-//! The source is highlighted with `viewer::source::highlight_code`, and the
-//! spans are cut at the *same* indices [`breaks`] gave the plain text, so the
-//! two accounts cannot drift. [`faithful`] measures the highlighter's answer
-//! against the line it came from first, and a line whose spans do not add up
-//! is drawn unstyled instead:
-//! the highlighter is a foreign grammar engine, and a version of it that
-//! silently dropped or added a character would otherwise slide every colour on
-//! that row sideways from the text it belongs to. Failing to one plain row is a
-//! cosmetic loss; drifting is a lie about which word is a heading.
+//! The rendering is a cache of its own here, because rendered rows and source
+//! rows share nothing — see [`For`].
 //!
 //! ## When the file is read, and when it is written
 //!
@@ -131,14 +117,17 @@
 //! already typed.
 //!
 //! Writing is a dirty flag and a two-second debounce: [`Pane::tick`] saves when
-//! the buffer has changed and nothing has been typed for [`QUIET`], and
+//! the text has changed and nothing has been typed for [`QUIET`], and
 //! [`PadPane::flush`] saves at once, which is what the shell calls on quit and
-//! when the pad leaves the screen.
+//! when the pad leaves the screen. `Ctrl+S` is the same save asked for by the
+//! user rather than the shell. A save that works tells the editor so, and from
+//! then on "has the text changed" is the editor's `is_modified` — so an undo
+//! back to what was written owes the file nothing.
 //!
 //! **The write is synchronous, on the tick thread, and that needs saying rather
 //! than assuming**, because `crate::pane::Pane::tick` says in as many words
 //! that it must not block. What makes it acceptable is the size: at most
-//! [`buffer::MAX_BYTES`] — 64 KiB — to a path in the user's own profile, at
+//! [`MAX_BYTES`] — 64 KiB — to a path in the user's own profile, at
 //! most once every two seconds, through a `write` and a `rename`. The
 //! alternative is a worker thread, a channel, a shutdown path and a way for a
 //! save that failed on the other side to become a notice on this one, which is
@@ -156,7 +145,6 @@
 //! it was read from deletes the rest of somebody's notes, and looks from the
 //! outside exactly like an ordinary autosave.
 
-mod buffer;
 mod store;
 
 use std::path::PathBuf;
@@ -166,28 +154,54 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
-use unicode_width::UnicodeWidthChar;
 
+use crate::editor::{Editor, Look, Outcome, Policy, Tabs, View};
 use crate::pane::{Handled, Pane};
+use crate::panes::viewer::source::Grammar;
 use crate::panes::viewer::{markdown, source, theme};
-use crate::scroll::{self, Scroll};
+use crate::scroll;
 use crate::text::{block, err};
-use buffer::Buffer;
 
-/// What can be typed and what can be drawn in colour are one decision, and this
-/// is the line that keeps them one.
+/// The most the pad will hold. An insert or a paste that would take it past
+/// this is refused rather than trimmed to fit.
 ///
-/// `buffer::MAX_BYTES` carries the argument at length: past
-/// `HIGHLIGHT_MAX_BYTES` the highlighter gives up and answers with plain text,
-/// so a pad allowed to grow past it would go grey one keystroke after it was
-/// fine, at a size nobody chose and with nothing on screen saying why. The two
-/// constants were written out separately only because `source` was private to
-/// the viewer; it is `pub(crate)` now, so a drift between them is a compile
-/// error rather than a colour that quietly stops happening.
-const _: () = assert!(buffer::MAX_BYTES == source::HIGHLIGHT_MAX_BYTES);
+/// The same number as `source::HIGHLIGHT_MAX_BYTES`, and deliberately the same
+/// rather than coincidentally: past that size the highlighter gives up and
+/// returns plain text, so a pad allowed to grow beyond it would go grey one
+/// keystroke after it was fine, at a size nobody chose and with nothing on
+/// screen saying why. What can be typed and what can be drawn in colour are
+/// one decision, and the assertion under this is the line that keeps them one:
+/// a drift between the two is a compile error rather than a colour that
+/// quietly stops happening.
+///
+/// It was the buffer's own constant while the buffer was the pad's. It is the
+/// pad's policy now, handed to the shared editor in [`PAD`]; the files view
+/// hands it the reader's 512 KiB instead and has to say when a file is too big
+/// to colour, which by this line the pad never does.
+const MAX_BYTES: usize = 64 * 1024;
+
+const _: () = assert!(MAX_BYTES == source::HIGHLIGHT_MAX_BYTES);
+
+/// What the pad tells the editor about its text: the cap above, that a tab is
+/// two spaces — typed, pasted or loaded — and that its file is LF with no byte
+/// order mark, so the cap counted on disk is the cap counted in memory.
+///
+/// Two rather than four because the pad holds markdown, where two spaces is a
+/// nesting level and four is a code block. Spaces rather than a literal tab
+/// because a note has no use for one and the pad has never held one: a tab
+/// pasted out of a code block becomes the same two spaces the key types. That
+/// used to be argued from the caret — a tab drawn four cells wide beside a
+/// column counted in characters — and the editor now measures in cells and
+/// draws a tab at its stop, so it is a choice about markdown rather than a
+/// limit of the layout.
+const PAD: Policy = Policy {
+    max_bytes: MAX_BYTES,
+    tabs: Tabs::Spaces(2),
+    line_ending_bytes: 1,
+    bom_bytes: 0,
+};
 
 /// How long the pad must be left alone before it is written.
 ///
@@ -233,57 +247,45 @@ impl Form {
     }
 }
 
-/// What the next frame owes the scroll offset, once it knows the layout.
+/// What a turn from the source to the rendering owes the next frame: the same
+/// fraction of the document on screen.
 ///
-/// Both answers depend on how the text wrapped, and nothing outside `render`
-/// knows that — the pane is not told its width until it is drawn. So the key
-/// that asked records what it wanted and the frame delivers it.
+/// `ViewerPane::toggle_raw`'s answer to the same problem: the two layouts share
+/// no rows, so the nearest honest thing to "where I was" is how far down I was.
+/// It depends on how the rendering wrapped, and nothing outside `render` knows
+/// that — the pane is not told its width until it is drawn — so the key that
+/// asked records what it wanted and the frame delivers it. The other direction,
+/// back to the source, brings the caret into view instead, which is the
+/// editor's `View::follow`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pending {
-    /// Bring the caret's row into view. Every key and click that moves the
-    /// caret asks for this, and nothing else does: `scroll_key` is deliberately
-    /// the one way the pad moves *without* dragging the caret along.
-    Caret,
-    /// Keep the same fraction of the document on screen. What a turn between
-    /// the two forms asks for, and `ViewerPane::toggle_raw`'s answer to the
-    /// same problem: the two layouts share no rows, so the nearest honest thing
-    /// to "where I was" is how far down I was.
-    Fraction { was: usize, before: usize },
+struct Fraction {
+    was: usize,
+    before: usize,
 }
 
-/// What a cached layout was built from.
+/// What a cached rendering was built from.
 ///
-/// All four, because a layout built for any other value of any of them will
-/// draw a row the caret is no longer on: the width decides where lines break,
-/// `rev` says whether the text is the text that was wrapped, the theme decides
-/// the colours the spans carry, and the form decides whether the rows are
-/// source or a rendering of it.
+/// All three, because a rendering built for any other value of any of them is
+/// a rendering of something else: the width decides where lines break, `rev`
+/// says whether the text is the text that was rendered, and the theme decides
+/// the colours. The edit form is not cached here — the editor keeps its own
+/// layout and mends it per line — and the rendering is not mended at all: a
+/// markdown rendering reflows whole paragraphs and tables, so an edit's reach
+/// in it is not a line, and the form it is drawn in is one nobody is typing
+/// into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct For {
     width: usize,
     rev: u64,
     mode: theme::Mode,
-    form: Form,
 }
 
-/// How one logical line was broken into visual rows.
-struct Wrap {
-    /// The document row this line's first row is, so a click on a row can find
-    /// the line it belongs to without re-walking the wrap.
-    first: usize,
-    /// The char index each of this line's rows begins at. Never empty, and
-    /// `starts[0]` is always 0.
-    starts: Vec<usize>,
-}
-
-/// The rows the last layout produced, and the table they were produced by.
-struct Laid {
+/// The rows the last rendering produced. No wrap table beside them: rendered
+/// rows correspond to nothing in the source, so there is no caret to place in
+/// them and no click to answer.
+struct Rendered {
     key: For,
     rows: Vec<Line<'static>>,
-    /// One entry per logical line, and empty in the rendered form — where there
-    /// is no caret to place and no click to answer, because rendered rows do
-    /// not correspond to anything in the source.
-    map: Vec<Wrap>,
 }
 
 /// A per-workspace markdown scratch pad.
@@ -322,8 +324,11 @@ pub struct PadPane {
     path: Option<PathBuf>,
     mode: theme::Mode,
     form: Form,
-    text: Buffer,
-    scroll: Scroll,
+    /// The text, the caret, its undo, and the edit form's layout.
+    text: Editor,
+    /// Where the pad is scrolled to, in either form, and whether the next
+    /// frame owes the caret a place on screen.
+    view: View,
     /// The rect the last frame was given, so `cursor` and a click are answered
     /// against the layout that is actually on screen.
     drawn: Rect,
@@ -361,11 +366,17 @@ pub struct PadPane {
     /// documentation says the two questions differ: a paste can be refused with
     /// room still spare, when what is left is smaller than what arrived.
     refused: bool,
-    /// Bumped on every change to the text, so a cached layout can tell whether
-    /// it was built from this text or the one before it.
+    /// Bumped on every change to the text, so the cached rendering can tell
+    /// whether it was built from this text or the one before it.
+    ///
+    /// The pane's own count, as it always was, rather than the one the editor
+    /// keeps for its layout. The rendering is this pane's cache, and keying it
+    /// by the editor's number would make it right only for as long as the
+    /// editor never starts counting again — which it does whenever it is
+    /// replaced, as `ensure_read` and several tests here replace it.
     rev: u64,
-    pending: Option<Pending>,
-    laid: Option<Laid>,
+    fraction: Option<Fraction>,
+    rendered: Option<Rendered>,
     /// Where the cursor goes, worked out by the frame that drew the row it sits
     /// on. `cursor` takes `&self` and cannot lay anything out, and a second
     /// calculation there is the drift this whole design exists to prevent.
@@ -385,8 +396,8 @@ impl PadPane {
             path: store::path_for(&root),
             mode: mode_of(theme),
             form: Form::Edit,
-            text: Buffer::new(),
-            scroll: Scroll::default(),
+            text: Editor::new(PAD),
+            view: View::default(),
             drawn: Rect::ZERO,
             noticed: 0,
             read: false,
@@ -397,8 +408,8 @@ impl PadPane {
             failed: None,
             refused: false,
             rev: 0,
-            pending: None,
-            laid: None,
+            fraction: None,
+            rendered: None,
             caret: None,
         }
     }
@@ -452,17 +463,20 @@ impl PadPane {
         let loaded = self.path.as_deref().map(store::load_at).unwrap_or_default();
         self.unreadable = loaded.unreadable;
         self.stamp = loaded.stamp;
-        self.text = Buffer::from_text(&loaded.text);
+        self.text = Editor::from_text(PAD, &loaded.text);
         // Either cap, because there are two of them and they are set
-        // independently: `store` stops the read at `buffer::MAX_BYTES` and the
-        // buffer refuses to hold more than that. They agree today, and the day
+        // independently: `store` stops the read at `MAX_BYTES` and the buffer
+        // refuses to hold more than that. They agree today, and the day
         // one of them moves is the day this pane would otherwise start saving a
         // pad it had only seen the front of.
         self.truncated = loaded.truncated || self.text.truncated();
         self.rev += 1;
-        // `from_text` leaves the caret at the end, which is where the next note
-        // goes, so the pad opens showing the end of what is already there.
-        self.pending = Some(Pending::Caret);
+        // The end, which is where the next note goes, so the pad opens showing
+        // the end of what is already there. `from_text` leaves the caret at the
+        // start, because where it goes is a question about what the text is
+        // for, and this is the pad's answer.
+        self.text.set_caret(usize::MAX, usize::MAX);
+        self.view.follow();
     }
 
     /// Write the pad, and say whether anything on screen changed by it.
@@ -487,6 +501,7 @@ impl PadPane {
         let now = match store::save_at(&path, &self.text.text(), self.stamp) {
             Ok(stamp) => {
                 self.stamp = stamp;
+                self.text.mark_saved();
                 // Cleared here and nowhere else, because this field is both the
                 // dirty flag and the retry: `tick` and `flush` each ask it
                 // whether anything is owed, so clearing it up front turned one
@@ -504,92 +519,62 @@ impl PadPane {
         differs
     }
 
-    /// A buffer method that may have changed the text.
-    fn wrote(&mut self, changed: bool) -> Handled {
-        if changed {
-            self.rev += 1;
-            self.changed = Some(Instant::now());
-            self.refused = false;
-            self.pending = Some(Pending::Caret);
+    /// What the editor did with a key, a paste or a click, answered for the
+    /// pad.
+    ///
+    /// An edit is a change the file is owed — unless it landed back on the
+    /// text last written, which the editor's saved point says in one
+    /// comparison, and then nothing is owed and a failure notice from before is
+    /// no longer true. Either way a refusal notice standing from before is
+    /// taken down, since the text it was about is not the text any more, and
+    /// the caret is brought into view. A refusal puts its notice up. A move
+    /// brings the caret into view and changes nothing else.
+    ///
+    /// What the shell is told is [`Outcome::handled`], whose variants carry the
+    /// two arguments this used to make for itself: a refused letter is still
+    /// claimed, because a declined `q` would move the writer into the agent's
+    /// prompt at the moment the pad is full; and a key that did nothing is
+    /// declined, because a frame for it re-renders the agent's whole screen.
+    fn after(&mut self, outcome: Outcome) -> Handled {
+        match outcome {
+            Outcome::Edited => {
+                self.rev += 1;
+                if self.text.is_modified() {
+                    self.changed = Some(Instant::now());
+                } else {
+                    self.changed = None;
+                    self.failed = None;
+                }
+                self.refused = false;
+                self.view.follow();
+            }
+            Outcome::Refused => self.refused = true,
+            Outcome::Moved => self.view.follow(),
+            Outcome::Still => {}
         }
-        changed.into()
-    }
-
-    /// The same, for the three ways in whose only reason to refuse is the cap —
-    /// and which the pad claims whether or not the buffer took them.
-    ///
-    /// `insert`, `insert_str` and `newline` return false when the pad is at
-    /// [`buffer::MAX_BYTES`] and for nothing else worth telling anybody about,
-    /// so a false here is a key that did nothing and a user who has to be told
-    /// why. A dead key and a full pad look identical from the outside, and the
-    /// argument the cap is built on is that a refusal has to be visible.
-    ///
-    /// **Claimed rather than declined, and both halves of that matter.**
-    /// `crate::app` reads a bare `q` the right pane did not want as "the user
-    /// is done with this pane" and moves focus to the agent — so a pad that
-    /// declined the letters it could not fit would eject the writer into the
-    /// agent's prompt at the exact moment it was trying to say it was full,
-    /// with every letter after that going into a conversation. The module doc
-    /// says `q` in the edit form is text; it has to go on being text at the
-    /// cap, because that is the one moment the claim is load-bearing.
-    ///
-    /// The redraw is the same answer to a different question. Setting
-    /// [`refused`](Self::refused) changes what [`PadPane::notices`] will draw,
-    /// and `App::handle_event` paints only for an event something came of, so a
-    /// declined refusal would set the flag and never put the sentence
-    /// explaining it on screen. Nothing else would rescue it either: `tick`
-    /// returns false unless a save is due, and a pad at the cap has nothing
-    /// left to save.
-    ///
-    /// The cost is a frame per repeat while a key is held down against a full
-    /// pad, which `crate::pane::Handled` warns about in general. It is the
-    /// right side of that trade here, because the alternative is not a wasted
-    /// frame but a lost pane.
-    fn typed(&mut self, changed: bool) -> Handled {
-        if changed {
-            return self.wrote(true);
-        }
-        self.refused = true;
-        Handled::Yes
-    }
-
-    /// A caret move, which changes no text and so leaves the layout alone.
-    ///
-    /// It passes the buffer's "did anything move" straight through, and that is
-    /// load-bearing rather than incidental. `Buffer::up` on the top row reports
-    /// false rather than sliding to the start of the document, and the reason
-    /// to keep it that way is not that a reader could not predict the slide —
-    /// vim and VS Code both do it and nobody is surprised by either. It is what
-    /// a false means *here*: not a dead key, but a message to
-    /// `App::handle_key`. A `Yes` for a press that moved nothing spends a frame
-    /// re-rendering the agent's entire screen to redraw a caret that is where
-    /// it already was, and somebody holding `Up` at the top of a pad pays that
-    /// at the key-repeat rate.
-    ///
-    /// Nothing routed through here is `Esc` or `q`, so the one rule that turns
-    /// a declined key into a change of focus cannot fire on an arrow, a `Home`
-    /// or an `End`. That is what makes declining safe on this path and unsafe
-    /// on [`typed`](Self::typed)'s.
-    fn stepped(&mut self, moved: bool) -> Handled {
-        if moved {
-            self.pending = Some(Pending::Caret);
-        }
-        moved.into()
+        outcome.handled()
     }
 
     /// Turn the pad over.
     fn turn(&mut self) -> Handled {
-        self.pending = Some(match self.form {
-            Form::Edit => Pending::Fraction {
-                was: self.scroll.offset,
-                before: self.scroll.max(),
-            },
+        match self.form {
+            Form::Edit => {
+                self.fraction = Some(Fraction {
+                    was: self.view.scroll.offset,
+                    before: self.view.scroll.max(),
+                });
+            }
             // Coming back to the source, the caret is where the reader was
             // before they looked at the rendering, and it is about to be drawn
             // again — so it is both the honest anchor and one that has to be on
-            // screen anyway.
-            Form::Rendered => Pending::Caret,
-        });
+            // screen anyway. A fraction still owed from a turn the other way
+            // that no frame has delivered is forgotten, because it was about a
+            // page that is no longer the one on screen.
+            Form::Rendered => {
+                self.fraction = None;
+                self.view.follow();
+            }
+        }
         self.form = self.form.turned();
         Handled::Yes
     }
@@ -597,69 +582,29 @@ impl PadPane {
     /// Edit mode, where every printable key is text.
     ///
     /// `q`, `j`, `g` and `t` included, which is the trade any type-into-a-pane
-    /// makes and the reason `takes_input` answers true here. Nothing in this
-    /// arm goes near `crate::scroll::Scroll::key`, and that is the single most
-    /// important line in the file: that vocabulary claims `j`, `k`, `g`, `G`,
-    /// `b` and space, every one of which is a letter somebody is in the middle
-    /// of typing, and a pad that routed keys through it would swallow a word
-    /// and scroll instead.
+    /// makes and the reason `takes_input` answers true here. Nothing typed here
+    /// goes near `crate::scroll::Scroll::key` unless the editor has handed it
+    /// back, and that is the single most important line in the file: that
+    /// vocabulary claims `j`, `k`, `g`, `G`, `b` and space, every one of which
+    /// is a letter somebody is in the middle of typing, and a pad that routed
+    /// keys through it would swallow a word and scroll instead.
     fn edit_key(&mut self, key: KeyEvent) -> Handled {
-        let alt = crate::keys::alt_chord(&key);
+        // Before the editor, though it would hand the chord back anyway: this
+        // is the key the whole pane hangs off and it should be the first thing
+        // read here.
+        if matches!(key.code, KeyCode::Char('t' | 'T')) && crate::keys::alt_chord(&key) {
+            return self.turn();
+        }
+        if let Some(outcome) = self.text.key(&key) {
+            return self.after(outcome);
+        }
         match key.code {
-            // Before the text arm, though the guard on that arm would exclude
-            // it anyway: this is the key the whole pane hangs off and it should
-            // be the first thing read here.
-            KeyCode::Char('t' | 'T') if alt => self.turn(),
-            KeyCode::Char(c) if crate::keys::is_text(&key) => {
-                let did = self.text.insert(c);
-                self.typed(did)
-            }
-            // The buffer turns this into spaces, at a width it and the caret
-            // agree about; see `buffer`'s `TAB`.
-            KeyCode::Tab => {
-                let did = self.text.insert('\t');
-                self.typed(did)
-            }
-            KeyCode::Enter => {
-                let did = self.text.newline();
-                self.typed(did)
-            }
-            KeyCode::Backspace => {
-                let did = self.text.backspace();
-                self.wrote(did)
-            }
-            KeyCode::Delete => {
-                let did = self.text.delete();
-                self.wrote(did)
-            }
-            KeyCode::Left => {
-                let did = self.text.left();
-                self.stepped(did)
-            }
-            KeyCode::Right => {
-                let did = self.text.right();
-                self.stepped(did)
-            }
-            KeyCode::Up => {
-                let did = self.text.up();
-                self.stepped(did)
-            }
-            KeyCode::Down => {
-                let did = self.text.down();
-                self.stepped(did)
-            }
-            KeyCode::Home => {
-                let did = self.text.home();
-                self.stepped(did)
-            }
-            KeyCode::End => {
-                let did = self.text.end();
-                self.stepped(did)
-            }
+            KeyCode::Char('s' | 'S') if crate::keys::ctrl_chord(&key) => self.save_now(),
             // The two keys in the scroll vocabulary that are not also letters,
             // so they can go on meaning what they mean everywhere else without
-            // taking a character away from anybody.
-            KeyCode::PageUp | KeyCode::PageDown => self.scroll.key(key).unwrap_or(Handled::No),
+            // taking a character away from anybody. They page the view and
+            // leave the caret, which is what `View::glance` is.
+            KeyCode::PageUp | KeyCode::PageDown => self.view.glance(key),
             // Declined rather than claimed, which is what puts the user back at
             // the agent through `crate::app`'s rule. There is nothing here for
             // `Esc` to close first — no filter box, no draft that is not
@@ -670,15 +615,21 @@ impl PadPane {
 
     /// The rendering, which is a read-only view like any other.
     fn rendered_key(&mut self, key: KeyEvent) -> Handled {
-        if let Some(handled) = self.scroll.key(key) {
+        if let Some(handled) = self.view.scroll.key(key) {
             return handled;
         }
         match key.code {
+            // Saving is not typing, so it is here too; the module doc says why
+            // undo is not.
+            KeyCode::Char('s' | 'S') if crate::keys::ctrl_chord(&key) => self.save_now(),
             // Bare `t` and `Alt+T` both, and the module doc says why the two
-            // forms differ about this. A bare Ctrl chord is excluded because a
-            // Ctrl chord in a right-hand pane belongs to whatever is hosted,
-            // not to abeam — but Ctrl *with* Alt is AltGr rather than a chord,
-            // which is why this is two questions and not `!ctrl`.
+            // forms differ about this. A bare Ctrl chord is excluded, and not
+            // because it belongs to something hosted — the pad hosts nothing,
+            // which is the reason it may take `Ctrl+S` above. `Ctrl+T` is
+            // simply neither the letter nor the chord this pane turns over on,
+            // and a toggle reachable by a third spelling is one more thing
+            // `F1, ?` would have to say. Ctrl *with* Alt is AltGr rather than a
+            // chord, which is why this is two questions and not `!ctrl`.
             KeyCode::Char('t' | 'T')
                 if crate::keys::is_text(&key) || crate::keys::alt_chord(&key) =>
             {
@@ -690,119 +641,51 @@ impl PadPane {
         }
     }
 
-    /// Build the rows and the wrap table, unless the ones in hand were built
-    /// from exactly this text at exactly this width.
-    fn ensure_layout(&mut self, width: usize) {
-        let key = For {
-            width,
-            rev: self.rev,
-            mode: self.mode,
-            form: self.form,
-        };
-        if self.laid.as_ref().is_some_and(|laid| laid.key == key) {
-            return;
+    /// `Ctrl+S`: the save the debounce would make, made now, and nothing when
+    /// nothing is owed.
+    ///
+    /// Through [`store`](Self::store), so it refuses exactly where the
+    /// autosave does — a truncated or unreadable pad, or one with nowhere to
+    /// go, each of which already has its notice standing — and a failure is the
+    /// same sentence on screen. It answers as `tick` does: a frame only when the
+    /// notice appeared or went, because a save that worked changes nothing
+    /// anybody can see.
+    ///
+    /// The undo step being typed ends here whether or not there is anything to
+    /// write, for the reason the module doc gives.
+    fn save_now(&mut self) -> Handled {
+        self.text.end_step();
+        if self.changed.is_none() {
+            return Handled::No;
         }
-        self.laid = Some(match self.form {
-            Form::Rendered => Laid {
-                key,
-                rows: markdown::render(&self.text.text(), width, self.mode),
-                map: Vec::new(),
-            },
+        self.store().into()
+    }
+
+    /// Bring the rows up to date for this width: the editor's own mended
+    /// layout in the edit form, and a rendering built from nothing unless the
+    /// one in hand was built from exactly this text at exactly this width.
+    fn ensure_layout(&mut self, width: usize) {
+        match self.form {
             Form::Edit => {
-                let whole = self.text.text();
-                let styled = source::highlight_code(&whole, "markdown", self.mode);
-                let mut rows: Vec<Line<'static>> = Vec::new();
-                let mut map: Vec<Wrap> = Vec::with_capacity(self.text.lines().len());
-                for (i, line) in self.text.lines().iter().enumerate() {
-                    let chars = line.chars().count();
-                    let spans = faithful(styled.get(i), line);
-                    let starts = breaks(line, width);
-                    let drawn = into_rows(&spans, &starts, chars);
-                    map.push(Wrap {
-                        first: rows.len(),
-                        starts,
-                    });
-                    rows.extend(drawn);
-                }
-                Laid { key, rows, map }
+                let look = Look {
+                    mode: self.mode,
+                    grammar: Grammar::for_code("markdown"),
+                };
+                self.text.lay_out(width, look);
             }
-        });
-    }
-
-    /// Where the caret is in the laid-out document, as `(row, column in
-    /// cells)`.
-    ///
-    /// The wrap table read forwards. `partition_point` finds the last row whose
-    /// start is at or before the caret, which resolves the one genuine
-    /// ambiguity in a wrapped line the way the drawing does: a caret sitting on
-    /// the index where a row begins is at the *start of that row*, in front of
-    /// the character that was pushed down onto it, rather than hanging off the
-    /// end of the row above. [`char_at`] is written to agree with that, which
-    /// is what keeps a click and the cursor it produces on one row.
-    ///
-    /// ## A column past the last cell of a row
-    ///
-    /// This happens, in two shapes, and they are one fact seen twice: the caret
-    /// is at a char index the row's cells do not reach.
-    ///
-    /// The expected shape is the end of a logical line that filled its last row
-    /// exactly. There is no next row for the caret to be at the start of, so
-    /// the column is the row's full width — the terminal's own deferred-wrap
-    /// position, and where the next character really will go.
-    ///
-    /// The other is mid-line, and this comment used to deny that it existed. A
-    /// zero-width character — a combining accent, a variation selector — that
-    /// falls after the last cell of a *full* row is on that row by index and
-    /// adds nothing to its width, so `"aa\u{301}bb\u{301}cc"` at two columns
-    /// reports column two on row zero. It is the same overflow and wants no
-    /// separate handling; the claim was simply wrong.
-    ///
-    /// What a reader sees depends on whether a scrollbar column was kept back.
-    /// From twenty-four columns up `scroll::bar_width` keeps one, and the caret
-    /// sits in it for a frame, which is honest. Below that there is no spare
-    /// column — a sixty-column terminal gives this pane twenty-two — and
-    /// `crate::app` clamps the cursor to the last one, so it is drawn *on* the
-    /// final character rather than after it and reads as being one place back.
-    ///
-    /// That is left alone, and the alternative is the reason. Making the
-    /// position drawable means giving a line that fills its last row exactly an
-    /// extra empty row to hold the caret: either for every such line, which
-    /// litters a pad of full-width prose with blank rows, or only for the line
-    /// the caret is on, which makes the document's row count change as the
-    /// caret moves and the view jump under somebody who pressed `Down`. A caret
-    /// one cell left of true, in the narrowest pane abeam will split at all, is
-    /// the cheapest of the three.
-    fn caret_cell(&self) -> Option<(usize, usize)> {
-        let laid = self.laid.as_ref()?;
-        let (row, col) = self.text.caret();
-        let wrap = laid.map.get(row)?;
-        let line = self.text.lines().get(row)?;
-        let r = wrap
-            .starts
-            .partition_point(|&at| at <= col)
-            .saturating_sub(1);
-        Some((wrap.first + r, cells(line, wrap.starts[r], col)))
-    }
-
-    /// Apply whatever the last key asked of the offset, now that the layout is
-    /// known.
-    fn settle(&mut self, height: usize) {
-        match self.pending.take() {
-            None => {}
-            Some(Pending::Caret) => {
-                if let Some((row, _)) = self.caret_cell() {
-                    if row < self.scroll.offset {
-                        self.scroll.to(row);
-                    } else if height > 0 && row >= self.scroll.offset + height {
-                        self.scroll.to(row + 1 - height);
-                    }
+            Form::Rendered => {
+                let key = For {
+                    width,
+                    rev: self.rev,
+                    mode: self.mode,
+                };
+                if self.rendered.as_ref().is_some_and(|r| r.key == key) {
+                    return;
                 }
-            }
-            Some(Pending::Fraction { was, before }) => {
-                // A form that fitted the pane whole has no fraction to keep,
-                // and the top is the only place it can have been.
-                let to = (was * self.scroll.max()).checked_div(before).unwrap_or(0);
-                self.scroll.to(to);
+                self.rendered = Some(Rendered {
+                    key,
+                    rows: markdown::render(&self.text.text(), width, self.mode),
+                });
             }
         }
     }
@@ -853,7 +736,7 @@ impl PadPane {
              session, because writing what is here would delete the rest of \
              that file.",
             self.names(),
-            buffer::MAX_BYTES / 1024
+            MAX_BYTES / 1024
         )
     }
 
@@ -903,7 +786,7 @@ fn full() -> String {
     format!(
         "The pad is full at {} KiB and will take nothing more. Move some of \
          what is here somewhere else to make room.",
-        buffer::MAX_BYTES / 1024
+        MAX_BYTES / 1024
     )
 }
 
@@ -925,157 +808,8 @@ fn would_not_fit() -> String {
         "That would not fit. The pad holds {} KiB, and what will not fit is \
          turned away whole rather than trimmed to the room left, so nothing \
          was added.",
-        buffer::MAX_BYTES / 1024
+        MAX_BYTES / 1024
     )
-}
-
-/// Where a logical line breaks when it is hard-wrapped to `width` cells.
-///
-/// The char index each visual row starts at, first one included, so the result
-/// is never empty and `starts[0]` is always 0. This is the whole of the layout:
-/// the drawing, the cursor and a click are all this table read one way or the
-/// other, which is what stops the caret and the text it is in disagreeing about
-/// which row they are on.
-///
-/// The `i > last` guard is what makes a character wider than the pane land
-/// somewhere rather than spinning: in a one-column pane an ideograph does not
-/// fit on any row, so it goes on the empty row it is already on and overflows
-/// it. A row that is one cell too wide is a cosmetic fault in a pane nobody can
-/// read anyway; a loop that never breaks the line is a hang in the draw path.
-fn breaks(line: &str, width: usize) -> Vec<usize> {
-    let width = width.max(1);
-    let mut starts = vec![0usize];
-    let mut used = 0usize;
-    for (i, ch) in line.chars().enumerate() {
-        let w = ch.width().unwrap_or(0);
-        if used + w > width && i > starts[starts.len() - 1] {
-            starts.push(i);
-            used = 0;
-        }
-        used += w;
-    }
-    starts
-}
-
-/// The cells `line` occupies between two char indices.
-fn cells(line: &str, from: usize, to: usize) -> usize {
-    line.chars()
-        .skip(from)
-        .take(to.saturating_sub(from))
-        .map(|ch| ch.width().unwrap_or(0))
-        .sum()
-}
-
-/// Which character of `line` a click at cell `col` landed on, for the row that
-/// begins at `from` and is followed by the row beginning at `next`.
-///
-/// The wrap table read backwards, and the one place a pointer becomes a text
-/// position. `next` is `None` on the last row of a logical line, and it is an
-/// `Option` rather than a second index because "is there another row after this
-/// one" is precisely what the answer turns on: a caller handed two numbers
-/// could get the relationship between them wrong, and a caller handed
-/// `starts.get(r + 1).copied()` cannot.
-///
-/// **Past the end of a wrapped row the answer is one short of where the next
-/// row starts**, and that subtraction is the whole of the invariant the module
-/// doc names. The caret positions belonging to a row are the indices inside it;
-/// the index the next row begins at belongs to *that* row, because
-/// [`PadPane::caret_cell`], reading the same table forwards, draws it there.
-/// Answering `next` would put the caret one line below the cell the pointer was
-/// over, and it takes no exotic text to reproduce — `abc日def` at four columns
-/// wraps after `abc`, so cell three of the first row is already past its
-/// content, and any line with an ideograph or an emoji in it has such a cell on
-/// most of its rows.
-///
-/// On the last row of a line there is no next row and the answer is the end of
-/// the line, which is what makes a click in the empty space to the right of a
-/// short line mean the end of that line — the commonest click there is, and the
-/// one `Buffer::set_caret`'s documentation is written around.
-///
-/// Inside a wide character the caret goes in front of it rather than to the
-/// nearer edge. Splitting an ideograph down the middle would make the answer
-/// depend on which half of a two-cell glyph the pointer was over, which is not
-/// something anybody aims at.
-fn char_at(line: &str, from: usize, next: Option<usize>, col: usize) -> usize {
-    let end = next.unwrap_or_else(|| line.chars().count());
-    let mut used = 0usize;
-    for (i, ch) in line
-        .chars()
-        .enumerate()
-        .skip(from)
-        .take(end.saturating_sub(from))
-    {
-        let w = ch.width().unwrap_or(0);
-        if used + w > col {
-            return i;
-        }
-        used += w;
-    }
-    // `breaks` emits no empty row, so a wrapped row always has a character to
-    // step back over and the floor below never fires. A floor rather than an
-    // assertion because this runs under somebody's pointer: the cost of being
-    // wrong about that should be a caret in a dull place, not the program going
-    // down mid-click.
-    match next {
-        Some(next) => next.saturating_sub(1).max(from),
-        None => end,
-    }
-}
-
-/// How many characters a run of spans holds.
-fn spans_chars(spans: &[Span<'static>]) -> usize {
-    spans.iter().map(|s| s.content.chars().count()).sum()
-}
-
-/// The highlighter's spans for one source line, or a plain one when they do not
-/// add up to the line they came from.
-///
-/// A function rather than three lines inside the layout, so that the guard can
-/// be exercised at all: what it defends against is a highlighter that
-/// miscounts, and there is no way to ask syntect for one. Eleven awkward
-/// markdown lines through the real thing all came back exact, so today this is
-/// belt to a brace that holds — but the brace is a foreign grammar engine one
-/// version bump away, and the cost of it ever being wrong is every colour on
-/// the row sliding off the word it belongs to, silently, in the one pane whose
-/// contents nobody but the user wrote. A row that has lost its colours says
-/// nothing untrue.
-fn faithful(spans: Option<&Vec<Span<'static>>>, line: &str) -> Vec<Span<'static>> {
-    match spans {
-        Some(spans) if spans_chars(spans) == line.chars().count() => spans.clone(),
-        _ => vec![Span::raw(line.to_string())],
-    }
-}
-
-/// Cut one logical line's spans at the indices [`breaks`] gave, keeping their
-/// colours.
-///
-/// Flattened to characters first, and that is not laziness: a cut has to be
-/// able to land in the middle of a span, spans do not line up with rows, and
-/// the two accounts of where a character is have to be the same walk or they
-/// are the drift this file exists to prevent. The runs are rebuilt afterwards,
-/// so a row of one colour is one span again.
-fn into_rows(spans: &[Span<'static>], starts: &[usize], chars: usize) -> Vec<Line<'static>> {
-    let flat: Vec<(char, Style)> = spans
-        .iter()
-        .flat_map(|span| {
-            let style = span.style;
-            span.content.chars().map(move |ch| (ch, style))
-        })
-        .collect();
-    (0..starts.len())
-        .map(|r| {
-            let from = starts[r].min(flat.len());
-            let to = starts.get(r + 1).copied().unwrap_or(chars).min(flat.len());
-            let mut row: Vec<Span<'static>> = Vec::new();
-            for &(ch, style) in &flat[from..to] {
-                match row.last_mut() {
-                    Some(last) if last.style == style => last.content.to_mut().push(ch),
-                    _ => row.push(Span::styled(ch.to_string(), style)),
-                }
-            }
-            Line::from(row)
-        })
-        .collect()
 }
 
 impl Pane for PadPane {
@@ -1160,25 +894,39 @@ impl Pane for PadPane {
             return;
         }
         self.ensure_layout(width);
-        let len = self.laid.as_ref().map_or(0, |laid| laid.rows.len());
-        self.scroll.measure(len, area.height as usize);
-        self.settle(area.height as usize);
-
         let text = Rect {
             width: width as u16,
             ..area
         };
-        if let Some(laid) = &self.laid {
-            let visible: Vec<Line<'static>> = laid
-                .rows
-                .iter()
-                .skip(self.scroll.offset)
-                .take(area.height as usize)
-                .cloned()
-                .collect();
-            f.render_widget(Paragraph::new(visible), text);
-        }
-        self.scroll.render_bar(f, area);
+        let height = area.height as usize;
+        let visible: Vec<Line<'static>> = match self.form {
+            // Measured, brought into view if a key asked, and coloured as far as
+            // the screen: the editor's `View`.
+            Form::Edit => self
+                .view
+                .frame(&mut self.text, height)
+                .into_iter()
+                .map(|row| row.text)
+                .collect(),
+            Form::Rendered => {
+                self.view.hide_cursor();
+                let rows = self.rendered.as_ref().map_or(&[][..], |r| &r.rows[..]);
+                self.view.scroll.measure(rows.len(), height);
+                if let Some(Fraction { was, before }) = self.fraction.take() {
+                    // A form that fitted the pane whole has no fraction to
+                    // keep, and the top is the only place it can have been.
+                    let to = (was * self.view.scroll.max()).checked_div(before).unwrap_or(0);
+                    self.view.scroll.to(to);
+                }
+                rows.iter()
+                    .skip(self.view.scroll.offset)
+                    .take(height)
+                    .cloned()
+                    .collect()
+            }
+        };
+        f.render_widget(Paragraph::new(visible), text);
+        self.view.scroll.render_bar(f, area);
 
         if self.text.is_empty() {
             // Under the first row in the edit form, because that row is the one
@@ -1200,15 +948,9 @@ impl Pane for PadPane {
             }
         }
 
-        if self.form == Form::Edit
-            && let Some((row, col)) = self.caret_cell()
-            && row >= self.scroll.offset
-            && row < self.scroll.offset + area.height as usize
-        {
-            self.caret = Some((
-                col as u16,
-                (area.y - inner.y) + (row - self.scroll.offset) as u16,
-            ));
+        // In pane coordinates: the view's row, below the notices.
+        if let Some((col, row)) = self.view.cursor() {
+            self.caret = Some((col as u16, (area.y - inner.y) + row as u16));
         }
     }
 
@@ -1239,40 +981,10 @@ impl Pane for PadPane {
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
         // The wheel first, and in both forms: it is the one gesture that means
         // the same thing on a page you are writing and a page you are reading.
-        if let Some(handled) = self.scroll.mouse(ev) {
+        if let Some(handled) = self.view.wheel(ev) {
             return Ok(handled);
         }
         if self.form != Form::Edit || !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return Ok(Handled::No);
-        }
-        let Some(laid) = self.laid.as_ref() else {
-            return Ok(Handled::No);
-        };
-        if laid.rows.is_empty() || laid.map.is_empty() {
-            return Ok(Handled::No);
-        }
-        // The one place this file reads the wrap table from outside the frame
-        // that built it, and so the one place it can be stale. `App::run`
-        // drains every queued input event before it draws, so a keystroke and a
-        // click arriving together get here with the keystroke applied and the
-        // layout still describing the text from before it: paste three lines,
-        // press `Enter` at the start of the first, click the third row, and the
-        // caret lands on the second — a line the pointer was never over, with
-        // no panic to mark it because `set_caret` clamps whatever it is handed.
-        // Declined rather than answered against the wrong table. The click
-        // becomes a selection, which is what `crate::app` does with everything
-        // a pane turns down, and the frame the keystroke has already asked for
-        // makes the next one right.
-        if laid.key.rev != self.rev {
-            return Ok(Handled::No);
-        }
-        // The column `scroll::bar_width` kept back is not a place in the text,
-        // whether or not a bar is drawn in it — without this a click there
-        // lands at the end of the row, which is a plausible answer to a
-        // question nobody asked. Harmless today, because `Scroll::mouse`
-        // answers only the wheel; the day the bar can be dragged it is a press
-        // that has already moved the caret before the bar ever sees it.
-        if ev.column as usize >= laid.key.width {
             return Ok(Handled::No);
         }
         // `ev.row` is pane-relative already; the notices are what stand between
@@ -1281,29 +993,20 @@ impl Pane for PadPane {
         let Some(row) = ev.row.checked_sub(self.noticed) else {
             return Ok(Handled::No);
         };
-        // A click below the last row means the last row, which is
-        // `Buffer::set_caret`'s own rule and the same one that makes a click
-        // past the end of a short line mean the end of it.
-        let at = (self.scroll.offset + row as usize).min(laid.rows.len() - 1);
-        let i = laid
-            .map
-            .partition_point(|wrap| wrap.first <= at)
-            .saturating_sub(1);
-        let Some(wrap) = laid.map.get(i) else {
-            return Ok(Handled::No);
-        };
-        let Some(line) = self.text.lines().get(i) else {
-            return Ok(Handled::No);
-        };
-        let r = at - wrap.first;
-        let col = char_at(
-            line,
-            wrap.starts[r],
-            wrap.starts.get(r + 1).copied(),
-            ev.column as usize,
-        );
-        let moved = self.text.set_caret(i, col);
-        Ok(self.stepped(moved))
+        // From there the editor's to answer, through the view that drew the
+        // rows — including the two clicks it declines rather than answers
+        // wrongly: one against a table the last keystroke has invalidated, and
+        // one on the column `scroll::bar_width` kept back. `Editor::click`
+        // carries both arguments. A declined click becomes a selection, which
+        // is what `crate::app` does with everything a pane turns down, and the
+        // frame the keystroke has already asked for makes the next one right.
+        match self
+            .view
+            .click(&mut self.text, row as usize, ev.column as usize)
+        {
+            Some(true) => Ok(self.after(Outcome::Moved)),
+            Some(false) | None => Ok(Handled::No),
+        }
     }
 
     /// The glance path — `Alt+J`, `Alt+K`, `Alt+PgDn`, `Alt+PgUp` — in both
@@ -1319,7 +1022,7 @@ impl Pane for PadPane {
     /// mistake would be worse: a glance binding that reached `edit_key` would
     /// type into a document.
     fn scroll_key(&mut self, key: KeyEvent) -> Result<Handled> {
-        Ok(self.scroll.key(key).unwrap_or(Handled::No))
+        Ok(self.view.glance(key))
     }
 
     /// True in the edit form and false in the rendering, which is the question
@@ -1341,15 +1044,11 @@ impl Pane for PadPane {
         if self.form != Form::Edit {
             return Ok(Handled::No);
         }
-        // A paste of nothing is not a paste that would not fit, and `typed`
-        // cannot tell the two apart: `Buffer::insert_str` answers false for
-        // both. Without this an empty clipboard would put a notice on screen
-        // saying the pad was too small to hold it.
-        if text.is_empty() {
-            return Ok(Handled::No);
-        }
-        let did = self.text.insert_str(text);
-        Ok(self.typed(did))
+        // An empty clipboard comes back `Still` rather than `Refused` — see
+        // `Editor::paste` — so it puts no notice up saying the pad was too
+        // small to hold it.
+        let outcome = self.text.paste(text);
+        Ok(self.after(outcome))
     }
 }
 
@@ -1396,6 +1095,10 @@ mod tests {
 
     fn alt(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     fn click(column: u16, row: u16) -> MouseEvent {
@@ -1467,14 +1170,14 @@ mod tests {
         p.handle_paste(&"a line\n".repeat(40)).unwrap();
         p.handle_key(alt(KeyCode::Char('t'))).unwrap();
         screen(&mut p, 30, 6);
-        p.scroll.to(0);
+        p.view.scroll.to(0);
 
         assert_eq!(p.handle_key(key(KeyCode::Char('j'))).unwrap(), Handled::Yes);
-        assert_eq!(p.scroll.offset, 1);
+        assert_eq!(p.view.scroll.offset, 1);
         assert_eq!(p.handle_key(key(KeyCode::Char('G'))).unwrap(), Handled::Yes);
-        assert_eq!(p.scroll.offset, p.scroll.max());
+        assert_eq!(p.view.scroll.offset, p.view.scroll.max());
         assert_eq!(p.handle_key(key(KeyCode::Char('g'))).unwrap(), Handled::Yes);
-        assert_eq!(p.scroll.offset, 0);
+        assert_eq!(p.view.scroll.offset, 0);
         // ...and `q` is the shell's again, which is how you leave a read-only
         // view.
         assert_eq!(p.handle_key(key(KeyCode::Char('q'))).unwrap(), Handled::No);
@@ -1549,9 +1252,9 @@ mod tests {
         assert_eq!(p.handle_key(altgr('t')).unwrap(), Handled::Yes);
         assert_eq!(p.form, Form::Edit);
 
-        // A plain Ctrl chord is still not the toggle: in a right-hand pane that
-        // belongs to whatever is hosted, and it is only Ctrl *with* Alt that
-        // means AltGr.
+        // A plain Ctrl chord is still not the toggle: the pad's Ctrl chords
+        // are undo, redo and save, and it is only Ctrl *with* Alt that means
+        // AltGr.
         let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(p.handle_key(ctrl_t).unwrap(), Handled::No);
         assert_eq!(p.form, Form::Edit);
@@ -1784,14 +1487,14 @@ mod tests {
         let (mut p, _) = pad(&dir);
         p.handle_paste(&"a line\n".repeat(40)).unwrap();
         screen(&mut p, 30, 6);
-        assert!(p.scroll.offset > 0, "a pad opens where the writing stopped");
+        assert!(p.view.scroll.offset > 0, "a pad opens where the writing stopped");
 
         let before = p.text.text();
-        p.scroll.to(0);
+        p.view.scroll.to(0);
         assert_eq!(p.scroll_key(key(KeyCode::Down)).unwrap(), Handled::Yes);
-        assert_eq!(p.scroll.offset, 1);
+        assert_eq!(p.view.scroll.offset, 1);
         assert_eq!(p.scroll_key(key(KeyCode::PageDown)).unwrap(), Handled::Yes);
-        assert!(p.scroll.offset > 1);
+        assert!(p.view.scroll.offset > 1);
         assert_eq!(p.scroll_key(key(KeyCode::Up)).unwrap(), Handled::Yes);
         assert_eq!(
             p.text.text(),
@@ -1803,9 +1506,9 @@ mod tests {
         // the override has to keep working.
         p.handle_key(alt(KeyCode::Char('t'))).unwrap();
         screen(&mut p, 30, 6);
-        p.scroll.to(0);
+        p.view.scroll.to(0);
         assert_eq!(p.scroll_key(key(KeyCode::Down)).unwrap(), Handled::Yes);
-        assert_eq!(p.scroll.offset, 1);
+        assert_eq!(p.view.scroll.offset, 1);
     }
 
     #[test]
@@ -1819,17 +1522,17 @@ mod tests {
         let (mut p, _) = pad(&dir);
         p.handle_paste(&"a line\n".repeat(40)).unwrap();
         screen(&mut p, 30, 8);
-        p.scroll.to(12);
-        let was = p.scroll.offset;
+        p.view.scroll.to(12);
+        let was = p.view.scroll.offset;
         assert!(was > 0, "somewhere to come back to");
 
         draw(&mut p, Rect::new(0, 0, 30, 0));
         draw(&mut p, Rect::new(0, 0, 0, 8));
         draw(&mut p, Rect::new(0, 0, 0, 0));
-        assert_eq!(p.scroll.offset, was);
+        assert_eq!(p.view.scroll.offset, was);
 
         screen(&mut p, 30, 8);
-        assert_eq!(p.scroll.offset, was, "the pad came back somewhere else");
+        assert_eq!(p.view.scroll.offset, was, "the pad came back somewhere else");
     }
 
     #[test]
@@ -1838,15 +1541,15 @@ mod tests {
         let (mut p, _) = pad(&dir);
         p.handle_paste(&"a line\n".repeat(40)).unwrap();
         screen(&mut p, 30, 6);
-        p.scroll.to(0);
+        p.view.scroll.to(0);
         p.handle_mouse(&wheel_down()).unwrap();
-        assert_eq!(p.scroll.offset, 3);
+        assert_eq!(p.view.scroll.offset, 3);
 
         p.handle_key(alt(KeyCode::Char('t'))).unwrap();
         screen(&mut p, 30, 6);
-        p.scroll.to(0);
+        p.view.scroll.to(0);
         p.handle_mouse(&wheel_down()).unwrap();
-        assert_eq!(p.scroll.offset, 3);
+        assert_eq!(p.view.scroll.offset, 3);
     }
 
     // --- pasting ----------------------------------------------------------
@@ -1894,7 +1597,7 @@ mod tests {
         let dir = TempDir::new("pad-full");
         let (mut p, _) = pad(&dir);
         p.read = true;
-        p.text = Buffer::from_text(&"x".repeat(buffer::MAX_BYTES));
+        p.text = Editor::from_text(PAD, &"x".repeat(MAX_BYTES));
         p.rev += 1;
 
         assert_eq!(p.handle_key(key(KeyCode::Char('y'))).unwrap(), Handled::Yes);
@@ -1914,7 +1617,7 @@ mod tests {
         let dir = TempDir::new("pad-full-q");
         let (mut p, _) = pad(&dir);
         p.read = true;
-        p.text = Buffer::from_text(&"x".repeat(buffer::MAX_BYTES));
+        p.text = Editor::from_text(PAD, &"x".repeat(MAX_BYTES));
         p.rev += 1;
 
         for ch in "qjgt ".chars() {
@@ -1933,13 +1636,13 @@ mod tests {
     fn a_refusal_asks_for_the_frame_that_draws_the_notice_explaining_it() {
         // `App::handle_event` paints only for an event something came of, so a
         // refusal reporting `No` would set the flag and never show the sentence
-        // — which is the silence `buffer::MAX_BYTES` is built to prevent, back
+        // — which is the silence `MAX_BYTES` is built to prevent, back
         // by another door. Nothing else rescues it: `tick` asks for no frame
         // unless a save is due, and a pad at the cap has nothing left to save.
         let dir = TempDir::new("pad-refusal-frame");
         let (mut p, _) = pad(&dir);
         p.read = true;
-        p.text = Buffer::from_text(&"x".repeat(buffer::MAX_BYTES));
+        p.text = Editor::from_text(PAD, &"x".repeat(MAX_BYTES));
         p.rev += 1;
         // A frame with no notice on it yet, so that the assertion below is
         // about this keystroke rather than about what was already drawn.
@@ -1951,7 +1654,7 @@ mod tests {
         // `Buffer::is_full`'s caveat is about — refused, with the pad not full
         // — and it is a keystroke rather than a paste, which is the half the
         // notice used to be wrong about.
-        p.text = Buffer::from_text(&"x".repeat(buffer::MAX_BYTES - 1));
+        p.text = Editor::from_text(PAD, &"x".repeat(MAX_BYTES - 1));
         p.rev += 1;
         assert!(!p.text.is_full(), "room to spare");
         let quiet = screen(&mut p, 46, 10);
@@ -1985,7 +1688,7 @@ mod tests {
         let dir = TempDir::new("pad-refused");
         let (mut p, _) = pad(&dir);
         p.read = true;
-        p.text = Buffer::from_text(&"x".repeat(buffer::MAX_BYTES - 4));
+        p.text = Editor::from_text(PAD, &"x".repeat(MAX_BYTES - 4));
         p.rev += 1;
         assert!(!p.text.is_full());
 
@@ -2007,6 +1710,225 @@ mod tests {
         p.failed = Some("abeam could not save the scratch pad: nowhere.".to_string());
         let drawn = screen(&mut p, 46, 10);
         assert!(drawn.contains("nowhere"), "{}", &drawn[..46 * 3]);
+    }
+
+    // --- undo, redo, and saving now ---------------------------------------
+
+    #[test]
+    fn ctrl_z_takes_a_sentence_back_a_word_at_a_time_and_ctrl_y_puts_it_back() {
+        let dir = TempDir::new("pad-undo");
+        let (mut p, _) = pad(&dir);
+        screen(&mut p, 40, 8);
+        type_in(&mut p, "the retry budget");
+
+        assert_eq!(p.handle_key(ctrl('z')).unwrap(), Handled::Yes);
+        assert_eq!(p.text.text(), "the retry ");
+        assert_eq!(p.handle_key(ctrl('z')).unwrap(), Handled::Yes);
+        assert_eq!(p.text.text(), "the ");
+        assert_eq!(p.handle_key(ctrl('y')).unwrap(), Handled::Yes);
+        assert_eq!(p.text.text(), "the retry ");
+
+        // The caret came back with the text, and the next frame draws it
+        // there: after the word that was put back, not where it was before.
+        screen(&mut p, 40, 8);
+        assert_eq!(p.cursor(), Some((10, 0)));
+    }
+
+    #[test]
+    fn an_undo_with_nothing_to_take_back_types_nothing_and_asks_for_no_frame() {
+        let dir = TempDir::new("pad-undo-nothing");
+        let (mut p, _) = pad(&dir);
+        screen(&mut p, 40, 8);
+        assert_eq!(p.handle_key(ctrl('z')).unwrap(), Handled::No);
+        assert_eq!(p.handle_key(ctrl('y')).unwrap(), Handled::No);
+        assert_eq!(p.text.text(), "", "a chord is not a letter");
+
+        // A capital with no Shift reported is Caps Lock, and still undo; with
+        // the Shift reported it is `Ctrl+Shift+Z`, which is redo.
+        type_in(&mut p, "x");
+        let caps = KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::CONTROL);
+        assert_eq!(p.handle_key(caps).unwrap(), Handled::Yes);
+        assert_eq!(p.text.text(), "");
+        let shifted = KeyEvent::new(
+            KeyCode::Char('Z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(p.handle_key(shifted).unwrap(), Handled::Yes);
+        assert_eq!(p.text.text(), "x");
+    }
+
+    #[test]
+    fn altgr_z_is_a_character_and_not_an_undo() {
+        // Ctrl+Alt is how Windows spells AltGr, and on a layout where AltGr+Z
+        // types something it arrives as that character. Read as an undo, it
+        // would take text back while the user was typing more of it.
+        let dir = TempDir::new("pad-altgr-z");
+        let (mut p, _) = pad(&dir);
+        type_in(&mut p, "ab");
+        let altgr = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT | KeyModifiers::CONTROL);
+        assert_eq!(p.handle_key(altgr).unwrap(), Handled::Yes);
+        assert_eq!(p.text.text(), "abz");
+    }
+
+    #[test]
+    fn an_undo_is_owed_to_the_file_like_any_other_edit() {
+        let dir = TempDir::new("pad-undo-saved");
+        let (mut p, path) = pad(&dir);
+        screen(&mut p, 40, 8);
+        type_in(&mut p, "keep this drop that");
+        p.flush();
+        assert!(p.changed.is_none());
+
+        p.handle_key(ctrl('z')).unwrap();
+        assert_eq!(p.text.text(), "keep this drop ");
+        assert!(p.changed.is_some(), "the undo changed the text and is unsaved");
+        p.changed = Instant::now().checked_sub(QUIET * 2);
+        assert!(!p.tick());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the pad"),
+            "keep this drop "
+        );
+    }
+
+    #[test]
+    fn an_undo_back_to_what_was_saved_leaves_nothing_owed() {
+        let dir = TempDir::new("pad-undo-to-saved");
+        let (mut p, path) = pad(&dir);
+        screen(&mut p, 40, 8);
+        type_in(&mut p, "abc");
+        p.handle_key(ctrl('s')).unwrap();
+        assert!(p.changed.is_none());
+
+        // The step after a save is a step of its own — this used to undo all
+        // six letters — and undoing it lands on what is on disk.
+        type_in(&mut p, "def");
+        assert!(p.changed.is_some());
+        p.handle_key(ctrl('z')).unwrap();
+        assert_eq!(p.text.text(), "abc");
+        assert!(p.changed.is_none(), "the file already has this text");
+
+        // So the debounce writes nothing: the file is left as it is.
+        std::fs::write(&path, "abc").expect("the same bytes, newer");
+        let before = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        assert!(!p.tick());
+        p.flush();
+        assert_eq!(std::fs::metadata(&path).and_then(|m| m.modified()).ok(), before);
+    }
+
+    #[test]
+    fn ctrl_s_on_a_pad_that_must_not_be_saved_writes_nothing() {
+        // The truncated and the unreadable pad each refuse every save for the
+        // session, and `Ctrl+S` is a save like the others: it must not be the
+        // one door that writes the front of somebody's notes over the whole.
+        let dir = TempDir::new("pad-ctrl-s-truncated");
+        let (mut p, path) = pad(&dir);
+        p.read = true;
+        p.truncated = true;
+        p.text = Editor::from_text(PAD, "the first sixty-four kilobytes of it\n");
+        p.rev += 1;
+        type_in(&mut p, "more");
+        p.handle_key(ctrl('s')).unwrap();
+        assert!(!path.exists(), "a truncated pad was written by Ctrl+S");
+
+        let dir = TempDir::new("pad-ctrl-s-unreadable");
+        let (mut p, path) = pad(&dir);
+        std::fs::create_dir_all(&path).expect("a directory in the file's place");
+        screen(&mut p, 46, 12);
+        assert!(p.unreadable);
+        type_in(&mut p, "more");
+        p.handle_key(ctrl('s')).unwrap();
+        assert!(p.failed.is_none(), "the pane tried to write: {:?}", p.failed);
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn an_undo_takes_down_the_notice_about_a_refusal_it_has_made_moot() {
+        let dir = TempDir::new("pad-undo-refused");
+        let (mut p, _) = pad(&dir);
+        p.read = true;
+        p.text = Editor::from_text(PAD, &"x".repeat(MAX_BYTES - 4));
+        p.rev += 1;
+        type_in(&mut p, "ab");
+        p.handle_paste("a paste much longer than the two bytes left").unwrap();
+        assert!(p.refused);
+
+        assert_eq!(p.handle_key(ctrl('z')).unwrap(), Handled::Yes);
+        assert!(!p.refused, "the notice outlived the text it was about");
+    }
+
+    #[test]
+    fn ctrl_s_saves_now_rather_than_two_seconds_from_now() {
+        let dir = TempDir::new("pad-ctrl-s");
+        let (mut p, path) = pad(&dir);
+        screen(&mut p, 40, 8);
+        type_in(&mut p, "a thought worth keeping");
+        assert!(!path.exists(), "the debounce has not run");
+
+        assert_eq!(
+            p.handle_key(ctrl('s')).unwrap(),
+            Handled::No,
+            "a save that worked changes nothing on screen, so asks for no frame"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the pad Ctrl+S wrote"),
+            "a thought worth keeping"
+        );
+        assert!(p.changed.is_none(), "and nothing is owed any more");
+        assert_eq!(p.text.text(), "a thought worth keeping", "and nothing was typed");
+
+        // With nothing owed it writes nothing, as `flush` does not.
+        std::fs::remove_file(&path).expect("clear the file");
+        assert_eq!(p.handle_key(ctrl('s')).unwrap(), Handled::No);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn ctrl_s_saves_from_the_rendering_too_and_undo_does_not_reach_it() {
+        let dir = TempDir::new("pad-ctrl-s-rendered");
+        let (mut p, path) = pad(&dir);
+        screen(&mut p, 40, 8);
+        type_in(&mut p, "read it back");
+        p.handle_key(alt(KeyCode::Char('t'))).unwrap();
+        assert_eq!(p.form, Form::Rendered);
+
+        p.handle_key(ctrl('s')).unwrap();
+        assert!(path.exists(), "saving is not typing, so the rendering takes it");
+        assert_eq!(p.handle_key(ctrl('z')).unwrap(), Handled::No);
+        assert_eq!(p.text.text(), "read it back", "the rendering is read-only");
+    }
+
+    #[test]
+    fn a_ctrl_s_that_fails_says_so_on_screen() {
+        // The retry test's obstruction: a file where the pad's directory would
+        // have to be.
+        let dir = TempDir::new("pad-ctrl-s-failed");
+        let (mut p, _) = pad(&dir);
+        screen(&mut p, 40, 8);
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("a file in the way");
+        p.set_path(blocked.join("scratch.md"));
+        type_in(&mut p, "worth keeping");
+
+        assert_eq!(
+            p.handle_key(ctrl('s')).unwrap(),
+            Handled::Yes,
+            "the failure is a notice that was not there before"
+        );
+        assert!(p.failed.is_some());
+        assert!(p.changed.is_some(), "and the save is still owed");
+    }
+
+    #[test]
+    fn the_overlay_names_the_pads_three_ctrl_keys() {
+        let row = |key: &str| {
+            crate::keys::HELP
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, what)| *what)
+                .unwrap_or_else(|| panic!("{key} is not in the F1 overlay"))
+        };
+        assert!(row("Ctrl+Z / Ctrl+Y (pad)").contains("undo / redo"));
+        assert!(row("Ctrl+S (pad)").contains("save now"));
     }
 
     // --- the file -----------------------------------------------------------
@@ -2073,7 +1995,7 @@ mod tests {
         // to prove it again would say nothing about the pane.
         p.read = true;
         p.truncated = true;
-        p.text = Buffer::from_text("the first sixty-four kilobytes of it\n");
+        p.text = Editor::from_text(PAD, "the first sixty-four kilobytes of it\n");
         p.rev += 1;
 
         let drawn = screen(&mut p, 46, 12);
@@ -2203,95 +2125,5 @@ mod tests {
             theirs,
             "the other window's notes were overwritten"
         );
-    }
-
-    // --- the layout, in the small ------------------------------------------
-
-    #[test]
-    fn a_line_breaks_where_the_cells_run_out_and_never_before() {
-        assert_eq!(breaks("", 10), [0]);
-        assert_eq!(
-            breaks("abcdefghij", 10),
-            [0],
-            "an exactly full row is one row"
-        );
-        assert_eq!(breaks("abcdefghijk", 10), [0, 10]);
-        // Cells, not characters: two ideographs fill four columns.
-        assert_eq!(breaks("設計設計設", 4), [0, 2, 4]);
-        // A character wider than the pane still lands somewhere.
-        assert_eq!(breaks("設計", 1), [0, 1]);
-    }
-
-    #[test]
-    fn the_rows_and_the_caret_are_cut_from_the_same_table() {
-        // `into_rows` is handed the indices `breaks` produced, so a row's text
-        // is by construction the characters the caret map says are on it.
-        let line = "設計abcdefgh";
-        let starts = breaks(line, 10);
-        let rows = into_rows(
-            &[Span::raw(line.to_string())],
-            &starts,
-            line.chars().count(),
-        );
-        let text: Vec<String> = rows
-            .iter()
-            .map(|row| row.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert_eq!(text, ["設計abcdef", "gh"]);
-        assert_eq!(cells(line, starts[0], 4), 6);
-        // Past the end of the last row is the end of the line; past the end of
-        // a wrapped one stops short of where the next row begins, so that the
-        // forward reading draws it back on the row that was clicked.
-        assert_eq!(char_at(line, starts[1], None, 99), 10);
-        assert_eq!(char_at(line, starts[0], Some(starts[1]), 99), starts[1] - 1);
-    }
-
-    #[test]
-    fn colours_are_cut_at_the_place_the_text_is() {
-        let styled = vec![
-            Span::styled("abc".to_string(), err()),
-            Span::raw("defgh".to_string()),
-        ];
-        let rows = into_rows(&styled, &[0, 4], 8);
-        assert_eq!(rows[0].spans.len(), 2, "the cut fell inside a span");
-        assert_eq!(rows[0].spans[0].content.as_ref(), "abc");
-        assert_eq!(rows[0].spans[0].style, err());
-        assert_eq!(rows[0].spans[1].content.as_ref(), "d");
-        assert_eq!(rows[1].spans[0].content.as_ref(), "efgh");
-    }
-
-    #[test]
-    fn a_line_the_highlighter_miscounted_is_drawn_plain_rather_than_shifted() {
-        // The guard the layout leans on, exercised rather than described. It
-        // cannot be reached through syntect — every markdown line anybody has
-        // thrown at the real highlighter comes back exact — so the miscount is
-        // supplied here, which is the whole reason `faithful` is a function.
-        let line = "one two";
-        let exact = vec![
-            Span::styled("one".to_string(), err()),
-            Span::raw(" two".to_string()),
-        ];
-        assert_eq!(
-            faithful(Some(&exact), line),
-            exact,
-            "an exact answer stands"
-        );
-
-        // One character short, which is what a grammar that swallowed a token
-        // would produce: every colour after the gap would land a cell early.
-        let short = vec![
-            Span::styled("one".to_string(), err()),
-            Span::raw(" tw".to_string()),
-        ];
-        let plain = vec![Span::raw(line.to_string())];
-        assert_eq!(
-            faithful(Some(&short), line),
-            plain,
-            "a miscounted line kept its colours"
-        );
-        // ...one character too many, and no answer at all.
-        let long = vec![Span::raw("one two three".to_string())];
-        assert_eq!(faithful(Some(&long), line), plain);
-        assert_eq!(faithful(None, line), plain);
     }
 }

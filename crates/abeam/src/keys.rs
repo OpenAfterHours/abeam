@@ -196,6 +196,31 @@ pub fn is_text(key: &KeyEvent) -> bool {
     }
 }
 
+/// True for `Ctrl`+key **without** `Alt`: the chord half of [`is_text`]'s
+/// answer, for the panes that bind one.
+///
+/// **A Ctrl chord is the right pane's to answer only while the right pane has
+/// focus**, and that is the whole rule. [`global`] claims no `Ctrl`+letter at
+/// all, so with focus on the agent every one of them is the agent's; with focus
+/// on the right pane the pane is offered it first, and a pane with a child in
+/// it — a shell — hands it on, because there it belongs to the child. The panes
+/// without one bind the chords their own vocabulary needs: the read-only views
+/// `Ctrl+D`/`Ctrl+U` to scroll half a page, the ask `Ctrl+L` to end its
+/// conversation, a selection `Ctrl+C` to copy, and the pad `Ctrl+Z`, `Ctrl+Y`
+/// and `Ctrl+S`. None of those can shadow a binding of the agent's, because
+/// none of them is offered anything while the agent has the keys.
+///
+/// `Alt` is excluded for the reason the module doc gives at length: Ctrl+Alt
+/// is how Windows spells AltGr, and on a layout where AltGr+Z types a
+/// character that character arrives as text and must not be read as an undo.
+/// `Shift` is ignored, as it is everywhere else here — it is what made the
+/// letter a capital, and some terminals report it for no other reason. One
+/// caller reads it on purpose, after asking this: `crate::editor::Editor::key`,
+/// for which `Ctrl+Shift+Z` is redo and the same chord without Shift is undo.
+pub fn ctrl_chord(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Open the F1 command hub. This is deliberately a distinct action from
@@ -730,6 +755,27 @@ pub const HELP: &[(&str, &str)] = &[
         "(in the pad, editing)",
         "every letter is typed; arrows, Home/End move the caret; PgUp/PgDn page; Ctrl+D/U do nothing",
     ),
+    // The pad's three Ctrl chords, which it may take because it has the keys
+    // only while it has focus — the rule `ctrl_chord` states once, and the
+    // same one that gives the ask its `Ctrl+L` and a selection its `Ctrl+C`.
+    // The context in brackets is theirs too. Rows of their own rather than
+    // clauses on the row above, which is already as long as the overlay can
+    // draw.
+    //
+    // The undo row says what one step is, because that is the question a
+    // first `Ctrl+Z` raises — whether it takes back a letter or a paragraph —
+    // and `crate::editor::history` is the answer it summarises.
+    (
+        "Ctrl+Z / Ctrl+Y (pad)",
+        "editing: undo / redo (or Ctrl+Shift+Z) — a word, a run of deletes or a paste at a time",
+    ),
+    // "now" is the whole of what the key adds: the pad saves itself two
+    // seconds after the last key and whenever it leaves the screen, and a row
+    // that only said "save" would read as though nothing else did.
+    (
+        "Ctrl+S (pad)",
+        "save now (it also saves itself two seconds after the last key)",
+    ),
     // The third statement of the box rule, and the one that has to be loudest:
     // this mode swallows *every* key, over a pane that may have a live shell in
     // it. A reader who does not know that is a reader typing at a child that is
@@ -740,11 +786,12 @@ pub const HELP: &[(&str, &str)] = &[
         "(selecting)",
         "the scroll keys move the caret; v anchors, y or Ctrl+C copies, Esc leaves",
     ),
-    // Its own row because it is the one place in the program where a
-    // `Ctrl`+letter is not the child's, and somebody who does not know that is
-    // somebody whose `Ctrl+C` did not interrupt what they thought it would.
-    // `global` still claims nothing — see the module doc — but the overlay has
-    // to say what the key does where it does it.
+    // Its own row because a selection can be up over a live shell, and there
+    // `Ctrl+C` is the one `Ctrl`+letter that is not the child's: somebody who
+    // does not know that is somebody whose `Ctrl+C` did not interrupt what
+    // they thought it would. `global` still claims nothing — see the module
+    // doc and `ctrl_chord` — but the overlay has to say what the key does
+    // where it does it.
     (
         "Ctrl+C (selecting)",
         "copies · to interrupt something instead, leave the selection first",
@@ -1094,6 +1141,31 @@ mod tests {
             KeyModifiers::ALT | KeyModifiers::CONTROL,
         );
         assert!(alt_chord(&altgr_t) && is_text(&altgr_t));
+    }
+
+    #[test]
+    fn a_ctrl_chord_is_ctrl_without_alt_and_never_a_character() {
+        // The pad's `Ctrl+Z` asks this, and the case it must refuse is AltGr:
+        // Ctrl+Alt+Z is a character on some layout, and reading it as an undo
+        // would take text back while the user was typing more of it.
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::CONTROL | KeyModifiers::SHIFT] {
+            let z = k(KeyCode::Char('z'), mods);
+            assert!(ctrl_chord(&z), "{mods:?}");
+            assert!(!is_text(&z), "a chord is never also text: {mods:?}");
+        }
+        for mods in [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        ] {
+            assert!(!ctrl_chord(&k(KeyCode::Char('z'), mods)), "{mods:?}");
+        }
+        // And no Ctrl chord is claimed by `global`, so a pad asking this is
+        // asking about a key nothing above it has already taken.
+        assert_eq!(global(&k(KeyCode::Char('z'), KeyModifiers::CONTROL)), None);
+        assert_eq!(global(&k(KeyCode::Char('y'), KeyModifiers::CONTROL)), None);
+        assert_eq!(global(&k(KeyCode::Char('s'), KeyModifiers::CONTROL)), None);
     }
 
     #[test]

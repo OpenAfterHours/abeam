@@ -14326,6 +14326,27 @@ mod tests {
     }
 
     #[test]
+    fn the_pads_ctrl_keys_reach_it_through_the_shell() {
+        // The pane's own tests prove what `Ctrl+Z` and `Ctrl+S` do; this is
+        // the wire. Nothing between the keyboard and a focused pad may take a
+        // Ctrl chord on the way — `keys::global` claims none, and the shell's
+        // `Esc`/`q` rule ignores chords — and the day something does, the save
+        // a user pressed for is the thing that silently stops happening.
+        let mut fx = app();
+        let path = pad_at(&mut fx, 0, "ctrl.md");
+        screen(&mut fx.app, 120, 24);
+        hub(&mut fx.app, KeyCode::Char('p'));
+        typed(&mut fx, "keep this drop that");
+
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        fx.app.handle_key(ctrl('z')).unwrap();
+        fx.app.handle_key(ctrl('s')).unwrap();
+        assert_eq!(fx.app.focus, Focus::Right, "a chord is not the way out");
+        let written = std::fs::read_to_string(&path).expect("the pad Ctrl+S wrote");
+        assert_eq!(written, "keep this drop ", "the undo, saved");
+    }
+
+    #[test]
     fn looking_away_from_the_pad_writes_it() {
         // A pane is never told it has left the screen, so the key that takes it
         // away is the last thing that can ask. Without this the note sits in

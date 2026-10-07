@@ -120,7 +120,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::buffer::MAX_BYTES;
+use super::MAX_BYTES;
 
 /// abeam's own directory inside the profile root, which is shared with every
 /// other program on the machine. The same name `crate::config` uses, because it
