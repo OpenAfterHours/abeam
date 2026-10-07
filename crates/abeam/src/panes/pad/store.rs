@@ -116,32 +116,23 @@
 //! and is not a lock; see the type for why a stat that cannot be taken means
 //! *go ahead*.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::MAX_BYTES;
+use crate::disk::profile::{self, PROFILE};
+use crate::disk::{Perms, Temp};
 
-/// abeam's own directory inside the profile root, which is shared with every
-/// other program on the machine. The same name `crate::config` uses, because it
-/// is the same program.
-const DIR: &str = "abeam";
-
-/// The pads' own directory inside that. Plural on purpose: there is one file
-/// per workspace root and a person may have a dozen.
+/// The pads' own directory inside abeam's, which `crate::disk::profile` names.
+/// Plural on purpose: there is one file per workspace root and a person may
+/// have a dozen.
 const SCRATCH: &str = "scratch";
 
 /// The extension, which is a promise about the contents rather than decoration.
 /// The pane renders this text as markdown, and a `.md` opens as markdown in
 /// whatever the user reaches for when they want it outside abeam.
 const EXT: &str = "md";
-
-/// What names the profile on this platform, for the one message that has to
-/// tell somebody why their pad has nowhere to go.
-#[cfg(windows)]
-const PROFILE: &str = "%APPDATA%";
-#[cfg(unix)]
-const PROFILE: &str = "$XDG_DATA_HOME and $HOME";
 
 // ---------------------------------------------------------------------------
 // where the file is
@@ -191,31 +182,15 @@ fn file(root: &Path) -> String {
     format!("{}.{EXT}", crate::paths::workspace_key(root))
 }
 
-/// Windows' answer, over the variable handed in rather than read.
+/// Windows' answer, over the variable handed in rather than read: the pad's
+/// own directory inside the one `crate::disk::profile::from_appdata` names.
 ///
-/// Split out for `crate::config::from_appdata`'s reason, which is that the
-/// process environment belongs to the whole test binary: a test that set
-/// `APPDATA` to prove this rule would be setting it for the three hundred and
-/// fifty tests running beside it, several of which spawn children that inherit
-/// it.
-///
-/// **A relative variable is refused rather than followed**, which is
-/// `crate::config`'s rule unchanged and for exactly the same reason. Joining
-/// onto a relative path leaves a relative path, so the write below stops being
-/// a question about the user's profile and becomes one about wherever this
-/// process happens to be standing — which `main` deliberately moves to
-/// `%SystemRoot%` or `/`, and which before that line is the repository on
-/// screen. An `APPDATA=.` left in a shell for some other program's benefit
-/// would then drop an `abeam\scratch` directory into a clone, which is the one
-/// place the module docs above spend a paragraph refusing to write to.
-/// Absoluteness rather than mere blankness, because blank is only the loudest
-/// way of being relative, and PowerShell leaves `$env:APPDATA = ""` behind when
-/// somebody clears it.
-///
-/// Compiled on both platforms and gated only at its caller, so that a machine
-/// of either kind can prove both rules. This is string arithmetic with no
-/// filesystem in it, and the Unix rule is the one most likely to be broken by
-/// somebody who cannot run it.
+/// The rule — `%APPDATA%` and nothing behind it, and a relative variable
+/// refused rather than followed — is that function's, along with its argument,
+/// since the day a recovery copy needed the same directory and two copies of
+/// the rule would have had to agree for ever. This is kept, under the name and
+/// shape it has always had, because the tests below prove the rule through it
+/// and because "where is the pad" is still a question with one answer here.
 #[cfg_attr(
     unix,
     // `#[allow]` and not `#[expect]`: the condition is a `cfg`, so on the
@@ -224,30 +199,13 @@ fn file(root: &Path) -> String {
     allow(dead_code, reason = "the other platform's rule, tested on both")
 )]
 fn from_appdata(appdata: Option<PathBuf>) -> Option<PathBuf> {
-    Some(
-        appdata
-            .filter(|dir| dir.is_absolute())?
-            .join(DIR)
-            .join(SCRATCH),
-    )
+    Some(profile::from_appdata(appdata)?.join(SCRATCH))
 }
 
-/// Unix's answer, over the two variables handed in rather than read.
-///
-/// `XDG_DATA_HOME` when it is set to something absolute, and `~/.local/share`
-/// otherwise, which is the fallback the specification names rather than abeam's
-/// own invention. Both are held to the absoluteness rule above, and the home
-/// directory is the reason it is applied twice rather than once: a container or
-/// a service unit can export an empty `HOME`, and `.local/share/abeam/scratch`
-/// resolved against `/` is a directory belonging to nobody that root can write.
-///
-/// A **relative** `XDG_DATA_HOME` falls through to `HOME` rather than ending
-/// the search, which is the one place this differs from simply refusing.
-/// `crate::config::from_xdg` makes the whole argument and it carries over
-/// without a word changed: the variable is discarded either way, so the only
-/// question left is whether one bad variable costs the user their pad, and the
-/// specification's own instruction is to consider a relative path invalid and
-/// ignore it.
+/// Unix's answer, over the two variables handed in rather than read: the
+/// pad's own directory inside the one `crate::disk::profile::from_xdg` names,
+/// which carries the rule and its argument for the reason [`from_appdata`]
+/// gives.
 #[cfg_attr(
     windows,
     // `#[allow]` and not `#[expect]`: the condition is a `cfg`, so on the
@@ -256,14 +214,7 @@ fn from_appdata(appdata: Option<PathBuf>) -> Option<PathBuf> {
     allow(dead_code, reason = "the other platform's rule, tested on both")
 )]
 fn from_xdg(data: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
-    let base = match data.filter(|dir| dir.is_absolute()) {
-        Some(data) => data,
-        None => home
-            .filter(|dir| dir.is_absolute())?
-            .join(".local")
-            .join("share"),
-    };
-    Some(base.join(DIR).join(SCRATCH))
+    Some(profile::from_xdg(data, home)?.join(SCRATCH))
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +534,12 @@ fn cap(text: &mut String) -> bool {
 /// behind that nothing sweeps: it is one file per killed process per workspace,
 /// it is named after the pad it was going to be, and a sweep would be code that
 /// deletes files in the user's profile on a guess about which of them are ours.
+///
+/// The mechanism — write, flush, rename, and the removal on every way out — is
+/// `crate::disk::Temp`'s now, shared with the files view's saves and the
+/// recovery copies, and [`Perms::Private`] is how this pad still asks for its
+/// 0600. What stays here is everything that is the pad's own: the stamp, the
+/// sentences, and the name of the temporary file.
 pub(super) fn save_at(path: &Path, text: &str, seen: Stamp) -> Result<Stamp, String> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(format!(
@@ -595,67 +552,27 @@ pub(super) fn save_at(path: &Path, text: &str, seen: Stamp) -> Result<Stamp, Str
     // and on a fresh profile no `abeam` either.
     std::fs::create_dir_all(dir).map_err(|why| refused(path, &why))?;
 
-    let temp = dir.join(format!(
-        "{}.{}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
-    if let Err(why) = whole(&temp, text) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(refused(path, &why));
-    }
+    // The plain name first and a counted one only if that is taken, which
+    // `Temp::write` decides and never by emptying what has the name.
+    let name = name.to_string_lossy();
+    let pid = std::process::id();
+    let temp = |n: u32| match n {
+        0 => dir.join(format!("{name}.{pid}.tmp")),
+        n => dir.join(format!("{name}.{pid}.{n}.tmp")),
+    };
+    let temp = Temp::write(temp, text.as_bytes(), Perms::Private)
+        .map_err(|why| refused(path, &why))?;
 
     // Asked as late as it can be asked and still be asked at all. See `Stamp`:
     // this catches the second abeam window, it is not a lock, and the window
-    // between this line and the next is real and unclosed.
+    // between this line and the next is real and unclosed. Returning drops the
+    // temporary file, and dropping it removes it.
     if moved(seen, stamp(path)) {
-        let _ = std::fs::remove_file(&temp);
         return Err(elsewhere(path));
     }
 
-    if let Err(why) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(refused(path, &why));
-    }
+    temp.rename_over(path).map_err(|why| refused(path, &why))?;
     Ok(stamp(path))
-}
-
-/// The whole text, on the disk, before anything names it.
-///
-/// See [`save_at`] for why the flush is here and why the file is created narrow
-/// rather than at the umask default.
-fn whole(temp: &Path, text: &str) -> std::io::Result<()> {
-    let mut file = private(temp)?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()
-}
-
-/// A new file only its owner can read.
-///
-/// The one place in this module with a per-platform body rather than a
-/// per-platform *rule*, so it is not the `from_appdata`/`from_xdg` shape and
-/// cannot be: there is no argument to hand in and nothing to compute — one
-/// platform has a mode to set at creation and the other has no such concept,
-/// and what each does is only observable on itself. The Unix half is asserted
-/// by a `#[cfg(unix)]` test.
-#[cfg(unix)]
-fn private(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-}
-
-/// Windows' half, where a new file inherits the directory's ACL and there is no
-/// mode to ask for. `%APPDATA%` is already per-user, which is the protection
-/// the Unix side has to spell out.
-#[cfg(windows)]
-fn private(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::create(path)
 }
 
 /// A pad that could not be written, said to the person who typed it.
@@ -714,6 +631,7 @@ pub(super) fn nowhere() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::profile::DIR;
     use crate::testutil::TempDir;
 
     /// Two directories this platform calls absolute.

@@ -28,7 +28,7 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 /// A NUL in the first block means binary — the same test `git` uses, and it is
 /// right about everything except UTF-16, which is rare enough in a repo to
 /// live with being called binary.
-const SNIFF_BYTES: usize = 8 * 1024;
+pub(crate) const SNIFF_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded {

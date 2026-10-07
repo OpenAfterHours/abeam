@@ -49,6 +49,7 @@ mod agentstate;
 mod app;
 mod ask;
 mod config;
+mod disk;
 mod dispatch;
 mod editor;
 mod keys;

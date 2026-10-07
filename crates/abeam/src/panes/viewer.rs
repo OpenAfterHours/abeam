@@ -164,7 +164,7 @@ mod docs;
 mod files;
 mod grep;
 mod list;
-mod load;
+pub(crate) mod load;
 pub(crate) mod markdown;
 mod mermaid;
 mod outline;

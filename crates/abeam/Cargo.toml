@@ -100,3 +100,18 @@ toml = { version = "1.1.4", default-features = false, features = ["parse", "serd
 # libc says so in its own manifest.
 [target."cfg(unix)".dependencies]
 libc = "0.2"
+
+# `ReplaceFileW`, for `src/disk/save.rs`: a save in the files view has to keep
+# the ACL, attributes and creation time of a file somebody else made, and a
+# rename keeps none of them. Not a new crate in the tree — portable-pty already
+# depends on winapi 0.3, and abeam-pty asks for three more of its modules; this
+# asks for the types and the error codes, so what changes is how much of winapi
+# compiles, not what is compiled. `winbase`, where the function itself lives,
+# is deliberately not on the list: 0.3.9 declares `ReplaceFileW` without its
+# return value, and a replacement whose failure cannot be seen is the one call
+# that must not be guessed at, so the declaration is written out in that file
+# with the SDK's signature — and so is `MoveFileExW`'s, which a new file is
+# placed with, rather than enabling the module to get it.
+[target."cfg(windows)".dependencies.winapi]
+version = "0.3"
+features = ["minwindef", "winerror", "winnt"]
