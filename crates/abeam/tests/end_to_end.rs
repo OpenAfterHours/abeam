@@ -1188,3 +1188,162 @@ fn rows_of_the_shell_view_are_selected_and_copied_and_the_child_never_sees_the_k
     send(&session, &command('q'));
     drop(session);
 }
+
+/// Wait until the file at `path` holds exactly `want`, or fail with what it
+/// held instead. A save is a keystroke the test cannot see the end of except on
+/// the disk, so the disk is what is polled — the screen's `●` going away would
+/// be the pane's word for it rather than the file's.
+fn wait_for_file(path: &Path, want: &[u8]) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let got = std::fs::read(path).ok();
+        if got.as_deref() == Some(want) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "waited {DEADLINE:?} for {} to hold {:?}; it held {:?}",
+                path.display(),
+                String::from_utf8_lossy(want),
+                got.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The names in `dir`, sorted, for an assertion that nothing was left beside
+/// what was meant to be there.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read a scratch directory")
+        .map(|entry| entry.expect("a directory entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_file_is_edited_saved_and_created_from_the_files_view_and_keeps_its_bytes() {
+    // The whole of editing, through the real binary: a file opened from the
+    // list, `e`, typing, `Ctrl+S`, and the bytes on disk afterwards; then `a`,
+    // a name with a directory in it, typing, `Ctrl+S`; then `a` and `Esc` with
+    // nothing typed. Every unit test of this builds a pane and calls it. This is
+    // the one that proves `Ctrl+S` arrives as `Ctrl+S` through ConPTY and a Unix
+    // pty, that the editor's caret and keys survive raw mode, and that what a
+    // save writes is the file's own line endings rather than this platform's.
+    //
+    // The CRLF is written as bytes into a scratch directory, not checked out,
+    // so that no `core.autocrlf` anywhere between here and the disk has a say
+    // in what the file holds before abeam reads it. The directory is not a git
+    // repository either, which keeps git's own idea of line endings out of it.
+    let dir = Dir::new("edit");
+    std::fs::write(dir.0.join("notes.md"), b"one\r\ntwo\r\n").expect("plant a CRLF file");
+    // The profile — where recovery copies and the pad live — is moved into a
+    // scratch directory of its own, a sibling of the repository rather than
+    // inside it (abeam refuses to keep copies inside the workspace), so that
+    // nothing typed here can reach the profile of whoever runs the suite.
+    let profile = Dir::new("edit-profile");
+    let home = profile.0.to_string_lossy().into_owned();
+    let session = PtySession::spawn(
+        PtyConfig::new(env!("CARGO_BIN_EXE_abeam"))
+            .arg(format!("+{HOSTED}"))
+            .cwd(&dir.0)
+            .env("ABEAM_SHELL", SHELL)
+            // Both, on both platforms: each is ignored where it is not the one
+            // the profile is read from.
+            .env("APPDATA", home.clone())
+            .env("XDG_DATA_HOME", home.clone())
+            .env("XDG_CONFIG_HOME", home)
+            // The suite's usual width, which gives the right pane 48 columns
+            // and its border 46 for the way out, the action and the title, in
+            // that order. Every wait below looks for something inside those
+            // 46, because what is past them is clipped on purpose: the border
+            // leads with what cannot be done without. The name box's title
+            // puts the name first for that reason and is checked here at its
+            // front; what its first save will make is at the back, where a
+            // narrow border loses it, and `crate::panes::viewer::browse`'s
+            // tests read it whole. Not narrower: at 80 columns the pane is 32
+            // wide and the editor's own `esc→done · ctrl+s save · ` takes 25 of
+            // them, leaving no room for the file it is editing.
+            .size(40, 120),
+    )
+    .expect("spawn abeam in a pty");
+    wait_for(&session, "git");
+
+    // --- an existing file, edited ------------------------------------------
+    //
+    // `F1, B` opens the list and gives it the keys; the one file in it is the
+    // selected row, so `Enter` opens it. `e` from the rendered page puts the
+    // caret at the top, where the text goes in front of `one`.
+    send(&session, &command('b'));
+    wait_for(&session, "./ · 1 item");
+    send(&session, b"\r");
+    wait_for(&session, "notes.md · rendered");
+    send(&session, b"e");
+    wait_for(&session, "notes.md · editing");
+    send(&session, b"zero ");
+    wait_for(&session, "ctrl+s save · ● notes.md");
+    send(&session, b"\x13"); // Ctrl+S
+    let notes = dir.0.join("notes.md");
+    // The typed text, CRLF on every line, no mark put on the front, and the
+    // final newline the file came with.
+    wait_for_file(&notes, b"zero one\r\ntwo\r\n");
+    wait_for(&session, "ctrl+s save · notes.md");
+    assert_eq!(names_in(&dir.0), ["notes.md"], "a save left something beside the file");
+
+    // --- a new file, named and saved ----------------------------------------
+    //
+    // Back to the list, `a`, a name whose directory does not exist yet. The box
+    // shows the name first, then where it goes; `Enter` opens an empty editor,
+    // whose way out is back to the list while nothing is typed in it.
+    send(&session, b"\x1b");
+    send(&session, &command('b'));
+    wait_for(&session, "./ · 1 item");
+    send(&session, b"a");
+    wait_for(&session, "esc→cancel · new file: ▌ · in ./");
+    send(&session, b"sub/new.md");
+    wait_for(&session, "new file: sub/new.md▌ · in ./");
+    assert!(!dir.0.join("sub").exists(), "naming made a directory");
+    send(&session, b"\r");
+    wait_for(&session, "esc→list · ctrl+s save · ");
+    send(&session, b"hello\r");
+    send(&session, b"\x13"); // Ctrl+S
+    // The line ending the file beside it uses, which is CRLF: `notes.md`.
+    let made = dir.0.join("sub").join("new.md");
+    wait_for_file(&made, b"hello\r\n");
+    assert_eq!(names_in(&dir.0.join("sub")), ["new.md"], "the save left a temporary file");
+    assert_eq!(names_in(&dir.0), ["notes.md", "sub"]);
+
+    // --- a new file named and left untouched --------------------------------
+    //
+    // `Esc` with nothing typed goes back to the list and leaves nothing at all:
+    // no file and no directory for the name that was given. The list opens
+    // beside the document now on screen, which is the new file, so this name is
+    // given in `sub/` — a name typed from a subdirectory goes into it.
+    send(&session, b"\x1b");
+    send(&session, &command('b'));
+    wait_for(&session, "sub/ · 1 item");
+    send(&session, b"a");
+    wait_for(&session, "new file: ▌ · in sub/");
+    send(&session, b"other/untouched.md");
+    wait_for(&session, "new file: other/untouched.md▌");
+    send(&session, b"\r");
+    wait_for(&session, "esc→list · ctrl+s save · ");
+    send(&session, b"\x1b");
+    wait_for(&session, "sub/ · 1 item");
+    assert_eq!(names_in(&dir.0.join("sub")), ["new.md"], "an untouched new file left a trace");
+    assert_eq!(names_in(&dir.0), ["notes.md", "sub"]);
+
+    // And none of it reached the profile it was kept away from: there was
+    // nothing unsaved for long enough to be copied, so the drafts directory
+    // was never needed — but if it had been, this is where it would be.
+    assert!(
+        names_in(&profile.0).iter().all(|name| name == "abeam"),
+        "something other than abeam's own directory appeared in the scratch profile"
+    );
+
+    send(&session, &command('q'));
+    send(&session, &command('q'));
+    drop(session);
+}
