@@ -90,6 +90,36 @@ forms, the persistence and the tests over all three; what is not done is
 immediately below, and it is a longer list than most things in this document
 arrive with.
 
+**The files view edits now, and nobody has typed into it by hand.** It is no
+longer the pad alone that writes: `e` puts a caret in the file on screen,
+`Ctrl+S` writes it back, `Esc` goes back to reading with the text kept, and `a`
+in the file list names a new file. That is the first code in abeam that writes
+inside a repository, and it is built to give back exactly the bytes it read — a
+file it could not is shown read-only with the reason — and never to write over
+a change the agent has made since the file was opened unless `Ctrl+S` is
+pressed a second time. Unsaved text is copied to the profile, beside the pad,
+and offered back after a crash. The editor underneath is the pad's, moved into
+`crates/abeam/src/editor/` and given undo, which the pad now has as well —
+`Ctrl+Z` and `Ctrl+Y` — with `Ctrl+S` to save it at once. The disk half is
+`crates/abeam/src/disk/`, and the pane half `crates/abeam/src/panes/viewer/edit.rs`.
+
+What that rests on is tests: over the strict read and the round trip of line
+endings, byte order marks and final newlines, over the save's refusals and the
+conflict, over the watcher's echo, the guards, the quit, the recovery copy, and
+the keys. The speed is measured rather than argued: `editor_bench`, an ignored
+test run by hand in a release build, times on the 46 KB README at sixty columns
+a character typed into the middle of a paragraph — 77–125 ms when the pad laid
+the whole document out again, about half a millisecond in the shared editor —
+typing into the info string of a fence over a 1500-line block, 12–14 ms, and
+the first frame of a 64 KiB file coloured, 4–6 ms, and of a 512 KiB file drawn
+plain, 16–23 ms; `crate::editor`'s module documentation has them with their
+conditions. What none of it is is use. Nobody has pressed `e`
+in a real terminal, typed into a file, saved it and read the diff, met the
+conflict state with a real agent writing the file, or opened a recovery copy
+after a real crash. The first person to do any of that is the first test that
+matters, and "Not done, and known" below lists what is already known to be
+missing.
+
 Codex support means the interactive TUI in the left pty. The official Windows
 Codex 0.149.0 binary was hosted through abeam with an isolated `CODEX_HOME`:
 the welcome/sign-in UI rendered, Down-arrow navigation worked, a 120×40 →
@@ -188,7 +218,9 @@ released to the focused child, apart from a right-pane editor's own local keys.
 Two more fell out of the same fact. The pad, the ask and the queue all guarded
 typing with `!ctrl && !alt`, which is a guard against AltGr and so against every
 character behind it — `€` on a UK layout, `@` and `€` on a German one — typed
-and silently dropped; `keys::is_text` is their shared answer. And literal-next
+and silently dropped; `keys::is_text` is their shared answer, and the files
+view's find and search boxes and its new-file name box now ask it too. And
+literal-next
 matched `Ctrl+\` on the control bit alone, so on the layouts that put `\` behind
 AltGr, typing a backslash armed it and sent the *next* keystroke to the agent
 raw. It reads `ctrl && !alt` now, and `F12` is still the alias on those layouts.
@@ -230,14 +262,25 @@ and reads the screen that comes back. That is what proves the parts no in-proces
 test can reach — that abeam starts at all, that raw mode and the alternate
 screen survive being someone else's child, that `F1, S` opens the shell, and
 that a command typed into the shell view runs
-in the right directory and puts its answer on screen. Four paths are pinned that
+in the right directory and puts its answer on screen. Six paths are pinned that
 way today: type a command in the shell and read its output; reach a file nothing
 pointed the pane at, by `F1, B` `/`; select rows of the shell view with
 `F7` and copy them, which is the only place `ESC [ 1 8 ~` is proved to come back
 out of ConPTY as the function key it names *and* the only place the mode's
 promise — that nothing reaches the child while a caret is up — is asked in front
-of a real prompt; and a copy of a real shell planted in the repository under the
-name abeam is about to look for, which abeam must refuse to run. That last one is
+of a real prompt; point the right pane at another worktree with `w` and watch
+the git view and the reader both land in it, while the left pane stays where it
+was started; edit and create a file from the files view — open a planted CRLF
+`notes.md` from the list, `e`, type, `Ctrl+S` sent as the byte `0x13`, and read
+back exactly the bytes expected, CRLF kept, no byte order mark, the final
+newline where it was; then `a`, a name in a directory that does not exist yet,
+type, `Ctrl+S`, and find the directory made, the file written with its
+neighbour's CRLF and nothing else left beside it; then a new file left untouched
+and `Esc`, which must leave nothing at all — with the profile pointed at a
+scratch directory of its own; and a copy of a real shell planted in the
+repository under the name abeam is about to look for, which abeam must refuse to
+run. The editing path has passed through ConPTY; it runs in CI's
+`ubuntu-latest` job and has not yet been run on Linux. That last one is
 a test about an attack rather than a feature, and
 the two platforms arrive at it down different roads, which is worth stating twice
 rather than generalising once. Windows resolves a bare program name against the
@@ -469,15 +512,17 @@ agent.
   the caret lands where a hand expects it, or whether the pad that comes back
   after a restart is the one that was typed. Until somebody does that, this is a
   feature that passes its tests.
-- **There is no undo, no selection inside the pad, and no word motion.** It is a
-  caret, the four arrows, `Home`, `End`, `Backspace`, `Delete` and typing —
-  which is the whole editor, and less than any text field a user has met this
-  decade. `Ctrl+Z` in particular does nothing, and the failure that buys is the
-  ordinary one: a paste over the wrong place, or a `Backspace` held down a beat
-  too long, is not recoverable and the file on disk will agree with the mistake
-  two seconds later. It is deliberate to the extent that the first version of a
-  text buffer should not also be the first version of an undo stack; it is not
-  deliberate in the sense of being finished.
+- **The pad has undo, and no selection inside it and no word motion.** A paste
+  over the wrong place or a `Backspace` held a beat too long can be taken back:
+  `Ctrl+Z` and `Ctrl+Y` — `Ctrl+Shift+Z` too, where the terminal
+  reports the Shift — undo and redo a word, a run of deletes or a paste at a
+  time, with the caret put back where it was, and `Ctrl+S` saves at once rather
+  than in two seconds. What is still missing is the rest of a text field: there
+  is no selection to cut, copy or type over inside the pad — a drag copies rows
+  out of it, which is a different thing — and no word motion. And the history
+  is the process's: it holds the last thousand steps or 256 KiB of text,
+  whichever comes first, and it does not survive a restart, so `Ctrl+Z` in
+  tomorrow's session takes nothing back of today's.
 - **The pad holds 64 KiB, and the number belongs to the syntax highlighter.**
   Past that size syntect gives up and returns plain text, so a pad allowed to
   grow beyond it would go grey one keystroke after it was fine with nothing on
@@ -515,6 +560,94 @@ agent.
   listed because "computed and then confirmed by a machine somewhere else" is a
   different claim from "someone watched it pass", and this document is the place
   that keeps those apart.
+- **Nobody has edited a file in the files view by hand, on either platform.**
+  That is the sentence to read before pointing it at a file you would mind
+  losing, and it is the pad's sentence again about a feature that writes into
+  your repository rather than into your profile. The unit tests drive the keys,
+  the save, the conflict and the recovery copy against real files in temporary
+  directories, and one test drives the built binary through a pty: `e`, typing,
+  `Ctrl+S` and `a` are pinned end to end through ConPTY, with the bytes on disk
+  read back afterwards — see "Verified how" above. What nothing has driven end
+  to end is `Ctrl+Z` and `Ctrl+Y`, a recovery copy offered back after a real
+  crash, and a conflict with a live agent writing the file somebody is typing
+  into; and nobody has driven any of it by hand, on Linux least of all. On Unix, `Ctrl+S` and
+  `Ctrl+Z` are the two keys a terminal is likeliest to have opinions about —
+  flow control and job control — and abeam's raw mode turns both off: crossterm
+  0.29's `enable_raw_mode` calls rustix's `Termios::make_raw` (`cfmakeraw`
+  under its `libc` feature), which clears `IXON` and `ISIG`, so `0x13` and
+  `0x1A` reach abeam as keys rather than stopping the output or the process.
+  That is the code; nobody has pressed either at abeam on Linux.
+- **The Unix half of saving is tested by CI and by nothing else.** Copying the
+  permission bits and the owner, refusing a mode with no write bit,
+  `access(2)`, and placing a new file with `link(2)` are `cfg(unix)` code,
+  written and checked on a Windows machine with `cargo check` for the Linux
+  target. Their tests run in CI's `ubuntu-latest` job — `cargo test
+  --workspace`, on every push to `main` and on every pull request — and have
+  not been run on a developer's machine. That is the persistence test's footing
+  above, for a larger body of code: a machine somewhere else, and never
+  watched.
+- **The tests about links skip themselves where the machine will not make
+  one.** Windows makes a symbolic link only for an elevated process or with
+  Developer Mode on, and a test that needs one passes without running rather
+  than failing on a machine that has neither. So a green run on such a machine
+  says nothing about saving through a link, or about refusing one that leads
+  outside the workspace; CI's `ubuntu-latest` job can make them. The junction
+  test is the other shape — `mklink /J` needs no privilege, so there a failure is a failure.
+- **The conflict check is a check and not a lock.** A save reads the file again
+  and compares it, byte for byte, with what the editor was opened on, and only
+  then replaces it; an agent that writes in the instant between the two is
+  written over, and nothing closes that instant. A lock would be worse — a file
+  nobody can save because some other process died holding it — and the window
+  is the width of one comparison rather than of a session, but it is real.
+  `crates/abeam/src/disk/save.rs` says so where the comparison is made.
+- **A new file on a Unix filesystem without hard links reopens the same
+  window.** A new file is put in place by an operation that fails if one has
+  appeared meanwhile — `link(2)` on Unix — so a file that arrived while somebody
+  typed is never replaced by it. FAT on a USB stick and some network mounts
+  cannot make a hard link, and there the placement falls back to a rename, which
+  replaces whatever arrived in the instant after the comparison looked.
+- **What a save keeps of a file has edges, and the hard link is the sharpest.**
+  On Windows `ReplaceFileW` keeps the ACL, the attributes and the creation time.
+  On Unix the permission bits are copied across, and the owner and group where
+  the platform allows it, but extended attributes and ACLs set with `setfacl`
+  are the temporary file's, and somebody who is not root, saving a file somebody
+  else owns but that they may write, ends up owning it — which every editor that
+  saves by renaming does too. On both, a file with a second hard link keeps the
+  old contents under the other name, which quietly stops changing. Writing in
+  place would keep the link and give back every failure the temporary file
+  exists to avoid.
+- **Two `ReplaceFileW` failures leave a save that has the text right and nothing
+  else.** `ERROR_UNABLE_TO_MOVE_REPLACEMENT` (1176) and
+  `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` (1177) happen after Windows has moved the
+  old file aside, when the new text exists only in the temporary file. The save
+  then finishes the job by placing the temporary file into the empty name, as a
+  new file would be — so none of the ACL, attributes or creation time came
+  across, and after 1177 the old file is still in the directory under a name
+  Windows chose — and the border says so. If even that placement fails, the
+  temporary file is kept and the message names it, because removing it would
+  delete the only copy. Neither failure has been seen; both are documented
+  outcomes of the call.
+- **A save killed half way leaves its temporary file behind.** Every failure the
+  save can see removes `.<name>.<pid>.abeam-save~`, apart from the one above. A
+  process that is killed between writing it and replacing the target cannot, so
+  the file stays in the repository's directory beside the one it was for. The
+  name says whose it is and what it was going to be, and its trailing `~` is
+  already in many `.gitignore`s; nothing cleans one up.
+- **A tab is drawn differently while typing than while reading.** The editor
+  fills to the next four-cell stop counted in cells and highlights the line
+  with its tabs in it; the reader's source view expands tabs counting
+  characters and highlights the expanded line. On a line with a wide character
+  before a tab the two put the text in different columns, and a grammar can
+  colour a tab-indented line differently, so a line can shift on `e` and shift
+  back on `Esc`. Accepted rather than unified, because the drawing and the caret
+  have to agree with each other first; `crate::editor`'s module doc owns it.
+- **One file at a time, and the editor is the pad's and no more.** While a file
+  holds unsaved text nothing else may replace the page, so a second file cannot
+  be opened until the first is saved or discarded. There is no selection, no
+  word motion and no find-and-replace inside the editor, and no rename, delete or
+  new directory in the file list beyond what a new file's name makes. Recovery
+  copies are written after two seconds of quiet, as the pad saves, so a crash in
+  that window loses that much; a quit writes the copy up to the last keystroke.
 - **Most of mermaid, by diagram type, is still shown as source.** Two families
   are drawn — `graph`/`flowchart` and `sequenceDiagram` — and `stateDiagram`,
   `classDiagram`, `erDiagram`, `gantt`, `pie`, `mindmap`, `journey`,

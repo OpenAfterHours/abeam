@@ -22,8 +22,12 @@ an editor open purely to read the markdown it produced. The difference from
 assembling that yourself out of a multiplexer and a git TUI is that **the right
 pane knows what the agent just did** — one watcher on the repository root turns
 the markdown it writes into the document on screen and refreshes git within a
-debounce interval of any file it touches. The panes are read-only, they never
-take focus from the agent, and they never switch themselves.
+debounce interval of any file it touches. Nothing in the right pane writes into
+your repository except the one file you choose — the one the files view is
+showing when you press `e`, or a new one named with `a` in its file list — and
+that only when you press `Ctrl+S`; the pad and the recovery copies of unsaved
+text live in your profile directory. The panes never take focus from the agent,
+and they never switch themselves.
 
 Text comes back the other way by dragging over it. Run something in the shell
 pane, highlight what it printed, and it is on your clipboard when you let go —
@@ -204,7 +208,8 @@ as a commit made in another terminal. `Enter` opens the selected file in the
 reader. `a` starts another agent in this checkout. `w` lists the repository's
 other worktrees, which is how the right pane is pointed at one.
 
-**files** (`F1, E`) — read-only markdown and source. Markdown is rendered rather
+**files** (`F1, E`) — markdown and source, to read and, when you press `e`, to
+edit. Markdown is rendered rather
 than shown as source: headings, lists, tables, quotes, GFM alerts, footnotes,
 YAML front matter as a header rather than a slab of source,
 syntax-highlighted code fences, and `graph`/`flowchart` and `sequenceDiagram`
@@ -258,6 +263,86 @@ Only `f` touches the disk, and it is the only one whose box waits for `Enter`
 rather than narrowing as you type. `Enter` on a result opens that file with the
 document search already looking for the same phrase.
 
+**`e` edits the file on screen**, and it is the one way anything in the right
+pane writes into your repository. The page becomes its source with a caret in
+it and a line-number gutter beside it, at the line you were looking at: the top
+line shown if you were reading the source, the same fraction of the way down if
+you were reading the rendering, whose rows belong to no one line. From there it
+types as the pad does — every letter is a letter, `q` and `j` included; the
+arrows, `Home`, `End` and a click move the caret; `PgUp`/`PgDn` page — and
+`Tab` types two spaces, or a tab if the file already indents a line with one.
+`Ctrl+Z` and `Ctrl+Y` undo and redo a word, a run of deletes or a paste at a
+time, and `Ctrl+Shift+Z` redoes too where the terminal reports the Shift.
+
+`Ctrl+S` saves and leaves you typing. Nothing else saves — not a pause, not
+`F4`, not quitting. `Esc` goes back to reading and **keeps what you typed**: the
+page shows your text, rendered or as source as `t` says, the title reads
+`● README.md`, and `e` puts you back at the caret — or at the place you have
+scrolled to since. `Ctrl+S` saves from there too. `x` twice throws the text
+away and shows the file as it is on disk; the second `x` counts only once the
+question is on screen, and any other key keeps the text. `F4` hands your keys
+to the agent and leaves the editor exactly as it was, which is why the border
+shows `ctrl+s` only while the pane has your keys: with the agent focused,
+`Ctrl+S` is the agent's, and in Claude it stashes your prompt.
+
+**A save gives back the file it was given.** The line endings, a byte order
+mark, whether the last line ends in a newline, and the tabs all come back as
+they were, so the diff is the lines you changed. A file abeam could not give
+back byte for byte stays read-only, with the reason above the page: text that
+is not UTF-8, line endings of two kinds, a binary, anything over 512 KiB, a path
+that leads outside the workspace once its links are followed. Over 64 KiB the
+editor draws plain text rather than colour, and says so. The save writes a
+temporary file beside the target and then puts it in the target's place — on
+Windows with `ReplaceFileW`, which keeps the file's permissions and attributes,
+waiting a moment if Defender or the indexer is holding it; on Linux keeping its
+permission bits. A read-only file is refused rather than replaced, and a link is
+saved through to the file it names when that file is inside the workspace.
+
+**It will not write over the agent.** Immediately before replacing anything
+abeam reads the file again and compares it, byte for byte, with what you started
+from. If the agent has changed it, nothing is written, the border says
+`◆ changed on disk`, and a second `Ctrl+S` writes over the version you were just
+told about — that one and no newer one, so a change the agent makes in between
+is refused in turn. The watcher usually gets there first and puts the `◆` up the
+moment the agent touches the file you are typing into; then the first `Ctrl+S`
+is the one refused. A file you have opened and not changed simply follows the
+agent: it is read again, with a fresh undo history, so that no `Ctrl+Z` can take
+the agent's change back out without anyone noticing.
+
+While there is unsaved text nothing replaces the page under you. `Enter` in the
+git view, `F1, B`, `Tab`, `r` and a switch to another worktree are each refused
+with a sentence on the border, and a document the agent writes meanwhile waits
+behind `◆`. `F1, Q` asks twice and names the file, and if the agent exits, abeam
+holds the door as it does for a live shell — the left title reads
+`unsaved README.md · F1, Q to quit`.
+
+**Unsaved text survives a crash, and is never kept in the repository.** Two
+seconds after you stop typing, a recovery copy goes into your profile directory
+beside the pad's — `drafts/`, next to `scratch/` — and not into the work, where
+it would be an untracked file in `git status`. Opening that file again says a
+copy is waiting; `e` puts it back as unsaved text, one `Ctrl+Z` from what is on
+disk, and starts in the `◆` state if the file has changed since the copy was
+typed. A copy is deleted by a save or by `x` `x`, and by `e` when it turns out
+to hold exactly what is on disk; nothing else deletes one, so quitting keeps it.
+
+`a` in the file list makes a new file. Name it — a path like `notes/plan.md` is
+fine, and the box reads `new file: notes/plan.md · in docs/ · creates notes/`,
+what you typed first — and `Enter` opens an empty editor. Nothing exists on
+disk until the first `Ctrl+S`, which makes the directories too, and `Esc` on a
+new file you never typed into leaves nothing behind. A name that is already
+there, or differs from one only in case, opens that file for editing instead.
+The name is relative to the directory the list is showing, and abeam refuses
+`..`; anything that resolves into a `.git` directory, however it is spelled; a
+link, or a path through one, that leads outside the workspace; a part longer
+than 255 UTF-16 units; and names Windows cannot hold — `<>:"|?*`, `CON`, `NUL`,
+`COM1` and the rest of the reserved names with or without an extension, a
+trailing dot or space — on Linux as well, because the next checkout of the
+repository may be on Windows. A new file takes the line endings of the files
+beside it, and never replaces one that appeared while you were typing it.
+
+**Nobody has typed into a file this way by hand yet.** It is built and tested;
+[status](docs/status.md) says what that does and does not cover.
+
 **shell** (`F1, S`) — real shells in the directory abeam was pointed at, next to
 the session that is about to be told what they printed. `pwsh` on Windows,
 falling back to `powershell` then `cmd`; `$SHELL` then `bash` then `sh` on Linux;
@@ -307,7 +392,9 @@ the arrows, `Home` and `End` move the caret, and `Alt+T` shows you the rendering
 instead, which is read-only and where a bare `t` brings the source back. What
 you type is saved a couple of seconds after you stop, in your own profile
 directory rather than in the repository, so it is still there next week and it
-never appears in `git status`. `Alt+T` here is the pad's own key rather than a
+never appears in `git status`. `Ctrl+Z` and `Ctrl+Y` undo and redo in the
+source, and `Ctrl+S` saves at once rather than two seconds later, from either
+form. `Alt+T` here is the pad's own key rather than a
 global, and it works from either `Alt` key like every other one. One thing to
 know about it: it needs the pad
 to have your keys. After `F4`, the pad is still on
@@ -398,12 +485,14 @@ accept text, so their commands focus the right pane. To leave any right-pane
 view reliably, press `F4`.
 
 While the right pane holds your keys its border leads with the way out —
-`esc→agent`, or `f4→agent` at a live shell — ahead of the pane's own title, so a
-long branch name cannot clip it off the end. Nothing else on screen says it:
-four of the seven views draw no cursor, so a focused one leaves the window with
-no cursor anywhere at all. The pad draws one while you are editing and none in
-the rendering, for the same reason: there is nothing there to put it in front
-of.
+`esc→agent`, or `f4→agent` at a live shell, or `esc→done` in a file you are
+editing — ahead of the pane's own keys and then its title, so neither a long
+branch name nor a long instruction can clip it off the end: `esc→done · ctrl+s
+save · ● README.md · editing`. Nothing else on screen says it: four of the seven
+views draw no cursor, so a focused one leaves the window with no cursor anywhere
+at all. The pad draws one while you are editing and none in the rendering, and
+the files view one while you type into a file and none while you read it, for
+the same reason: there is nothing there to put it in front of.
 
 Once the right pane has focus, plain keys work — deliberately the same
 vocabulary as Claude's own transcript view:
@@ -414,20 +503,32 @@ space / b       a page        Tab / Shift+Tab     the selection
 Ctrl+D / Ctrl+U a half page   Enter               open · queue: do it now
 r  refresh      t  the rendering / what was typed  Esc or q   back to the agent
 o  outline of this document, when it has one
+e  edit the file on screen    a  in the file list, a new file
 ```
 
-`r` is the one of those that is not the same everywhere: it refreshes in the
-files and git views, and clears the finished rows in the queue.
+Not all of those mean the same thing everywhere. `r` refreshes in the files and
+git views and clears the finished rows in the queue; `a` names a new file in the
+file list, starts another agent in the git view and arms sending in the queue;
+and `e` and `o` belong to the files view alone.
 
-**Three views do not answer to that paragraph.** The **shell** takes every plain
+**Three views do not answer to that paragraph, and a fourth stops answering to
+it while you type.** The **shell** takes every plain
 key, because a pane you type into cannot also read what you typed. The **ask**
 is the same: its composer is live the whole time the pane is, so `j`, `k`, `g`,
 `G`, `space`, `b`, `r` and `q` are letters there, and what scrolls is the
 arrows, PgUp/PgDn, Home/End and `Ctrl+D`/`Ctrl+U`. So is the **pad** while you
 are editing, which is why `t` there is `Alt+T` — the letter is a letter. The
 pad's rendering is read-only, so the vocabulary comes back to it, `t` included.
+And so is the **files** view once `e` has put a caret in it: every letter is the
+file's, `Ctrl+D`/`Ctrl+U` do nothing, and `Esc` goes back to reading rather than
+to the agent — with your text kept — at which point the vocabulary is back.
 That is what the `F1, ?` reference's mode rows are for: a pane whose keys mean
 something else, with nothing on screen saying so, reads as a broken pane.
+
+A `Ctrl` chord pressed while the right pane has your keys is that pane's, and it
+never reaches the agent: the pad's and the editor's `Ctrl+Z`, `Ctrl+Y` and
+`Ctrl+S`, the ask's `Ctrl+L`, `Ctrl+D`/`Ctrl+U` for the half page. With the
+agent focused every one of them is the agent's, as it always was.
 
 `Ctrl+\` exists so abeam can never permanently shadow a binding of the agent you
 are typing at. If a future release of an agent binds a key needed outside the
@@ -448,8 +549,9 @@ something in the shell view, drag over what it printed, hand it over, and add a
 sentence of your own before you press Enter yourself.
 
 `Ctrl+C` copies too, whenever a highlight is up. It is the only `Ctrl`+letter
-abeam ever takes, and only in that state — with nothing selected it is the
-child's, as always. If you meant to interrupt something, `Esc` first.
+abeam ever takes away from a child, and only in that state — with nothing
+selected it is the child's, as always. If you meant to interrupt something,
+`Esc` first.
 
 `F7` is the same thing without a mouse: it puts a caret on the right pane, the
 scroll keys move it, `v` anchors a selection, and `y` or `Ctrl+C` copies. That is
@@ -714,9 +816,15 @@ before you install it.
   Expect the row arithmetic to be the first thing that disappoints: three agents
   want a 42-row terminal before all three are drawn whole.
 - **Nobody has typed into the scratch pad by hand either**, on either platform.
-  It has tests and it has never had a user. It also has no undo and no
+  It has tests and it has never had a user. It has undo now and still no
   selection, it holds 64 KiB, and it saves two seconds after you stop typing —
   so a machine that loses power in that gap loses that much.
+- **Nobody has edited a file in the files view by hand**, and that is the first
+  feature that writes into your repository. It saves only on `Ctrl+S`, will not
+  write over a change the agent has made since you opened the file unless you
+  press `Ctrl+S` a second time, and keeps unsaved text in your profile rather
+  than beside the file — all of it tested, none of it used. The Linux half of
+  saving is tested by CI's Linux job and has never run on a developer's machine.
 - **A turn in the ask pane that never ends has no way out** but `F1, Q`. There is
   no cancel key and no timeout.
 - **Copying takes whole rows, of the right pane, that are on screen.** Not a
@@ -766,9 +874,15 @@ crates/abeam/src/select.rs         the rows a drag chose, and the keys that
                                    choose them without one
 crates/abeam/src/ask/              the second agent, and a wire format abeam
                                    does not own
+crates/abeam/src/editor/           text with a caret in it, and undo: what the
+                                   pad and the files view both type into
+crates/abeam/src/disk/             reading a file to edit it and writing it
+                                   back — the only code that writes into a
+                                   repository — and the recovery copies, which
+                                   never go there
 crates/abeam/src/panes/            one file per view
-crates/abeam/src/panes/pad/        the scratch pad: the text, the caret in it,
-                                   and the one file abeam writes
+crates/abeam/src/panes/pad/        the scratch pad, and the file in your
+                                   profile it saves itself to
 crates/abeam/tests/end_to_end.rs   abeam itself, hosted in a pty and typed at
 ```
 
