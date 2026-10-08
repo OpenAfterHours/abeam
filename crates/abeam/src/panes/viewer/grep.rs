@@ -682,9 +682,12 @@ impl Grep {
     /// included. The same trade `browse::find_key` makes and the same table,
     /// because a reader who has learned one filter box in this pane has learned
     /// all of them: the arrows and `Ctrl+N`/`Ctrl+P` step the results behind
-    /// the box, and the paging keys page them.
+    /// the box, and the paging keys page them. The same rule for what is a
+    /// letter as well — `crate::keys::is_text`, so that `Ctrl` and `Alt`
+    /// together, which is AltGr on Windows, types the `{`, `@` or `\` a phrase
+    /// of code is full of rather than being read as a chord.
     fn box_key(&mut self, key: KeyEvent) -> Outcome {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = crate::keys::ctrl_chord(&key);
         let page = self.cursor.page() as isize;
         let half = self.cursor.half() as isize;
 
@@ -702,9 +705,8 @@ impl Grep {
             KeyCode::Char('d') if ctrl => self.step(half),
             KeyCode::Char('u') if ctrl => self.step(-half),
             // Ctrl+letter is the agent's everywhere else in the program, so the
-            // rest must not fall into the plain-letter arm below.
-            KeyCode::Char(_) if ctrl => Outcome::Ignored,
-            KeyCode::Char(c) => {
+            // rest must not be letters: they fall to the arm at the bottom.
+            KeyCode::Char(c) if crate::keys::is_text(&key) => {
                 self.query.push(c);
                 Outcome::Moved
             }
@@ -1858,6 +1860,28 @@ mod tests {
         g.open();
         assert!(matches!(g.key(key(KeyCode::Enter)), Outcome::Ignored));
         assert!(g.typing(), "and the box is still open to type into");
+    }
+
+    #[test]
+    fn altgr_is_a_letter_in_the_box_and_a_chord_is_still_not() {
+        // Windows reports AltGr as Ctrl and Alt together; `{`, `@` and `\` are
+        // behind it on most layouts, and a phrase of code is full of them.
+        let dir = TempDir::new("grep-altgr");
+        let mut g = Grep::new(dir.path().to_path_buf());
+        g.set_index(Arc::from(vec!["a.txt".to_string()]), false);
+        g.open();
+        let altgr = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        for c in ['@', '{', '\\', '}', '€'] {
+            assert!(matches!(g.key(altgr(c)), Outcome::Moved), "{c}");
+        }
+        assert_eq!(g.query, "@{\\}€");
+        // A chord is not one, and `Ctrl+N` still steps rather than typing.
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(matches!(g.key(ctrl('z')), Outcome::Ignored));
+        let alt = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+        assert!(matches!(g.key(alt), Outcome::Ignored));
+        g.key(ctrl('n'));
+        assert_eq!(g.query, "@{\\}€");
     }
 
     #[test]

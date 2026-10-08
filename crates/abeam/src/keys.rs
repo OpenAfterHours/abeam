@@ -172,10 +172,13 @@ pub fn alt_chord(key: &KeyEvent) -> bool {
 ///
 /// `Ctrl` and `Alt` **together** are therefore text, and `Ctrl` or `Alt` alone
 /// is not. What that gives up is `Ctrl+Alt`+letter as a chord, which nothing in
-/// abeam binds and nothing hosted can hear: the three panes that ask this
-/// question are abeam's own composers, with no child in them for a chord to be
-/// aimed at. `Shift` is not part of the question at all — it is what made the
-/// letter a capital.
+/// abeam binds and nothing hosted can hear: the panes that ask this question —
+/// those three composers, the editor, and the files view's four boxes (the
+/// list's find, the name box, the document's `/` and the repository's `f`) —
+/// are abeam's own, with no child in them for a chord to be aimed at. A box
+/// that binds `Ctrl` chords of its own asks [`ctrl_chord`] for them, so that
+/// AltGr is never one. `Shift` is not part of the question at all — it is what
+/// made the letter a capital.
 ///
 /// A pane that also reads an `Alt` binding of its own must match it *before*
 /// this, which is what `crate::panes::pad`'s `Alt+T` arm does. That ordering is
@@ -206,9 +209,11 @@ pub fn is_text(key: &KeyEvent) -> bool {
 /// it — a shell — hands it on, because there it belongs to the child. The panes
 /// without one bind the chords their own vocabulary needs: the read-only views
 /// `Ctrl+D`/`Ctrl+U` to scroll half a page, the ask `Ctrl+L` to end its
-/// conversation, a selection `Ctrl+C` to copy, and the pad `Ctrl+Z`, `Ctrl+Y`
-/// and `Ctrl+S`. None of those can shadow a binding of the agent's, because
-/// none of them is offered anything while the agent has the keys.
+/// conversation, a selection `Ctrl+C` to copy, the pad `Ctrl+Z`, `Ctrl+Y`
+/// and `Ctrl+S`, and the files view's editor the same three — `Ctrl+S` from its
+/// reading view as well, while that holds unsaved text. None of those can
+/// shadow a binding of the agent's, because none of them is offered anything
+/// while the agent has the keys.
 ///
 /// `Alt` is excluded for the reason the module doc gives at length: Ctrl+Alt
 /// is how Windows spells AltGr, and on a layout where AltGr+Z types a
@@ -664,6 +669,16 @@ pub const HELP: &[(&str, &str)] = &[
         "document: jump to a heading or a definition, if it has any",
     ),
     ("Backspace or -", "file list: up a directory"),
+    // The list's own row for the one key that makes something. "when first
+    // saved" is the half nobody would guess and the half that matters: naming
+    // a file and walking away leaves nothing, not an empty file and not the
+    // directories its name passes through. A bare letter for the *intercept*
+    // paragraph at the top of this file, and in the box it opens every key is
+    // a letter — the `(in a find box)` row's rule.
+    (
+        "a (file list)",
+        "name a new file here (notes/ makes a directory); it exists once first saved",
+    ),
     ("r", "refresh · queue: clear what has finished (twice)"),
     // Not another global view key: `Alt+W` is Claude's, and one spelled `F6`
     // would be a key nobody groups with the workspace views. Why a bare letter

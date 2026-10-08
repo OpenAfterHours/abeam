@@ -11819,6 +11819,38 @@ mod tests {
         );
     }
 
+    /// The name box puts what is being typed before where it goes, by the
+    /// find's rule: a forty-column border, behind `esc→cancel`, still shows the
+    /// name whole when the directory it is going into is three deep — which,
+    /// with the directory first, pushed the name off the border before its
+    /// first letter.
+    #[test]
+    fn the_name_being_typed_survives_a_forty_column_border() {
+        let mut fx = app();
+        std::fs::create_dir_all(fx.dir.path().join("src/panes/viewer")).unwrap();
+        let deep = fx.dir.write("src/panes/viewer/x.rs", b"x\n");
+        assert!(fx.app.viewer.show(&deep));
+        hub(&mut fx.app, KeyCode::Char('b'));
+        assert_eq!(fx.app.right_view, RightView::Viewer);
+        fx.app.set_focus(Focus::Right);
+        screen(&mut fx.app, 240, 24);
+        fx.app.handle_key(key(KeyCode::Char('a'))).unwrap();
+        for c in "todo/plan.md".chars() {
+            fx.app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        let whole: String = fx
+            .app
+            .right_title(true)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        // Two cells of the forty go to the border's corners.
+        let shown: String = whole.chars().take(40 - 2).collect();
+        assert!(shown.starts_with(" esc→cancel · new file: todo/plan.md▌"), "{shown}");
+        assert!(whole.contains("· in src/panes/viewer/ · creates todo/"), "{whole}");
+    }
+
     /// The way out writes the reader's recovery copy — up to the last key, not
     /// the last quiet interval — and does not write the file: a quit is not a
     /// save. The copy is what the next `e` on that file offers back.

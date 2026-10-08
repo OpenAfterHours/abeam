@@ -172,6 +172,7 @@ mod list;
 pub(crate) mod load;
 pub(crate) mod markdown;
 mod mermaid;
+mod name;
 mod outline;
 mod search;
 pub(crate) mod source;
@@ -1188,7 +1189,7 @@ impl ViewerPane {
     /// Is a find box open? The border and the paste route both ask, and both
     /// are asking about this instant rather than about the pane's type.
     fn finding(&self) -> bool {
-        matches!(self.mode, Mode::Browse) && self.browse.finding()
+        matches!(self.mode, Mode::Browse) && self.browse.typing()
     }
 
     /// Is the *document's* search box open? The other half of the same
@@ -1321,6 +1322,7 @@ impl ViewerPane {
                 self.rescan();
                 changed.into()
             }
+            browse::Outcome::Name { dir, name } => self.name_file(dir, name),
             browse::Outcome::Open(path) => {
                 self.show(path);
                 // The list has answered its question. Staying in it after Enter
@@ -1584,8 +1586,13 @@ impl ViewerPane {
     /// are the shape a reader already has in their fingers for a filter box,
     /// and the paging and jump keys still move the document, which is all that
     /// is left of the F1 promise once `j`, `g` and `space` are letters.
+    ///
+    /// A chord is `Ctrl` without `Alt`, and a letter is what
+    /// `crate::keys::is_text` says — the rule `browse::find_key` keeps too,
+    /// because `Ctrl` and `Alt` together is AltGr on Windows, and a search for
+    /// `@param` or `{` must be one somebody outside the US can type.
     fn search_key(&mut self, key: KeyEvent) -> Handled {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = crate::keys::ctrl_chord(&key);
         match key.code {
             // Closes the box and keeps the hits. Only an Esc with nothing left
             // to close falls through to the shell — being thrown out of the
@@ -1604,10 +1611,8 @@ impl ViewerPane {
             KeyCode::Char('d') if ctrl => self.scroll_searching(key),
             KeyCode::Char('u') if ctrl => self.scroll_searching(key),
             // Ctrl+letter is the agent's everywhere else in the program, so the
-            // rest must not fall into the plain-letter arm below.
-            KeyCode::Char(_) if ctrl => Handled::No,
-
-            KeyCode::Char(c) => {
+            // rest must not be letters: they fall to the arm at the bottom.
+            KeyCode::Char(c) if crate::keys::is_text(&key) => {
                 if let Some(search) = self.search.as_mut() {
                     search.push(c);
                     search.find(&self.lines, self.margin);
@@ -2316,7 +2321,7 @@ impl Pane for ViewerPane {
             // own is open — in there `f` is a letter of a filename, and the
             // list is asked first about every other printable key for exactly
             // that reason.
-            if !self.browse.finding() && bare(key, 'f') {
+            if !self.browse.typing() && bare(key, 'f') {
                 return Ok(self.open_results(Back::Browse));
             }
             let out = self.browse.key(key);
@@ -2597,6 +2602,12 @@ impl Pane for ViewerPane {
             return "esc→page";
         }
         if matches!(self.mode, Mode::Browse) {
+            // The name box is a step short of the list, as the find is, but
+            // what the press does there is throw the name away — and the
+            // border says that rather than where it lands.
+            if self.browse.naming() {
+                return "esc→cancel";
+            }
             return if self.browse.finding() {
                 "esc→list"
             } else {
@@ -5096,6 +5107,35 @@ mod tests {
         // Ctrl+letter is still the agent's, exactly as it is in the list's find.
         assert_eq!(pane.handle_key(ctrl('c')).unwrap(), Handled::No);
         assert!(pane.title().contains("/qjnNrtgG/"), "{}", pane.title());
+    }
+
+    #[test]
+    fn altgr_is_a_letter_in_the_search_box_and_ctrl_n_still_steps() {
+        // Windows reports AltGr as Ctrl and Alt together, and `@`, `{` and `\`
+        // are behind it on most layouts outside the US.
+        let dir = TempDir::new("view-search-altgr");
+        let mut pane = needles(&dir);
+        laid(&mut pane, 40, 10);
+        query(&mut pane, "");
+        let altgr = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        for c in ['@', '{', '\\', '€'] {
+            assert_eq!(pane.handle_key(altgr(c)).unwrap(), Handled::Yes, "{c}");
+        }
+        assert!(pane.title().contains("/@{\\€"), "{}", pane.title());
+        let alt = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+        assert_eq!(pane.handle_key(alt).unwrap(), Handled::No, "Alt alone is not a letter");
+
+        // The chords the box binds are still chords.
+        for _ in 0..4 {
+            pane.handle_key(key(KeyCode::Backspace)).unwrap();
+        }
+        for c in "needle".chars() {
+            pane.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        let first = nth_hit(&pane);
+        assert_eq!(pane.handle_key(ctrl('n')).unwrap(), Handled::Yes);
+        assert_ne!(nth_hit(&pane), first, "Ctrl+N stepped");
+        assert!(pane.title().contains("/needle"), "{}", pane.title());
     }
 
     #[test]

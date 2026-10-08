@@ -16,10 +16,12 @@
 //! is a letter, `q` and `j` included. **Reading unsaved text** is the state the
 //! others do not have, and it is the one this design turns on: `Esc` from
 //! typing goes back to the reading view and *keeps the text*, shown rendered or
-//! as source exactly as `t` says, with `● unsaved` in the title. `Esc` never
-//! throws anything away, because it is the key every other mode in this pane
-//! has taught as "never mind", and a "never mind" that cost somebody a
-//! paragraph would be the worst key in the program. Throwing it away is `x`
+//! as source exactly as `t` says, with `● ` in front of the file's name in the
+//! title — and, on the border while the pane has the keys, `● unsaved` leading
+//! the hint that says what can be done with it (see the border section below).
+//! `Esc` never throws anything away, because it is the key every other mode in
+//! this pane has taught as "never mind", and a "never mind" that cost somebody
+//! a paragraph would be the worst key in the program. Throwing it away is `x`
 //! twice, saving it is `Ctrl+S` — from either state, because saving is not
 //! typing — and `e` goes back to typing.
 //!
@@ -33,6 +35,22 @@
 //! from a clean editor closes it, and so does anything that replaces the page.
 //! Closing it loses a caret. Keeping it would make every guard below fire on a
 //! page that has nothing to lose.
+//!
+//! ## A file that is not there yet
+//!
+//! `a` in the file list names one, and `super::name` decides what the name may
+//! be. A name that is already a file opens it, as `e` would. Any other opens
+//! an empty editor whose baseline is [`Baseline::Absent`] ([`Edit::create`]),
+//! and that one fact carries the rest: the first save *creates*, making the
+//! directories the name passes through, and is refused like any other if a
+//! file has appeared there since — so an agent that wrote the same name first
+//! is not written over by one press. Until then nothing of it is on disk.
+//! `Esc` with nothing typed goes back to the list and leaves no file and no
+//! directory; with something typed it is unsaved text like any other —
+//! guarded, copied out, offered back by naming the file again — and `x x`
+//! throws it away and puts back the page the name was given over. A first save
+//! tells the list and starts the walk again, so the list, the find and `Tab`
+//! know the file; the watcher tells the git view.
 //!
 //! ## What may not replace the page
 //!
@@ -181,7 +199,8 @@ use super::{Doc, Gutter, Mode, State, ViewerPane};
 use crate::disk::drafts::{self, Drafts};
 use crate::disk::{self, Baseline, Fingerprint, Format, Opened, Options, Refusal, SaveError, Saved};
 use super::load::MAX_BYTES;
-use crate::editor::{Editor, Look, Outcome, View};
+use super::name::{self, Named};
+use crate::editor::{Editor, Look, Outcome, Policy, TabKey, View};
 use crate::pane::Handled;
 use crate::panes::pad::QUIET;
 use crate::paths;
@@ -251,6 +270,15 @@ pub(super) struct Edit {
     gutter: u16,
     /// Where the last frame drew the caret, in pane coordinates.
     caret: Option<(u16, u16)>,
+    /// The file stopped being one abeam can edit while nothing here was
+    /// unsaved — deleted, renamed, grown past the cap — in the strict read's
+    /// words. See [`ViewerPane::recheck`] for why the editor stays open over
+    /// it rather than closing.
+    gone: Option<String>,
+    /// For a file `a` is creating: the document that was on the page when the
+    /// name was given, which a discard puts back. `None` for a file that was
+    /// opened rather than named.
+    came_from: Option<PathBuf>,
 }
 
 /// The disk is not what the text was typed against.
@@ -411,6 +439,35 @@ enum Place {
     Fraction { at: usize, of: usize },
 }
 
+/// What an [`Edit`] is started on, from either door: a file `disk::open` read,
+/// or one `a` named that is not there yet.
+struct File {
+    requested: PathBuf,
+    /// The resolved path, which is also the recovery copy's key for the edit's
+    /// life.
+    resolved: PathBuf,
+    text: String,
+    format: Format,
+    policy: Policy,
+    baseline: Baseline,
+    /// The fingerprint of what the text is typed against: the file's, or
+    /// `None` for a file that is not there.
+    against: Option<Fingerprint>,
+}
+
+/// Where the recovery copy of `path` is kept: the path resolved, links
+/// followed — or, for a path that is not there (deleted, renamed, or not
+/// created yet), the deepest part of it that is, resolved, with the rest joined
+/// on. One spelling for one file however it was reached, which is what makes a
+/// copy findable by a later session that reached it another way.
+pub(super) fn key_for(path: &Path) -> Option<PathBuf> {
+    if let Ok(resolved) = paths::resolve(path) {
+        return Some(resolved);
+    }
+    let name = path.file_name()?;
+    Some(key_for(path.parent()?)?.join(name))
+}
+
 /// Which kind of thing a notice is, for the two whose being drawn is what lets
 /// a key act.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,11 +481,61 @@ impl Edit {
     /// An editor on `opened`, with any recovery copy of it put over the disk's
     /// text, and the caret at `place`.
     fn open(opened: Opened, drafts: Option<&Drafts>, place: Place) -> Self {
-        let mut editor = Editor::from_text(opened.policy(), &opened.text);
-        let grammar = Grammar::for_file(&opened.requested, &opened.text);
-        let mut copy = Copy {
+        let file = File {
+            policy: opened.policy(),
             against: Some(opened.fingerprint()),
-            key: opened.path.clone(),
+            requested: opened.requested,
+            resolved: opened.path,
+            text: opened.text,
+            format: opened.format,
+            baseline: opened.baseline,
+        };
+        let mut edit = Edit::start(file, drafts);
+        edit.place_caret(place);
+        edit
+    }
+
+    /// An empty editor on `requested`, a file that is not there yet: `a`'s.
+    ///
+    /// The baseline is [`Baseline::Absent`], which is the whole of what makes
+    /// it a new file to everything downstream: the first save creates rather
+    /// than replaces, and is refused if a file has appeared there since; the
+    /// directories its name passes through are made by that save and not
+    /// before, so `Esc` on an untouched one leaves nothing behind. `key` is
+    /// where its recovery copy goes — see [`key_for`] — and a copy already
+    /// there, from a session that crashed while naming the same file, is
+    /// offered back exactly as one for an existing file is. A new file's `Tab`
+    /// types two spaces: there is no indentation of its own to follow.
+    fn create(
+        requested: PathBuf,
+        key: PathBuf,
+        format: Format,
+        drafts: Option<&Drafts>,
+        came_from: Option<PathBuf>,
+    ) -> Self {
+        let file = File {
+            policy: format.policy(TabKey::Spaces(2)),
+            against: None,
+            requested,
+            resolved: key,
+            text: String::new(),
+            format,
+            baseline: Baseline::Absent,
+        };
+        let mut edit = Edit::start(file, drafts);
+        edit.came_from = came_from;
+        edit.place_caret(Place::Line(0));
+        edit
+    }
+
+    /// The editor both of the above build, with any recovery copy of the file
+    /// put over its text.
+    fn start(file: File, drafts: Option<&Drafts>) -> Self {
+        let mut editor = Editor::from_text(file.policy, &file.text);
+        let grammar = Grammar::for_file(&file.requested, &file.text);
+        let mut copy = Copy {
+            against: file.against,
+            key: file.resolved.clone(),
             ..Copy::default()
         };
         let mut said = None;
@@ -438,14 +545,14 @@ impl Edit {
             // telling somebody afterwards that their words were never being
             // kept is telling them too late.
             None => copy.blocked = Some(drafts::nowhere()),
-            Some(drafts) => match drafts.read(&opened.path) {
+            Some(drafts) => match drafts.read(&copy.key) {
                 Ok(None) => {}
                 // Over the disk's text as one step, so the text reads as
                 // unsaved and one undo is exactly what is on disk.
                 Ok(Some(recovery)) => match editor.replace_all(&recovery.text) {
                     Outcome::Edited => {
                         said = Some(Said::Recovered(ago(recovery.saved_at)));
-                        if recovery.base != Some(opened.fingerprint()) {
+                        if recovery.base != file.against {
                             conflict = Some(Conflict::found(Why::Recovered));
                             copy.against = recovery.base;
                         }
@@ -454,10 +561,10 @@ impl Edit {
                     // another way, so nothing is unsaved and the copy is stale.
                     // A delete that fails leaves it to be found equal again.
                     Outcome::Still | Outcome::Moved => {
-                        let _ = drafts.delete(&opened.path);
+                        let _ = drafts.delete(&copy.key);
                     }
                     Outcome::Refused => {
-                        copy.blocked = Some(too_big_to_recover(&opened.requested));
+                        copy.blocked = Some(too_big_to_recover(&file.requested));
                     }
                 },
                 // There and unreadable: somebody's unsaved text, which a copy
@@ -465,13 +572,13 @@ impl Edit {
                 Err(why) => copy.blocked = Some(why),
             },
         }
-        let mut edit = Edit {
-            requested: opened.requested,
-            resolved: opened.path,
+        Edit {
+            requested: file.requested,
+            resolved: file.resolved,
             editor,
             view: View::default(),
-            format: opened.format,
-            baseline: opened.baseline,
+            format: file.format,
+            baseline: file.baseline,
             grammar,
             typing: true,
             conflict,
@@ -485,9 +592,15 @@ impl Edit {
             noticed: 0,
             gutter: 0,
             caret: None,
-        };
-        edit.place_caret(place);
-        edit
+            gone: None,
+            came_from: None,
+        }
+    }
+
+    /// A file `a` named and nothing has saved yet: nothing of it is on disk,
+    /// and closing it should leave the reader where the name was given.
+    fn unborn(&self) -> bool {
+        matches!(self.baseline, Baseline::Absent)
     }
 
     /// Put the caret at the start of the line `place` names, and that line at
@@ -608,6 +721,7 @@ impl Edit {
         self.resolved = opened.path;
         self.copy.against = Some(against);
         self.conflict = None;
+        self.gone = None;
         self.said = Some(Said::Reloaded);
         Ok(())
     }
@@ -778,23 +892,47 @@ impl ViewerPane {
             }
             Ok(false) if !edit.editor.is_modified() => match edit.reload(&self.root) {
                 Ok(()) => true,
-                // Gone, or no longer a file abeam can edit. There is nothing of
-                // the user's to keep, and keeping the editor would be keeping a
-                // text of a file that is not there: so it closes, and the page
-                // is the disk's.
+                // Already said, and still so: nothing new to draw.
+                Err(_) if edit.gone.is_some() => false,
+                // Gone, or no longer a file abeam can edit, with nothing of the
+                // user's in the editor.
+                //
+                // **The editor stays open over it, and blocked**, rather than
+                // closing. It used to close, and the next key somebody was
+                // already pressing then landed in the reader instead: `Tab`
+                // opened another file, `?` the ask, and `q` handed the keys to
+                // the agent, so the rest of a sentence typed into a file went
+                // into the agent's composer and its `Enter` sent it. A pane must
+                // not change what the keys mean under somebody typing — the rule
+                // the watcher has kept since the first page it ever held back.
+                // So it stays the editor, keeps the keys, says why at the top,
+                // and saves nothing until a save has been refused against what
+                // is there now (`seen: None`); `Esc` is the way out, and shows
+                // the disk as it is.
                 Err(refusal) => {
-                    let requested = edit.requested.clone();
-                    let name = self.label(&requested);
-                    self.edit = None;
-                    self.show(requested);
-                    self.note = Some(format!(
-                        "{name} changed on disk into a file abeam cannot edit, so the editor \
-                         has closed. {}",
-                        refusal.message()
-                    ));
+                    edit.gone = Some(refusal.message());
+                    edit.conflict = Some(Conflict {
+                        why: Why::Refused,
+                        drawn: false,
+                        seen: None,
+                    });
                     true
                 }
             },
+            // A refusal about exactly what is on disk now is still true: the
+            // watcher has reported the change the refusal was made against —
+            // typically a debounce after it — and replacing it with a fresh
+            // conflict would make the overwrite the notice promises take a
+            // third press.
+            Ok(false)
+                if edit.conflict.as_ref().is_some_and(|c| {
+                    let seen = c.seen.as_ref();
+                    c.why == Why::Refused
+                        && seen.is_some_and(|seen| seen.is_on_disk(&edit.resolved).unwrap_or(false))
+                }) =>
+            {
+                false
+            }
             Ok(false) => {
                 // Not drawn yet even if a conflict was already up: what the
                 // reader saw described a change, and this is another one —
@@ -881,11 +1019,63 @@ impl ViewerPane {
         Handled::Yes
     }
 
+    /// `Enter` in the file list's name box: the name checked, and then an empty
+    /// editor on a file that is not there yet, or the file it already names
+    /// opened to edit — or the reason back on the box, which stays open. See
+    /// `super::name`.
+    pub(super) fn name_file(&mut self, dir: PathBuf, name: String) -> Handled {
+        match name::check(&self.root, &dir, &name) {
+            Err(why) => self.browse.refuse_name(why),
+            Ok(Named::Existing(path)) => {
+                self.browse.close_name();
+                if self.show(path) {
+                    self.mode = Mode::Doc;
+                    // Laid out now, so that `e` places the caret against this
+                    // file's rows and not the last one's.
+                    if self.laid_out > 0 {
+                        self.ensure_layout(self.laid_out);
+                    }
+                    self.begin_edit();
+                }
+            }
+            Ok(Named::New { path, .. }) => {
+                self.browse.close_name();
+                self.create(path);
+            }
+        }
+        Handled::Yes
+    }
+
+    /// An empty editor on `path`, which is not there yet, with the line ending
+    /// its neighbours use (`super::name::line_ending`) and no mark.
+    ///
+    /// The page behind it is left as it was — the editor is drawn over it, and
+    /// `Esc` with nothing typed goes back to the list without touching it — and
+    /// remembered, so that throwing the new file's text away can put it back.
+    fn create(&mut self, path: PathBuf) {
+        // The list cannot be open over unsaved text, so this is a backstop; a
+        // clean editor is let go as `show` lets one go.
+        if !self.may_replace() {
+            return;
+        }
+        self.drop_clean_edit();
+        let key = key_for(&path).unwrap_or_else(|| path.clone());
+        let format = Format {
+            eol: name::line_ending(&path, &self.root),
+            bom: false,
+        };
+        let came_from = self.path().map(Path::to_path_buf);
+        self.edit = Some(Edit::create(path, key, format, self.drafts.as_ref(), came_from));
+        self.echo = None;
+        self.offered = None;
+        self.mode = Mode::Doc;
+    }
+
     /// Where the recovery copy of the file at `path` is, if there is one: by
     /// the key a copy is written under, which is the path resolved.
     pub(super) fn copy_of(&self, path: &Path) -> Option<PathBuf> {
         let drafts = self.drafts.as_ref()?;
-        let copy = drafts.path_of(&paths::resolve(path).ok()?);
+        let copy = drafts.path_of(&key_for(path)?);
         copy.is_file().then_some(copy)
     }
 
@@ -969,6 +1159,14 @@ impl ViewerPane {
         let Some(edit) = self.edit.as_mut() else {
             return Handled::No;
         };
+        // A file `a` named, with nothing typed into it: it leaves nothing at
+        // all behind — no file, no directory, no page for a file that is not
+        // there — and the reader goes back to the list the name was given in.
+        if edit.unborn() && !edit.editor.is_modified() {
+            self.edit = None;
+            self.mode = Mode::Browse;
+            return Handled::Yes;
+        }
         edit.typing = false;
         edit.caret = None;
         let top = edit.top;
@@ -998,6 +1196,10 @@ impl ViewerPane {
         let Some(edit) = self.drop_clean_edit() else {
             return;
         };
+        // Never saved: nothing of it is on disk, and nothing goes on the page.
+        if edit.unborn() {
+            return;
+        }
         if edit.conflict.is_some() {
             self.show(edit.requested);
         } else {
@@ -1188,12 +1390,18 @@ impl ViewerPane {
         };
         let Some(expect) = expect else {
             edit.conflict = Some(Conflict::refused(&edit.resolved));
+            edit.gone = None;
             return Handled::Yes;
         };
         let bytes = edit.format.encode(&edit.editor.text());
+        // A file `a` named makes the directories its name passes through, at
+        // its first save and only then; a file that was opened never does — a
+        // directory that vanished under it is a change, not something to put
+        // back quietly.
+        let born = edit.unborn();
         let options = Options {
             force: false,
-            create_dirs: false,
+            create_dirs: born,
         };
         edit.said = None;
         match disk::save(&edit.requested, &self.root, &bytes, &expect, options) {
@@ -1225,8 +1433,19 @@ impl ViewerPane {
                         self.note = Some(said.join(" "));
                     }
                 }
+                // A file that did not exist does now: the list shows it at
+                // once, and the walk that feeds the find, `Tab` and `f` is
+                // started again so they know it too. The watcher tells the git
+                // view.
+                if born {
+                    self.browse.relist();
+                    self.rescan();
+                }
             }
-            Err(SaveError::Changed) => edit.conflict = Some(Conflict::refused(&edit.resolved)),
+            Err(SaveError::Changed) => {
+                edit.conflict = Some(Conflict::refused(&edit.resolved));
+                edit.gone = None;
+            }
             Err(why) => edit.said = Some(Said::Failed(why.message(Path::new(&name)))),
         }
         Handled::Yes
@@ -1262,6 +1481,22 @@ impl ViewerPane {
         if let Err(why) = edit.forget_copy(self.drafts.as_ref()) {
             self.note = Some(why);
         }
+        // Never on disk: there is no file to show as it is, so the page goes
+        // back to what it was when the name was given, and the reader to the
+        // list it was given in.
+        if edit.unborn() {
+            match edit.came_from {
+                Some(path) => {
+                    self.show(path);
+                }
+                None => {
+                    self.state = State::Empty;
+                    self.dirty = true;
+                }
+            }
+            self.mode = Mode::Browse;
+            return;
+        }
         self.show(edit.requested);
     }
 
@@ -1295,7 +1530,11 @@ impl ViewerPane {
         };
         let name = self.label(&edit.requested);
         if let Some(conflict) = &edit.conflict {
-            out.push((Says::Conflict, block(&changed(conflict, &name), width, bad)));
+            let said = match &edit.gone {
+                Some(why) => gone(&name, why),
+                None => changed(conflict, &name),
+            };
+            out.push((Says::Conflict, block(&said, width, bad)));
         }
         match &edit.said {
             Some(Said::Failed(why) | Said::Noted(why)) => {
@@ -1454,8 +1693,9 @@ impl ViewerPane {
         }
         let edit = self.edit.as_ref()?;
         let mark = if self.pending.is_some() { "◆ " } else { "" };
+        let new = if edit.unborn() { " · new" } else { "" };
         Some(format!(
-            "{mark}{}{} · editing{} · {}",
+            "{mark}{}{} · editing{new}{} · {}",
             self.dot(),
             self.label(&edit.requested),
             self.diamond(),
@@ -1484,10 +1724,11 @@ impl ViewerPane {
             return None;
         }
         let edit = self.edit.as_ref()?;
-        Some(if !edit.editor.is_modified() && self.pending.is_some() {
-            "esc→new file"
-        } else {
-            "esc→done"
+        Some(match (edit.editor.is_modified(), edit.unborn()) {
+            // Nothing typed into a file that is not there: back to the list.
+            (false, true) => "esc→list",
+            (false, false) if self.pending.is_some() => "esc→new file",
+            _ => "esc→done",
         })
     }
 
@@ -1506,10 +1747,14 @@ impl ViewerPane {
         }
         let edit = self.edit.as_ref()?;
         let why = edit.conflict.as_ref().map(|conflict| conflict.why);
+        // `again overwrites` only for a refusal that saw something it may
+        // write over; one that could not hold the disk refuses again instead.
+        let overwrites = edit.conflict.as_ref().is_some_and(|c| c.seen.is_some());
         if edit.typing {
             return Some(match why {
-                Some(Why::Refused) => "◆ ctrl+s again overwrites",
-                Some(Why::Changed | Why::Recovered) => "◆ ctrl+s save",
+                _ if edit.gone.is_some() && !edit.editor.is_modified() => "◆ no longer editable",
+                Some(Why::Refused) if overwrites => "◆ ctrl+s again overwrites",
+                Some(_) => "◆ ctrl+s save",
                 None => "ctrl+s save",
             });
         }
@@ -1519,12 +1764,10 @@ impl ViewerPane {
         }
         Some(match (edit.question, why) {
             (Some(_), _) => "x again discards",
-            (None, Some(Why::Refused)) => {
+            (None, Some(Why::Refused)) if overwrites => {
                 "● unsaved · ◆ ctrl+s again overwrites · e edit · x x discard"
             }
-            (None, Some(Why::Changed | Why::Recovered)) => {
-                "● unsaved · ◆ ctrl+s save · e edit · x x discard"
-            }
+            (None, Some(_)) => "● unsaved · ◆ ctrl+s save · e edit · x x discard",
             (None, None) => "● unsaved · ctrl+s save · e edit · x x discard",
         })
     }
@@ -1578,6 +1821,15 @@ fn changed(conflict: &Conflict, name: &str) -> String {
              and only a second save writes over that change."
         ),
     }
+}
+
+/// The file stopped being one abeam can edit under an editor with nothing
+/// unsaved in it. No key named, for this section's reason.
+fn gone(name: &str, why: &str) -> String {
+    format!(
+        "{name} changed on disk into a file abeam cannot edit. {why} Nothing here will be \
+         written over it; leaving the editor shows it as it now is."
+    )
 }
 
 fn recovered(when: &str) -> String {
@@ -2280,9 +2532,11 @@ mod tests {
     }
 
     #[test]
-    fn a_file_gone_from_under_a_clean_editor_closes_it_and_the_page_shows_the_disk() {
-        // Deleted: there is nothing of the user's to keep, and a clean editor
-        // offering to save would be offering to bring the file back.
+    fn a_file_gone_from_under_a_clean_editor_blocks_it_and_it_keeps_the_keys() {
+        // Deleted while somebody is about to type: the editor stays, keeps the
+        // keys, says why, and writes nothing — the next letters must not land
+        // in the reader, where `Tab` opens another file and `q` hands the
+        // sentence to the agent.
         let fx = Fx::new("edit-watch-gone");
         let path = fx.write("notes.txt", b"one\n");
         let mut pane = fx.pane(&path);
@@ -2291,23 +2545,90 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         assert_eq!(pane.disk_changed(&path), Some(true));
-        assert!(pane.edit.is_none(), "the editor closed");
-        assert!(!pane.takes_input());
+        assert!(pane.editing(), "the editor stayed open");
+        assert!(pane.takes_input());
+        assert_eq!(pane.action_hint(), Some("◆ no longer editable"));
         let shown = page(&mut pane, 60, 10);
         assert!(shown.contains("changed on disk into a file abeam cannot edit"), "{shown}");
-        assert!(shown.contains("no such file"), "the page is the disk's: {shown}");
-        assert!(!path.exists(), "and nothing put it back");
+        assert!(shown.contains("No such file"), "and why: {shown}");
+        assert_eq!(chord(&mut pane, 's'), Handled::No, "nothing to save, so nothing saved");
+        assert_eq!(pane.disk_changed(&path), Some(false), "the same news again draws nothing");
 
-        // Grown into something the strict read refuses: the same.
+        // The keys are still the editor's.
+        for code in [KeyCode::Char('q'), KeyCode::Tab, KeyCode::Char('?')] {
+            assert_eq!(press(&mut pane, code), Handled::Yes, "{code:?}");
+        }
+        assert!(pane.editing());
+        assert!(text(&pane).starts_with("q"), "{:?}", text(&pane));
+        assert!(!path.exists(), "and nothing put it back");
+        for _ in 0..3 {
+            chord(&mut pane, 'z');
+        }
+
+        // `Esc` is the way out, and the page is the disk's.
+        press(&mut pane, KeyCode::Esc);
+        assert!(pane.edit.is_none());
+        assert!(page(&mut pane, 60, 10).contains("no such file"));
+
+        // Grown into something the strict read refuses: the same block.
         let path = fx.write("mixed.txt", b"one\n");
         let mut pane = fx.pane(&path);
         draw(&mut pane, 60, 10);
         press(&mut pane, KeyCode::Char('e'));
         std::fs::write(&path, b"one\r\ntwo\n").unwrap();
         assert_eq!(pane.disk_changed(&path), Some(true));
-        assert!(pane.edit.is_none());
+        assert!(pane.editing());
         assert!(page(&mut pane, 60, 10).contains("Mixed line endings"));
         assert_eq!(std::fs::read(&path).unwrap(), b"one\r\ntwo\n");
+    }
+
+    #[test]
+    fn the_watcher_s_report_of_a_refused_change_does_not_start_the_refusal_over() {
+        // The refusal is made against v2; the watcher then reports v2, a
+        // debounce later. The notice promised that one more press writes over
+        // that version, and it must still be one.
+        let fx = Fx::new("edit-refusal-echo");
+        let path = fx.write("plan.md", b"one\n");
+        let mut pane = fx.pane(&path);
+        draw(&mut pane, 50, 12);
+        press(&mut pane, KeyCode::Char('e'));
+        type_in(&mut pane, "x");
+        std::fs::write(&path, b"agent v2\n").unwrap();
+        chord(&mut pane, 's');
+        draw(&mut pane, 50, 12);
+
+        assert_eq!(pane.disk_changed(&path), Some(false), "nothing new to say");
+        assert!(edit(&pane).conflict.as_ref().is_some_and(|c| c.why == Why::Refused && c.drawn));
+        chord(&mut pane, 's');
+        assert_eq!(std::fs::read(&path).unwrap(), b"xone\n");
+
+        // A newer change than the refusal saw is news, and starts it over.
+        type_in(&mut pane, "y");
+        std::fs::write(&path, b"agent v3\n").unwrap();
+        chord(&mut pane, 's');
+        draw(&mut pane, 50, 12);
+        std::fs::write(&path, b"agent v4\n").unwrap();
+        assert_eq!(pane.disk_changed(&path), Some(true));
+        assert!(edit(&pane).conflict.as_ref().is_some_and(|c| c.why == Why::Changed));
+    }
+
+    #[test]
+    fn a_copy_of_a_file_that_is_gone_is_still_found() {
+        // Deleted or renamed: the copy is under the path the file had, and
+        // resolving that path fails, so it is found through the directory.
+        let fx = Fx::new("edit-copy-gone");
+        let path = fx.write("plan.md", b"# Plan\n");
+        let key = crate::paths::resolve(&path).unwrap();
+        fx.drafts().write(&fx.root(), &key, "mine\n", Some(Fingerprint::of(b"# Plan\n"))).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(key_for(&path), Some(key.clone()));
+
+        let mut pane = fx.pane(&path);
+        draw(&mut pane, 200, 12);
+        press(&mut pane, KeyCode::Char('e'));
+        let shown = page(&mut pane, 200, 12);
+        let copy = fx.drafts().path_of(&key).display().to_string();
+        assert!(shown.contains(&copy), "{shown}");
     }
 
     #[test]
@@ -2861,6 +3182,270 @@ mod tests {
         draw(&mut pane, 60, 12);
         press(&mut pane, KeyCode::Char('e'));
         assert!(page(&mut pane, 60, 12).contains("nowhere in your profile"));
+    }
+
+    // --- a new file -----------------------------------------------------------
+
+    /// The file list open over `pane`, its name box open, and `name` typed.
+    fn naming(pane: &mut ViewerPane, name: &str) {
+        pane.open_browse();
+        draw(pane, 60, 12);
+        assert_eq!(press(pane, KeyCode::Char('a')), Handled::Yes);
+        for c in name.chars() {
+            press(pane, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn a_in_the_list_opens_a_name_box_whose_every_key_is_a_letter() {
+        let fx = Fx::new("create-box");
+        let path = fx.write("README.md", b"# hi\n");
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "");
+        assert!(pane.browse.naming());
+        assert!(pane.takes_input());
+        assert_eq!(pane.exit_hint(), "esc→cancel");
+        assert!(pane.title().starts_with("new file: ▌ · in ./"), "{}", pane.title());
+
+        // `f`, `q`, `j`, `a` and `r` are keys in the list; here they are letters.
+        for c in "fqjar/x.md".chars() {
+            assert_eq!(press(&mut pane, KeyCode::Char(c)), Handled::Yes, "{c}");
+        }
+        assert!(matches!(pane.mode, Mode::Browse), "f opened no search");
+        assert_eq!(pane.title(), "new file: fqjar/x.md▌ · in ./ · creates fqjar/");
+        assert!(pane.handle_paste("y").unwrap().is_yes());
+        assert!(pane.title().contains("x.mdy▌"));
+
+        // `Esc` throws the name away and stays in the list; so does
+        // `Backspace` past the start.
+        assert_eq!(press(&mut pane, KeyCode::Esc), Handled::Yes);
+        assert!(!pane.browse.naming());
+        assert!(matches!(pane.mode, Mode::Browse));
+        press(&mut pane, KeyCode::Char('a'));
+        press(&mut pane, KeyCode::Backspace);
+        assert!(!pane.browse.naming());
+        assert!(!fx.root().join("fqjar").exists(), "and nothing was made");
+
+        // A name that is a file already says what `Enter` will do.
+        press(&mut pane, KeyCode::Char('a'));
+        for c in "README.md".chars() {
+            press(&mut pane, KeyCode::Char(c));
+        }
+        assert!(pane.title().ends_with("· there already: opens it"), "{}", pane.title());
+    }
+
+    #[test]
+    fn a_refused_name_keeps_the_box_open_and_says_why_until_the_name_changes() {
+        let fx = Fx::new("create-refused");
+        let path = fx.write("README.md", b"# hi\n");
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "con.md");
+        assert_eq!(press(&mut pane, KeyCode::Enter), Handled::Yes);
+        assert!(pane.browse.naming(), "the box is still open");
+        assert!(pane.edit.is_none());
+        let shown = page(&mut pane, 60, 12);
+        assert!(shown.contains("con.md is a device on Windows"), "{shown}");
+        assert!(shown.contains("README.md"), "the listing is still under it: {shown}");
+        press(&mut pane, KeyCode::Backspace);
+        assert!(!page(&mut pane, 60, 12).contains("is a device"), "mended, and gone");
+        assert!(std::fs::read_dir(fx.root()).unwrap().count() == 1, "nothing was made");
+    }
+
+    #[test]
+    fn a_new_name_opens_an_empty_editor_and_esc_with_nothing_typed_leaves_nothing() {
+        let fx = Fx::new("create-untouched");
+        let path = fx.write("README.md", b"# hi\n");
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "notes/today.md");
+        assert!(pane.title().ends_with("· creates notes/"), "{}", pane.title());
+        press(&mut pane, KeyCode::Enter);
+
+        assert!(pane.editing());
+        assert!(edit(&pane).unborn());
+        assert_eq!(text(&pane), "");
+        // Named the way the reader names every file: relative, with this
+        // platform's separator.
+        let name = pane.label(&fx.root().join("notes").join("today.md"));
+        assert!(pane.title().starts_with(&format!("{name} · editing · new")), "{}", pane.title());
+        assert_eq!(pane.exit_hint(), "esc→list");
+        draw(&mut pane, 60, 12);
+        assert_eq!(pane.cursor(), Some((4, 0)));
+
+        assert_eq!(press(&mut pane, KeyCode::Esc), Handled::Yes);
+        assert!(pane.edit.is_none());
+        assert!(matches!(pane.mode, Mode::Browse), "back to the list the name was given in");
+        assert!(!fx.root().join("notes").exists(), "no directory");
+        assert_eq!(pane.path(), Some(path.as_path()), "and the page is as it was");
+    }
+
+    #[test]
+    fn the_first_save_makes_the_directories_and_the_file_in_its_neighbours_ending() {
+        let fx = Fx::new("create-save");
+        let path = fx.write("README.md", b"# hi\r\n");
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "notes/today.md");
+        press(&mut pane, KeyCode::Enter);
+        type_in(&mut pane, "hello");
+        press(&mut pane, KeyCode::Enter);
+        assert_eq!(pane.exit_hint(), "esc→done", "something typed: Esc keeps it");
+
+        assert_eq!(chord(&mut pane, 's'), Handled::Yes);
+        let made = fx.root().join("notes").join("today.md");
+        assert_eq!(std::fs::read(&made).unwrap(), b"hello\r\n", "the root README's ending");
+        assert!(!edit(&pane).unborn(), "a file now, saved like any other");
+        assert!(!pane.title().contains("· new"), "{}", pane.title());
+        assert!(pane.scan.is_some(), "the walk that feeds the find and Tab was started");
+        assert!(pane.browse.title().contains("2 items"), "{}", pane.browse.title());
+        let names: Vec<_> = std::fs::read_dir(fx.root().join("notes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["today.md"], "and nothing beside it");
+
+        // The page is the file now.
+        press(&mut pane, KeyCode::Esc);
+        assert!(pane.edit.is_none());
+        assert_eq!(pane.path(), Some(made.as_path()));
+        assert!(page(&mut pane, 60, 12).contains("hello"));
+    }
+
+    #[test]
+    fn a_name_that_is_already_a_file_opens_it_to_edit() {
+        let fx = Fx::new("create-existing");
+        let path = fx.write("README.md", b"# hi\n");
+        let other = fx.write("other.md", b"# other\n\nline\n");
+        let mut pane = fx.pane(&other);
+        // In any case, on every platform: `super::name`'s rule, because on
+        // Windows and macOS any case is that file.
+        naming(&mut pane, "readme.MD");
+        press(&mut pane, KeyCode::Enter);
+
+        assert!(pane.editing());
+        assert!(!edit(&pane).unborn());
+        assert_eq!(text(&pane), "# hi\n");
+        assert_eq!(pane.label(&edit(&pane).requested), "README.md", "the disk's spelling");
+        assert_eq!(edit(&pane).editor.caret(), (0, 0));
+        assert_eq!(pane.path().map(Path::to_path_buf), crate::paths::resolve(&path).ok());
+    }
+
+    /// A file that is there, reached through a link that leads out of the
+    /// workspace: refused in the box, and the page never shows a line of it —
+    /// the strict read `e` makes would refuse it too, but only after `show`
+    /// had put it on screen.
+    #[test]
+    fn a_name_that_leads_to_a_file_outside_the_workspace_never_reaches_the_page() {
+        let fx = Fx::new("create-outside");
+        let path = fx.write("README.md", b"# hi\n");
+        let elsewhere = fx.dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("secret.md"), b"# not the work\n").unwrap();
+        // A junction on Windows, which needs no privilege; a symlink on Unix.
+        let link = fx.root().join("out");
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&elsewhere)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success());
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&elsewhere, &link).is_ok();
+        if !made {
+            eprintln!("skipped: this machine would not make a directory link");
+            return;
+        }
+
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "out/secret.md");
+        assert!(!pane.title().contains("opens it"), "{}", pane.title());
+        assert_eq!(press(&mut pane, KeyCode::Enter), Handled::Yes);
+        assert!(pane.browse.naming(), "the box is still open");
+        assert!(pane.edit.is_none());
+        assert_eq!(pane.path(), Some(path.as_path()), "the page is still the one it was");
+        let shown = page(&mut pane, 60, 12);
+        assert!(shown.contains("outside this workspace"), "{shown}");
+        assert!(!shown.contains("not the work"), "the outside file was drawn: {shown}");
+    }
+
+    #[test]
+    fn throwing_a_new_file_s_text_away_goes_back_to_the_list_and_the_page_it_left() {
+        let fx = Fx::new("create-discard");
+        let path = fx.write("README.md", b"# hi\n");
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "draft.md");
+        press(&mut pane, KeyCode::Enter);
+        type_in(&mut pane, "never kept");
+        press(&mut pane, KeyCode::Esc);
+        assert!(pane.title().starts_with("● draft.md"), "{}", pane.title());
+        assert!(page(&mut pane, 60, 12).contains("never kept"));
+
+        press(&mut pane, KeyCode::Char('x'));
+        draw(&mut pane, 60, 12);
+        press(&mut pane, KeyCode::Char('x'));
+        assert!(pane.edit.is_none());
+        assert!(matches!(pane.mode, Mode::Browse));
+        assert_eq!(pane.path(), Some(path.as_path()), "the page it was named over");
+        assert!(!fx.root().join("draft.md").exists());
+    }
+
+    #[test]
+    fn a_file_that_appears_before_the_first_save_is_not_written_over_by_one_press() {
+        let fx = Fx::new("create-appeared");
+        let path = fx.write("README.md", b"# hi\n");
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "new.md");
+        press(&mut pane, KeyCode::Enter);
+        type_in(&mut pane, "mine");
+        let made = fx.root().join("new.md");
+        std::fs::write(&made, b"theirs\n").unwrap();
+
+        chord(&mut pane, 's');
+        assert_eq!(std::fs::read(&made).unwrap(), b"theirs\n", "refused, not replaced");
+        assert_eq!(pane.action_hint(), Some("◆ ctrl+s again overwrites"));
+        draw(&mut pane, 60, 12);
+        chord(&mut pane, 's');
+        assert_eq!(std::fs::read(&made).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn a_new_file_s_unsaved_text_is_guarded_and_copied_out_like_any_other() {
+        let fx = Fx::new("create-guarded");
+        let path = fx.write("README.md", b"# hi\n");
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "notes/new.md");
+        press(&mut pane, KeyCode::Enter);
+        type_in(&mut pane, "unsaved");
+        let target = fx.root().join("notes").join("new.md");
+        assert!(!pane.show(&path), "nothing replaces it");
+        pane.keystroke();
+        let name = pane.label(&target);
+        assert_eq!(pane.quit_note(), Some(format!("unsaved {name} kept as a recovery copy")));
+
+        // Kept under a key that does not depend on the file being there: the
+        // directory that is, resolved, and the rest of the name.
+        quiet_is_over(&mut pane);
+        pane.tick();
+        let key = key_for(&target).unwrap();
+        assert_eq!(fx.drafts().read(&key).unwrap().expect("a copy").text, "unsaved");
+        assert_eq!(fx.drafts().read(&key).unwrap().expect("a copy").base, None);
+        assert!(!fx.root().join("notes").exists(), "still nothing in the repository");
+
+        // A later session naming the same file is offered it back.
+        let mut pane = fx.pane(&path);
+        naming(&mut pane, "notes/new.md");
+        press(&mut pane, KeyCode::Enter);
+        assert_eq!(text(&pane), "unsaved");
+        assert!(edit(&pane).conflict.is_none(), "typed against no file, and there is none");
+    }
+
+    #[test]
+    fn the_overlay_names_the_key_that_makes_a_file() {
+        let (_, said) = crate::keys::HELP
+            .iter()
+            .find(|(key, _)| *key == "a (file list)")
+            .expect("`a` is in the F1 overlay");
+        assert!(said.contains("new file"), "{said}");
     }
 
     #[test]
