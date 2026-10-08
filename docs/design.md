@@ -955,7 +955,15 @@ names the file, and the agent's exit holds the door with
 `unsaved README.md · F1, Q to quit` — ranked below another agent and above a
 shell, because it is cheaper to end than a turn somebody is paying for, there
 being a recovery copy, and dearer than a shell at a prompt, being words nothing
-will type again.
+will type again. Unlike a shell's, that hold outlasts what caused it: a shell
+ends on its own and abeam may go with it, but text stops counting because
+somebody is in the files view saving or discarding it, and leaving on the next
+pass sent the keys typed after a `Ctrl+S` to the parent shell. So once text has
+held the door it is held until `F1, Q`. The question `F1, Q` asks says the text
+is kept only when a copy of it was written — the first press writes it before
+asking — because a profile inside the workspace refuses every copy, and a
+promise made on being allowed to write one was a promise the second press
+broke.
 
 **A save gives back the file it was given, and the strict read is where that is
 decided.** The reader decodes generously on purpose — a Latin-1 byte becomes a
@@ -1026,7 +1034,12 @@ by `x x` and by nothing else — not by an undo back to the disk and not by
 leaving — because keeping one too long costs a second offer of it, and deleting
 one too soon costs the work it held. The one exception is a copy that turns out,
 at `e`, to hold exactly what is on disk: it has nothing left to lose, and it is
-deleted there.
+deleted there. For the same reason a copy offered back and undone to look at the
+disk does not let the file "follow the agent": the editor is clean, but the
+copy's text is in its redo and in the profile and nowhere else, and a reload
+would take the redo and let the next keystroke's copy replace the old one. A
+change on disk while such a copy is in the profile is a conflict, as it is for
+unsaved text.
 
 **Undo is a word at a time, and a save closes the step.** A history that took
 back a keystroke per press would cost forty presses to unwrite a sentence, so

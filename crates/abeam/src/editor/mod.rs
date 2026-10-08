@@ -1,5 +1,5 @@
 //! Text with a caret in it: what the scratch pad types into, and what the
-//! files view will type into when it edits a file.
+//! files view types into when it edits a file.
 //!
 //! This was the pad's, and it moved here the moment a second pane needed it,
 //! because every hard part of it is about editing and none of it is about the
@@ -27,8 +27,9 @@
 //! [`Policy`]: how much the text may hold, counted in the bytes it will have on
 //! disk, and what a tab becomes. The pad's is a 64 KiB cap and two spaces for
 //! every tab, because that cap is the highlighter's and two spaces is a
-//! markdown nesting level; a file's will be the reader's 512 KiB and its own
-//! literal tabs, because a save has to give back the bytes it was given. Which
+//! markdown nesting level; a file's is the reader's 512 KiB and the file's own
+//! habit — a literal tab where it already indents with one, two spaces where
+//! it does not — because a save has to give back the bytes it was given. Which
 //! grammar colours the text and which palette it is drawn in arrive at each
 //! frame as a [`Look`].
 //!
@@ -36,7 +37,7 @@
 //! `Ctrl+S`, an `Alt` chord, `PgUp`/`PgDn`, which [`Editor::key`] hands back
 //! untouched — and where the caret starts. `Editor::from_text` leaves it at
 //! the start of the text; the pad moves it to the end, because a note is
-//! reopened to be added to, and the files view will move it to where the reader
+//! reopened to be added to, and the files view moves it to where the reader
 //! was looking. The pad's rendered form, `Alt+T`, its autosave and its notices
 //! are the pad's alone. Line endings and a byte order mark are nobody's
 //! business here beyond what they cost: the buffer holds lines joined by `\n`;

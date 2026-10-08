@@ -170,7 +170,7 @@ impl Buffer {
     /// before it has said anything: where the caret should *go* is a question
     /// about what the text is for. The pad moves it to the end, because the
     /// note you are about to add goes after the ones already made; the files
-    /// view will move it to where the reader was looking. Both say so with
+    /// view moves it to where the reader was looking. Both say so with
     /// [`Buffer::set_caret`], which clamps, so "the end" is `usize::MAX`.
     ///
     /// The text is cleaned on the way in for the reason [`clean`] gives. That

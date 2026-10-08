@@ -1577,6 +1577,19 @@ pub struct App {
     /// Quitting kills a live session, so it asks twice. One bit rather than a
     /// modal dialog: any other key cancels it, which is the whole interaction.
     pending_quit: bool,
+    /// The session's agent has gone and unsaved text in a file held the door,
+    /// so the door stays held until `F1, Q`, whatever happens to the text.
+    ///
+    /// **Saving is not quitting**, and without this it was. The loop asks
+    /// [`App::anything_live`] on every pass, and the text stops counting the
+    /// moment it is saved — so the `Ctrl+S` that a held door's title invites
+    /// ended abeam on the next pass, and the keys typed after it went to the
+    /// shell abeam was started from, where an `Enter` runs them. A shell or an
+    /// agent holding the door is different: it ends on its own, and abeam
+    /// leaving with it is the rule the loop states. Text ends because somebody
+    /// is in the files view doing something to it, and the window must not
+    /// close under them. Set by [`App::door_closes`] and by nothing else.
+    held_for_text: bool,
     /// The active shell named by the last `F1, X`, if that confirmation has not
     /// been cancelled by another action. Stable identity is required here: a
     /// shell before it may close while the prompt is visible, changing every
@@ -2086,6 +2099,7 @@ impl App {
             hub: None,
             literal_next: false,
             pending_quit: false,
+            held_for_text: false,
             pending_shell_close: None,
             shell_close_drawn: None,
             pending_close: None,
@@ -2367,6 +2381,24 @@ impl App {
     /// opens that file again and knows to look.
     fn anything_live(&self) -> bool {
         self.any_agent_live() || self.any_shell_live() || self.viewer.unsaved().is_some()
+    }
+
+    /// The loop's question, once a pass has recorded the session's agent
+    /// leaving: may abeam leave with it?
+    ///
+    /// [`App::anything_live`]'s answer, with one thing remembered across
+    /// passes: unsaved text that held the door once holds it until `F1, Q`,
+    /// saved or thrown away or not — see
+    /// [`held_for_text`](Self::held_for_text). Split out of
+    /// [`drive`](Self::drive) so a test can ask it; the loop wants a terminal.
+    fn door_closes(&mut self) -> bool {
+        if self.session_agent().exit.is_none() {
+            return false;
+        }
+        if self.viewer.unsaved().is_some() {
+            self.held_for_text = true;
+        }
+        !self.held_for_text && !self.anything_live()
     }
 
     /// Point the keyboard at another agent.
@@ -3678,7 +3710,7 @@ impl App {
             // that pressing F1, S once, early, changes how the session ends —
             // which is why the title names what is holding the door rather than
             // just saying abeam is still here.
-            if self.session_agent().exit.is_some() && !self.anything_live() {
+            if self.door_closes() {
                 return Ok(());
             }
 
@@ -5329,6 +5361,13 @@ impl App {
                 if confirming || (self.session_agent().pane.has_exited() && !self.anything_live()) {
                     return Ok(Flow::Quit);
                 }
+                // The reader's recovery copy is written *before* the question,
+                // so that what the question says about it is the answer of a
+                // write that happened: `ViewerPane::quit_note` says "kept" only
+                // for a copy that is on disk and up to date, and a promise made
+                // on the strength of a write that has not been tried is the one
+                // the second press would break.
+                self.viewer.flush_draft();
                 self.pending_quit = true;
             }
             // Direct selection, not a cycle: `F1, G` always means "git is now
@@ -6197,10 +6236,12 @@ impl App {
         // was, so the second name buys no action at the price of the pane's
         // own; and the agent leads because it is the more expensive thing to
         // end — a turn somebody is paying for, against a shell sitting at a
-        // prompt. The empty arm is not decoration either: this branch is drawn
-        // from a test as readily as from the loop, and a title that asserted a
-        // live shell where there is none would be the border making something
-        // up.
+        // prompt. The empty arm is not decoration either: it is what the loop
+        // draws once text that held the door has been saved or thrown away —
+        // the door stays held for that ([`App::held_for_text`]) and there is
+        // nothing left to name, the agent's own title already saying it
+        // exited — and a title that asserted a live shell where there is none
+        // would be the border making something up.
         //
         // `any_agent_live` counts `agents[0]` too, and here it cannot be one of
         // them: the branch is only reached once that child's exit has been
@@ -11638,6 +11679,11 @@ mod tests {
     #[test]
     fn unsaved_text_in_a_file_holds_the_door_and_the_quit_names_the_file() {
         let mut fx = app();
+        // `F1, Q` writes the recovery copy before it asks; into a profile this
+        // test owns.
+        let profile = TempDir::new("app-door-drafts");
+        let drafts = crate::disk::drafts::Drafts::at(profile.path().join("drafts"));
+        fx.app.viewer.set_drafts(Some(drafts));
         editing(&mut fx, "notes.md", "unsaved ");
         until("the session's agent to go", || {
             fx.app.reap().expect("try_wait on a child that exists");
@@ -11668,6 +11714,72 @@ mod tests {
             hub(&mut fx.app, KeyCode::Char('q')),
             Flow::Quit
         ));
+    }
+
+    /// The `Ctrl+S` a held door invites is not a quit. Once unsaved text has
+    /// held the door it stays held after the text is saved — the loop used to
+    /// leave on the next pass, and the keys typed after the save went to the
+    /// shell abeam was started from — and `F1, Q` is the way out, straight out
+    /// now that nothing would be lost.
+    #[test]
+    fn saving_the_text_that_held_the_door_does_not_let_abeam_leave_on_its_own() {
+        let mut fx = app();
+        let profile = TempDir::new("app-held-drafts");
+        let drafts = crate::disk::drafts::Drafts::at(profile.path().join("drafts"));
+        fx.app.viewer.set_drafts(Some(drafts));
+        let notes = editing(&mut fx, "notes.md", "unsaved ");
+        until("the session's agent to go", || {
+            fx.app.reap().expect("try_wait on a child that exists");
+            fx.app.agents[0].pane.has_exited()
+        });
+        fx.app.agents[0].exit = Some((abeam_pty::ExitStatus::with_exit_code(0), Vec::new()));
+        assert!(!fx.app.door_closes(), "the text holds the door");
+
+        fx.app.handle_key(ctrl('s')).unwrap();
+        assert_eq!(std::fs::read(&notes).unwrap(), b"unsaved # notes\n");
+        assert!(fx.app.viewer.unsaved().is_none());
+        assert!(!fx.app.anything_live(), "nothing is live: the door is held by the rule");
+        for _ in 0..3 {
+            assert!(!fx.app.door_closes(), "abeam left on its own after a save");
+        }
+        let shown = screen(&mut fx.app, 300, 24);
+        assert!(shown.contains("F1, Q to quit"), "{shown}");
+        assert!(!shown.contains("unsaved notes.md"), "{shown}");
+        assert!(matches!(
+            hub(&mut fx.app, KeyCode::Char('q')),
+            Flow::Quit
+        ));
+
+        // Without text there is nothing to hold it: the agent leaving ends
+        // abeam, as it always has.
+        let mut fx = app();
+        until("the session's agent to go", || {
+            fx.app.reap().expect("try_wait on a child that exists");
+            fx.app.agents[0].pane.has_exited()
+        });
+        assert!(!fx.app.door_closes(), "not until the exit is recorded");
+        fx.app.agents[0].exit = Some((abeam_pty::ExitStatus::with_exit_code(0), Vec::new()));
+        assert!(fx.app.door_closes());
+    }
+
+    /// abeam started in the home directory has its profile inside the
+    /// workspace, where no recovery copy may go. `F1, Q` tries the copy before
+    /// it asks, and says the text will be lost when the write was refused —
+    /// it used to say "kept" on the strength of being allowed to try.
+    #[test]
+    fn the_quit_question_says_the_text_is_lost_when_no_copy_could_be_written() {
+        let mut fx = app();
+        let inside = fx.dir.path().join(".local").join("abeam").join("drafts");
+        fx.app.viewer.set_drafts(Some(crate::disk::drafts::Drafts::at(inside)));
+        editing(&mut fx, "notes.md", "unsaved ");
+        assert!(matches!(
+            hub(&mut fx.app, KeyCode::Char('q')),
+            Flow::Continue { .. }
+        ));
+        assert!(fx.app.pending_quit);
+        let shown = screen(&mut fx.app, 300, 24);
+        assert!(shown.contains("F1, Q again to quit · unsaved notes.md will be lost"), "{shown}");
+        assert!(!fx.dir.path().join(".local").exists(), "a copy went into the workspace");
     }
 
     /// A change to the file being edited reaches the reader whatever it is

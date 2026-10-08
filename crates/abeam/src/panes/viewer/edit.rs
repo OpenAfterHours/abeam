@@ -145,7 +145,9 @@
 //! and will not read is left alone for the session and a notice above the
 //! page says so — `Drafts::read`'s rule. Quitting keeps the copy, written up
 //! to the last keystroke, and the warning before the quit says so: a confirmed
-//! quit takes the text off the screen and not out of the profile.
+//! quit takes the text off the screen and not out of the profile. It says so
+//! only of a copy that was written — the first `F1, Q` writes it before asking
+//! — and a copy the profile refused is named as text the quit will lose.
 //!
 //! ## What focus does not do
 //!
@@ -389,6 +391,18 @@ struct Copy {
     blocked: Option<String>,
     /// The last write failed, in `Drafts`' words.
     failed: Option<String>,
+    /// The profile holds a copy of this file that this edit answers for —
+    /// offered back at `e`, or written since — and no save or discard has
+    /// deleted it. Not a [`Copy::blocked`] one, which nothing here touches.
+    ///
+    /// What it guards is the text in that copy when the editor no longer
+    /// holds it: a copy offered back and undone to look at the disk leaves the
+    /// editor clean, with the recovered text only in the redo and the profile.
+    /// A clean editor is reloaded when the file changes on disk, and the reload
+    /// is a fresh editor with no redo — so the next keystroke's copy would have
+    /// replaced the only one left. While this is set the change is a conflict
+    /// instead, as it is for unsaved text; see [`ViewerPane::recheck`].
+    in_profile: bool,
     /// The fingerprint of the version the text was typed against, which is
     /// what the copy records.
     ///
@@ -552,6 +566,7 @@ impl Edit {
                 Ok(Some(recovery)) => match editor.replace_all(&recovery.text) {
                     Outcome::Edited => {
                         said = Some(Said::Recovered(ago(recovery.saved_at)));
+                        copy.in_profile = true;
                         if recovery.base != file.against {
                             conflict = Some(Conflict::found(Why::Recovered));
                             copy.against = recovery.base;
@@ -678,8 +693,9 @@ impl Edit {
         let failed = drafts
             .write(root, &self.copy.key, &text, self.copy.against)
             .err();
-        if failed.is_some() {
-            self.copy.owed = Some(Instant::now());
+        match failed {
+            Some(_) => self.copy.owed = Some(Instant::now()),
+            None => self.copy.in_profile = true,
         }
         let differs = failed != self.copy.failed;
         self.copy.failed = failed;
@@ -694,10 +710,14 @@ impl Edit {
         if self.copy.blocked.is_some() {
             return Ok(());
         }
-        match drafts {
+        let forgot = match drafts {
             Some(drafts) => drafts.delete(&self.copy.key),
             None => Ok(()),
+        };
+        if forgot.is_ok() {
+            self.copy.in_profile = false;
         }
+        forgot
     }
 
     /// The file changed on disk with nothing unsaved here: read it again, or
@@ -778,12 +798,25 @@ impl ViewerPane {
     }
 
     /// What the quit warning says about unsaved text: the file, and whether a
-    /// copy of it will survive the quit — which it will unless this session was
-    /// told it may not write one.
+    /// copy of it will survive the quit.
+    ///
+    /// **Kept only when a copy is on disk and holds the text as it is now**:
+    /// written since the last change by a write that worked, or offered back at
+    /// `e` and not changed since. Being *allowed* to write one is not enough,
+    /// and this used to say "kept" on that alone. A profile inside the
+    /// workspace — abeam started in the home directory — refuses every copy,
+    /// and the warning then promised the very text the second press threw
+    /// away. `F1, Q` writes the copy before it asks (`crate::app`), so by the
+    /// time this is drawn the answer is the answer of a write that was tried.
     pub fn quit_note(&self) -> Option<String> {
         let edit = self.edit.as_ref().filter(|edit| edit.editor.is_modified())?;
         let name = self.label(&edit.requested);
-        Some(if self.drafts.is_some() && edit.copy.blocked.is_none() {
+        let copy = &edit.copy;
+        let kept = self.drafts.is_some()
+            && copy.blocked.is_none()
+            && copy.failed.is_none()
+            && copy.owed.is_none();
+        Some(if kept {
             format!("unsaved {name} kept as a recovery copy")
         } else {
             format!("unsaved {name} will be lost")
@@ -878,6 +911,11 @@ impl ViewerPane {
         let Some(edit) = self.edit.as_mut() else {
             return false;
         };
+        // Nothing of the user's is in this edit: no unsaved text, and no copy
+        // in the profile that the editor has stopped holding — text a reload
+        // would lose as surely, see `Copy::in_profile`. Only then is a change
+        // on disk read in rather than raised as a conflict.
+        let nothing_of_theirs = !edit.editor.is_modified() && !edit.copy.in_profile;
         match edit.baseline.is_on_disk(&edit.resolved) {
             // The disk is what this pane last read or wrote: its own save
             // coming back, or a change undone. A conflict about the disk
@@ -890,7 +928,7 @@ impl ViewerPane {
                 }
                 false
             }
-            Ok(false) if !edit.editor.is_modified() => match edit.reload(&self.root) {
+            Ok(false) if nothing_of_theirs => match edit.reload(&self.root) {
                 Ok(()) => true,
                 // Already said, and still so: nothing new to draw.
                 Err(_) if edit.gone.is_some() => false,
@@ -2631,6 +2669,58 @@ mod tests {
         assert!(shown.contains(&copy), "{shown}");
     }
 
+    /// A copy offered back, undone to look at the disk — the editor is clean,
+    /// and the recovered text is in the redo and the profile and nowhere else —
+    /// and then the agent writes the file. That used to reload into a fresh
+    /// editor, which took the redo with it, and the next keystroke's copy
+    /// replaced the old one: the text was gone from both places.
+    #[test]
+    fn a_recovered_copy_undone_to_look_at_the_disk_survives_the_disk_changing() {
+        let fx = Fx::new("edit-recovered-undo");
+        let path = fx.write("plan.md", b"# Plan\n");
+        let key = crate::paths::resolve(&path).unwrap();
+        fx.drafts().write(&fx.root(), &key, "mine\n", Some(Fingerprint::of(b"# Plan\n"))).unwrap();
+        let mut pane = fx.pane(&path);
+        draw(&mut pane, 60, 12);
+        press(&mut pane, KeyCode::Char('e'));
+        assert_eq!(text(&pane), "mine\n");
+        chord(&mut pane, 'z');
+        assert_eq!(text(&pane), "# Plan\n", "one undo is the disk");
+        assert!(pane.unsaved().is_none());
+
+        std::fs::write(&path, b"# Plan, the agent's\n").unwrap();
+        assert_eq!(pane.disk_changed(&path), Some(true));
+        assert!(
+            edit(&pane).conflict.as_ref().is_some_and(|c| c.why == Why::Changed),
+            "a conflict, not a reload"
+        );
+        assert_eq!(fx.drafts().read(&key).unwrap().expect("the copy").text, "mine\n");
+        chord(&mut pane, 'y');
+        assert_eq!(text(&pane), "mine\n", "the redo still holds what was recovered");
+
+        // Undone again and left: the copy is still there for the next `e`,
+        // which offers it in conflict with the file as it now is.
+        chord(&mut pane, 'z');
+        press(&mut pane, KeyCode::Esc);
+        assert!(pane.edit.is_none());
+        assert_eq!(fx.drafts().read(&key).unwrap().expect("the copy").text, "mine\n");
+        draw(&mut pane, 60, 12);
+        press(&mut pane, KeyCode::Char('e'));
+        assert_eq!(text(&pane), "mine\n");
+        assert!(edit(&pane).conflict.as_ref().is_some_and(|c| c.why == Why::Recovered));
+
+        // With no copy in the profile, a clean editor is still read in again.
+        let fx = Fx::new("edit-clean-reload");
+        let path = fx.write("plan.md", b"# Plan\n");
+        let mut pane = fx.pane(&path);
+        draw(&mut pane, 60, 12);
+        press(&mut pane, KeyCode::Char('e'));
+        std::fs::write(&path, b"# Plan, the agent's\n").unwrap();
+        assert_eq!(pane.disk_changed(&path), Some(true));
+        assert!(edit(&pane).conflict.is_none());
+        assert_eq!(text(&pane), "# Plan, the agent's\n");
+    }
+
     #[test]
     fn a_clean_editor_never_writes_even_in_a_conflict() {
         let fx = Fx::new("edit-clean-conflict");
@@ -3081,9 +3171,46 @@ mod tests {
         draw(&mut pane, 40, 10);
         press(&mut pane, KeyCode::Char('e'));
         type_in(&mut pane, "x");
+        // Nothing written yet, so nothing promised: `F1, Q` writes the copy
+        // before it asks, which is the flush here.
+        assert_eq!(pane.quit_note().as_deref(), Some("unsaved plan.md will be lost"));
+        pane.flush_draft();
         assert_eq!(pane.quit_note().as_deref(), Some("unsaved plan.md kept as a recovery copy"));
         pane.set_drafts(None);
         assert_eq!(pane.quit_note().as_deref(), Some("unsaved plan.md will be lost"));
+    }
+
+    /// A profile inside the workspace — abeam started in the home directory —
+    /// refuses every copy. The warning used to promise one anyway, on the
+    /// strength of being allowed to write it, and the second `F1, Q` then lost
+    /// the text it had called safe.
+    #[test]
+    fn the_quit_warning_promises_a_copy_only_once_a_write_of_it_has_worked() {
+        let fx = Fx::new("edit-quit-inside");
+        let path = fx.write("plan.md", b"# Plan\n");
+        let mut pane = fx.pane(&path);
+        let inside = fx.root().join(".abeam").join("drafts");
+        pane.set_drafts(Some(Drafts::at(inside)));
+        draw(&mut pane, 40, 10);
+        press(&mut pane, KeyCode::Char('e'));
+        type_in(&mut pane, "x");
+        pane.flush_draft();
+        assert!(edit(&pane).copy.failed.is_some(), "the profile inside refused the copy");
+        assert_eq!(pane.quit_note().as_deref(), Some("unsaved plan.md will be lost"));
+        assert!(!fx.root().join(".abeam").exists(), "and nothing was made in the repository");
+
+        // The same text once a profile takes it: written, and only then kept.
+        pane.set_drafts(Some(fx.drafts()));
+        assert_eq!(pane.quit_note().as_deref(), Some("unsaved plan.md will be lost"));
+        pane.flush_draft();
+        assert_eq!(pane.quit_note().as_deref(), Some("unsaved plan.md kept as a recovery copy"));
+        let key = crate::paths::resolve(&path).unwrap();
+        assert_eq!(fx.drafts().read(&key).unwrap().expect("a copy").text, "x# Plan\n");
+        // A change since is not in the copy until it is written again.
+        type_in(&mut pane, "y");
+        assert_eq!(pane.quit_note().as_deref(), Some("unsaved plan.md will be lost"));
+        pane.flush_draft();
+        assert_eq!(pane.quit_note().as_deref(), Some("unsaved plan.md kept as a recovery copy"));
     }
 
     #[test]
@@ -3420,6 +3547,8 @@ mod tests {
         assert!(!pane.show(&path), "nothing replaces it");
         pane.keystroke();
         let name = pane.label(&target);
+        // As `F1, Q` asks it: the copy written first.
+        pane.flush_draft();
         assert_eq!(pane.quit_note(), Some(format!("unsaved {name} kept as a recovery copy")));
 
         // Kept under a key that does not depend on the file being there: the

@@ -570,8 +570,9 @@ agent.
   read back afterwards — see "Verified how" above. What nothing has driven end
   to end is `Ctrl+Z` and `Ctrl+Y`, a recovery copy offered back after a real
   crash, and a conflict with a live agent writing the file somebody is typing
-  into; and nobody has driven any of it by hand, on Linux least of all. On Unix, `Ctrl+S` and
-  `Ctrl+Z` are the two keys a terminal is likeliest to have opinions about —
+  into; and nobody has driven any of it by hand, on Linux least of all. On
+  Unix, `Ctrl+S` and `Ctrl+Z` are the two keys a terminal is likeliest to have
+  opinions about —
   flow control and job control — and abeam's raw mode turns both off: crossterm
   0.29's `enable_raw_mode` calls rustix's `Termios::make_raw` (`cfmakeraw`
   under its `libc` feature), which clears `IXON` and `ISIG`, so `0x13` and
@@ -648,6 +649,14 @@ agent.
   new directory in the file list beyond what a new file's name makes. Recovery
   copies are written after two seconds of quiet, as the pad saves, so a crash in
   that window loses that much; a quit writes the copy up to the last keystroke.
+- **Two abeam windows editing the same file share one recovery copy.** The copy
+  is named after the file, not after the window, and nothing compares what is
+  there before writing it, so the window that writes last wins and the other
+  window's unsaved text is in neither the file nor its copy. The pad already
+  refuses this case with a stamp on its file; doing the same here needs a
+  refusal of its own and a rule for one window's save deleting the other's copy,
+  and was left for a change that can be argued on its own. The file itself is
+  safe: each window's save still meets the conflict check.
 - **Most of mermaid, by diagram type, is still shown as source.** Two families
   are drawn — `graph`/`flowchart` and `sequenceDiagram` — and `stateDiagram`,
   `classDiagram`, `erDiagram`, `gantt`, `pie`, `mindmap`, `journey`,

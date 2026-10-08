@@ -1223,6 +1223,28 @@ fn names_in(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Wait until `dir` holds exactly `want`, or fail with what it held, saying
+/// `why`. After a save this, and not one look: on Unix a new file is put in
+/// place by a hard link and its temporary name unlinked a moment later — see
+/// `place` in `crate::disk::save` — so the file's bytes, which is what
+/// [`wait_for_file`] waits on, are there before the temporary name is gone, and
+/// a listing taken between the two sees both. The product is right to do it in
+/// that order; it is the test that has to wait for the second step. Bounded,
+/// so a temporary file that is never taken away still fails.
+fn wait_for_names(dir: &Path, want: &[&str], why: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let got = names_in(dir);
+        if got == want {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("{why}: after {DEADLINE:?}, {} held {got:?}, not {want:?}", dir.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn a_file_is_edited_saved_and_created_from_the_files_view_and_keeps_its_bytes() {
     // The whole of editing, through the real binary: a file opened from the
@@ -1290,7 +1312,7 @@ fn a_file_is_edited_saved_and_created_from_the_files_view_and_keeps_its_bytes() 
     // final newline the file came with.
     wait_for_file(&notes, b"zero one\r\ntwo\r\n");
     wait_for(&session, "ctrl+s save · notes.md");
-    assert_eq!(names_in(&dir.0), ["notes.md"], "a save left something beside the file");
+    wait_for_names(&dir.0, &["notes.md"], "a save left something beside the file");
 
     // --- a new file, named and saved ----------------------------------------
     //
@@ -1312,8 +1334,8 @@ fn a_file_is_edited_saved_and_created_from_the_files_view_and_keeps_its_bytes() 
     // The line ending the file beside it uses, which is CRLF: `notes.md`.
     let made = dir.0.join("sub").join("new.md");
     wait_for_file(&made, b"hello\r\n");
-    assert_eq!(names_in(&dir.0.join("sub")), ["new.md"], "the save left a temporary file");
-    assert_eq!(names_in(&dir.0), ["notes.md", "sub"]);
+    wait_for_names(&dir.0.join("sub"), &["new.md"], "the save left a temporary file");
+    wait_for_names(&dir.0, &["notes.md", "sub"], "the save left something beside the file");
 
     // --- a new file named and left untouched --------------------------------
     //

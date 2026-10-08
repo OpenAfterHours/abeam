@@ -312,9 +312,12 @@ the agent's change back out without anyone noticing.
 While there is unsaved text nothing replaces the page under you. `Enter` in the
 git view, `F1, B`, `Tab`, `r` and a switch to another worktree are each refused
 with a sentence on the border, and a document the agent writes meanwhile waits
-behind `◆`. `F1, Q` asks twice and names the file, and if the agent exits, abeam
-holds the door as it does for a live shell — the left title reads
-`unsaved README.md · F1, Q to quit`.
+behind `◆`. `F1, Q` asks twice and names the file — and says whether a recovery
+copy of the text was written, or whether quitting will lose it. If the agent
+exits, abeam holds the door as it does for a live shell — the left title reads
+`unsaved README.md · F1, Q to quit` — and saving the text does not let go of it:
+the door stays held until you press `F1, Q`, so the keys you type after a save
+never land in the shell abeam was started from.
 
 **Unsaved text survives a crash, and is never kept in the repository.** Two
 seconds after you stop typing, a recovery copy goes into your profile directory
