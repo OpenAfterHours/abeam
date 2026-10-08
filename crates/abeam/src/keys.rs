@@ -776,6 +776,52 @@ pub const HELP: &[(&str, &str)] = &[
         "Ctrl+S (pad)",
         "save now (it also saves itself two seconds after the last key)",
     ),
+    // The files view's door into typing, and the only row that says it exists:
+    // nothing in the reading view's border advertises `e`, because a title
+    // already carrying the name, the form, the query and the position has no
+    // room to name a key the reader has not asked about. A bare letter for the
+    // *intercept* paragraph at the top of this file, like `t`, `o` and `f`.
+    (
+        "e (files)",
+        "edit the file on screen, or go back to its unsaved text",
+    ),
+    // The mode `e` opens owes this overlay a row of its own — `docs/keymap.md`
+    // says a mode that changes what every key means and announces it nowhere
+    // reads as a broken pane — and it is the pad's row word for word, for the
+    // pad's row's reason: `Ctrl+D`/`Ctrl+U` scroll half a page in the reading
+    // view one keystroke earlier, and a reader who reaches for them here finds
+    // them doing nothing at all, which looks like a pane that stopped
+    // listening.
+    (
+        "(in the files, editing)",
+        "every letter is typed; arrows, Home/End move the caret; PgUp/PgDn page; Ctrl+D/U do nothing",
+    ),
+    // Its own row, because it is the one key that differs from the pad's: the
+    // pad hands `Esc` back to the shell, and here it is the way back to
+    // reading, with nothing thrown away.
+    (
+        "Esc (files, editing)",
+        "to reading, text kept; Ctrl+S saves it from there and x x throws it away",
+    ),
+    // The pad's Ctrl rows, in the files view's context: the same keys, the
+    // same editor, and the one rule `ctrl_chord` states once.
+    (
+        "Ctrl+Z / Ctrl+Y (files)",
+        "editing: undo / redo (or Ctrl+Shift+Z), as in the pad",
+    ),
+    // "and from the reading view" because that is the half nobody would guess:
+    // `Esc` keeps unsaved text on the page, and saving it is not typing, so it
+    // does not need the editor back first.
+    (
+        "Ctrl+S (files)",
+        "save; and from the reading view while there is unsaved text",
+    ),
+    // Twice, like every key in this table that destroys something, and the
+    // second press counts only once the question is on screen.
+    (
+        "x x (files)",
+        "throw away unsaved text and show the file as it is on disk",
+    ),
     // The third statement of the box rule, and the one that has to be loudest:
     // this mode swallows *every* key, over a pane that may have a live shell in
     // it. A reader who does not know that is a reader typing at a child that is
@@ -837,9 +883,14 @@ pub const HELP: &[(&str, &str)] = &[
     // the reason the ask's does. `Esc` is not in the pad's half of this list
     // because the pad declines it in both forms, which is this row working
     // rather than an exception to it.
+    //
+    // A file being edited is the sixth, and it keeps both: `q` is a letter of
+    // the file, and `Esc` goes back to the reading view — keeping the text —
+    // rather than to the agent. The words are shorter than they were because
+    // the row is now as wide as the overlay draws at 120 columns.
     (
         "Esc or q",
-        "back to the agent (a shell and a find box keep both; ask and pad keep q; worktrees keep Esc)",
+        "back to the agent (shell, find box, editing keep both; ask and pad keep q; worktrees keep Esc)",
     ),
 ];
 

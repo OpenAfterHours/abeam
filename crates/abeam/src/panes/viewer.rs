@@ -1,9 +1,13 @@
 //! The file / markdown view.
 //!
 //! This is the pane that replaces opening an editor to read what an agent just
-//! wrote. It is read-only, and deliberately: everything it does not do — no
-//! editing, no shelling out, no text input — is what lets an unbound keystroke
-//! here be harmless.
+//! wrote. It is read-only until somebody presses `e`, and deliberately:
+//! everything it does not do — no shelling out, no text input in the reading
+//! view — is what lets an unbound keystroke here be harmless. `e` is the one
+//! door into typing, and everything on the far side of it is [`edit`]'s, which
+//! says what the door costs: a mode the border names, a key out of it that
+//! never throws anything away, and a page the watcher may not replace while it
+//! holds text that is on no disk.
 //!
 //! ## How it stays out of the way
 //!
@@ -161,6 +165,7 @@
 
 mod browse;
 mod docs;
+mod edit;
 mod files;
 mod grep;
 mod list;
@@ -327,6 +332,59 @@ struct Doc {
     symbols: Vec<(usize, u8, String)>,
 }
 
+impl Doc {
+    /// A document holding `text`, with everything that is derived from the
+    /// text alone scanned once, here.
+    ///
+    /// Two callers, and the second is why this is a function rather than the
+    /// body of `show`: a file read off the disk, and the unsaved text an edit
+    /// leaves on the page when `Esc` takes the reader back to it — see
+    /// [`edit`]. Both have to scan `regions` and `symbols` from the text they
+    /// are about to show, and two copies of the scan would be two places to
+    /// forget that `has_docs` is derived from the regions rather than stored.
+    fn of(path: PathBuf, text: String, truncated: bool, bytes: u64) -> Doc {
+        // Scanned before the body is moved into place, and only ever here. A
+        // markdown file gets a scan too and it costs one extension test:
+        // `docs::regions` has no rules for `.md` and hands back a single code
+        // region, which is exactly what raw markdown — which goes down
+        // `source_lines` like any other source — wants to be given.
+        let regions = docs::regions(&text, &path);
+        let has_docs = regions.iter().any(docs::Region::is_doc);
+        // Scanned here for `regions`' reason rather than a second one: it does
+        // not depend on the width, and everything that runs per frame does.
+        //
+        // A `.md` costs more than the line above does — a real `pulldown_cmark`
+        // pass over the source rather than an extension test — and it is paid
+        // here for the same reason and once. It is paid even when the document
+        // opens *rendered*, where the entries come from the renderer and this
+        // list is never read: the alternative is scanning on the `t` that first
+        // asks for it, which puts a parse of the file on a keystroke instead of
+        // on the load that already reads it off the disk.
+        let symbols = outline::symbols(&text, &path);
+        let body = if crate::watch::is_markdown(&path) {
+            Body::Markdown(text)
+        } else {
+            Body::Source(text)
+        };
+        Doc {
+            path,
+            body,
+            truncated,
+            bytes,
+            regions,
+            has_docs,
+            symbols,
+        }
+    }
+
+    /// The text this document holds, whichever body it is.
+    fn text(&self) -> &str {
+        match &self.body {
+            Body::Markdown(text) | Body::Source(text) => text,
+        }
+    }
+}
+
 /// What one pass of [`ViewerPane::build`] produced.
 ///
 /// A struct rather than the tuple this was, and the reason is not that three is
@@ -338,11 +396,18 @@ struct Doc {
 /// stale outline lands `Enter` in the wrong paragraph. Returned as one value so
 /// the three arrive and are stored together, which is the version of "these are
 /// only ever right together" that a caller cannot get half of.
+///
+/// `line_rows` is the fourth, and the same kind of thing: the row each source
+/// line of a source layout starts on, which only means anything beside these
+/// rows. It is what lets `e` put the caret on the line the reader has at the
+/// top of the page, and `Esc` put that line back at the top — see [`edit`].
+/// Empty for a rendered page, whose rows correspond to no line at all.
 #[derive(Default)]
 struct Layout {
     lines: Vec<Line<'static>>,
     margin: Margin,
     outline: Vec<outline::Entry>,
+    line_rows: Vec<usize>,
 }
 
 enum State {
@@ -487,6 +552,38 @@ pub struct ViewerPane {
     /// Whether the shell's watcher started. Display only — the pane says so on
     /// an empty screen rather than quietly never updating.
     watching: bool,
+
+    /// The row each source line starts on in `lines`, for a source layout;
+    /// empty for a rendered one. Held beside `lines` and rebuilt with them,
+    /// for the reason every other index into them is — see [`Layout`].
+    line_rows: Vec<usize>,
+    /// The file being edited, or holding text that is not on disk yet. `None`
+    /// is every other moment. See [`edit`], which is the whole of what this
+    /// field means and the only code that writes it.
+    edit: Option<edit::Edit>,
+    /// The last file this pane saved, and what it wrote, so that the
+    /// watcher's report of that write is recognised as an echo once the edit
+    /// itself has gone. See [`edit::Echo`].
+    echo: Option<edit::Echo>,
+    /// Where recovery copies of unsaved text are kept, or `None` when this
+    /// machine will not say. Worked out once, in [`ViewerPane::new`], for the
+    /// pad's `path` reason: a directory derived twice can be derived
+    /// differently.
+    drafts: Option<crate::disk::drafts::Drafts>,
+    /// Why the last thing that would have replaced the page did not: a
+    /// sentence for the border, drawn by the shell in front of whichever view
+    /// is on screen, and gone at the next keystroke. See
+    /// [`ViewerPane::may_replace`].
+    refusal: Option<String>,
+    /// A sentence for above the page — why `e` found the file read-only — gone
+    /// at the next keystroke like `refusal`, and drawn in the body rather than
+    /// the border because it is a reason in the disk's words and runs longer
+    /// than a border keeps.
+    note: Option<String>,
+    /// A dim line for above the page while it shows a file with a recovery copy
+    /// waiting: worked out by `show`, and gone with the page or with the `e`
+    /// that opens the copy. See [`ViewerPane::offer_copy`].
+    offered: Option<String>,
 }
 
 impl ViewerPane {
@@ -520,6 +617,13 @@ impl ViewerPane {
             recent_ix: 0,
             scan,
             watching: false,
+            line_rows: Vec::new(),
+            edit: None,
+            echo: None,
+            drafts: edit::drafts_here(),
+            refusal: None,
+            note: None,
+            offered: None,
         }
     }
 
@@ -592,7 +696,22 @@ impl ViewerPane {
     /// is `Empty` and a scan lands, so a workspace switch behaves exactly like
     /// startup and the reader opens on the newest document *of the worktree it
     /// has moved to*.
-    pub fn set_root(&mut self, root: PathBuf) {
+    ///
+    /// **Refused while there is unsaved text**, and the answer says so: `false`,
+    /// with [`ViewerPane::refusal`] set for the border. `State::Empty` is the
+    /// one write here that cannot be taken back — the text in the editor is on
+    /// no disk — and the shell asks [`ViewerPane::may_replace`] before it moves
+    /// anything else, so that a refused switch leaves the git pane, the shells
+    /// and this pane all still describing one worktree. Refusing here as well
+    /// is the backstop for a caller that forgets to ask.
+    pub fn set_root(&mut self, root: PathBuf) -> bool {
+        if !self.may_replace() {
+            return false;
+        }
+        // Nothing unsaved, so what is dropped is at most a caret.
+        self.drop_clean_edit();
+        self.echo = None;
+        self.offered = None;
         self.browse = Browser::new(root.clone());
         self.browse.set_theme(self.theme);
         // Rebuilt wholesale for the same reason and with one more of its own:
@@ -637,6 +756,7 @@ impl ViewerPane {
         // rather than merely unwanted: the worker's `send` fails and nothing has
         // to remember to ignore it.
         self.scan = Some(files::spawn_scan(root));
+        true
     }
 
     /// Told once at startup, so the empty screen can admit it when there is no
@@ -678,8 +798,24 @@ impl ViewerPane {
     /// something the pane says rather than something the caller handles — the
     /// caller has nowhere to put an error, and the reader is better served by
     /// being told which file and why.
-    pub fn show(&mut self, path: impl Into<PathBuf>) {
+    ///
+    /// **The one exception is unsaved text, and it is enforced here because
+    /// this is the funnel.** Every route that replaces the page comes through
+    /// this method — `Enter` in the git view, `Tab`, `r`, a file chosen in the
+    /// list, a repository result, a document the watcher queued — so the guard
+    /// is one line here rather than one beside each of them, and a route added
+    /// later inherits it without being told. While [`edit`] holds text that is
+    /// on no disk, every one of them is refused, including the reload of the
+    /// same file, which would put the disk's text over the reader's: the
+    /// answer is `false` and [`ViewerPane::refusal`] says why in the border.
+    /// An edit with nothing unsaved in it is simply closed, because closing it
+    /// loses a caret and nothing else.
+    pub fn show(&mut self, path: impl Into<PathBuf>) -> bool {
         let path = path.into();
+        if !self.may_replace() {
+            return false;
+        }
+        self.drop_clean_edit();
         // Whatever was queued is superseded. `show` means "this file is on
         // screen now", so by definition nothing is waiting to be — and the
         // queue is checked again by the very next `render`, which would
@@ -738,51 +874,19 @@ impl ViewerPane {
             }
         }
 
+        // A recovery copy left by an earlier session is said on the page, so it
+        // is found by reading the file and not only by knowing to press `e`.
+        self.offered = self.offer_copy(&path);
         self.state = match load::load(&path) {
             Ok(Loaded {
                 text,
                 truncated,
                 bytes,
-            }) => {
-                // Scanned before the body is moved into place, and only ever
-                // here. A markdown file gets a scan too and it costs one
-                // extension test: `docs::regions` has no rules for `.md` and
-                // hands back a single code region, which is exactly what raw
-                // markdown — which goes down `source_lines` like any other
-                // source — wants to be given.
-                let regions = docs::regions(&text, &path);
-                let has_docs = regions.iter().any(docs::Region::is_doc);
-                // Scanned here for `regions`' reason rather than a second one:
-                // it does not depend on the width, and everything that runs per
-                // frame does.
-                //
-                // A `.md` costs more than the line above does — a real
-                // `pulldown_cmark` pass over the source rather than an
-                // extension test — and it is paid here for the same reason and
-                // once. It is paid even when the document opens *rendered*,
-                // where the entries come from the renderer and this list is
-                // never read: the alternative is scanning on the `t` that first
-                // asks for it, which puts a parse of the file on a keystroke
-                // instead of on the load that already reads it off the disk.
-                let symbols = outline::symbols(&text, &path);
-                let body = if crate::watch::is_markdown(&path) {
-                    Body::Markdown(text)
-                } else {
-                    Body::Source(text)
-                };
-                State::Doc(Doc {
-                    path,
-                    body,
-                    truncated,
-                    bytes,
-                    regions,
-                    has_docs,
-                    symbols,
-                })
-            }
+            }) => State::Doc(Doc::of(path, text, truncated, bytes)),
             Err(why) => State::Failed { path, why },
         };
         self.dirty = true;
+        true
     }
 
     /// Open a file at a match a repository search found in it: `Enter` on a
@@ -819,7 +923,12 @@ impl ViewerPane {
     /// what they are searching; a seed is the pane searching on their behalf for
     /// something it was told is in the *file*, and there is no file.
     fn show_at(&mut self, path: PathBuf, query: String, ordinal: usize) {
-        self.show(path);
+        // Refused over unsaved text, and then the list stays up with the
+        // refusal in the border: the reader is still choosing, and the page
+        // behind the results is the one they have not saved.
+        if !self.show(path) {
+            return;
+        }
         if self.reader_has_a_document() {
             self.missed = None;
             self.search = Some(Search::seeded(query, ordinal));
@@ -878,6 +987,11 @@ impl ViewerPane {
     /// drives from the shell.
     #[allow(dead_code)] // retained for the pane's direct transition tests
     pub fn toggle_browse(&mut self) {
+        // The list would hide the page, and `Enter` in it would replace it:
+        // `open_browse`'s guard, for the same two reasons.
+        if !self.leave_page() {
+            return;
+        }
         // The results are peeled off first, and then `Alt+E` does what it has
         // always done. It has meant "between the document and the file list"
         // since before there was a third thing to be in, and a key that meant
@@ -928,7 +1042,16 @@ impl ViewerPane {
     /// Show the file browser without making the reader command stateful.
     /// `F1, B` owns this explicit transition; `F1, E` always selects the
     /// reader, so repeating either command cannot mean its opposite.
+    ///
+    /// **Refused while there is unsaved text**, with the sentence in the
+    /// border: the list would take the page off the screen, and the one thing
+    /// the list is for — `Enter` on a file — would replace it. An edit with
+    /// nothing unsaved in it is closed on the way, and the page left behind it
+    /// shows what the editor last held. See [`ViewerPane::leave_page`].
     pub fn open_browse(&mut self) {
+        if !self.leave_page() {
+            return;
+        }
         if let Mode::Results { back } = self.mode {
             self.mode = back.mode();
             self.grep.close_box();
@@ -1260,10 +1383,12 @@ impl ViewerPane {
             lines,
             margin,
             outline,
+            line_rows,
         } = self.build(width);
         self.lines = lines;
         self.margin = margin;
         self.outline = outline;
+        self.line_rows = line_rows;
         self.laid_out = width;
         self.dirty = false;
         if let Some(search) = self.search.as_mut() {
@@ -1353,13 +1478,13 @@ impl ViewerPane {
                 // file, gutter and all: syntect has a Markdown grammar, and a
                 // reader looking at the source of a document wants to see the
                 // line numbers they are about to talk about.
-                let (mut lines, gutter, outline) = match &doc.body {
+                let (mut lines, gutter, outline, line_rows) = match &doc.body {
                     Body::Markdown(text) if !self.raw => {
                         // The renderer's own answer, because it is the only
                         // thing that knows which row a heading landed on. See
                         // [`markdown::render_outlined`].
                         let (lines, outline) = markdown::render_outlined(text, width, self.theme);
-                        (lines, 0, outline)
+                        (lines, 0, outline, Vec::new())
                     }
                     Body::Markdown(text) | Body::Source(text) => {
                         // `raw` is one question asked of both bodies — "show me
@@ -1384,8 +1509,12 @@ impl ViewerPane {
                         // line below is drawn as code and every one of those
                         // lines has a row to be mapped to.
                         let want: Vec<usize> = doc.symbols.iter().map(|(at, ..)| *at).collect();
-                        let (lines, gutter, at) =
-                            source_lines(text, &doc.path, regions, width, self.theme, &want);
+                        let Source {
+                            lines,
+                            gutter,
+                            at,
+                            line_rows,
+                        } = source_lines(text, &doc.path, regions, width, self.theme, &want);
                         // A symbol that was never drawn as a code row has no
                         // row to name. It should not happen — a definition
                         // inside a doc region would mean `docs` had swallowed a
@@ -1405,7 +1534,7 @@ impl ViewerPane {
                                 })
                             })
                             .collect();
-                        (lines, gutter, outline)
+                        (lines, gutter, outline, line_rows)
                     }
                 };
                 // Measured before the notice below is appended, because the
@@ -1430,6 +1559,7 @@ impl ViewerPane {
                     lines,
                     margin,
                     outline,
+                    line_rows,
                 }
             }
         }
@@ -1689,6 +1819,12 @@ impl ViewerPane {
             // did nothing.
             return Handled::No;
         }
+        // Asked before the cursor moves, so a refused `Tab` leaves the walk
+        // where it was rather than one file further on than the page. `Yes`,
+        // because the refusal is a sentence the next frame has to draw.
+        if !self.may_replace() {
+            return Handled::Yes;
+        }
         let n = self.recent.len();
         // Only advance from the current file if it is actually in the list;
         // otherwise `Tab` after a `show()` from outside should start at the top.
@@ -1715,14 +1851,7 @@ impl ViewerPane {
     }
 
     fn position(&self) -> String {
-        let max = self.scroll.max();
-        if max == 0 {
-            return "all".into();
-        }
-        if self.scroll.offset >= max {
-            return "end".into();
-        }
-        format!("{}%", self.scroll.offset * 100 / max)
+        edit::percent(&self.scroll)
     }
 }
 
@@ -1746,7 +1875,12 @@ impl Pane for ViewerPane {
             // of the two.
             let mark = if self.pending.is_some() { "◆ " } else { "" };
             let name = match &self.state {
-                State::Doc(doc) => self.label(&doc.path),
+                // With the marks the page's own title carries, because the
+                // outline is a layer over a page that may be holding unsaved
+                // text, and the border is where that is said.
+                State::Doc(doc) => {
+                    format!("{}{}{}", self.dot(), self.label(&doc.path), self.diamond())
+                }
                 // Unreachable, and it takes the whole of `show` to say why
                 // rather than `o`'s guard alone: `o` declines an empty outline,
                 // so this mode is only entered over a document — and `show` and
@@ -1779,13 +1913,19 @@ impl Pane for ViewerPane {
             let mark = if self.pending.is_some() { "◆ " } else { "" };
             return format!("{mark}{}", self.browse.title());
         }
-        // The document view marks a pending file in exactly one state, and for
-        // the same reason the list does: normally a file waiting here could
-        // never be seen, because by the time this pane renders its own title it
-        // has already taken one up. While the search box is open it does not,
-        // so this is where the reader is told — and, as in the list, the key
-        // that closes the box is the key that releases the file.
-        let mark = if self.typing() && self.pending.is_some() {
+        // Typing into the file is a title of its own: see `edit`.
+        if let Some(title) = self.edit_title() {
+            return title;
+        }
+        // The document view marks a pending file in two states, and for the
+        // same reason the list does: normally a file waiting here could never
+        // be seen, because by the time this pane renders its own title it has
+        // already taken one up. While the search box is open it does not, and
+        // while the page holds unsaved text it does not either — so this is
+        // where the reader is told. As in the list, the key that closes the box
+        // is the key that releases the file; for unsaved text it is saving it or
+        // throwing it away.
+        let mark = if (self.typing() || self.edit.is_some()) && self.pending.is_some() {
             "◆ "
         } else {
             ""
@@ -1910,9 +2050,16 @@ impl Pane for ViewerPane {
                 // wherever it runs out. That is the whole of what the number is
                 // for, and `CRUMB_MAX` carries the measurement it was chosen
                 // against — including the one the old comment here got wrong.
+                //
+                // The unsaved mark goes in front of the name and the conflict
+                // straight after the form, for the ordering's own reason: they
+                // are the two answers on this line the reader can lose work by
+                // not seeing, and a mark in front cannot be clipped off the end.
                 format!(
-                    "{mark}{}{form}{find}{trunc} · {}{crumb}",
+                    "{mark}{}{}{form}{}{find}{trunc} · {}{crumb}",
+                    self.dot(),
                     self.label(&doc.path),
+                    self.diamond(),
                     self.position()
                 )
             }
@@ -1991,7 +2138,14 @@ impl Pane for ViewerPane {
         // enough while the pane is being *used*. A file arriving under an open
         // search box would rebuild every row and take every hit with it, mid
         // query. See the module doc.
+        //
+        // The sixth door is an edit, and it is closed for both of those reasons
+        // at once and a third: somebody typing into the file is using the pane,
+        // and a page holding unsaved text is a page `show` would refuse to
+        // replace anyway. The file waits behind the `◆` in the title until the
+        // text is saved or thrown away. See [`edit`].
         if !self.typing()
+            && self.edit.is_none()
             && let Some(path) = self.pending.take()
         {
             self.show(path);
@@ -1999,6 +2153,14 @@ impl Pane for ViewerPane {
             // a moment ago, which is no longer the state under it. See `owed`.
             self.owed = true;
         }
+
+        if self.editing() {
+            self.render_edit(f, inner);
+            return;
+        }
+        // What the pane has to say above the page — a question, a refusal, a
+        // save that failed — in the rows it takes from the top of the view.
+        let inner = self.draw_notices(f, inner);
 
         // The column is reserved whether or not the bar is drawn: deciding per
         // frame would re-wrap the whole document every time a scrollbar
@@ -2087,6 +2249,10 @@ impl Pane for ViewerPane {
             changed = true;
         }
 
+        // The recovery copy of unsaved text, on the pad's quiet interval. See
+        // `edit`; a frame only when what it says about the copy changed.
+        changed |= self.tick_edit();
+
         changed
     }
 
@@ -2106,6 +2272,23 @@ impl Pane for ViewerPane {
         // because it is the key that opened this view and the key that reopens
         // its box, which is a fact about the pane's modes rather than about the
         // grep.
+        //
+        // **Before any of that, the two things a keystroke ends wherever it
+        // lands**: a refusal is an answer to the key before this one, and the
+        // `x x` question is answered by this key or withdrawn by it. See
+        // [`ViewerPane::keystroke`], which the shell calls for the keys that
+        // never reach here.
+        self.refusal = None;
+        self.note = None;
+        let asked = self.take_question();
+
+        // Typing into the file owns every key, ahead of every other vocabulary
+        // in this pane, for the reason the search box does below and with more
+        // of the keyboard: every printable key is text.
+        if self.editing() {
+            return Ok(self.edit_key(key));
+        }
+
         if matches!(self.mode, Mode::Results { .. }) {
             let out = self.grep.key(key);
             return Ok(self.absorb_result(out));
@@ -2173,6 +2356,15 @@ impl Pane for ViewerPane {
             // a chord aimed at the agent. `browse.rs` and `list.rs` have said
             // this since they were written; the document view had the same hole
             // and no arm to close it.
+            //
+            // One chord is this pane's, and only while the page holds unsaved
+            // text: saving is not typing, so it works from the reading view too
+            // — the pad's rule, for the pad's reason. With nothing unsaved it
+            // falls into the arm below and does nothing, which is what it
+            // always did here.
+            KeyCode::Char('s' | 'S') if crate::keys::ctrl_chord(&key) && self.edit.is_some() => {
+                self.save()
+            }
             KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::No,
 
             KeyCode::Tab => self.step(true),
@@ -2196,6 +2388,15 @@ impl Pane for ViewerPane {
             // table of contents. See [`ViewerPane::open_outline`], including
             // why it declines rather than opening an empty list.
             _ if bare(key, 'o') => self.open_outline(),
+            // Into the file, and back to unsaved text. Pane-local and exempt
+            // for the reason the keys above are; see [`edit`] for everything
+            // on the far side of it.
+            _ if bare(key, 'e') => self.begin_edit(),
+            // Throwing unsaved text away, which takes two presses with the
+            // question drawn between them — see [`ViewerPane::discard_key`].
+            // Only while there is something to throw away: otherwise `x` is
+            // what it has always been here, a key that does nothing.
+            _ if bare(key, 'x') && self.edit.is_some() => self.discard_key(asked),
             KeyCode::Char('n') => self.step_hit(true),
             KeyCode::Char('N') => self.step_hit(false),
             // `?` for the ask view, about the document on screen. Pane-local
@@ -2249,6 +2450,11 @@ impl Pane for ViewerPane {
     }
 
     fn handle_mouse(&mut self, ev: &MouseEvent) -> Result<Handled> {
+        // A click on the file being typed into is a caret, and the wheel is
+        // the wheel: see `edit`.
+        if self.editing() {
+            return Ok(self.edit_mouse(ev));
+        }
         if matches!(self.mode, Mode::Results { .. }) {
             let out = self.grep.mouse(ev);
             return Ok(self.absorb_result(out));
@@ -2280,6 +2486,12 @@ impl Pane for ViewerPane {
     /// focus round trip, so it must not quietly re-aim the `Enter` the reader
     /// presses when they get here. It moves the view alone.
     fn scroll_key(&mut self, key: KeyEvent) -> Result<Handled> {
+        // A file being typed into is the pad's case exactly: `Down` there is a
+        // caret key, so a glance must move the page and leave the caret where
+        // it was — `editor::View::glance`, which never touches it.
+        if self.editing() {
+            return Ok(self.edit_glance(key));
+        }
         // The results are a list, so the same rule again: `Down` in there moves
         // the row `Enter` would open, and a glance from the other side of the
         // window must not re-aim it.
@@ -2316,8 +2528,11 @@ impl Pane for ViewerPane {
     /// box open moves the view and does not step between hits — and nothing
     /// else. It is not where a paste is routed and it is not what hands focus
     /// back to the agent; neither of those has ever asked.
+    ///
+    /// And while a file is being typed into, which is a box the size of the
+    /// pane: `j` there is a letter of somebody's file.
     fn takes_input(&self) -> bool {
-        self.finding() || self.typing() || self.grepping()
+        self.finding() || self.typing() || self.grepping() || self.editing()
     }
 
     /// Eight answers, and the border has to be true in every one of them
@@ -2355,7 +2570,17 @@ impl Pane for ViewerPane {
     /// is a sentence in the title with no state behind it, so `Esc` passes
     /// straight through it to the shell and the answer is `esc→agent` — which is
     /// exactly what happens.
+    ///
+    /// The ninth is a file being typed into, and it is `esc→done`: the press
+    /// takes the reader back to the page and keeps every word, which is
+    /// neither the agent nor a discard, and the border must say which. With
+    /// nothing unsaved and a document waiting it is `esc→new file`, for the
+    /// search box's reason — the press closes the editor, and the next frame
+    /// takes the waiting document up.
     fn exit_hint(&self) -> &'static str {
+        if let Some(hint) = self.edit_exit_hint() {
+            return hint;
+        }
         if let Mode::Results { back } = self.mode {
             return match (self.grep.typing(), self.grep.has_results(), back) {
                 (true, true, _) => "esc→results",
@@ -2390,6 +2615,25 @@ impl Pane for ViewerPane {
         }
     }
 
+    /// The keys that act on a file being edited or holding unsaved text, and
+    /// nothing in any other state — see [`ViewerPane::edit_action_hint`].
+    ///
+    /// Here rather than in the title because the shell draws this only while
+    /// the pane has the keys, and that is the condition `ctrl+s` needs: with
+    /// the agent focused the chord is the agent's — Claude's stash — and a
+    /// border naming it over an unfocused pane would be sending somebody's
+    /// keystroke to the wrong program.
+    fn action_hint(&self) -> Option<&'static str> {
+        self.edit_action_hint()
+    }
+
+    /// The caret, while a file is being typed into, and nowhere otherwise: the
+    /// reading view has nothing to type into. The shell draws it only while
+    /// the pane has focus.
+    fn cursor(&self) -> Option<(u16, u16)> {
+        self.edit_cursor()
+    }
+
     /// Pasted text goes into whichever box is open, and nowhere else.
     ///
     /// Both are somewhere a read-only pane can put text, which is what
@@ -2397,6 +2641,11 @@ impl Pane for ViewerPane {
     /// agent's transcript is a likely way to reach a file; a phrase pasted out
     /// of it is a likely way to find where the agent got that phrase from.
     fn handle_paste(&mut self, text: &str) -> Result<Handled> {
+        // Into the file, whole, newlines and all, while it is being typed into:
+        // the editor knows what to do with them, as it does in the pad.
+        if self.editing() {
+            return Ok(self.edit_paste(text));
+        }
         if matches!(self.mode, Mode::Results { .. }) {
             let out = self.grep.paste(text);
             return Ok(self.absorb_result(out));
@@ -2485,6 +2734,10 @@ impl Pane for ViewerPane {
 /// Answered with a cursor that only ever moves forwards, because `want` is
 /// sorted and the regions are walked in order: the cost is one comparison per
 /// wanted line for the whole file, not a lookup per line of it.
+///
+/// The fourth answer is the same question asked of every line rather than of a
+/// few — the row each one starts on — for `e` and for the `Esc` back out of
+/// it. See [`Source::line_rows`].
 fn source_lines(
     text: &str,
     path: &Path,
@@ -2492,7 +2745,7 @@ fn source_lines(
     width: usize,
     mode: theme::Mode,
     want: &[usize],
-) -> (Vec<Line<'static>>, usize, Vec<Option<usize>>) {
+) -> Source {
     // **One highlighter pass over the whole file, sliced afterwards.** Not a
     // highlighter per code region, and this is the sharpest constraint in the
     // function: `syntect::easy::HighlightLines` carries the grammar's context
@@ -2535,8 +2788,38 @@ fn source_lines(
     }
     page.code(next..count);
 
-    let gutter = page.gutter();
-    (page.out, gutter, page.at)
+    Source {
+        gutter: page.gutter.width(),
+        lines: page.out,
+        at: page.at,
+        line_rows: page.starts,
+    }
+}
+
+/// What [`source_lines`] hands back: the rows, and three things that are only
+/// ever true of those rows.
+///
+/// A struct rather than the tuple this was, for [`Layout`]'s reason one level
+/// down: a fourth positional member is a puzzle at a call site three hundred
+/// lines away, and all four describe the same rows.
+#[derive(Debug, PartialEq)]
+struct Source {
+    lines: Vec<Line<'static>>,
+    /// How wide the gutter came out. See [`search::Margin`].
+    gutter: usize,
+    /// The row each entry of `want` starts on, in the same order.
+    at: Vec<Option<usize>>,
+    /// The row every source line starts on, one entry per line and never
+    /// decreasing.
+    ///
+    /// A line inside a rendered doc block has no row of its own — the block is
+    /// reflowed, and its rows are prose rather than lines — so it is given the
+    /// row the block starts on. That is the answer both readers want. `e` from
+    /// a row in the middle of a docstring puts the caret at the head of the
+    /// docstring, which is on screen; and `Esc` back from a line inside one
+    /// puts the block's first row at the top, which is where the line's words
+    /// are.
+    line_rows: Vec<usize>,
 }
 
 /// The rows of a source file being built, and the one thing that draws the
@@ -2554,9 +2837,8 @@ struct Page<'w> {
     out: Vec<Line<'static>>,
     width: usize,
     mode: theme::Mode,
-    /// Digits in the number column, or zero in a pane too narrow to spend the
-    /// columns on one.
-    digits: usize,
+    /// The number column, which is [`Gutter`]'s to draw.
+    gutter: Gutter,
     /// Source lines somebody wants the row of, sorted, and how far down that
     /// list this page has got. See [`source_lines`].
     want: &'w [usize],
@@ -2564,6 +2846,9 @@ struct Page<'w> {
     /// The answer, one slot per entry of `want`, filled as the rows are emitted
     /// and left `None` for a line that was never drawn as code.
     at: Vec<Option<usize>>,
+    /// The row every line starts on, as it is emitted. See
+    /// [`Source::line_rows`].
+    starts: Vec<usize>,
 }
 
 impl<'w> Page<'w> {
@@ -2573,20 +2858,29 @@ impl<'w> Page<'w> {
         mode: theme::Mode,
         want: &'w [usize],
     ) -> Self {
-        let digits = if width >= LINE_NUMBER_MIN_WIDTH {
-            rows.len().to_string().len().max(3)
-        } else {
-            0
-        };
         Page {
             out: Vec::with_capacity(rows.len()),
+            gutter: Gutter::new(rows.len(), width, mode),
+            starts: Vec::with_capacity(rows.len()),
             rows,
             width,
             mode,
-            digits,
             want,
             next: 0,
             at: vec![None; want.len()],
+        }
+    }
+
+    /// Source line `line` starts at row `row`, for [`Source::line_rows`].
+    ///
+    /// Asked to be called in line order and kept honest if it is not: a line
+    /// recorded twice keeps its first row, and a line skipped is given the row
+    /// of the next one recorded, so the list stays one entry per line and never
+    /// decreases whatever `docs::regions` handed over — the same tolerance of a
+    /// broken partition `source_lines` keeps for the rows themselves.
+    fn start(&mut self, line: usize, row: usize) {
+        while self.starts.len() <= line {
+            self.starts.push(row);
         }
     }
 
@@ -2609,49 +2903,6 @@ impl<'w> Page<'w> {
         }
     }
 
-    /// The gutter is the number plus the space after it, and every row wears it
-    /// — a wrapped continuation gets a blank one of exactly the same width,
-    /// which is what makes one number describe the whole layout.
-    fn gutter(&self) -> usize {
-        if self.digits == 0 { 0 } else { self.digits + 1 }
-    }
-
-    fn numbered(&self, line: usize) -> Vec<Span<'static>> {
-        if self.digits == 0 {
-            return Vec::new();
-        }
-        let digits = self.digits;
-        vec![Span::styled(
-            format!("{line:>digits$} "),
-            self.mode.theme().dim(),
-        )]
-    }
-
-    fn blank(&self) -> Vec<Span<'static>> {
-        if self.digits == 0 {
-            return Vec::new();
-        }
-        let digits = self.digits;
-        vec![Span::raw(format!("{:>digits$} ", ""))]
-    }
-
-    /// The interior of a rendered doc block. See [`DOC_ROW`].
-    ///
-    /// Right-aligned like a number and one cell wide, so it lands under the
-    /// units digit of the numbers above and below it and the gutter stays
-    /// exactly [`Page::gutter`] columns for every row on the page — which is
-    /// the whole of what [`search::Margin`] needs from this.
-    fn pip(&self) -> Vec<Span<'static>> {
-        if self.digits == 0 {
-            return Vec::new();
-        }
-        let digits = self.digits;
-        vec![Span::styled(
-            format!("{DOC_ROW:>digits$} "),
-            self.mode.theme().dim(),
-        )]
-    }
-
     /// Source lines, numbered and hard-wrapped: the whole of what this function
     /// used to do, and byte for byte what it still does for a file with no
     /// documentation in it.
@@ -2662,9 +2913,10 @@ impl<'w> Page<'w> {
             // would put the head of the definition off the top of the pane,
             // which is the same landing the heading arm in `markdown` refuses.
             self.mark(i, self.out.len());
+            self.start(i, self.out.len());
             let row = std::mem::take(&mut self.rows[i]);
-            let first = self.numbered(i + 1);
-            let cont = self.blank();
+            let first = self.gutter.numbered(i + 1);
+            let cont = self.gutter.blank();
             self.out
                 .extend(wrap::hard_wrap(row, self.width, &first, &cont));
         }
@@ -2684,7 +2936,7 @@ impl<'w> Page<'w> {
         first: usize,
         last: usize,
     ) {
-        let avail = self.width.saturating_sub(self.gutter() + indent);
+        let avail = self.width.saturating_sub(self.gutter.width() + indent);
         // Rendered before it is decided whether the rendering may be used, and
         // that order is the point. `markdown::render` does not guarantee a row
         // fits the width it was given — a two-cell glyph under a prefix it has
@@ -2724,6 +2976,12 @@ impl<'w> Page<'w> {
             return;
         }
 
+        // Every line of the block starts where the block does: see
+        // [`Source::line_rows`].
+        for line in range.clone() {
+            self.start(line, self.out.len());
+        }
+
         // **N source lines become M rendered rows, and M is not N.** A paragraph
         // reflows to the pane's width, a fence keeps its shape, a list grows a
         // hanging indent — so there is no mapping from a rendered row back to
@@ -2748,9 +3006,9 @@ impl<'w> Page<'w> {
         let rendered = body.len();
         for (n, mut line) in body.into_iter().enumerate() {
             let mut prefix = match n {
-                0 => self.numbered(first + 1),
-                n if n + 1 == rendered && last > first => self.numbered(last + 1),
-                _ => self.pip(),
+                0 => self.gutter.numbered(first + 1),
+                n if n + 1 == rendered && last > first => self.gutter.numbered(last + 1),
+                _ => self.gutter.pip(),
             };
             if indent > 0 {
                 prefix.push(Span::raw(pad.clone()));
@@ -2767,18 +3025,97 @@ impl<'w> Page<'w> {
             // because the alternative is a line number that never appears and a
             // pair of lines the reader can see in the source and not in the
             // rendering.
-            self.out.push(Line::from(self.numbered(first + 1)));
+            self.out.push(Line::from(self.gutter.numbered(first + 1)));
         }
+    }
+}
+
+/// The line-number column: a **number**, a **blank**, or a [`DOC_ROW`] pip,
+/// all exactly as wide as each other. See [`source_lines`] for what the three
+/// say.
+///
+/// Its own type because two things draw it now and one of them is not a page of
+/// rows: the reader's source view builds [`Page`]s, and the edit mode numbers
+/// the editor's rows one frame at a time — `crate::editor::Row` carries the
+/// line and whether this is its first row, which is everything a gutter needs.
+/// A second copy of the format strings in [`edit`] would be a gutter that can
+/// come out one column wider in one mode than the other, and the text beside it
+/// would jump sideways on `e`.
+#[derive(Clone, Copy, Debug)]
+struct Gutter {
+    /// Digits in the number column, or zero in a pane too narrow to spend the
+    /// columns on one.
+    digits: usize,
+    mode: theme::Mode,
+}
+
+impl Gutter {
+    /// The gutter for a text of `lines` lines in a pane `width` columns wide:
+    /// as many digits as the last line number needs, never fewer than three,
+    /// and none at all below [`LINE_NUMBER_MIN_WIDTH`].
+    fn new(lines: usize, width: usize, mode: theme::Mode) -> Self {
+        let digits = if width >= LINE_NUMBER_MIN_WIDTH {
+            lines.to_string().len().max(3)
+        } else {
+            0
+        };
+        Gutter { digits, mode }
+    }
+
+    /// The gutter is the number plus the space after it, and every row wears it
+    /// — a wrapped continuation gets a blank one of exactly the same width,
+    /// which is what makes one number describe the whole layout.
+    fn width(&self) -> usize {
+        if self.digits == 0 { 0 } else { self.digits + 1 }
+    }
+
+    fn numbered(&self, line: usize) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::styled(
+            format!("{line:>digits$} "),
+            self.mode.theme().dim(),
+        )]
+    }
+
+    fn blank(&self) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::raw(format!("{:>digits$} ", ""))]
+    }
+
+    /// The interior of a rendered doc block. See [`DOC_ROW`].
+    ///
+    /// Right-aligned like a number and one cell wide, so it lands under the
+    /// units digit of the numbers above and below it and the gutter stays
+    /// exactly [`Gutter::width`] columns for every row on the page — which is
+    /// the whole of what [`search::Margin`] needs from this.
+    fn pip(&self) -> Vec<Span<'static>> {
+        if self.digits == 0 {
+            return Vec::new();
+        }
+        let digits = self.digits;
+        vec![Span::styled(
+            format!("{DOC_ROW:>digits$} "),
+            self.mode.theme().dim(),
+        )]
     }
 }
 
 /// A letter with nothing held down with it.
 ///
-/// `Ctrl` plus a letter is the agent's everywhere in this program, and both
-/// `crate::scroll` and `list::Cursor` hand it back rather than declining it —
-/// so that the pane's own arms are where that gets decided rather than where it
-/// gets forgotten. `Alt+F` is Claude's `nextWord`, which `crate::keys` names as
-/// the collision that nearly shipped; it is not this pane's either.
+/// `Ctrl` plus a letter is never this: a Ctrl chord is a focused pane's only by
+/// name — this one answers `Ctrl+D`/`Ctrl+U`, and `Ctrl+S` over unsaved text,
+/// and an unfocused pane answers none, which leaves them all to the agent (see
+/// `crate::keys::ctrl_chord`). Both `crate::scroll` and `list::Cursor` hand the
+/// rest back rather than declining them, so that the pane's own arms are where
+/// that gets decided rather than where it gets forgotten. `Alt+F` is Claude's
+/// `nextWord`, which `crate::keys` names as the collision that nearly shipped;
+/// it is not this pane's either.
 fn bare(key: KeyEvent, c: char) -> bool {
     key.code == KeyCode::Char(c) && key.modifiers.is_empty()
 }
@@ -6205,12 +6542,13 @@ mod tests {
         // The exhaustive list itself, so that adding a sixth deviation to the
         // code without adding it to the table fails here. It has caught one
         // since it was written: the scratch pad keeps `q` while it is being
-        // typed into, exactly as the ask does, and the row did not say so.
+        // typed into, exactly as the ask does, and the row did not say so. And
+        // a second: a file being edited keeps both, which is `editing` below.
         let (_, said) = crate::keys::HELP
             .iter()
             .find(|(k, _)| *k == "Esc or q")
             .expect("the row that promises the way out");
-        assert!(said.contains("a shell and a find box keep both"), "{said}");
+        assert!(said.contains("shell, find box, editing keep both"), "{said}");
         assert!(said.contains("ask and pad keep q"), "{said}");
         assert!(said.contains("worktrees keep Esc"), "{said}");
         assert!(!said.contains("outline"), "the outline is not a deviation");

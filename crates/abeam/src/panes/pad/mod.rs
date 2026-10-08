@@ -209,7 +209,13 @@ const PAD: Policy = Policy {
 /// what is lost to a crash is a phrase and not a paragraph. It is also the
 /// number in the residual the module doc discloses, so the two have to be the
 /// same number and this is it.
-const QUIET: Duration = Duration::from_secs(2);
+///
+/// The files view's recovery copies wait for the same quiet, and read it from
+/// here rather than keeping a second two: it is the same trade — a write per
+/// sentence rather than per key, and a phrase lost to a crash — made for the
+/// same kind of text, and two numbers for one trade would be one of them
+/// wrong.
+pub(crate) const QUIET: Duration = Duration::from_secs(2);
 
 /// What an empty pad says about itself.
 ///

@@ -231,6 +231,12 @@ pub enum SaveError {
     ReadOnly,
     /// Windows refused for as long as the retries waited, and a probe for
     /// write access was refused too: a permission, not a moment. Windows only.
+    #[cfg_attr(
+        unix,
+        // `#[allow]` and not `#[expect]`, for `Attempt::Vacated`'s reason: the
+        // condition is a `cfg`, and on Windows this is made.
+        allow(dead_code, reason = "made by the Windows retry's probe only")
+    )]
     Denied(io::Error),
     /// The path resolves to somewhere outside the workspace root.
     Outside,

@@ -80,7 +80,7 @@ impl FromStr for Fingerprint {
 /// against the file as it was opened.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Baseline {
-    /// There was no file: one being created.
+    /// There was no file: one being created, or one deleted since it was read.
     Absent,
     /// There was a file and these were all of its bytes.
     Present(Box<[u8]>),

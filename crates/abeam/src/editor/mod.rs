@@ -171,18 +171,10 @@ pub enum Tabs {
     /// A file's: it is given back with the bytes it had, and the caller
     /// decides what new indentation is from the file — a literal tab where it
     /// is already indented with them, spaces where it is not.
-    #[allow(
-        dead_code,
-        reason = "the files view's edit mode is the caller; built by the tests until then"
-    )]
     Keep { key: TabKey },
 }
 
 /// What the `Tab` key types where tabs are kept.
-#[allow(
-    dead_code,
-    reason = "the files view's edit mode is the caller; built by the tests until then"
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabKey {
     Tab,
@@ -405,10 +397,6 @@ impl Editor {
     /// gives back what the user had before it. Cleaned, and refused whole when
     /// it would not fit, like a paste; [`Outcome::Still`] when it is the text
     /// already here, which records nothing.
-    #[allow(
-        dead_code,
-        reason = "read by the tests; delete this waiver when the files view's edit mode reads it"
-    )]
     pub fn replace_all(&mut self, text: &str) -> Outcome {
         let mut fits = true;
         let did = self.edit(Kind::Paste, |b| match b.replace_all(text) {
@@ -670,17 +658,8 @@ impl Editor {
     }
 }
 
-/// What the files view will read and the pad does not: the caret as an index,
-/// the size decision, and what a gutter and the `e` key need to place things.
-///
-/// One waiver for the set rather than one each, because they share one reason
-/// and one expiry. `#[allow]` rather than `#[expect]`, for the reason
-/// `crate::agentstate::Session::pid` gives: the tests read every one of these,
-/// so under `cargo clippy --all-targets` an expectation would be unfulfilled.
-#[allow(
-    dead_code,
-    reason = "read by the tests; delete this waiver when the files view's edit mode reads them"
-)]
+/// What the files view reads and the pad does not: the caret as an index, the
+/// size decision, and what a gutter and the `e` key need to place things.
 impl Editor {
     /// Where the caret is, as `(row, col)` with `col` counted in `char`s.
     pub fn caret(&self) -> (usize, usize) {
@@ -776,10 +755,6 @@ impl View {
     /// Not the pad's: its own turn between forms keeps a fraction of the
     /// *rendering*, whose rows are no line of the source, so this has nothing
     /// to say there.
-    #[allow(
-        dead_code,
-        reason = "read by the tests; delete this waiver when the files view's edit mode reads it"
-    )]
     pub fn show_line_at_top(&mut self, line: usize) {
         self.top = Some(line);
     }

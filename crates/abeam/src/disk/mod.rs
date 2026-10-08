@@ -69,42 +69,14 @@
 //! - [`profile`] is where in the profile abeam's own files live, the pad's and
 //!   the drafts' alike.
 
-#[allow(
-    dead_code,
-    reason = "the files view's edit mode is the caller; built by the tests until then"
-)]
 pub mod baseline;
-#[allow(
-    dead_code,
-    reason = "the files view's edit mode is the caller; built by the tests until then"
-)]
 pub mod drafts;
-#[allow(
-    dead_code,
-    reason = "the files view's edit mode is the caller; built by the tests until then"
-)]
 pub mod open;
 pub(crate) mod profile;
-#[allow(
-    dead_code,
-    reason = "the files view's edit mode is the caller; built by the tests until then"
-)]
 pub mod save;
 
-#[allow(
-    unused_imports,
-    reason = "the files view's edit mode is the caller; built by the tests until then"
-)]
 pub use baseline::{Baseline, Fingerprint};
-#[allow(
-    unused_imports,
-    reason = "the files view's edit mode is the caller; built by the tests until then"
-)]
-pub use open::{Eol, Format, Opened, Refusal, open};
-#[allow(
-    unused_imports,
-    reason = "the files view's edit mode is the caller; built by the tests until then"
-)]
+pub use open::{Format, Opened, Refusal, open};
 pub use save::{Options, SaveError, Saved, save};
 
 use std::ffi::{OsStr, OsString};
@@ -190,10 +162,6 @@ pub(crate) enum Perms {
     Private,
     /// What any editor's new file gets: the umask's default on Unix, the
     /// directory's ACL on Windows. A file being created in a repository.
-    #[allow(
-        dead_code,
-        reason = "the files view's edit mode is the caller; built by the tests until then"
-    )]
     Default,
     /// What the file this one will replace has — its permission bits, and its
     /// owner and group where the platform will allow it — so that a save
@@ -204,9 +172,11 @@ pub(crate) enum Perms {
     /// flag and nothing else, and `ReplaceFileW` carries the target's ACL and
     /// attributes across itself; copying the flag would only make the
     /// temporary file read-only and the replacement fail.
-    #[allow(
-        dead_code,
-        reason = "the files view's edit mode is the caller; built by the tests until then"
+    #[cfg_attr(
+        windows,
+        // `#[allow]` and not `#[expect]`: the condition is a `cfg`, so on the
+        // platform this *is* read an expectation would be unfulfilled.
+        allow(dead_code, reason = "read by the Unix half of `apply` only; see above")
     )]
     Like(std::fs::Metadata),
 }
@@ -312,10 +282,6 @@ impl Temp {
     /// Something else has put the file in place, or the file is the only copy
     /// of what it holds and must stay where it is: either way it is no longer
     /// this value's to remove. Hands back where it was written.
-    #[allow(
-        dead_code,
-        reason = "the files view's edit mode is the caller; built by the tests until then"
-    )]
     pub(crate) fn release(mut self) -> PathBuf {
         self.armed = false;
         std::mem::take(&mut self.path)

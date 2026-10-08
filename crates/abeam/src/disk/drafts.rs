@@ -111,6 +111,10 @@ impl Drafts {
         Self { dir }
     }
 
+    #[allow(
+        dead_code,
+        reason = "the tests read where the copies went; the files view never needs to"
+    )]
     pub fn dir(&self) -> &Path {
         &self.dir
     }

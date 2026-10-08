@@ -2356,8 +2356,17 @@ impl App {
     /// third condition added to one of them and not the other is a door held
     /// open in the loop and slammed by the key, which is the shape of bug
     /// nobody notices until it costs them a build.
+    ///
+    /// **Text typed into a file and not saved counts as live**, though nothing
+    /// is running: it is work that leaving would take off the screen, which is
+    /// the question this asks. The reader keeps a recovery copy of it in the
+    /// profile, and the copy survives the quit — `crate::panes::viewer::edit`
+    /// says so — so what the second `F1, Q` costs is the text on screen rather
+    /// than the text itself. That is still worth one press and a sentence
+    /// naming the file, because a copy is offered back only to somebody who
+    /// opens that file again and knows to look.
     fn anything_live(&self) -> bool {
-        self.any_agent_live() || self.any_shell_live()
+        self.any_agent_live() || self.any_shell_live() || self.viewer.unsaved().is_some()
     }
 
     /// Point the keyboard at another agent.
@@ -3203,9 +3212,19 @@ impl App {
     /// it. Re-rooting any of them would mean a prompt queued for the agent being
     /// aimed at a directory the agent is not in — which `crate::agentstate` is
     /// explicit is the one mistake in this program nobody would see happen.
+    ///
+    /// **Refused while the reader holds unsaved text**, before anything moves:
+    /// the reader is re-rooted with the rest of the right pane, and re-rooting
+    /// it would drop text that is on no disk. A refusal still owes a frame,
+    /// because its sentence is at the front of the right border — see
+    /// [`ViewerPane::may_replace`] — so this answers `true` with `at` exactly
+    /// where it was.
     fn set_workspace(&mut self, ix: usize) -> bool {
         if ix >= self.spaces.len() || ix == self.at {
             return false;
+        }
+        if !self.viewer.may_replace() {
+            return true;
         }
         self.at = ix;
         // Every view in the right pane is now describing a different worktree —
@@ -3533,10 +3552,18 @@ impl App {
     /// terminal and a loop that only stops when a person or an error stops it.
     /// What a test can reach is this, and what it pins is the word *every*.
     /// That `run` calls it is one line above a `?` and is held by reading.
+    ///
+    /// The reader's recovery copy goes here too, for the same reason and with
+    /// the same stakes: unsaved text in a file is copied to the profile two
+    /// seconds after the last key, and the way out is the one moment that
+    /// interval is not going to elapse. It is the copy that is written and not
+    /// the file — a quit is not a save — and it is what the next `e` on that
+    /// file offers back.
     fn flush_pads(&mut self) {
         for space in &mut self.spaces {
             space.pad.flush();
         }
+        self.viewer.flush_draft();
     }
 
     /// The loop.
@@ -4142,11 +4169,17 @@ impl App {
         // Enter in the git view. Draining unconditionally matters — a request
         // left sitting fires late, at whatever unrelated moment next reads it.
         if let Some(path) = self.git.take_open_request() {
-            self.viewer.show(path);
             // Switching views here is right where the watcher switching would
             // be wrong: this one is a key the user pressed asking for exactly
             // this. Focus stays on the right pane, where they already were.
-            self.set_right_view(RightView::Viewer);
+            //
+            // Unless the reader is holding unsaved text, which `show` refuses
+            // to put another file over. Then the git view stays up with the
+            // refusal at the front of its border — the reader's sentence on the
+            // view the key was pressed in, which is where the reader is looking.
+            if self.viewer.show(path) {
+                self.set_right_view(RightView::Viewer);
+            }
             redraw = true;
         }
 
@@ -4626,8 +4659,41 @@ impl App {
             redraw = true;
         }
 
+        // **The file the reader is editing, or last saved, is the reader's to
+        // answer — whatever its extension.** Everything else here routes
+        // markdown and only markdown to the reader, because following a `.rs`
+        // the agent wrote would yank the page on every build. A file somebody
+        // is typing into is the opposite case: a change to it is news the
+        // reader must have at once, `.rs` or not, because it is about to be
+        // written over. And the same path must then *not* be followed, which
+        // is the other half: following it would queue a reload of the page
+        // over the unsaved text — or, for the reader's own save coming back,
+        // mark the border unread for a write nobody else made. See
+        // `crate::panes::viewer::edit`.
+        //
+        // Skipped whole when the reader has nothing to recognise, which is
+        // almost always; and the reader's name match goes before `mine`, which
+        // walks every root, because the name match is two comparisons and a
+        // `git checkout` is thousands of paths.
+        let mut answered = Vec::new();
+        if self.viewer.minds_disk() {
+            for path in &change.changed {
+                if !self.viewer.minds(path) || !mine(path) {
+                    continue;
+                }
+                if let Some(owed) = self.viewer.disk_changed(path) {
+                    redraw |= owed;
+                    answered.push(path.clone());
+                }
+            }
+        }
+        // A batch that kept none of its paths may have held that file too.
+        if change.overflowed {
+            redraw |= self.viewer.disk_may_have_changed();
+        }
+
         for path in change.markdown {
-            if !mine(&path) {
+            if !mine(&path) || answered.contains(&path) {
                 continue;
             }
             // Queued, never shown from here. The viewer takes it up on the
@@ -4978,6 +5044,9 @@ impl App {
             }
             Event::Paste(text) => {
                 self.cancel_handoff_for_input();
+                // A paste is a keystroke to the reader's questions too: see
+                // the confirmations below, and [`ViewerPane::keystroke`].
+                self.viewer.keystroke();
                 // Offered to the focused pane unconditionally. The read-only
                 // views decline by returning `No` — which is the same mechanism
                 // every other event uses, and it leaves room for a pane that
@@ -5030,6 +5099,9 @@ impl App {
                 if !matches!(me.kind, MouseEventKind::Moved) {
                     self.cancel_handoff_for_input();
                     self.pending_shell_close = None;
+                    // A click or a wheel is somebody doing something else, and
+                    // withdraws the reader's `x x` like any key.
+                    self.viewer.keystroke();
                 }
                 self.handle_mouse(me)?;
                 Ok(Flow::redraw())
@@ -5067,6 +5139,11 @@ impl App {
         // `Ctrl+\` and the key it passes through do not leave it on screen for
         // the rest of the session.
         self.agent_refused = None;
+        // The reader's two answers to the key before this one, for the same
+        // reason and at the same moment — and its `x x` question set aside for
+        // this key to answer or withdraw, wherever it goes. See
+        // [`ViewerPane::keystroke`].
+        self.viewer.keystroke();
         if std::mem::take(&mut self.literal_next) {
             self.pending_shell_close = None;
             // To whichever pane has focus, not to the agent. The hatch exists
@@ -6096,8 +6173,17 @@ impl App {
         // whichever pane the cursor happened to be on — and drawing every
         // border at once is what made a per-item answer expressible at all. See
         // [`App::pump_queue`].
+        //
+        // The file is named when the quit would take unsaved text off the
+        // screen, because the question is then about it: "again to quit" over
+        // a pane whose title says `●` is a question nobody can answer without
+        // looking for which pane. And it says whether the text survives the
+        // quit, because that is the whole of what the second press costs.
         let state = if self.pending_quit {
-            Some("F1, Q again to quit".to_string())
+            Some(match self.viewer.quit_note() {
+                Some(note) => format!("F1, Q again to quit · {note}"),
+                None => "F1, Q again to quit".to_string(),
+            })
         } else {
             None
         };
@@ -6121,13 +6207,20 @@ impl App {
         // *recorded*, which `drive` does from `exit_status()` and therefore
         // only after `poll_exit` has reaped it. So "another agent" is exactly
         // what a `true` means — a pane opened later.
+        //
+        // Unsaved text is the third thing that can hold the door, and it ranks
+        // between the other two: cheaper to end than a turn — there is a
+        // recovery copy — and dearer than a shell at a prompt, because it is
+        // words somebody typed and nothing will type them again.
         let door = (state.is_none() && self.session_agent().exit.is_some()).then(|| {
             let holding = if self.any_agent_live() {
-                "another agent · "
+                "another agent · ".to_string()
+            } else if let Some(name) = self.viewer.unsaved_name() {
+                format!("unsaved {name} · ")
             } else if self.any_shell_live() {
-                "shell open · "
+                "shell open · ".to_string()
             } else {
-                ""
+                String::new()
             };
             format!("{holding}F1, Q to quit")
         });
@@ -6764,6 +6857,22 @@ impl App {
             ));
         }
 
+        // Why the last key did not replace the reader's page: it holds text on
+        // no disk. On whichever view is up rather than only the reader's,
+        // because two of the keys it answers are pressed in the git view —
+        // `Enter` on a file and on a worktree — and the git view stays up when
+        // they are refused. Ahead of the focus hint for the reason the shell's
+        // prompt is: it is the answer to the key just pressed, and gone at the
+        // next. See [`ViewerPane::may_replace`].
+        if let Some(why) = self.viewer.refusal() {
+            spans.push(Span::styled(
+                format!("{why} · "),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
         // What has the keys, and how to give them back — **first**, for the
         // reason the unread mark is near the front and with more riding on it.
         // A git title carrying a branch name and a change count fills the pane
@@ -6823,9 +6932,18 @@ impl App {
             // was a pane owning a piece of chrome the module doc on `Pane` says
             // belongs here — and it is what made moving the hint a rewrite of
             // six files rather than of this line.
+            //
+            // **The way out first, and the pane's action after it**, for the
+            // reason this whole slot leads the border: a title is clipped from
+            // the right, and the action used to go in front. The pad's
+            // `alt+t→rendered · esc→agent` lost its way out below sixty
+            // columns, and the files view's `e edit · ctrl+s save · x x
+            // discard` lost it below a hundred and twenty. One order for every
+            // pane, and it is the one in which the instruction that cannot be
+            // done without survives the narrowest border.
             let pane = self.right_pane_ref();
             let hint = match pane.action_hint() {
-                Some(action) => format!("{action} · {} · ", pane.exit_hint()),
+                Some(action) => format!("{} · {action} · ", pane.exit_hint()),
                 None => format!("{} · ", pane.exit_hint()),
             };
             spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
@@ -11486,6 +11604,261 @@ mod tests {
         );
     }
 
+    // --- a file being edited in the reader ----------------------------------
+    //
+    // The reader's own tests (`crate::panes::viewer::edit`) pin what the pane
+    // does; these pin the wiring the pane cannot see — the watcher's routing,
+    // the quit, the guards that are the shell's, and the keys that never reach
+    // the pane at all.
+
+    /// `name` from the fixture's directory, open in the reader with focus on
+    /// it, and `typed` typed into it — through the shell's own key handling,
+    /// as somebody at the keyboard would.
+    fn editing(fx: &mut Fixture, name: &str, typed: &str) -> PathBuf {
+        let path = fx.dir.path().join(name);
+        assert!(fx.app.viewer.show(&path));
+        hub(&mut fx.app, KeyCode::Char('e'));
+        fx.app.set_focus(Focus::Right);
+        screen(&mut fx.app, 240, 24);
+        fx.app.handle_key(key(KeyCode::Char('e'))).unwrap();
+        for c in typed.chars() {
+            fx.app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        path
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// The third thing that holds the door, and the quit that names it.
+    ///
+    /// No agent and no shell is live, and both are asserted, so that the door
+    /// held here is held by the text and nothing else.
+    #[test]
+    fn unsaved_text_in_a_file_holds_the_door_and_the_quit_names_the_file() {
+        let mut fx = app();
+        editing(&mut fx, "notes.md", "unsaved ");
+        until("the session's agent to go", || {
+            fx.app.reap().expect("try_wait on a child that exists");
+            fx.app.agents[0].pane.has_exited()
+        });
+        assert!(!fx.app.any_agent_live());
+        assert!(!fx.app.any_shell_live());
+        assert!(
+            fx.app.anything_live(),
+            "the loop would leave and take the text with it"
+        );
+
+        fx.app.agents[0].exit = Some((abeam_pty::ExitStatus::with_exit_code(0), Vec::new()));
+        let shown = screen(&mut fx.app, 300, 24);
+        assert!(shown.contains("unsaved notes.md · F1, Q to quit"), "{shown}");
+
+        assert!(matches!(
+            hub(&mut fx.app, KeyCode::Char('q')),
+            Flow::Continue { .. }
+        ));
+        assert!(fx.app.pending_quit, "F1, Q went straight out over unsaved text");
+        let shown = screen(&mut fx.app, 300, 24);
+        assert!(
+            shown.contains("F1, Q again to quit · unsaved notes.md kept as a recovery copy"),
+            "{shown}"
+        );
+        assert!(matches!(
+            hub(&mut fx.app, KeyCode::Char('q')),
+            Flow::Quit
+        ));
+    }
+
+    /// A change to the file being edited reaches the reader whatever it is
+    /// called, and the reader's own save coming back reaches nobody.
+    #[test]
+    fn the_watcher_reaches_the_file_being_edited_and_its_own_save_marks_nothing() {
+        let mut fx = app();
+        let code = fx.dir.write("main.rs", b"fn main() {}\n");
+        editing(&mut fx, "main.rs", "x");
+        std::fs::write(&code, b"fn main() { theirs() }\n").unwrap();
+        let change = Change {
+            markdown: Vec::new(),
+            changed: vec![code.clone()],
+            overflowed: false,
+        };
+        assert!(fx.app.route(change), "a `.rs` the reader is editing is the reader's news");
+        assert!(
+            fx.app.viewer.title().contains("◆ changed on disk"),
+            "{}",
+            fx.app.viewer.title()
+        );
+
+        let mut fx = app();
+        let notes = editing(&mut fx, "notes.md", "saved ");
+        fx.app.handle_key(ctrl('s')).unwrap();
+        assert_eq!(std::fs::read(&notes).unwrap(), b"saved # notes\n");
+        // The save's echo, as the watcher reports a markdown write.
+        let change = Change {
+            markdown: vec![notes.clone()],
+            changed: vec![notes.clone()],
+            overflowed: false,
+        };
+        fx.app.route(change);
+        assert!(!fx.app.viewer.has_pending(), "its own save came back as a document");
+        hub(&mut fx.app, KeyCode::Char('g'));
+        assert!(
+            !screen(&mut fx.app, 240, 24).contains('◆'),
+            "the git view's border marked the reader's own write unread"
+        );
+    }
+
+    /// The guards that are the shell's to ask — `Enter` in the git view, `F1,
+    /// B`, a worktree switch — each refused with the sentence in the border,
+    /// and the text kept through all three.
+    #[test]
+    fn git_enter_f1_b_and_a_worktree_switch_are_refused_over_unsaved_text() {
+        let mut fx = app();
+        fx.dir.write("other.md", b"# other\n");
+        let notes = editing(&mut fx, "notes.md", "mine ");
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(fx.app.viewer.unsaved().is_some());
+
+        hub(&mut fx.app, KeyCode::Char('g'));
+        fx.app.git.stub_open_request("other.md");
+        assert!(fx.app.pump(), "the refusal is worth a frame");
+        assert_eq!(fx.app.right_view, RightView::Git, "refused, so git stays up");
+        assert_eq!(fx.app.viewer.path(), Some(notes.as_path()));
+        let shown = screen(&mut fx.app, 240, 24);
+        assert!(shown.contains("notes.md has unsaved text"), "{shown}");
+        fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert!(
+            !screen(&mut fx.app, 240, 24).contains("has unsaved text"),
+            "the sentence outlived the next key"
+        );
+
+        hub(&mut fx.app, KeyCode::Char('b'));
+        assert_eq!(fx.app.right_view, RightView::Viewer);
+        let shown = screen(&mut fx.app, 240, 24);
+        assert!(shown.contains("notes.md has unsaved text"), "{shown}");
+        assert!(shown.contains("mine # notes"), "the unsaved page, not the list: {shown}");
+
+        let other = a_second_workspace(&fx, ".claude/worktrees/other");
+        fx.app.spaces.push(space(other, "other"));
+        assert!(fx.app.set_workspace(1), "a refusal is worth a frame");
+        assert_eq!(fx.app.at, 0, "the switch happened over unsaved text");
+        assert!(screen(&mut fx.app, 240, 24).contains("notes.md has unsaved text"));
+        assert_eq!(fx.app.viewer.path(), Some(notes.as_path()));
+        assert!(fx.app.viewer.unsaved().is_some(), "and the text was kept throughout");
+    }
+
+    /// `F4` while typing into a file: nothing is saved — the pad's flush on
+    /// focus loss is the pad's — and `ctrl+s` leaves the border, because the
+    /// next `Ctrl+S` is the agent's.
+    #[test]
+    fn focus_going_back_to_the_agent_saves_nothing_and_takes_ctrl_s_off_the_border() {
+        let mut fx = app();
+        let notes = editing(&mut fx, "notes.md", "x");
+        let shown = screen(&mut fx.app, 240, 24);
+        assert!(shown.contains("esc→done · ctrl+s save · ● notes.md · editing"), "{shown}");
+
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        assert_eq!(fx.app.focus, Focus::Left);
+        assert_eq!(std::fs::read(&notes).unwrap(), b"# notes\n", "saved on the way out");
+        let shown = screen(&mut fx.app, 240, 24);
+        assert!(!shown.contains("ctrl+s"), "{shown}");
+        assert!(shown.contains("● notes.md · editing"), "{shown}");
+    }
+
+    /// The way out leads every border, and in every state of a file being
+    /// edited the way out and the mark that changes what `Ctrl+S` does are
+    /// still there at forty columns — the border is clipped from the right, so
+    /// whatever has to survive goes first.
+    #[test]
+    fn the_way_out_and_the_mark_survive_a_forty_column_border_while_editing() {
+        let mut fx = app();
+        // What a border `cols` wide shows of the title: two cells go to its
+        // corners.
+        let border = |app: &App, cols: usize| -> String {
+            let whole: String = app
+                .right_title(true)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            whole.chars().take(cols - 2).collect()
+        };
+        let notes = editing(&mut fx, "notes.md", "x");
+        assert!(border(&fx.app, 40).starts_with(" esc→done · ctrl+s save · ● notes.md"));
+        let wider = border(&fx.app, 60);
+        assert!(wider.starts_with(" esc→done · ctrl+s save · ● notes.md · editing"), "{wider}");
+
+        // Reading the unsaved text: the state before the keys.
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        let reading = border(&fx.app, 40);
+        assert!(reading.starts_with(" esc→agent · ● unsaved · ctrl+s save"), "{reading}");
+        assert!(
+            border(&fx.app, 80)
+                .starts_with(" esc→agent · ● unsaved · ctrl+s save · e edit · x x discard"),
+            "{}",
+            border(&fx.app, 80)
+        );
+        fx.app.handle_key(key(KeyCode::Char('x'))).unwrap();
+        assert!(border(&fx.app, 40).starts_with(" esc→agent · x again discards"));
+        fx.app.handle_key(key(KeyCode::Char('j'))).unwrap();
+
+        // A conflict, reading and typing.
+        std::fs::write(&notes, b"# theirs\n").unwrap();
+        assert_eq!(fx.app.viewer.disk_changed(&notes), Some(true));
+        let reading = border(&fx.app, 40);
+        assert!(reading.starts_with(" esc→agent · ● unsaved · ◆ ctrl+s save"), "{reading}");
+        fx.app.handle_key(key(KeyCode::Char('e'))).unwrap();
+        fx.app.handle_key(ctrl('s')).unwrap();
+        let typing = border(&fx.app, 40);
+        assert!(typing.starts_with(" esc→done · ◆ ctrl+s again overwrites"), "{typing}");
+        assert!(
+            border(&fx.app, 100).contains("● notes.md · editing · ◆ changed on disk"),
+            "{}",
+            border(&fx.app, 100)
+        );
+    }
+
+    /// The way out writes the reader's recovery copy — up to the last key, not
+    /// the last quiet interval — and does not write the file: a quit is not a
+    /// save. The copy is what the next `e` on that file offers back.
+    #[test]
+    fn leaving_writes_the_reader_s_recovery_copy_and_not_the_file() {
+        let mut fx = app();
+        let profile = TempDir::new("app-drafts");
+        let drafts = crate::disk::drafts::Drafts::at(profile.path().join("drafts"));
+        fx.app.viewer.set_drafts(Some(drafts.clone()));
+        let notes = editing(&mut fx, "notes.md", "kept ");
+
+        fx.app.flush_pads();
+        let resolved = paths::resolve(&notes).expect("the file is there");
+        let copy = drafts.read(&resolved).expect("readable").expect("a copy");
+        assert_eq!(copy.text, "kept # notes\n");
+        assert_eq!(std::fs::read(&notes).unwrap(), b"# notes\n", "a quit is not a save");
+    }
+
+    /// `x`, then a key that goes to the agent, then `x`: the question was
+    /// withdrawn by the key in between, so the second `x` asks again.
+    #[test]
+    fn a_key_that_never_reaches_the_reader_withdraws_its_x_x_question() {
+        let mut fx = app();
+        let notes = editing(&mut fx, "notes.md", "x");
+        fx.app.handle_key(key(KeyCode::Esc)).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('x'))).unwrap();
+        screen(&mut fx.app, 240, 24);
+        fx.app.handle_key(key(KeyCode::F(4))).unwrap();
+        fx.app.handle_key(key(KeyCode::F(5))).unwrap();
+        fx.app.handle_key(key(KeyCode::Char('x'))).unwrap();
+        assert!(
+            fx.app.viewer.unsaved().is_some(),
+            "F4 between the presses did not withdraw the question"
+        );
+        screen(&mut fx.app, 240, 24);
+        fx.app.handle_key(key(KeyCode::Char('x'))).unwrap();
+        assert!(fx.app.viewer.unsaved().is_none(), "asked again and answered");
+        assert_eq!(std::fs::read(&notes).unwrap(), b"# notes\n");
+    }
+
     /// The session's own agent is the one pane that will not close, and the
     /// cursor survives the list changing length.
     ///
@@ -14269,16 +14642,18 @@ mod tests {
                 .collect()
         };
 
+        // The way out leads, and the route to the other form follows it: a
+        // narrow border clips the end, and the end is the less necessary half.
         let editing = title(&fx.app, true);
         assert!(
-            editing.starts_with(" alt+t→rendered · esc→agent · pad "),
+            editing.starts_with(" esc→agent · alt+t→rendered · pad "),
             "{editing}"
         );
 
         fx.app.handle_key(alt(KeyCode::Char('t'))).unwrap();
         let rendered = title(&fx.app, true);
         assert!(
-            rendered.starts_with(" t→editing · esc→agent · pad · rendered "),
+            rendered.starts_with(" esc→agent · t→editing · pad · rendered "),
             "{rendered}"
         );
 
