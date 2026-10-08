@@ -166,7 +166,8 @@ pub trait Pane {
     }
 
     /// A pane-local action worth keeping in the border while this pane has
-    /// focus, before [`exit_hint`](Pane::exit_hint).
+    /// focus, after [`exit_hint`](Pane::exit_hint) — the way out leads every
+    /// border, because a border is clipped from the right.
     ///
     /// Unlike a pane's title, this is an instruction and is shown only while
     /// its key can honestly be acted on by that pane. Most views need no such

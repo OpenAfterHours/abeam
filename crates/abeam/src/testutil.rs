@@ -129,6 +129,23 @@ impl TempDir {
     }
 }
 
+/// A symbolic link at `link` to the file `target`, or `false` where this
+/// machine will not make one.
+///
+/// A `bool` rather than a panic, because the refusal is a fact about the
+/// machine and not about the code under test: Windows makes symlinks only for
+/// an elevated process or with Developer Mode on, and a test that needs one
+/// should say it was skipped and pass, not fail on a laptop that never turned
+/// either on. `crate::paths`'s junction test is the other shape — `mklink /J`
+/// needs no privilege, so there a failure *is* the test failing.
+pub fn symlink_file(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    made.is_ok()
+}
+
 /// Poll until `f` holds, or fail loudly.
 ///
 /// **There is nothing here to wait *on*, which is the whole reason this is a

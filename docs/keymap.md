@@ -48,6 +48,91 @@ a two-sequence action: enter the full `F1, X` sequence twice to close the active
 shell and its process tree. Closing the last shell returns focus to the agent
 and leaves an empty shell view rather than immediately spawning a replacement.
 
+### Editing a file, and the pad's undo
+
+These are pane-local: each is delivered only while the right pane has focus and
+that view is up, which is the exemption `crate::keys` states once. None of them
+is in the table above, and none needs an audit against a hosted agent's map.
+
+The files view, reading (the document, not the file list):
+
+| Key | Does |
+| --- | --- |
+| `e` | Edit the file on screen, or go back to its unsaved text. From the source view the caret starts on the top line shown; from the rendering, at the same fraction of the way down |
+| `Ctrl+S` | While there is unsaved text: save it, without going back to the caret |
+| `x`, `x` | While there is unsaved text: throw it away and show the file as it is on disk. The second `x` counts only once the question is on screen; any other key keeps the text |
+| `t`, `/`, `o`, the scroll keys | As ever — over the unsaved text, while there is some |
+
+The files view, editing (after `e`):
+
+| Key | Does |
+| --- | --- |
+| Letters, `Enter`, `Backspace`, `Delete` | Type, as in the pad's edit form — `q`, `j`, `t` and the rest are letters |
+| Arrows, `Home` / `End`, a click | Move the caret |
+| `PgUp` / `PgDn` | Page the view and leave the caret where it is, as `F1, J` / `F1, K` and `F1, PgUp` / `F1, PgDn` do from outside the pane |
+| `Tab` | Two spaces, or a literal tab where the file already indents a line with one |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo — a word, a run of deletes or a paste at a time; `Ctrl+Shift+Z` is redo too where the terminal reports the Shift, and a capital `Z` without it is undo |
+| `Ctrl+S` | Save, and go on typing. In the conflict state the first press is refused and a second, once the refusal is on screen, overwrites the version it was refused over |
+| `Esc` | Back to reading, with the text kept: the title keeps the `●` before the file's name, and the focused border leads with `● unsaved`. It never discards |
+| `Ctrl+D` / `Ctrl+U` | Nothing — the half page is a reading key |
+| `F4` | Keys to the agent; the editor and its text stay, and nothing is saved |
+
+The file list:
+
+| Key | Does |
+| --- | --- |
+| `a` | Name a new file in the directory shown; `Enter` opens an empty editor for it, and nothing is on disk until its first `Ctrl+S` |
+
+The scratch pad:
+
+| Key | Does |
+| --- | --- |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo, in the edit form only (`Ctrl+Shift+Z` too) |
+| `Ctrl+S` | Save now, from either form; the pad still saves itself two seconds after the last key |
+| `Alt+T` | Unchanged: the rendering / what was typed |
+
+**A `Ctrl` chord pressed into a focused right pane is that pane's, and never
+reaches the agent.** `keys::global` claims no `Ctrl`+letter at all — every one
+of them is bound somewhere in Claude, which "What that means" records below — so
+with the agent focused every `Ctrl` chord goes to the agent exactly as it always
+did. With the right pane focused, the pane is offered it first. A shell hands
+it on, because there it belongs to the child. The panes with no child in them
+bind what their own vocabulary needs — `Ctrl+D` / `Ctrl+U` in the read-only
+views, `Ctrl+L` in the ask, `Ctrl+C` over a selection, and `Ctrl+Z`, `Ctrl+Y`
+and `Ctrl+S` in the pad and in a file being edited — and any other chord does
+nothing there rather than being passed to the agent. That is the interception
+exemption extended from letters to chords rather than argued afresh: no agent is
+listening to a key delivered to a focused pane. `keys::ctrl_chord` is the one
+test for "this is a chord", and it reads `Ctrl+Alt` as AltGr text rather than as
+a chord, so on a layout where AltGr+Z types a character the character is typed
+and nothing is undone.
+
+**What that costs is on the other side of `F4`, and the border is where it is
+paid.** `Ctrl+S` is `chat:stash` in Claude's Chat context and stash-and-pop in
+Copilot's prompt, and with the agent focused that is what it does, however much
+the right pane looks as though it is waiting for a save. So a pane names a
+`Ctrl` chord on its border only while it has focus: the editor's `ctrl+s save`
+is drawn through `Pane::action_hint`, which the shell shows to a focused pane
+and to no other, and the notices drawn above the text name no key that could
+reach the agent, because they are drawn whether the pane has the keys or not. A
+border saying `ctrl+s` over a pane without the keys would be telling somebody to
+stash their prompt.
+
+**Every right-pane border leads with the way out, then the pane's own keys, and
+then its title.** `esc→agent`, `f4→agent` at a live shell, `esc→done` in a file
+being edited — first, because a border is clipped from the right and the way
+out is the one instruction nobody can do without. The pane's action used to go
+in front of it, which is how the pad's `alt+t→rendered · esc→agent` lost its way
+out in a pane narrower than about thirty columns — a terminal narrower than about
+seventy-two. It is one order for every pane, composed by the shell
+(`App::right_title`) and not by each pane's literals. While a file is being
+edited, the state comes next: `esc→done · ctrl+s save · ● README.md · editing`
+while typing, `esc→agent · ● unsaved · ctrl+s save · e edit · x x discard` while
+reading the unsaved text, and `◆` at the front of the instruction in a conflict
+— `esc→done · ◆ ctrl+s again overwrites` — so that at forty columns the way out
+and the mark that changes what `Ctrl+S` will do both survive. `crate::app`'s
+tests measure it.
+
 The material below is retained as a **historical audit of the retired direct
 map**. It records the evidence and collision decisions that led to the hub, but
 its `Alt+…`, `F2`, `F3`, `F6`, `F8`, and `F9` descriptions are not current
@@ -489,9 +574,10 @@ terminal's own selection used, kept doing what it did. `F7` is what a keyboard
 has instead, and what anyone has when the right pane is running something that
 asked for the mouse.
 
-What it opens is a mode, and the mode is one of four places in abeam where the
-ordinary vocabulary is suspended — the find boxes, the ask's composer and the
-scratch pad's edit form being the others. Every one of them owes the F1 overlay
+What it opens is a mode, and the mode is one of five places in abeam where the
+ordinary vocabulary is suspended — the find and name boxes, the ask's composer,
+the scratch pad's edit form and a file being edited being the others. Every one of
+them owes the F1 overlay
 a row of its own, because a mode that changes what each key means and announces
 it nowhere reads as a broken pane rather than as a mode. This one
 is stated loudest because it swallows *every* key while it is up, over a pane
@@ -501,7 +587,11 @@ view, `v` anchors, `y` copies to the host terminal's clipboard over OSC 52,
 leaves. Nothing reaches the pane or the child until it does.
 
 **`Ctrl+C` copies while a selection is up, and it is the one `Ctrl`+letter in
-this program that is ever abeam's.** It is deliberately not in the table above,
+this program that abeam ever takes away from a child.** (The pad's and the
+editor's `Ctrl+Z`, `Ctrl+Y` and `Ctrl+S`, and the ask's `Ctrl+L`, are read by
+panes with no child behind the keys; "Editing a file, and the pad's undo" at the
+top of this document states the rule they share.) It is deliberately not in the
+table above,
 and the distinction is this file's own: `global` claims nothing, so the invariant
 at the top holds unchanged. The key is read inside a mode that is already
 swallowing every keystroke, so what it costs the child is nothing it would have
@@ -669,7 +759,9 @@ rather than opening an empty list, `Backspace` or `-`
 to climb a directory in the file list, and three searches: `/` finds a file
 anywhere under the root while the list is up and a phrase on the page while a
 document is, `n` and `N` walk that document's matches, and `f` reads every file
-under the root for a phrase. The queue view adds `i` to write an item, `a` to
+under the root for a phrase. `e` edits the file on screen and `a` in the file
+list names a new one; both are in the tables under "Editing a file, and the
+pad's undo" above. The queue view adds `i` to write an item, `a` to
 arm or disarm sending, `d` to delete one, `m` to switch an item between being
 typed into the live session and being dispatched as its own background agent,
 `r` to clear the rows it has finished with, and `Enter` to do the selected one
@@ -765,6 +857,14 @@ the letter is a letter there. That chord is read by the pane and never by
 and out of the invariant — see the paragraph on `F9` above for why the
 distinction is worth making out loud in this one case, when Claude binds
 `meta+t` in its Chat context.
+
+Undo brought the pad three `Ctrl` chords — `Ctrl+Z` and `Ctrl+Y` in the edit
+form, `Ctrl+S` in both — and a file being edited in the files view has the same
+three from the same editor. They are pane-local by the rule "Editing a file, and
+the pad's undo" states at the top of this document for every `Ctrl` chord in a
+focused right pane, and the editing mode is the pad's suspension over again,
+with one difference: `Esc` there goes back to reading with the text kept,
+rather than falling through to the agent.
 
 ## Claude Code's bindings, as of the audited build
 
@@ -893,6 +993,9 @@ because they are three different shapes of the same mistake:
   character behind it. `€` on a UK layout; `@`, `€`, `~`, `|`, `[`, `]`, `{`
   and `}` on a German one. Typed, and silently dropped. `keys::is_text` is the
   shared answer, and it reads `Ctrl` and `Alt` *together* as no modifier at all.
+  The files view's find and search boxes had the same guard and were the last
+  to be given that answer, together with the new-file name box: a path is where
+  a German keyboard reaches for `\`, `[` and `{`.
 - **`Ctrl+\` literal-next** matched on `ctrl` alone. On the layouts that put `\`
   behind AltGr — German, Spanish, Italian — typing a backslash therefore armed
   literal-next and sent the *next* keystroke to the agent raw. The note beside
@@ -1396,9 +1499,10 @@ discipline rather than with an agent.
 
 The keys abeam still takes before a child sees them are the ones in
 `keys::global` — `F1` and the key after it, `F4`, `F5`, `F7`, `F12` and
-`Ctrl+\` — and nothing else reaches the question: the pad's `Alt+T` and a
-selection's `Ctrl+C` are pane-local, heard only while the right pane has the
-keys, which is the exemption `crate::keys` states once for all of them.
+`Ctrl+\` — and nothing else reaches the question: the pad's `Alt+T`, a
+selection's `Ctrl+C` and the editors' `Ctrl+Z`, `Ctrl+Y` and `Ctrl+S` are
+pane-local, heard only while the right pane has the keys, which is the exemption
+`crate::keys` states once for all of them.
 
 **On Windows the line is the console's.** CPython's `input()` on a console goes
 through `_PyOS_WindowsConsoleReadline`, which calls `ReadConsoleW` and sets no

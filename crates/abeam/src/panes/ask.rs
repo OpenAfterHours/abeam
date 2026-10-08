@@ -1794,7 +1794,7 @@ impl Pane for AskPane {
         // where this pane's vocabulary lives anyway. Nothing of the hosted
         // agent's is shadowed: this arrives only when the right pane has focus,
         // which is the same exemption `w` in the git view has.
-        if ctrl && !alt && matches!(key.code, KeyCode::Char('l' | 'L')) {
+        if crate::keys::ctrl_chord(&key) && matches!(key.code, KeyCode::Char('l' | 'L')) {
             self.clear();
             return Ok(Handled::Yes);
         }

@@ -93,6 +93,14 @@ impl ShellSessions {
         // Relaxed is enough: allocation orders no other memory, it only has to
         // answer differently to every caller. `fetch_update` keeps the counter
         // from wrapping and making an ancient id valid again.
+        //
+        // Rust 1.99 renamed it `try_update` and deprecated the old name, which
+        // CI's `-D warnings` on `stable` turns into an error. The new name does
+        // not exist before 1.99, so switching to it would break every older
+        // toolchain this builds on. `#[allow]` rather than `#[expect]` because
+        // the lint only fires from 1.99 on, and before that an expectation is
+        // unfulfilled — the toolchain is a `cfg` in all but name.
+        #[allow(deprecated, reason = "`try_update` from 1.99; switch when the floor reaches it")]
         let id = ShellId(
             NEXT_SHELL_ID
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {

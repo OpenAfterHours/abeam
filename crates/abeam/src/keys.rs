@@ -172,10 +172,13 @@ pub fn alt_chord(key: &KeyEvent) -> bool {
 ///
 /// `Ctrl` and `Alt` **together** are therefore text, and `Ctrl` or `Alt` alone
 /// is not. What that gives up is `Ctrl+Alt`+letter as a chord, which nothing in
-/// abeam binds and nothing hosted can hear: the three panes that ask this
-/// question are abeam's own composers, with no child in them for a chord to be
-/// aimed at. `Shift` is not part of the question at all — it is what made the
-/// letter a capital.
+/// abeam binds and nothing hosted can hear: the panes that ask this question —
+/// those three composers, the editor, and the files view's four boxes (the
+/// list's find, the name box, the document's `/` and the repository's `f`) —
+/// are abeam's own, with no child in them for a chord to be aimed at. A box
+/// that binds `Ctrl` chords of its own asks [`ctrl_chord`] for them, so that
+/// AltGr is never one. `Shift` is not part of the question at all — it is what
+/// made the letter a capital.
 ///
 /// A pane that also reads an `Alt` binding of its own must match it *before*
 /// this, which is what `crate::panes::pad`'s `Alt+T` arm does. That ordering is
@@ -194,6 +197,33 @@ pub fn is_text(key: &KeyEvent) -> bool {
         // either abeam's or the agent's, but neither is a character.
         _ => false,
     }
+}
+
+/// True for `Ctrl`+key **without** `Alt`: the chord half of [`is_text`]'s
+/// answer, for the panes that bind one.
+///
+/// **A Ctrl chord is the right pane's to answer only while the right pane has
+/// focus**, and that is the whole rule. [`global`] claims no `Ctrl`+letter at
+/// all, so with focus on the agent every one of them is the agent's; with focus
+/// on the right pane the pane is offered it first, and a pane with a child in
+/// it — a shell — hands it on, because there it belongs to the child. The panes
+/// without one bind the chords their own vocabulary needs: the read-only views
+/// `Ctrl+D`/`Ctrl+U` to scroll half a page, the ask `Ctrl+L` to end its
+/// conversation, a selection `Ctrl+C` to copy, the pad `Ctrl+Z`, `Ctrl+Y`
+/// and `Ctrl+S`, and the files view's editor the same three — `Ctrl+S` from its
+/// reading view as well, while that holds unsaved text. None of those can
+/// shadow a binding of the agent's, because none of them is offered anything
+/// while the agent has the keys.
+///
+/// `Alt` is excluded for the reason the module doc gives at length: Ctrl+Alt
+/// is how Windows spells AltGr, and on a layout where AltGr+Z types a
+/// character that character arrives as text and must not be read as an undo.
+/// `Shift` is ignored, as it is everywhere else here — it is what made the
+/// letter a capital, and some terminals report it for no other reason. One
+/// caller reads it on purpose, after asking this: `crate::editor::Editor::key`,
+/// for which `Ctrl+Shift+Z` is redo and the same chord without Shift is undo.
+pub fn ctrl_chord(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,6 +669,16 @@ pub const HELP: &[(&str, &str)] = &[
         "document: jump to a heading or a definition, if it has any",
     ),
     ("Backspace or -", "file list: up a directory"),
+    // The list's own row for the one key that makes something. "when first
+    // saved" is the half nobody would guess and the half that matters: naming
+    // a file and walking away leaves nothing, not an empty file and not the
+    // directories its name passes through. A bare letter for the *intercept*
+    // paragraph at the top of this file, and in the box it opens every key is
+    // a letter — the `(in a find box)` row's rule.
+    (
+        "a (file list)",
+        "name a new file here (notes/ makes a directory); it exists once first saved",
+    ),
     ("r", "refresh · queue: clear what has finished (twice)"),
     // Not another global view key: `Alt+W` is Claude's, and one spelled `F6`
     // would be a key nobody groups with the workspace views. Why a bare letter
@@ -730,6 +770,73 @@ pub const HELP: &[(&str, &str)] = &[
         "(in the pad, editing)",
         "every letter is typed; arrows, Home/End move the caret; PgUp/PgDn page; Ctrl+D/U do nothing",
     ),
+    // The pad's three Ctrl chords, which it may take because it has the keys
+    // only while it has focus — the rule `ctrl_chord` states once, and the
+    // same one that gives the ask its `Ctrl+L` and a selection its `Ctrl+C`.
+    // The context in brackets is theirs too. Rows of their own rather than
+    // clauses on the row above, which is already as long as the overlay can
+    // draw.
+    //
+    // The undo row says what one step is, because that is the question a
+    // first `Ctrl+Z` raises — whether it takes back a letter or a paragraph —
+    // and `crate::editor::history` is the answer it summarises.
+    (
+        "Ctrl+Z / Ctrl+Y (pad)",
+        "editing: undo / redo (or Ctrl+Shift+Z) — a word, a run of deletes or a paste at a time",
+    ),
+    // "now" is the whole of what the key adds: the pad saves itself two
+    // seconds after the last key and whenever it leaves the screen, and a row
+    // that only said "save" would read as though nothing else did.
+    (
+        "Ctrl+S (pad)",
+        "save now (it also saves itself two seconds after the last key)",
+    ),
+    // The files view's door into typing, and the only row that says it exists:
+    // nothing in the reading view's border advertises `e`, because a title
+    // already carrying the name, the form, the query and the position has no
+    // room to name a key the reader has not asked about. A bare letter for the
+    // *intercept* paragraph at the top of this file, like `t`, `o` and `f`.
+    (
+        "e (files)",
+        "edit the file on screen, or go back to its unsaved text",
+    ),
+    // The mode `e` opens owes this overlay a row of its own — `docs/keymap.md`
+    // says a mode that changes what every key means and announces it nowhere
+    // reads as a broken pane — and it is the pad's row word for word, for the
+    // pad's row's reason: `Ctrl+D`/`Ctrl+U` scroll half a page in the reading
+    // view one keystroke earlier, and a reader who reaches for them here finds
+    // them doing nothing at all, which looks like a pane that stopped
+    // listening.
+    (
+        "(in the files, editing)",
+        "every letter is typed; arrows, Home/End move the caret; PgUp/PgDn page; Ctrl+D/U do nothing",
+    ),
+    // Its own row, because it is the one key that differs from the pad's: the
+    // pad hands `Esc` back to the shell, and here it is the way back to
+    // reading, with nothing thrown away.
+    (
+        "Esc (files, editing)",
+        "to reading, text kept; Ctrl+S saves it from there and x x throws it away",
+    ),
+    // The pad's Ctrl rows, in the files view's context: the same keys, the
+    // same editor, and the one rule `ctrl_chord` states once.
+    (
+        "Ctrl+Z / Ctrl+Y (files)",
+        "editing: undo / redo (or Ctrl+Shift+Z), as in the pad",
+    ),
+    // "and from the reading view" because that is the half nobody would guess:
+    // `Esc` keeps unsaved text on the page, and saving it is not typing, so it
+    // does not need the editor back first.
+    (
+        "Ctrl+S (files)",
+        "save; and from the reading view while there is unsaved text",
+    ),
+    // Twice, like every key in this table that destroys something, and the
+    // second press counts only once the question is on screen.
+    (
+        "x x (files)",
+        "throw away unsaved text and show the file as it is on disk",
+    ),
     // The third statement of the box rule, and the one that has to be loudest:
     // this mode swallows *every* key, over a pane that may have a live shell in
     // it. A reader who does not know that is a reader typing at a child that is
@@ -740,11 +847,12 @@ pub const HELP: &[(&str, &str)] = &[
         "(selecting)",
         "the scroll keys move the caret; v anchors, y or Ctrl+C copies, Esc leaves",
     ),
-    // Its own row because it is the one place in the program where a
-    // `Ctrl`+letter is not the child's, and somebody who does not know that is
-    // somebody whose `Ctrl+C` did not interrupt what they thought it would.
-    // `global` still claims nothing — see the module doc — but the overlay has
-    // to say what the key does where it does it.
+    // Its own row because a selection can be up over a live shell, and there
+    // `Ctrl+C` is the one `Ctrl`+letter that is not the child's: somebody who
+    // does not know that is somebody whose `Ctrl+C` did not interrupt what
+    // they thought it would. `global` still claims nothing — see the module
+    // doc and `ctrl_chord` — but the overlay has to say what the key does
+    // where it does it.
     (
         "Ctrl+C (selecting)",
         "copies · to interrupt something instead, leave the selection first",
@@ -790,9 +898,14 @@ pub const HELP: &[(&str, &str)] = &[
     // the reason the ask's does. `Esc` is not in the pad's half of this list
     // because the pad declines it in both forms, which is this row working
     // rather than an exception to it.
+    //
+    // A file being edited is the sixth, and it keeps both: `q` is a letter of
+    // the file, and `Esc` goes back to the reading view — keeping the text —
+    // rather than to the agent. The words are shorter than they were because
+    // the row is now as wide as the overlay draws at 120 columns.
     (
         "Esc or q",
-        "back to the agent (a shell and a find box keep both; ask and pad keep q; worktrees keep Esc)",
+        "back to the agent (shell, find box, editing keep both; ask and pad keep q; worktrees keep Esc)",
     ),
 ];
 
@@ -1094,6 +1207,31 @@ mod tests {
             KeyModifiers::ALT | KeyModifiers::CONTROL,
         );
         assert!(alt_chord(&altgr_t) && is_text(&altgr_t));
+    }
+
+    #[test]
+    fn a_ctrl_chord_is_ctrl_without_alt_and_never_a_character() {
+        // The pad's `Ctrl+Z` asks this, and the case it must refuse is AltGr:
+        // Ctrl+Alt+Z is a character on some layout, and reading it as an undo
+        // would take text back while the user was typing more of it.
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::CONTROL | KeyModifiers::SHIFT] {
+            let z = k(KeyCode::Char('z'), mods);
+            assert!(ctrl_chord(&z), "{mods:?}");
+            assert!(!is_text(&z), "a chord is never also text: {mods:?}");
+        }
+        for mods in [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        ] {
+            assert!(!ctrl_chord(&k(KeyCode::Char('z'), mods)), "{mods:?}");
+        }
+        // And no Ctrl chord is claimed by `global`, so a pad asking this is
+        // asking about a key nothing above it has already taken.
+        assert_eq!(global(&k(KeyCode::Char('z'), KeyModifiers::CONTROL)), None);
+        assert_eq!(global(&k(KeyCode::Char('y'), KeyModifiers::CONTROL)), None);
+        assert_eq!(global(&k(KeyCode::Char('s'), KeyModifiers::CONTROL)), None);
     }
 
     #[test]

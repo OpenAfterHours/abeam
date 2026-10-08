@@ -7,14 +7,16 @@
 > you know what went wrong first. Why one leading `+` token and nothing else on
 > the command line is abeam's; why the config file is read from your profile and
 > never from the repository; why three of the seven views do not answer to the
-> shared scroll vocabulary; why the obvious version of the worktree routing rule
-> is a no-op dressed as a rule.
+> shared scroll vocabulary; why the one pane that writes into the repository
+> writes only when asked, and never over the agent; why the obvious version of
+> the worktree routing rule is a no-op dressed as a rule.
 >
 > The rest of the reasoning lives in the source, in the module documentation of
 > the file that owns each decision — `crates/abeam/src/workspace.rs` for the
 > routing rule, `crates/abeam/src/launch/` for what may be started,
-> `crates/abeam/src/ask/` for the second agent. `docs/keymap.md` is the keyboard
-> audit, and `docs/status.md` is what has and has not been proven.
+> `crates/abeam/src/ask/` for the second agent, `crates/abeam/src/disk/` for
+> what a save may do to a file that is not abeam's. `docs/keymap.md` is the
+> keyboard audit, and `docs/status.md` is what has and has not been proven.
 
 > **Current keyboard map:** the Option A `F1` command hub is authoritative.
 > Historical examples below that use global `Alt` bindings or retired direct
@@ -36,10 +38,76 @@ the day somebody ran two agents on one project. The pane still knows what the
 agent just did. What it costs to keep that true is a routing rule with an
 argument in it.
 
-Everything else is a consequence of that. The panes are read-only, they never
-take focus from the agent, and they never switch themselves — a pane that yanks
-itself into view while you are reading is delightful twice and infuriating
-thereafter.
+Everything else is a consequence of that. The panes never take focus from the
+agent, and they never switch themselves — a pane that yanks itself into view
+while you are reading is delightful twice and infuriating thereafter.
+
+They were read-only as well, and that clause stood in the sentence above until
+the files view learned to edit. It is the one founding rule this document has
+had to give up rather than sharpen, and it is given up for one pane and one
+action — a save somebody pressed a key for — which is worth arguing here rather
+than leaving to be inferred, because the reasons the rule was right are the
+reasons the exception has the shape it has.
+
+**The request was small, and it was abeam's own job.** The three windows this
+replaces were the agent, git, and an editor open purely to read what the agent
+wrote — and the editor turned out to be open for a second job nobody had written
+down: the one-word fix to the README the agent has just produced, the line of
+`AGENTS.md` it keeps misreading. With a read-only reader each of those was a
+trip back to the window abeam exists to close, for an edit shorter than the
+trip. So `e` puts a caret in the file already on screen.
+
+**Built in, rather than `$EDITOR` in the right pane**, and not for want of the
+alternative: `vim README.md` in the shell view works today, and nothing here
+takes it away. An editor in a pty is a child, and a child cannot be told the
+things that make this safe — that the agent has just written the file under it,
+that the save it is about to make would go over that write, that the page it is
+showing is the page the reader was on. Each of those is a fact only abeam has.
+And `$EDITOR` is not a thing abeam can count on being set — Windows sets none
+by default — and the editor every Windows machine does have opens a window of
+its own, which is the request again, unanswered. The cost was
+smaller than it sounds, because the pad already had an editor; `crate::editor`
+is that editor moved out from under it, and the files view is its second caller
+rather than a second editor.
+
+**Saved when you say so, and never by itself.** The pad autosaves because its
+file is abeam's own, in the profile, read by nobody but the person who wrote it.
+A file in a repository has two other readers, and both would take an autosave as
+a decision: git, which shows every byte of it, and the agent, which reads
+`AGENTS.md` as instructions and would act on half a sentence written there two
+seconds after somebody paused in the middle of it. So `Ctrl+S` is the only thing
+that writes — not a pause, not `F4`, not a quit — and `Esc` neither saves nor
+discards but keeps the text, because `Esc` is the key every other mode in this
+program has taught as "never mind", and a "never mind" that cost a paragraph
+would be the worst key there is.
+
+**Never over the agent's write.** The agent is writing in this repository while
+the user types, and the one failure worth any amount of code here is a save that
+quietly replaces what it wrote: from the outside that looks exactly like the
+agent having done nothing, and git cannot help, because the version that was
+written over was never committed. So immediately before the replacement the
+file is read again and compared, byte for byte, with what the editor was opened
+on — bytes and not a size and a time, because an agent can rewrite a file to the
+same length inside one tick of a coarse clock — and any difference writes
+nothing. A second `Ctrl+S` overwrites, and only the version the first one was
+refused over: a version the agent writes after that is one nobody has seen, and
+it is refused in turn. It is a check and not a lock, and the instant between the
+comparison and the replacement is real; a lock would be a file nobody can save
+because some other process died holding it.
+
+**Recovery copies, and never in the repository.** Unsaved text that dies with a
+closed terminal is what not autosaving costs, and the answer is to copy it
+somewhere that is not the file — into the profile, beside the pad, after the
+pad's two seconds of quiet — and offer it back the next time that file is
+opened for editing. Inside the workspace a copy would be an untracked file in
+the git pane, a change the watcher reports, and somebody's unsaved text sitting
+in the one directory that gets committed and pushed. The writer asks whether
+the profile is inside the workspace rather than assuming it is not, because a
+dotfiles repository rooted at the home directory contains the profile whole.
+
+The rest is under **files** in "The panes" below, and the rules themselves are
+enforced in one place, `crates/abeam/src/disk/`, whose module documentation is
+the long form of the last three paragraphs.
 
 ## Running it
 
@@ -457,6 +525,10 @@ is the only one that answers to the vocabulary in one of its forms and not in
 the other: its edit form is a text field, so `j`, `k`, `g`, `q` and `t` are
 letters somebody is typing and `Alt+T` is what turns the page over, while its
 rendering takes nothing and the whole vocabulary comes back, bare `t` included.
+A file being edited in the files view is the same suspension in a fourth place
+rather than a fourth view — it is the pad's editor, so it is the pad's letters —
+and it differs in one key: `Esc` there goes back to reading, with the text kept,
+rather than to the agent.
 
 `w` is the one key in that vocabulary that is not about reading: in the git view
 it opens the repository's worktrees, `Enter` there points the right pane at the
@@ -543,7 +615,8 @@ every terminal with copy-on-select already assumes, and what the host terminal
 would have done here if abeam had not taken its mouse. `Ctrl+C` copies too while
 a highlight is up, which is the same rule Windows Terminal applies: with a
 selection it copies, without one it belongs to the child. It is the only
-`Ctrl`+letter abeam ever takes and it is not in `crate::keys`'s table, because
+`Ctrl`+letter abeam ever takes away from a child, and it is not in
+`crate::keys`'s table, because
 `global` claims nothing — the state it is reached in is one where every key is
 already being swallowed, so it costs the child nothing it was going to get.
 
@@ -627,8 +700,9 @@ viewer saying "no such file". `w` leaves the status list for the repository's
 other worktrees, which is how the right pane is pointed at one; the section
 after this is the whole of that.
 
-**files** — read-only markdown and source, and a way to reach any of it.
-Markdown is rendered, not shown as source: headings, lists, tables, quotes, GFM
+**files** — markdown and source, a way to reach any of it, and, on `e`, a way
+to change one; the editing is the last part of this section. Markdown is
+rendered, not shown as source: headings, lists, tables, quotes, GFM
 alerts, footnotes, YAML front matter as a key/value header, images as their alt
 text, syntax-highlighted fenced code, and mermaid diagrams. `t`
 swaps that for the source it was rendered from, highlighted and numbered like
@@ -801,10 +875,10 @@ makes on a file with no second form.
 `Esc` or a second `o` puts the outline away; `Enter` jumps and puts it away.
 `q` is not one of the ways out, and that is the same answer the worktree list
 in the git pane already gives: it means what it means everywhere else in this
-program, which is hand focus back to the agent. The five views that keep `q`
-keep it because something is being typed into them — the scratch pad's edit form
-is the newest of them and the plainest case, since `q` there is a letter and
-nothing else — and nothing is being typed here.
+program, which is hand focus back to the agent. The views that keep `q` keep it
+because something is being typed into them — a file being edited is the newest
+of them, and with the scratch pad's edit form the plainest case, since `q` there
+is a letter and nothing else — and nothing is being typed here.
 
 The title carries a breadcrumb of the section the reader has scrolled into, and
 it sits **after** the position, which is to say last, which is to say it is the
@@ -840,6 +914,211 @@ grouping and `markdown::render` does not, so it is either a second output from
 the renderer or a rule true of one body form and not the other. It is written
 down in `crates/abeam/src/panes/viewer/search.rs` rather than half-done, because
 half of it is the inconsistency and not the fix.
+
+**`e` makes the source view an editor, and the page then has three states
+rather than two.** Reading the disk is the reader as it always was. Typing is
+`e`: the caret is in the text, with the reader's line-number gutter beside it,
+and every printable key is a letter. The third is the one this design turns on,
+which is *reading unsaved text*: `Esc` from typing goes back to the reader with
+the text kept — rendered or as source as `t` says, with `●` before the file's
+name in the title and `● unsaved` leading the border's keys while the pane has
+focus — and the page in that state is an ordinary document whose body is the
+editor's text, which is what lets `t`, `/`, `o` and the scroll keys work on it without
+each of them being told that a second source of text exists. `e` goes back to
+the caret. `Ctrl+S` saves from there too, because saving is not typing — the
+pad's argument for its own `Ctrl+S`, which works from its rendering. `x` twice
+throws the text away, and the second `x` counts only once the question has been
+drawn, which is `crate::app`'s `close_drawn` rule arriving in a pane: the shell
+drains every queued key before it draws, so an `xx` in one batch, from key
+repeat or a paste, would otherwise discard with the question never on screen.
+A clean editor is not kept once nobody is typing in it — `Esc` from one closes
+it — because keeping it would make every guard below fire on a page with
+nothing to lose.
+
+Where the caret starts is a place rather than a guess. From the source view it
+is the top line shown, which is a line. From the rendering it is the same
+fraction of the way down, because a rendered row belongs to no one source line
+— the gap the search paragraph above ran into — and a fraction is the one thing
+both forms share honestly. `Esc` and then `e` with nothing scrolled in between
+costs nothing at all: the caret is where it was.
+
+**While there is unsaved text, nothing may replace the page**, because the page
+is the only copy of that text outside a recovery file. `Enter` in the git view,
+`Tab` and `Shift+Tab`, `r`, `Enter` on an `f` result, `F1, B` and a switch to
+another worktree are each refused, with a sentence on the border rather than
+silently, and the sentence names the route — `F1, E to save or discard it` —
+rather than a key, because it may be drawn on the git view's border, where the
+files view's keys mean nothing. A document the watcher queues waits behind `◆`,
+which is the never-switch-under-you rule already serving the file list. The quit
+counts unsaved text as something live, so `F1, Q` asks twice and the question
+names the file, and the agent's exit holds the door with
+`unsaved README.md · F1, Q to quit` — ranked below another agent and above a
+shell, because it is cheaper to end than a turn somebody is paying for, there
+being a recovery copy, and dearer than a shell at a prompt, being words nothing
+will type again. Unlike a shell's, that hold outlasts what caused it: a shell
+ends on its own and abeam may go with it, but text stops counting because
+somebody is in the files view saving or discarding it, and leaving on the next
+pass sent the keys typed after a `Ctrl+S` to the parent shell. So once text has
+held the door it is held until `F1, Q`. The question `F1, Q` asks says the text
+is kept only when a copy of it was written — the first press writes it before
+asking — because a profile inside the workspace refuses every copy, and a
+promise made on being allowed to write one was a promise the second press
+broke.
+
+**A save gives back the file it was given, and the strict read is where that is
+decided.** The reader decodes generously on purpose — a Latin-1 byte becomes a
+replacement character, a `\r\n` becomes a `\n` — and every one of those
+generosities is a lie the moment the text is written back: the first save would
+make the approximate reading true, and a diff about one typo would change every
+line ending in the file. So `e` asks the stricter question, and a file it cannot
+give back exactly — not UTF-8, line endings of two kinds, a binary, over the
+reader's 512 KiB, not a regular file, outside the workspace once its links are
+followed — stays read-only with the reason above the page, shown exactly as the
+reader always showed it. What it says yes to it takes apart: the text with `\n`
+between lines, which is all the editor ever holds; the line ending and the byte
+order mark, which the save puts back; and the bytes as read, which the save
+compares against. The final newline needs nothing of its own, which is the one
+most editors get wrong: the editor's text is its lines joined by `\n`, so a file
+that ends in one has an empty last line and gives it back on the join. Tabs are
+kept as they are, and the `Tab` key types a tab only in a file that already
+indents a line with one — decided once, at `e`, so that the key cannot change
+what it types the first time somebody indents a line by hand.
+
+**The replacement keeps what the file had.** A rename keeps nothing of the file
+it replaces, which is right for the pad, whose mode is abeam's to choose, and
+wrong for a file somebody else made. On Windows the replacement is
+`ReplaceFileW`, which carries the old file's ACL, attributes and creation time
+across, and which is retried for a fraction of a second on the sharing and
+access errors that Defender, the indexer and OneDrive cause by holding open the
+file the agent has just written. On Unix it is a rename with the target's
+permission bits copied onto the temporary file first, and its owner and group
+where the platform allows. A read-only file is refused rather than replaced,
+which on Unix has to be asked for, because `rename(2)` asks nothing of the
+target. A link is saved through to the file it names, provided that file is
+inside the workspace. And a new file is put in place by an operation that fails
+if a file has appeared in the meantime, because a rename there would replace
+somebody else's whole file. `crates/abeam/src/disk/save.rs` has every one of
+these, and the residues each leaves, which [status](status.md) lists.
+
+The temporary file is `.<name>.<pid>.abeam-save~`, beside the target, and the
+watcher filters it out, so a save reports the file and not its scaffolding. **A
+save's own echo is recognised by its bytes**: when the watcher reports the file
+just written, the disk is compared with what was written, and equal is silent —
+no `◆`, no document queued, no border marked unread — where different is a
+change somebody else made.
+
+**The watcher is the first line of the conflict check and the comparison at
+save time is the backstop.** While a file is being edited the watcher's news of
+it reaches the pane whatever the file's extension, not only for markdown, and a
+change raises `◆ changed on disk` at once — so somebody typing learns that the
+agent has written the file before they reach for `Ctrl+S` rather than after. The
+first `Ctrl+S` in that state writes nothing: it *is* the save that is refused,
+against whatever is on disk at that instant, so a habit — `Ctrl+S` on coming
+back to a pane — can never be the keystroke that writes over somebody's work,
+and `ctrl+s again overwrites` is on the border only once there has been a first
+press. A file with nothing unsaved has nothing to be in conflict with, and
+follows the agent as the reader always has: it is read again into a *fresh*
+editor rather than given the new text as a step, because a step can be undone,
+and one `Ctrl+Z` and a `Ctrl+S` would then take the agent's change back out with
+no conflict to say so. The reload is a floor the history cannot go below.
+
+**A recovery copy comes back as one step of undo.** `e` on a file with a copy
+waiting opens the disk's text and puts the copy over it as a single step, so the
+text reads as unsaved and one `Ctrl+Z` is the disk as it is now. The copy
+records which version of the file it was typed against, and a disk that has
+moved on since opens in the conflict state — where, for a copy, the refused
+first `Ctrl+S` is the only thing between it and the disk, because the baseline
+there *is* the disk. Reading the file says a copy is waiting, so it is found by
+somebody who does not already know to press `e`. A copy is deleted by a save and
+by `x x` and by nothing else — not by an undo back to the disk and not by
+leaving — because keeping one too long costs a second offer of it, and deleting
+one too soon costs the work it held. The one exception is a copy that turns out,
+at `e`, to hold exactly what is on disk: it has nothing left to lose, and it is
+deleted there. For the same reason a copy offered back and undone to look at the
+disk does not let the file "follow the agent": the editor is clean, but the
+copy's text is in its redo and in the profile and nowhere else, and a reload
+would take the redo and let the next keystroke's copy replace the old one. A
+change on disk while such a copy is in the profile is a conflict, as it is for
+unsaved text.
+
+**Undo is a word at a time, and a save closes the step.** A history that took
+back a keystroke per press would cost forty presses to unwrite a sentence, so
+typing joins one step until a word begins after a space or a punctuation mark, a
+run of backspaces or of deletes is one step, and a paste is always its own.
+"Unsaved" is the history's position against the one last saved — so a character
+typed and rubbed out reads as unsaved, which is every editor's dirty marker and
+the cheap rule — and that comparison is honest only if a saved step never grows,
+so a save closes the step being typed. `crate::editor::history` has the
+argument, and keeps a thousand steps or four times the text cap, whichever is
+reached first.
+
+**Nothing is saved when the keys go back to the agent.** The pad saves on focus
+loss because its file is abeam's own; this one is the user's, and `F4` is not a
+decision about it. That has a cost on the border, and it is paid there: the
+editor's `ctrl+s` is drawn only while the pane has focus, through
+`Pane::action_hint`, because with the agent focused `Ctrl+S` is the agent's —
+Claude's stash — and the notices above the text name no key at all, because they
+are drawn either way.
+
+**Highlighting is lazy, and that is what made 512 KiB editable.** The pad laid
+its whole buffer out again on every keystroke, which on the 46 KB README cost
+77–125 ms a character — several frames, in a pane somebody is typing into. The
+shared editor re-wraps only the lines an edit changed, and colours only what is
+on screen, from the changed line down to the first line after which the
+highlighter is where it was before; that character costs about half a
+millisecond now. Whether to colour at all is decided once, when the file is
+opened — above the highlighter's 64 KiB the editor draws plain text and says
+why — and is never flipped by an edit, because a page that went grey one
+keystroke after it was fine would look like a fault. `crate::editor`'s module
+documentation has the numbers.
+
+**A tab is drawn by the editor's rule and not the reader's**, and the two can
+disagree. The editor fills to the next four-cell stop counted in cells from the
+start of the row, and hands the highlighter the line with its tabs in it; the
+reader's source view expands tabs counting characters, and highlights the
+expanded line. On a line with a wide character before a tab the stops land
+differently, and a grammar can colour a tab-indented line differently from one
+indented with spaces. That is accepted rather than unified for now: the drawing
+and the caret have to agree with each other first, and cells are the only unit
+they can agree in.
+
+**A new file is named in the file list, with `a`**, relative to the directory
+the list is showing, and nothing touches the disk until its first `Ctrl+S`,
+which makes the directories its name passes through — `notes/` in
+`notes/plan.md`, which the box says as `creates notes/` before anything is made.
+`Esc` on a new file nobody typed into leaves nothing, and a save that is refused
+takes back any directory it made, so trying leaves no trace. A name is refused
+rather than mangled when it would go somewhere this feature has no business:
+anything absolute; a `.` or `..` part; anything whose *resolved* path has a
+`.git` component in any case, which is what catches an 8.3 short name such as
+`GIT~1` and a link into `.git` as well as the plain spelling; a link to a file
+outside the workspace, refused before it is shown, and a path through a linked
+directory that leads outside it; a part longer than 255 UTF-16 units; and the
+names Windows cannot hold — `<>:"|?*`, the reserved `CON`, `PRN`, `AUX`, `NUL`,
+`COM1`–`COM9` and `LPT1`–`LPT9` with or without an extension, a trailing dot or
+space. **The Windows rules are applied on every platform**, which is one rule
+rather than a cleverer one per machine: on Linux each of those is a legal name,
+and each is a file the repository's next checkout on Windows cannot write, so a
+check that answered by where abeam happened to be running would let one machine
+make a file that breaks the clone on the other. `/` and `\` both separate parts
+of a name everywhere, for the same reason, and a name that differs from an
+existing file only in case opens that file, on every platform: on Windows the
+two are one file, and on Linux making the second would be the same breakage at
+the next Windows checkout. A name that already exists opens that file for
+editing rather than making a second, which is the only reading of the gesture
+that cannot lose anything; one that is a directory is refused.
+
+The box puts what you typed first — `new file: notes/plan.md▌ · in docs/ ·
+creates notes/` — because a title is clipped from the right, and of the three
+the name is the one the person typing is looking at.
+
+A new file has no line endings of its own to give back, so it takes the ones the
+files beside it use — the first file in its directory that has one, then the
+workspace root's — and `\n` when nothing answers. No platform default, so the
+same keystroke in the same repository makes the same file on every machine, and
+never a byte order mark, which is a habit of the file that has one rather than
+of the directory. Once saved, it is in the list, the `/` index and the `f` sweep
+like any other file.
 
 **shell** — `F1, S`, and the reason it is here rather than in another window:
 `git branch`, `uv run ruff format`, `cargo test`, run in the directory abeam was
@@ -1202,7 +1481,9 @@ re-roots and says "reading the repository…" until the first refresh lands, in
 preference to drawing the other repository's branch and change count under the
 new workspace's name for most of a second. The reader rebuilds its whole index
 and opens the newest markdown of the worktree it has moved to, exactly as it
-does at startup. The command view is per workspace, and that is the one place
+does at startup — which is why a switch is refused, before any of the three has
+moved, while the reader is holding unsaved text. The command view is per
+workspace, and that is the one place
 the asymmetry above reaches the right-hand side as well: a shell cannot be
 re-rooted any more than the agent can, so switching with the shell up starts a
 *second* child, in the new worktree, the first time it is drawn there. Every

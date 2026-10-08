@@ -1,26 +1,47 @@
-//! The scratch pad's text, and the caret in it.
+//! The text being edited, and the caret in it.
 //!
-//! This is the first place in abeam where a caret lives *inside* text. The
+//! This was the first place in abeam where a caret lived *inside* text. The
 //! queue's composer and the ask's composer are both append-only — `push` and
 //! `pop` are their whole vocabulary — so neither has ever had to answer where
 //! the insertion point is, and neither would survive being asked. A pad is a
-//! document you go back into and change the middle of, so it has to.
+//! document you go back into and change the middle of, so it has to, and a
+//! file opened for editing is the same problem with a larger cap. It was the
+//! pad's own module until the files view needed one too; what is policy rather
+//! than mechanism — how much it may hold, what a tab becomes, and what a line
+//! ending and a byte order mark will cost once the text is on disk — now
+//! arrives as a [`Policy`] instead of being written in here.
 //!
 //! It is a `Vec<String>`, one entry per line, rather than one `String` with an
-//! offset into it or a rope. A rope buys nothing at this size — the whole pad
-//! is capped at [`MAX_BYTES`], and the pane hands the text to the highlighter
-//! whole on every frame regardless — and a single `String` would put the line
-//! the caret is on at the far end of a scan, so every keystroke would count
-//! newlines from the start of the document to work out which row had changed.
-//! Lines are also the shape both consumers already want: the highlighter
-//! returns one row of spans per source line, and a caret is drawn at a row and
-//! a column.
+//! offset into it or a rope. A rope buys nothing at these sizes — the largest
+//! document anything hands this is the files view's 512 KiB — and a single
+//! `String` would put the line the caret is on at the far end of a scan, so
+//! every keystroke would count newlines from the start of the document to work
+//! out which row had changed. Lines are also the shape both consumers already
+//! want: the highlighter takes and returns one line at a time, the layout
+//! beside this keeps one entry per line and finds what an edit changed by
+//! comparing two lists of them, and a caret is drawn at a row and a column.
 //!
-//! There is no undo, no selection and no word motion, and that is a decision
-//! rather than a stopping point. The pad is for a sentence you had while the
-//! agent was busy; every one of those features is a second keymap to learn and
-//! a second state to draw, spent on making the pad more like the editor the
-//! user already has open in the window next door.
+//! ## One writer
+//!
+//! Every change to the text goes through [`Buffer::splice`], and that is the
+//! one rule in this file that something else depends on. Undo needs to know,
+//! for every edit, what was there and what replaced it; a buffer with six
+//! mutators each writing `lines` its own way would need six correct accounts
+//! of that, and the first one to get it wrong would make `Ctrl+Z` put back a
+//! document that never existed. With one writer there is one account, taken
+//! where the write happens, and an edit method that forgot to report itself
+//! is not a thing that can be written: it would have to bypass the only
+//! function that can change the text. [`Buffer::take_change`] is where the
+//! history collects it.
+//!
+//! There is still no selection and no word motion, and that is still a
+//! decision rather than a stopping point. The pad is for a sentence you had
+//! while the agent was busy and the files view for a fix too small to be worth
+//! the editor in the window next door; both features are a second keymap to
+//! learn and a second state to draw, spent on becoming that editor. Undo was
+//! the exception, and it was made once editing reached files: a slip in a
+//! scratch note costs a retyped word, a slip in a source file that is then
+//! saved costs a diff somebody has to read.
 //!
 //! ## What a step is
 //!
@@ -33,46 +54,40 @@
 //! about. `Backspace` there is worse than useless — it takes the `a` and leaves
 //! the combining acute to settle onto whatever is now in front of it.
 //!
-//! It is still the trade to take for a scratch pad. Stepping by cluster means a
+//! It is still the trade to take here. Stepping by cluster means a
 //! segmentation crate, and this codebase argues about every dependency it takes
 //! in the manifest that names them; combining marks are rare in the prose
 //! people type into a note, and the damage is one keystroke that looks odd
 //! rather than a panic or a lost document. Changing it later is a dependency,
 //! those three methods, and one decision that reaches further than they do:
 //! [`Buffer::caret`] would then report a column counted in clusters, and the
-//! pane places the cursor by measuring a prefix of that many *characters*.
+//! layout places the cursor by measuring a prefix of that many *characters*.
 
-/// The most the pad will hold. An insert or a paste that would take it past
-/// this is refused rather than trimmed to fit.
-///
-/// The same number as `crate::panes::viewer::source::HIGHLIGHT_MAX_BYTES`, and
-/// deliberately the same rather than coincidentally: past that size the
-/// highlighter gives up and returns plain text, so a pad allowed to grow beyond
-/// it would go grey one keystroke after it was fine, with nothing on screen
-/// saying why. What can be typed and what can be drawn in colour are one
-/// decision. The value is written out rather than taken from that constant only
-/// because `source` is private to the viewer; if it is ever widened these two
-/// should be joined.
-///
-/// A paste that does not fit is refused whole. Half a pasted paragraph is worse
-/// than none of it: the user has to notice the cut, and the place it happened
-/// is off the bottom of a pane they had already stopped looking at.
-pub const MAX_BYTES: usize = 64 * 1024;
+use super::{Policy, TabKey, Tabs};
 
-/// What a tab types.
-///
-/// Two rather than four because the pad holds markdown, where two spaces is a
-/// nesting level and four is a code block. Spaces rather than a tab because a
-/// literal `\t` has no width the highlighter and the wrapper can agree on —
-/// `viewer::source`'s own `TAB` constant carries the argument, and the caret
-/// makes it sharper: [`Buffer::caret`] reports a column the pane measures by
-/// taking that many characters off the front of the line, and a tab drawn as
-/// four cells and measured as one would put the cursor somewhere the text is
-/// not.
-const TAB: &str = "  ";
+/// A place in the text, as `(row, col)` with `col` counted in `char`s — the
+/// same pair [`Buffer::caret`] answers with.
+pub type Pos = (usize, usize);
 
-/// A pad's worth of text, with somewhere in it to type.
+/// One change to the text, in the terms undo needs to take it back: where it
+/// began, what was there, and what is there now.
+///
+/// Both strings are text as the buffer holds it — LF between lines, already
+/// cleaned — so putting either back is a [`Buffer::replace`] and never another
+/// trip through [`clean`], which could only make it something it was not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub at: Pos,
+    pub removed: String,
+    pub inserted: String,
+}
+
+/// Some text, with somewhere in it to type.
 pub struct Buffer {
+    /// What the caller decided this text may hold. Fixed for the buffer's
+    /// life: a cap that moved under a document would make states the history
+    /// can return to into states the buffer would refuse.
+    policy: Policy,
     /// One entry per line, and **never empty**: a buffer with nothing in it is
     /// one empty line.
     ///
@@ -100,8 +115,8 @@ pub struct Buffer {
     /// the first `é` anybody backspaced over would panic with `byte index 2 is
     /// not a char boundary` — in the draw path, taking the whole program with
     /// it. Display width is a third thing again and is not this module's
-    /// problem: the pane measures cells with `unicode_width`, and what it
-    /// measures is the prefix this column names.
+    /// problem: the layout measures cells, and what it measures is the prefix
+    /// this column names.
     col: usize,
     /// The column [`Buffer::up`] and [`Buffer::down`] are trying to get back
     /// to.
@@ -125,37 +140,48 @@ pub struct Buffer {
     ///
     /// Only `up` and `down` read it, and neither of them writes it.
     desired: usize,
-    /// This pad arrived larger than [`MAX_BYTES`] and what is here is the front
-    /// of it. Set by [`Buffer::from_text`], never cleared, and read through
-    /// [`Buffer::truncated`], which carries the argument.
+    /// This text arrived larger than the policy's cap and what is here is the
+    /// front of it. Set by [`Buffer::from_text`], never cleared, and read
+    /// through [`Buffer::truncated`], which carries the argument.
     truncated: bool,
+    /// What the last edit did, waiting for [`Buffer::take_change`]. See the
+    /// module doc's *One writer*.
+    last: Option<Change>,
 }
 
 impl Buffer {
-    /// An empty pad, which is one empty line with the caret at the start of it.
-    pub fn new() -> Self {
+    /// An empty buffer, which is one empty line with the caret at the start of
+    /// it.
+    pub fn new(policy: Policy) -> Self {
         Self {
+            policy,
             lines: vec![String::new()],
             row: 0,
             col: 0,
             desired: 0,
             truncated: false,
+            last: None,
         }
     }
 
-    /// A pad loaded from what was saved, with the caret at the end of it.
+    /// A buffer loaded from what was saved, with the caret at the start of it.
     ///
-    /// At the end rather than at the start because of what reopening a pad is
-    /// for: the note you are about to add goes after the notes you already
-    /// made. A caret parked at `0,0` would put the next sentence in front of
-    /// them.
+    /// The start because that is the only place every caller can agree on
+    /// before it has said anything: where the caret should *go* is a question
+    /// about what the text is for. The pad moves it to the end, because the
+    /// note you are about to add goes after the ones already made; the files
+    /// view moves it to where the reader was looking. Both say so with
+    /// [`Buffer::set_caret`], which clamps, so "the end" is `usize::MAX`.
     ///
     /// The text is cleaned on the way in for the reason [`clean`] gives. That
-    /// makes `from_text` lossy for exactly one input — a CRLF file, which comes
-    /// back with LF endings — and the alternative was to hold a `\r` that the
-    /// pane cannot draw and the caret cannot count.
+    /// makes `from_text` lossy for a CRLF file, which comes back with LF
+    /// endings, and the alternative was to hold a `\r` that the pane cannot
+    /// draw and the caret cannot count. A caller that has to give the file
+    /// back with the endings it had records them itself; that is not a
+    /// question about where a caret is.
     ///
-    /// Capped like every other way in, and the *only* one where the overflow is
+    /// Capped like every other way in — in the bytes the text will have on
+    /// disk, see [`Buffer::bytes`] — and the *only* one where the overflow is
     /// cut rather than refused, because a constructor has no way to say no.
     /// Cleaning is what makes that necessary rather than tidy: a pad file of
     /// tabs is inside the cap on disk and twice the size the moment every tab
@@ -169,29 +195,24 @@ impl Buffer {
     /// [`Buffer::truncated`] is how the pane finds out, and it has to ask,
     /// because a cut nobody was told about is a save that puts the front of a
     /// document over the whole of it.
-    pub fn from_text(text: &str) -> Self {
-        let mut text = clean(text);
-        let truncated = text.len() > MAX_BYTES;
-        if truncated {
-            let mut end = MAX_BYTES;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-        }
+    pub fn from_text(policy: Policy, text: &str) -> Self {
+        let mut text = clean(text, policy);
+        let end = fit(&text, policy);
+        let truncated = end < text.len();
+        text.truncate(end);
         let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-        let row = lines.len() - 1;
-        let col = lines[row].chars().count();
         Self {
+            policy,
             lines,
-            row,
-            col,
-            desired: col,
+            row: 0,
+            col: 0,
+            desired: 0,
             truncated,
+            last: None,
         }
     }
 
-    /// The whole pad as one string, which is what gets saved.
+    /// The whole text as one string, which is what gets saved.
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
@@ -199,6 +220,11 @@ impl Buffer {
     /// The lines, for drawing. Never empty.
     pub fn lines(&self) -> &[String] {
         &self.lines
+    }
+
+    /// The policy this buffer was made with.
+    pub fn policy(&self) -> Policy {
+        self.policy
     }
 
     /// Whether there is anything here worth keeping.
@@ -214,26 +240,26 @@ impl Buffer {
     ///
     /// The pane draws a notice off this, and the notice is the whole point of
     /// the method. Refusing a paste whole is only defensible if the user is
-    /// told: the argument on [`MAX_BYTES`] is that they must never be handed
-    /// half a sentence they have to notice, and a `Ctrl+V` that does nothing
-    /// and says nothing fails that same test — a full pad and a broken one look
-    /// identical from the outside.
+    /// told: the argument on [`Policy::max_bytes`] is that they must never be
+    /// handed half a sentence they have to notice, and a `Ctrl+V` that does
+    /// nothing and says nothing fails that same test — a full pad and a broken
+    /// one look identical from the outside.
     ///
-    /// It reports the pad's state rather than the last refusal, and those are
-    /// not quite the same question: a paste can be turned away with room to
+    /// It reports the buffer's state rather than the last refusal, and those
+    /// are not quite the same question: a paste can be turned away with room to
     /// spare, when what is left is smaller than what arrived. That case is
     /// still tellable apart, because the only other way [`Buffer::insert_str`]
     /// returns `false` is an empty argument and the caller knows what it
     /// passed — but this is the cheap signal rather than the complete one, and
     /// it is the one that can be read *before* a paste as well as after.
     pub fn is_full(&self) -> bool {
-        self.bytes() >= MAX_BYTES
+        self.bytes() >= self.policy.max_bytes
     }
 
-    /// Whether this pad is the front of a larger one.
+    /// Whether this text is the front of a larger one.
     ///
-    /// True when [`Buffer::from_text`] was handed more than [`MAX_BYTES`] and
-    /// kept the beginning of it. The pane must read this and refuse to save,
+    /// True when [`Buffer::from_text`] was handed more than the cap and kept
+    /// the beginning of it. The pane must read this and refuse to save,
     /// because the alternative is the quietest data loss in the program: the
     /// tail the user cannot see is written away by the first flush after they
     /// type a character, and nothing on screen was ever different.
@@ -242,6 +268,8 @@ impl Buffer {
     /// that makes room does not bring the tail back with it, so a flag that
     /// cleared itself on the first `backspace` would hand the save path
     /// permission to overwrite exactly the document it was there to protect.
+    /// Undo does not clear it either, for the same reason: the oldest state
+    /// the history can return to is the truncated one.
     ///
     /// **A `dead_code` waiver used to stand here and it was never true**, which
     /// is worth a sentence because it is a sharper lesson than a waiver going
@@ -261,33 +289,37 @@ impl Buffer {
     ///
     /// Always inside the text — see the invariants on `lines` and `col` — so a
     /// caller may index with it.
-    pub fn caret(&self) -> (usize, usize) {
+    pub fn caret(&self) -> Pos {
         (self.row, self.col)
     }
 
     /// Type one character. Returns whether anything changed.
     ///
     /// Tabs and line endings are dealt with here rather than at the key
-    /// handler, so that there is one answer for every caller: the pane, a
-    /// paste, and whatever the next thing to type into a pad turns out to be.
-    /// A `\n` that was written into a line instead of splitting it would break
-    /// the invariant on `lines` quietly, and the symptom — a row that renders
-    /// as two and a caret column measured against the wrong half — would not
-    /// point back here.
+    /// handler, so that there is one answer for every caller: the pad, the
+    /// files view, a paste, and whatever the next thing to type into one turns
+    /// out to be. A `\n` that was written into a line instead of splitting it
+    /// would break the invariant on `lines` quietly, and the symptom — a row
+    /// that renders as two and a caret column measured against the wrong
+    /// half — would not point back here.
+    ///
+    /// A tab is the policy's: kept as a literal `\t` under [`Tabs::Keep`], and
+    /// otherwise replaced by spaces the way a pasted one is. This is the
+    /// character arriving, not the `Tab` key; the key is
+    /// [`super::Editor::tab`], which types [`Buffer::tab_text`] under either.
     pub fn insert(&mut self, c: char) -> bool {
         match c {
-            '\t' => return self.insert_str(TAB),
+            '\t' if matches!(self.policy.tabs, Tabs::Spaces(_)) => {
+                return self.insert_str(&self.tab_text());
+            }
             '\n' | '\r' => return self.newline(),
             _ => {}
         }
-        if self.bytes() + c.len_utf8() > MAX_BYTES {
+        if self.bytes() + c.len_utf8() > self.policy.max_bytes {
             return false;
         }
-        let byte = byte_at(&self.lines[self.row], self.col);
-        self.lines[self.row].insert(byte, c);
-        self.col += 1;
-        self.desired = self.col;
-        true
+        let at = self.caret();
+        self.edit(at, at, c.encode_utf8(&mut [0; 4]))
     }
 
     /// Paste. Returns whether anything changed.
@@ -298,41 +330,50 @@ impl Buffer {
     /// finishes after the last character that went in, which is where the next
     /// thing typed belongs.
     ///
-    /// Refused whole when it will not fit, for the reason on [`MAX_BYTES`].
+    /// Refused whole when it will not fit, for the reason on
+    /// [`Policy::max_bytes`].
     pub fn insert_str(&mut self, s: &str) -> bool {
-        let text = clean(s);
+        let text = clean(s, self.policy);
         if text.is_empty() {
             return false;
         }
-        if self.bytes() + text.len() > MAX_BYTES {
+        if self.bytes() + self.on_disk(&text) > self.policy.max_bytes {
             return false;
         }
+        let at = self.caret();
+        self.edit(at, at, &text)
+    }
 
-        // The caret splits the line it is on; the first piece of the paste
-        // finishes that line, and whatever was to the right of the caret goes
-        // on the end of the last piece.
-        let byte = byte_at(&self.lines[self.row], self.col);
-        let tail = self.lines[self.row].split_off(byte);
-        let mut pieces = text.split('\n');
-        let first = pieces.next().unwrap_or_default();
-        self.lines[self.row].push_str(first);
-        let mut added: Vec<String> = pieces.map(str::to_string).collect();
-
-        if added.is_empty() {
-            self.col += first.chars().count();
-            self.lines[self.row].push_str(&tail);
-        } else {
-            let last = added.len() - 1;
-            self.col = added[last].chars().count();
-            added[last].push_str(&tail);
-            let at = self.row + 1;
-            self.row += added.len();
-            let after = self.lines.split_off(at);
-            self.lines.extend(added);
-            self.lines.extend(after);
+    /// Replace the whole text with `s`, as one edit: `None` when it would not
+    /// fit, `Some(false)` when it is the text already here, `Some(true)` when
+    /// it went in.
+    ///
+    /// One splice from the start of the text to its end, so the change undo
+    /// records is the whole of what was there and the whole of what replaced
+    /// it, and one `Ctrl+Z` puts the old text back. Cleaned like a paste and
+    /// refused whole like one, against the cap counted on disk. The caret stays
+    /// where it was, clamped into the new text, because the commonest caller is
+    /// a document coming back from disk with a line changed somewhere else and
+    /// the reader still looking where they were.
+    pub fn replace_all(&mut self, s: &str) -> Option<bool> {
+        let text = clean(s, self.policy);
+        if self.policy.bom_bytes + self.on_disk(&text) > self.policy.max_bytes {
+            return None;
         }
+        if text == self.text() {
+            return Some(false);
+        }
+        let (row, col) = self.caret();
+        let last = self.lines.len() - 1;
+        let end = (last, self.lines[last].chars().count());
+        self.edit((0, 0), end, &text);
+        // Back where it was rather than at the end of what went in, and not
+        // reported as a move: the change already says where the caret is.
+        let row = row.min(self.lines.len() - 1);
+        self.row = row;
+        self.col = col.min(self.lines[row].chars().count());
         self.desired = self.col;
-        true
+        Some(true)
     }
 
     /// Break the line at the caret. Returns whether anything changed.
@@ -342,54 +383,40 @@ impl Buffer {
     /// honours is one that a held-down `Enter` walks straight past, and the
     /// result is a saved pad the highlighter has already given up on.
     pub fn newline(&mut self) -> bool {
-        if self.bytes() + 1 > MAX_BYTES {
+        if self.bytes() + self.policy.line_ending_bytes > self.policy.max_bytes {
             return false;
         }
-        let byte = byte_at(&self.lines[self.row], self.col);
-        let tail = self.lines[self.row].split_off(byte);
-        self.lines.insert(self.row + 1, tail);
-        self.row += 1;
-        self.col = 0;
-        self.desired = 0;
-        true
+        let at = self.caret();
+        self.edit(at, at, "\n")
     }
 
     /// Delete backwards. At the start of a line this joins it to the one above,
     /// leaving the caret at the seam. Returns whether anything changed.
     pub fn backspace(&mut self) -> bool {
         if self.col > 0 {
-            let byte = byte_at(&self.lines[self.row], self.col - 1);
-            self.lines[self.row].remove(byte);
-            self.col -= 1;
+            self.edit((self.row, self.col - 1), self.caret(), "")
         } else if self.row > 0 {
-            let line = self.lines.remove(self.row);
-            self.row -= 1;
-            self.col = self.row_len();
-            self.lines[self.row].push_str(&line);
+            let above = self.row - 1;
+            let end = self.lines[above].chars().count();
+            self.edit((above, end), self.caret(), "")
         } else {
             // The start of the first line, which is the one place there is
             // nothing behind the caret to take. The last line is never removed
             // here, which is half of why `lines` is never empty.
-            return false;
+            false
         }
-        self.desired = self.col;
-        true
     }
 
     /// Delete forwards. At the end of a line this pulls the next one up without
     /// moving the caret. Returns whether anything changed.
     pub fn delete(&mut self) -> bool {
         if self.col < self.row_len() {
-            let byte = byte_at(&self.lines[self.row], self.col);
-            self.lines[self.row].remove(byte);
+            self.edit(self.caret(), (self.row, self.col + 1), "")
         } else if self.row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.row + 1);
-            self.lines[self.row].push_str(&next);
+            self.edit(self.caret(), (self.row + 1, 0), "")
         } else {
-            return false;
+            false
         }
-        self.desired = self.col;
-        true
     }
 
     /// One character left, over the line ending if there is one. Returns
@@ -508,31 +535,194 @@ impl Buffer {
         moved
     }
 
+    /// What the last edit did, once. `None` when nothing has been edited since
+    /// the last time this was asked, which a move or a refused edit leaves it
+    /// as.
+    pub fn take_change(&mut self) -> Option<Change> {
+        self.last.take()
+    }
+
+    /// Replace the text between `from` and `to` with `with`, verbatim, for
+    /// the history putting a step back or forward.
+    ///
+    /// Neither capped nor cleaned, and both on purpose. Everything `with` can
+    /// be came out of this buffer through [`Buffer::splice`], so it is already
+    /// clean, and cleaning it again could only change it — which for undo is
+    /// the one thing it may not do. And every state undo or redo can reach is
+    /// a state the buffer was in, so it is inside the cap the buffer was held
+    /// to at the time; the policy never changes, so it still is. A cap
+    /// consulted here could only ever refuse to put back what the user had.
+    ///
+    /// It is not reported to [`Buffer::take_change`]: the history is the
+    /// caller, and it already knows what it did.
+    pub fn replace(&mut self, from: Pos, to: Pos, with: &str) {
+        debug_assert!(!with.contains('\r'), "history handed back text the buffer never held");
+        self.splice(from, to, with);
+    }
+
+    /// The one place `lines` is written. See the module doc's *One writer*.
+    ///
+    /// `from` must not be after `to`, and both must be inside the text; every
+    /// caller computes them from the caret or from a change this function
+    /// produced, so both hold by construction. The caret finishes at the end of
+    /// what went in, which is right for every edit there is: after a typed
+    /// character or a paste, at the seam after a deletion either way, and at
+    /// the start of the new line after `Enter`.
+    ///
+    /// The single-line case is its own branch because it is nearly every
+    /// keystroke, and it is the only shape that can be done in place. The
+    /// general one rebuilds the lines between `from` and `to` and splices them
+    /// back, which is a move of the vector's tail — the same cost the
+    /// `insert` and `remove` on `lines` it replaced already paid.
+    fn splice(&mut self, from: Pos, to: Pos, with: &str) -> Change {
+        debug_assert!(from <= to, "a splice that ends before it starts");
+        let (fr, fc) = from;
+        let (tr, tc) = to;
+        let fb = byte_at(&self.lines[fr], fc);
+        let tb = byte_at(&self.lines[tr], tc);
+
+        let removed = if fr == tr {
+            self.lines[fr][fb..tb].to_string()
+        } else {
+            let mut out = self.lines[fr][fb..].to_string();
+            for line in &self.lines[fr + 1..tr] {
+                out.push('\n');
+                out.push_str(line);
+            }
+            out.push('\n');
+            out.push_str(&self.lines[tr][..tb]);
+            out
+        };
+
+        if fr == tr && !with.contains('\n') {
+            self.lines[fr].replace_range(fb..tb, with);
+        } else {
+            let tail = self.lines[tr][tb..].to_string();
+            let mut head = std::mem::take(&mut self.lines[fr]);
+            head.truncate(fb);
+            let mut pieces = with.split('\n');
+            head.push_str(pieces.next().unwrap_or_default());
+            let mut added = vec![head];
+            added.extend(pieces.map(str::to_string));
+            // `split` yields at least one piece, so `added` has a last line.
+            if let Some(last) = added.last_mut() {
+                last.push_str(&tail);
+            }
+            self.lines.splice(fr..=tr, added);
+        }
+
+        let (row, col) = end_of(from, with);
+        self.row = row;
+        self.col = col;
+        self.desired = col;
+        Change {
+            at: from,
+            removed,
+            inserted: with.to_string(),
+        }
+    }
+
+    /// An edit that is going to happen: the splice, and the record of it.
+    /// Always true, so the mutators above can return it as their answer.
+    fn edit(&mut self, from: Pos, to: Pos, with: &str) -> bool {
+        let change = self.splice(from, to, with);
+        self.last = Some(change);
+        true
+    }
+
     /// How many `char`s are on the row the caret is on.
     fn row_len(&self) -> usize {
         self.lines[self.row].chars().count()
     }
 
-    /// What [`Buffer::text`] would be the length of, without building it.
+    /// What the text will take on disk, in bytes, without building it: what
+    /// the cap is counted in.
+    ///
+    /// On disk rather than in memory, because the cap is a promise about the
+    /// file. The buffer holds `\n` between lines whatever the file had, so a
+    /// CRLF file counted in memory is a line ending's worth of bytes short on
+    /// every line — and a file edited up to a 512 KiB cap counted that way
+    /// would be saved larger than the reader's 512 KiB will open again. So the
+    /// policy says what a line ending and a byte order mark will cost, and the
+    /// count is of the bytes the save will write. For the pad, whose file is
+    /// LF with no mark, the two counts are the same number.
     ///
     /// Recomputed on every edit rather than carried as a field. A cached length
-    /// is a second copy of the truth maintained by nine methods, and the first
-    /// one to forget it leaves a pad that refuses a paste it has room for, or
-    /// takes one it does not — a bug that only shows up at the size where
-    /// nobody is looking. At [`MAX_BYTES`] this walks a few thousand short
-    /// strings, which is nothing beside the syntax highlighting the same
+    /// is a second copy of the truth maintained by every writer, and the first
+    /// one to forget it leaves a buffer that refuses a paste it has room for,
+    /// or takes one it does not — a bug that only shows up at the size where
+    /// nobody is looking. At the files view's 512 KiB this walks some thousands
+    /// of short strings, which is microseconds beside the frame the same
     /// keystroke is about to pay for.
     ///
     /// The `- 1` is safe because `lines` is never empty, and the joining
-    /// newlines are counted because [`Buffer::text`] writes them.
-    fn bytes(&self) -> usize {
+    /// line endings are counted because the save writes them.
+    pub fn bytes(&self) -> usize {
+        self.policy.bom_bytes
+            + self.lines.iter().map(String::len).sum::<usize>()
+            + (self.lines.len() - 1) * self.policy.line_ending_bytes
+    }
+
+    /// The length of [`Buffer::text`]: the text as it is held, `\n` between
+    /// lines and no mark. What the highlighter's own cap is measured in, which
+    /// is the reader's unit and not the file's.
+    pub fn text_bytes(&self) -> usize {
         self.lines.iter().map(String::len).sum::<usize>() + self.lines.len() - 1
+    }
+
+    /// What `s`, already clean, adds to [`Buffer::bytes`] when it goes in.
+    fn on_disk(&self, s: &str) -> usize {
+        let breaks = s.bytes().filter(|&b| b == b'\n').count();
+        s.len() + breaks * (self.policy.line_ending_bytes.saturating_sub(1))
+    }
+
+    /// What the `Tab` key types, and what a tab arriving under
+    /// [`Tabs::Spaces`] becomes.
+    pub fn tab_text(&self) -> String {
+        match self.policy.tabs {
+            Tabs::Spaces(n) | Tabs::Keep { key: TabKey::Spaces(n) } => " ".repeat(n),
+            Tabs::Keep { key: TabKey::Tab } => "\t".to_string(),
+        }
     }
 }
 
-impl Default for Buffer {
-    fn default() -> Self {
-        Self::new()
+/// How much of `text`, already clean, fits the policy's cap on disk: the byte
+/// length of the longest prefix that does, which is all of it when it fits.
+///
+/// Walked a character at a time, because a line ending's cost on disk is the
+/// policy's and not one byte, and because the cut must land on a character
+/// boundary — through one it would be a panic on load, with the file already
+/// written.
+fn fit(text: &str, policy: Policy) -> usize {
+    let budget = policy.max_bytes.saturating_sub(policy.bom_bytes);
+    let mut used = 0usize;
+    for (at, ch) in text.char_indices() {
+        let cost = if ch == '\n' {
+            policy.line_ending_bytes
+        } else {
+            ch.len_utf8()
+        };
+        if used + cost > budget {
+            return at;
+        }
+        used += cost;
+    }
+    text.len()
+}
+
+/// Where the caret finishes after `text` is written at `at`: the end of it.
+///
+/// Shared with the history, which has to work out the far end of a change it
+/// is putting back and must get the answer the buffer would. Two copies of
+/// this arithmetic would be two places for a step that crosses a line ending
+/// to land one character out.
+pub fn end_of(at: Pos, text: &str) -> Pos {
+    match text.rfind('\n') {
+        None => (at.0, at.1 + text.chars().count()),
+        Some(i) => (
+            at.0 + text.bytes().filter(|&b| b == b'\n').count(),
+            text[i + 1..].chars().count(),
+        ),
     }
 }
 
@@ -551,7 +741,7 @@ fn byte_at(line: &str, col: usize) -> usize {
         .map_or(line.len(), |(byte, _)| byte)
 }
 
-/// Text with the two things a line may not contain taken out of it.
+/// Text with the things a line may not contain taken out of it.
 ///
 /// Line endings first. A Windows clipboard hands over `\r\n` and an old Mac
 /// file hands over a lone `\r`; either one left inside a line is a character
@@ -561,12 +751,14 @@ fn byte_at(line: &str, col: usize) -> usize {
 /// itself disagree, since [`Buffer::lines`] would report one line where
 /// [`Buffer::text`] round-tripped through a file gives two.
 ///
-/// Tabs second, to the same [`TAB`] that [`Buffer::insert`] writes. A pasted
-/// tab is the same problem the typed one is — the viewer expands tabs to
-/// four-column stops when it draws, while a column here counts characters, so a
-/// line with one in it is drawn at a different width than the caret is measured
-/// against and the cursor sits away from the text.
-fn clean(text: &str) -> String {
+/// Tabs second, and only under [`Tabs::Spaces`]: then each one becomes those
+/// spaces, the same text the `Tab` key types. That is the pad's rule, and its
+/// reason was that a caret measured in characters could not stand next to a
+/// tab drawn four cells wide. The layout now measures cells and draws a tab at
+/// its stop, so the reason is gone and the rule is policy: the pad keeps it
+/// because two spaces is a nesting level in the markdown it holds, and a file
+/// keeps its tabs because a save has to give back the bytes it was given.
+fn clean(text: &str, policy: Policy) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -577,7 +769,10 @@ fn clean(text: &str) -> String {
                 }
                 out.push('\n');
             }
-            '\t' => out.push_str(TAB),
+            '\t' => match policy.tabs {
+                Tabs::Spaces(n) => out.extend(std::iter::repeat_n(' ', n)),
+                Tabs::Keep { .. } => out.push('\t'),
+            },
             _ => out.push(ch),
         }
     }
@@ -591,6 +786,36 @@ fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pad's policy, written out here rather than borrowed from the pad:
+    /// the editor is below the pad and must not reach up into it, and these
+    /// tests were written against these numbers when the buffer was the pad's.
+    const NOTE: Policy = Policy {
+        max_bytes: 64 * 1024,
+        tabs: Tabs::Spaces(2),
+        line_ending_bytes: 1,
+        bom_bytes: 0,
+    };
+
+    /// The cap under [`NOTE`], by the name these tests have always used.
+    const MAX_BYTES: usize = NOTE.max_bytes;
+
+    /// What a file opened for editing is held to: a larger cap, and its tabs.
+    const FILE: Policy = Policy {
+        max_bytes: 512 * 1024,
+        tabs: Tabs::Keep { key: TabKey::Tab },
+        line_ending_bytes: 1,
+        bom_bytes: 0,
+    };
+
+    /// `text` loaded and the caret moved to the end of it, which is what the
+    /// pad does and what these tests were written against when `from_text`
+    /// did it itself.
+    fn loaded(policy: Policy, text: &str) -> Buffer {
+        let mut b = Buffer::from_text(policy, text);
+        b.set_caret(usize::MAX, usize::MAX);
+        b
+    }
 
     /// The lines as string slices, so a test can compare against an array
     /// literal and read like the screen it is describing.
@@ -622,7 +847,7 @@ mod tests {
     /// A buffer with the caret put where a test needs it, rather than five
     /// lines of walking there with the methods under test.
     fn at(text: &str, row: usize, col: usize) -> Buffer {
-        let mut b = Buffer::from_text(text);
+        let mut b = Buffer::from_text(NOTE, text);
         b.row = row;
         b.col = col;
         b.desired = col;
@@ -633,7 +858,7 @@ mod tests {
 
     #[test]
     fn an_empty_buffer_is_one_empty_line_and_cannot_be_emptied_further() {
-        let mut b = Buffer::new();
+        let mut b = Buffer::new(NOTE);
         assert_eq!(rows(&b), [""]);
         assert_eq!(b.caret(), (0, 0));
         assert!(b.is_empty());
@@ -703,7 +928,7 @@ mod tests {
             ),
         ];
 
-        let mut b = Buffer::from_text("one\n\nthrée\n日本\nfour");
+        let mut b = Buffer::from_text(NOTE, "one\n\nthrée\n日本\nfour");
         // A fixed sequence rather than a random one, so a failure here is a
         // failure anybody can reproduce from the file alone.
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
@@ -756,7 +981,7 @@ mod tests {
 
     #[test]
     fn a_buffer_is_empty_only_while_there_is_nothing_in_it_to_lose() {
-        let mut b = Buffer::new();
+        let mut b = Buffer::new(NOTE);
         assert!(b.is_empty());
         assert!(b.newline());
         assert!(!b.is_empty(), "somebody pressed a key to make that line");
@@ -764,6 +989,67 @@ mod tests {
         assert!(b.is_empty());
         assert!(b.insert(' '));
         assert!(!b.is_empty(), "a space is text");
+    }
+
+    // --- one writer -------------------------------------------------------
+
+    #[test]
+    fn every_edit_leaves_a_change_that_puts_the_text_back_exactly() {
+        // The property undo stands on, checked under the same kind of walk as
+        // the caret: after every press that changed the text, the change it
+        // left must be the whole truth about what happened — replacing what
+        // went in with what came out has to give back the text from before,
+        // character for character, including across line endings.
+        let mut b = Buffer::from_text(NOTE, "one\n\nthrée\n日本\nfour");
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..3000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let before = b.text();
+            let changed = match (seed >> 33) % 10 {
+                0 => b.insert('x'),
+                1 => b.insert('é'),
+                2 => b.newline(),
+                3 => b.backspace(),
+                4 => b.delete(),
+                5 => b.insert_str("pa\r\nste\n"),
+                6 => b.left(),
+                7 => b.up(),
+                8 => b.set_caret((seed >> 40) as usize % 8, (seed >> 50) as usize % 12),
+                _ => b.insert('\t'),
+            };
+            let change = b.take_change();
+            let moved_only = (seed >> 33) % 10 >= 6 && (seed >> 33) % 10 <= 8;
+            if moved_only {
+                assert_eq!(change, None, "a move reported an edit");
+                continue;
+            }
+            assert_eq!(changed, change.is_some(), "an edit and its record disagree");
+            let Some(change) = change else { continue };
+            assert_eq!(
+                b.caret(),
+                end_of(change.at, &change.inserted),
+                "the caret is not at the end of what went in"
+            );
+
+            let after = b.text();
+            let end = end_of(change.at, &change.inserted);
+            b.replace(change.at, end, &change.removed);
+            assert_eq!(b.text(), before, "undoing {change:?} did not restore the text");
+            let end = end_of(change.at, &change.removed);
+            b.replace(change.at, end, &change.inserted);
+            assert_eq!(b.text(), after, "redoing {change:?} did not restore the text");
+            assert_eq!(b.take_change(), None, "the history's own writes were reported");
+        }
+    }
+
+    #[test]
+    fn the_far_end_of_a_change_is_counted_in_characters_across_line_endings() {
+        assert_eq!(end_of((2, 3), ""), (2, 3));
+        assert_eq!(end_of((2, 3), "héllo"), (2, 8));
+        assert_eq!(end_of((2, 3), "a\n"), (3, 0));
+        assert_eq!(end_of((2, 3), "a\nb\n日本"), (4, 2));
     }
 
     // --- what goes in comes out -------------------------------------------
@@ -778,25 +1064,29 @@ mod tests {
             "\n",
             "héllo\n日本語",
         ] {
-            assert_eq!(Buffer::from_text(source).text(), source);
+            assert_eq!(Buffer::from_text(NOTE, source).text(), source);
         }
         // The one input that comes back changed, and on purpose: a `\r` is not
         // something a line is allowed to hold.
-        assert_eq!(Buffer::from_text("one\r\ntwo").text(), "one\ntwo");
+        assert_eq!(Buffer::from_text(NOTE, "one\r\ntwo").text(), "one\ntwo");
     }
 
     #[test]
-    fn from_text_leaves_the_caret_at_the_end_because_a_pad_is_reopened_to_add_to() {
-        assert_eq!(Buffer::from_text("a note\nand another").caret(), (1, 11));
-        assert_eq!(Buffer::from_text("").caret(), (0, 0));
-        assert_eq!(Buffer::from_text("done\n").caret(), (1, 0));
+    fn from_text_leaves_the_caret_at_the_start_and_the_end_is_one_clamped_move_away() {
+        // The start, because where the caret goes is the caller's: the pad
+        // wants the end and the files view where the reader was. This test
+        // used to pin the end, when the pad's choice was made in here.
+        assert_eq!(Buffer::from_text(NOTE, "a note\nand another").caret(), (0, 0));
+        assert_eq!(loaded(NOTE, "a note\nand another").caret(), (1, 11));
+        assert_eq!(loaded(NOTE, "").caret(), (0, 0));
+        assert_eq!(loaded(NOTE, "done\n").caret(), (1, 0));
     }
 
     // --- characters, not bytes --------------------------------------------
 
     #[test]
     fn a_column_counts_characters_so_an_accent_is_one_step_and_not_two() {
-        let mut b = Buffer::from_text("héllo");
+        let mut b = loaded(NOTE, "héllo");
         assert_eq!(b.caret(), (0, 5), "five characters, six bytes");
 
         assert!(b.left());
@@ -812,7 +1102,7 @@ mod tests {
 
     #[test]
     fn a_cjk_line_can_be_edited_from_either_end() {
-        let mut b = Buffer::from_text("日本語");
+        let mut b = loaded(NOTE, "日本語");
         assert_eq!(b.caret(), (0, 3), "three characters, nine bytes");
 
         assert!(b.home());
@@ -982,7 +1272,7 @@ mod tests {
         // the pad then saved that back, and the session after it found a file
         // it could not take whole and went read-only — made too big by abeam,
         // with nothing in the round trip that could have said so.
-        let b = Buffer::from_text(&"\t".repeat(MAX_BYTES));
+        let b = Buffer::from_text(NOTE, &"\t".repeat(MAX_BYTES));
         assert_eq!(
             b.text().len(),
             MAX_BYTES,
@@ -991,9 +1281,9 @@ mod tests {
         assert!(b.truncated(), "and the pane can find out that it was");
         assert!(b.is_full());
 
-        let b = Buffer::from_text("an ordinary note");
+        let b = Buffer::from_text(NOTE, "an ordinary note");
         assert!(!b.truncated());
-        assert!(!Buffer::new().truncated());
+        assert!(!Buffer::new(NOTE).truncated());
     }
 
     #[test]
@@ -1002,7 +1292,7 @@ mod tests {
         // lands inside one. `String::truncate` panics on that — on load, in a
         // constructor, with the file already on disk and nothing the user could
         // do about it — so this test failing at all is the whole finding.
-        let b = Buffer::from_text(&format!("a{}", "é".repeat(MAX_BYTES)));
+        let b = Buffer::from_text(NOTE, &format!("a{}", "é".repeat(MAX_BYTES)));
         assert!(b.truncated());
         assert_eq!(
             b.text().len(),
@@ -1014,7 +1304,7 @@ mod tests {
 
     #[test]
     fn a_pad_that_was_cut_goes_on_saying_so_after_there_is_room_again() {
-        let mut b = Buffer::from_text(&"\t".repeat(MAX_BYTES));
+        let mut b = loaded(NOTE, &"\t".repeat(MAX_BYTES));
         assert!(b.truncated());
         for _ in 0..100 {
             assert!(b.backspace());
@@ -1030,7 +1320,7 @@ mod tests {
 
     #[test]
     fn a_click_past_the_end_of_a_short_line_lands_at_the_end_of_it() {
-        let mut b = Buffer::from_text("a long first line\nx\nanother long line");
+        let mut b = Buffer::from_text(NOTE, "a long first line\nx\nanother long line");
         assert!(b.set_caret(1, 40));
         assert_eq!(
             b.caret(),
@@ -1047,7 +1337,7 @@ mod tests {
 
         // And on an empty pad, where the only row is the one that is always
         // there.
-        let mut b = Buffer::new();
+        let mut b = Buffer::new(NOTE);
         assert!(!b.set_caret(9, 9), "there is nowhere else to be");
         assert_eq!(b.caret(), (0, 0));
     }
@@ -1081,7 +1371,7 @@ mod tests {
 
     #[test]
     fn a_paste_from_a_windows_clipboard_arrives_as_ordinary_lines() {
-        let mut b = Buffer::new();
+        let mut b = Buffer::new(NOTE);
         assert!(b.insert_str("one\r\ntwo\rthree\n"));
         assert_eq!(rows(&b), ["one", "two", "three", ""]);
         assert_eq!(b.text(), "one\ntwo\nthree\n");
@@ -1111,12 +1401,13 @@ mod tests {
 
     #[test]
     fn a_paste_that_would_not_fit_is_refused_whole_rather_than_trimmed() {
-        let mut b = Buffer::from_text(&"a".repeat(MAX_BYTES - 10));
+        let mut b = loaded(NOTE, &"a".repeat(MAX_BYTES - 10));
         let before = b.text();
 
         assert!(!b.insert_str(&"b".repeat(11)));
         assert_eq!(b.text(), before, "not one character of it went in");
         assert_eq!(b.caret(), (0, MAX_BYTES - 10), "and the caret did not move");
+        assert_eq!(b.take_change(), None, "and nothing was recorded as done");
 
         // The boundary is not off by one: the ten that do fit are taken.
         assert!(b.insert_str(&"b".repeat(10)));
@@ -1125,7 +1416,7 @@ mod tests {
 
     #[test]
     fn a_full_pad_refuses_every_way_of_making_it_bigger() {
-        let mut b = Buffer::from_text(&"a".repeat(MAX_BYTES));
+        let mut b = loaded(NOTE, &"a".repeat(MAX_BYTES));
         assert!(!b.insert('c'));
         assert!(!b.insert('\t'));
         assert!(!b.insert_str("c"));
@@ -1143,9 +1434,9 @@ mod tests {
 
     #[test]
     fn a_full_pad_says_so_rather_than_leaving_a_paste_to_fail_silently() {
-        assert!(!Buffer::from_text("an ordinary note").is_full());
+        assert!(!Buffer::from_text(NOTE, "an ordinary note").is_full());
 
-        let mut b = Buffer::from_text(&"a".repeat(MAX_BYTES));
+        let mut b = loaded(NOTE, &"a".repeat(MAX_BYTES));
         assert!(b.is_full());
         assert!(!b.insert_str("one more thought"));
         assert!(
@@ -1158,6 +1449,80 @@ mod tests {
         assert!(!b.is_full(), "a cap on growth, not a state to be stuck in");
     }
 
+    #[test]
+    fn the_cap_is_counted_in_the_bytes_the_file_will_have() {
+        // A CRLF file with a byte order mark: every line ending is two bytes on
+        // disk and the mark is three more, though the buffer holds neither.
+        // Counted in memory, a file edited to the cap would be saved larger
+        // than the reader's cap will open again.
+        let crlf = Policy {
+            max_bytes: 20,
+            line_ending_bytes: 2,
+            bom_bytes: 3,
+            ..FILE
+        };
+        let mut b = loaded(crlf, "abc\ndef");
+        assert_eq!(b.bytes(), 3 + 3 + 2 + 3, "mark, line, CRLF, line");
+        assert_eq!(b.text_bytes(), 7, "and the text itself is still LF");
+
+        // Nine bytes of room: a line ending costs two of them, not one.
+        assert!(b.insert_str("1234567"));
+        assert_eq!(b.bytes(), 18);
+        assert!(!b.insert_str("\nx"), "two bytes of CRLF and an x is three");
+        assert!(b.newline(), "and two bytes is exactly what is left");
+        assert_eq!(b.bytes(), 20);
+        assert!(!b.newline());
+        assert!(b.is_full());
+
+        // A load is cut in the same unit, and on a character boundary.
+        let cut = Buffer::from_text(crlf, "aaaa\nbbbb\ncccc\n");
+        assert!(cut.truncated());
+        assert!(cut.bytes() <= 20, "{}", cut.bytes());
+        assert_eq!(
+            cut.text(),
+            "aaaa\nbbbb\ncccc",
+            "3 + 4 + 2 + 4 + 2 + 4 is nineteen, and the last line ending would make it 21"
+        );
+    }
+
+    #[test]
+    fn replacing_the_whole_text_is_one_change_that_puts_the_old_text_back() {
+        let mut b = loaded(NOTE, "one\ntwo\nthree");
+        b.set_caret(2, 4);
+        assert_eq!(b.replace_all("uno\r\ndos\tx"), Some(true));
+        assert_eq!(b.text(), "uno\ndos  x", "cleaned like a paste");
+        assert_eq!(b.caret(), (1, 4), "where it was, clamped into the new text");
+        let change = b.take_change().expect("one change, recorded");
+        assert_eq!(change.at, (0, 0));
+        assert_eq!(change.removed, "one\ntwo\nthree");
+        assert_eq!(change.inserted, "uno\ndos  x");
+
+        assert_eq!(b.replace_all("uno\ndos\tx"), Some(false), "already this text");
+        assert_eq!(b.take_change(), None);
+
+        let mut b = loaded(NOTE, "small");
+        assert_eq!(b.replace_all(&"x".repeat(MAX_BYTES + 1)), None, "refused whole");
+        assert_eq!(b.text(), "small");
+        assert_eq!(b.replace_all(&"x".repeat(MAX_BYTES)), Some(true), "the cap itself fits");
+    }
+
+    #[test]
+    fn the_cap_is_the_policys_and_a_file_may_hold_more_than_a_pad() {
+        // The pad's 64 KiB is the pad's decision, not the buffer's: a file
+        // opened for editing is held to the reader's 512 KiB instead, and a
+        // paste the pad would refuse goes into it whole.
+        let big = "x".repeat(MAX_BYTES + 1);
+        let mut pad = Buffer::new(NOTE);
+        assert!(!pad.insert_str(&big));
+        let mut file = Buffer::new(FILE);
+        assert!(file.insert_str(&big));
+        assert_eq!(file.bytes(), MAX_BYTES + 1);
+
+        let cut = Buffer::from_text(FILE, &"y".repeat(FILE.max_bytes + 5));
+        assert!(cut.truncated());
+        assert_eq!(cut.bytes(), FILE.max_bytes);
+    }
+
     // --- keys that change nothing -----------------------------------------
 
     #[test]
@@ -1166,7 +1531,7 @@ mod tests {
         // changed nothing is spending a frame — including re-rendering the
         // agent's whole screen — on it. Every one of these is a key somebody
         // holds down.
-        let mut b = Buffer::new();
+        let mut b = Buffer::new(NOTE);
         assert!(!b.backspace());
         assert!(!b.delete());
         assert!(!b.left());
@@ -1177,9 +1542,10 @@ mod tests {
         assert!(!b.end());
         assert!(!b.insert_str(""), "an empty clipboard is not an edit");
         assert_eq!(b.text(), "");
+        assert_eq!(b.take_change(), None);
 
         // The far corner of a real document, where the ends are the other ends.
-        let mut b = Buffer::from_text("one\ntwo");
+        let mut b = loaded(NOTE, "one\ntwo");
         assert!(!b.right());
         assert!(!b.down());
         assert!(!b.delete());
@@ -1194,8 +1560,8 @@ mod tests {
     // --- tabs -------------------------------------------------------------
 
     #[test]
-    fn tab_types_two_spaces_because_a_literal_tab_has_no_agreed_width() {
-        let mut b = Buffer::new();
+    fn tab_types_two_spaces_in_the_pad_because_two_is_a_markdown_nesting_level() {
+        let mut b = Buffer::new(NOTE);
         assert!(b.insert('\t'));
         assert_eq!(b.text(), "  ");
         assert_eq!(b.caret(), (0, 2), "two characters typed, two columns moved");
@@ -1205,7 +1571,42 @@ mod tests {
         assert!(b.insert_str("a\tb"));
         assert_eq!(b.text(), "  a  b");
         assert!(!b.text().contains('\t'));
-        assert_eq!(Buffer::from_text("\tindented").text(), "  indented");
+        assert_eq!(Buffer::from_text(NOTE, "\tindented").text(), "  indented");
+    }
+
+    #[test]
+    fn the_tab_key_types_what_the_policy_says_and_a_kept_tab_stays_a_tab() {
+        assert_eq!(Buffer::new(NOTE).tab_text(), "  ");
+        assert_eq!(Buffer::new(FILE).tab_text(), "\t");
+        let spaced = Policy {
+            tabs: Tabs::Keep {
+                key: TabKey::Spaces(2),
+            },
+            ..FILE
+        };
+        // A file with no tab-indented line keeps the tabs it has and types
+        // spaces for new indentation.
+        let mut b = Buffer::from_text(spaced, "a\tb");
+        assert_eq!(b.tab_text(), "  ");
+        assert!(b.insert('\t'), "the character, not the key");
+        assert_eq!(b.text(), "\ta\tb");
+    }
+
+    #[test]
+    fn a_file_keeps_a_literal_tab_wherever_it_arrives_from() {
+        // A save has to give back the bytes it was given, so a policy that
+        // keeps tabs keeps them on every way in: typed, pasted and loaded.
+        let mut b = loaded(FILE, "\tindented\n");
+        assert_eq!(b.text(), "\tindented\n", "loaded");
+        assert!(b.insert('\t'));
+        assert!(b.insert_str("a\tb"));
+        assert_eq!(b.text(), "\tindented\n\ta\tb", "typed and pasted");
+        assert_eq!(b.caret(), (1, 4), "a tab is one character to the caret");
+
+        // Line endings are still the buffer's, whatever the policy: a `\r` is
+        // never something a line may hold.
+        assert!(b.insert_str("\r\nnext"));
+        assert_eq!(rows(&b), ["\tindented", "\ta\tb", "next"]);
     }
 
     #[test]

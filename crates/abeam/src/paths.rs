@@ -240,15 +240,35 @@ pub fn workspace_key(root: &Path) -> String {
 /// name that has to mean the same thing after the next `rustup update`, and the
 /// standard library's hasher promises the opposite of that.
 fn fnv1a(parts: &[Vec<u8>]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    parts
+        .iter()
+        .fold(FNV_OFFSET, |hash, part| fnv1a_feed(fnv1a_feed(hash, part), &[0]))
+}
 
-    let mut hash = OFFSET;
-    for part in parts {
-        for byte in part.iter().chain(std::iter::once(&0)) {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
+/// FNV-1a, 64 bits, over one run of bytes with nothing added — the hash
+/// `crate::disk` writes down as a file's fingerprint.
+///
+/// The same six lines as [`fnv1a`] and deliberately not a second copy of them,
+/// for that function's reason pointed the other way: a recovery copy records
+/// the fingerprint of the file it was typed against and is compared with it in
+/// a later session, perhaps after a toolchain bump, so the number has to be one
+/// anybody can recompute from this page. A path is not a run of bytes and a
+/// file is, which is the whole of the difference between the two functions —
+/// the separator that keeps `/a/bc` and `/ab/c` apart has no counterpart in
+/// the contents of one file.
+pub fn fnv1a_bytes(bytes: &[u8]) -> u64 {
+    fnv1a_feed(FNV_OFFSET, bytes)
+}
+
+/// The offset basis and the prime of the 64-bit variant, as published.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// One round of FNV-1a per byte, carried on from `hash`.
+fn fnv1a_feed(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
 }
@@ -331,10 +351,27 @@ fn fnv1a(parts: &[Vec<u8>]) -> u64 {
 /// a name that surprises somebody once and a routing rule that is wrong all
 /// session, the name is the cheaper of the two.
 pub fn resolve_root(root: &Path) -> PathBuf {
-    match std::fs::canonicalize(root) {
-        Ok(resolved) => plain(resolved),
-        Err(_) => root.to_path_buf(),
-    }
+    resolve(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// What `path` resolves to on disk — every link, junction, `..` and short name
+/// followed — spelled the way [`resolve_root`] spells a root, or the reason it
+/// could not be.
+///
+/// [`resolve_root`] without its fallback, for `crate::disk`, whose question is
+/// the opposite one. A root that cannot be resolved is better spelled badly than
+/// not at all, because the alternative is not starting. A file that is about to
+/// be *written* cannot be treated that way: whether it is inside the workspace
+/// is decided by [`under`] on what this returns, and an answer built from the
+/// spelling somebody handed in is an answer about the link rather than about
+/// the file the link points at. So the failure comes back, and the caller turns
+/// it into a refusal.
+///
+/// One spelling rule for both, which is why this is here rather than in the
+/// module that needed it. A file resolved to `\\?\C:\…` and compared with a root
+/// resolved to `C:\…` is outside every workspace on the machine.
+pub fn resolve(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path).map(plain)
 }
 
 /// A canonical path written the way the rest of the machine writes one.
@@ -729,6 +766,24 @@ mod tests {
         // vector plus one more round of the same two lines.
         assert_eq!(fnv1a(&[]), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a(&[b"foobar".to_vec()]), 0x3453_1ca7_168b_8f38);
+
+        // ...and the plain form, which is the reference vector itself with
+        // nothing added: what `crate::disk` writes down as a fingerprint has to
+        // be the number anybody else's FNV-1a gives for the same bytes.
+        assert_eq!(fnv1a_bytes(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_bytes(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_resolved_is_an_error_and_not_a_spelling() {
+        // `resolve_root`'s fallback is the wrong answer for a file about to be
+        // written: a containment check on the spelling handed in is a check on
+        // the link and not on what it points at.
+        let dir = crate::testutil::TempDir::new("paths-resolve-err");
+        assert!(resolve(&dir.path().join("not-there")).is_err());
+        let resolved = resolve(dir.path()).expect("the fixture resolves");
+        assert!(same_dir(&resolved, dir.path()));
+        assert!(!resolved.to_string_lossy().starts_with(r"\\?\"));
     }
 
     // --- the one spelling everything else starts from ----------------------

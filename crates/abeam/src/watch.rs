@@ -52,6 +52,15 @@
 //! The noise list is filtering by *path*. There is a second filter, by what the
 //! event says happened, and it is a Linux fact rather than a preference — see
 //! [`is_change`].
+//!
+//! And a third, by *name*, for the one file abeam itself writes inside a
+//! workspace that nobody should hear about: the temporary file a save goes
+//! through (`crate::disk::SAVE_SUFFIX`). A save creates it, fills it and
+//! renames it over the target inside one debounce, so without this the git
+//! pane would be asked to refresh for a path that no longer exists and the
+//! router would be handed it to find an owner for. The target's own events
+//! are kept — they are the news — and what they mean when abeam wrote them is
+//! the files view's question, not this module's. See [`classify`].
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -291,7 +300,11 @@ fn is_change(kind: &EventKind) -> bool {
 fn classify<I: IntoIterator<Item = PathBuf>>(root: &Path, paths: I) -> Change {
     let mut change = Change::default();
     for path in paths {
-        if in_noise(root, &path) {
+        // A save's scaffolding is dropped by name, wherever it is and whoever
+        // wrote it: the name is unmistakably abeam's, and the rename that ends
+        // the save is reported under the target's name as well, which is the
+        // event that matters.
+        if in_noise(root, &path) || crate::disk::is_save_temp(&path) {
             continue;
         }
         // A delete or a rename is real news for git — something moved — but it
@@ -499,6 +512,71 @@ mod tests {
         // ...and the filter still bites on the parts that are actually noise.
         assert!(in_noise(root, &root.join("dist/bundle.md")));
         assert!(in_noise(root, &root.join(".git/COMMIT_EDITMSG")));
+    }
+
+    #[test]
+    fn a_saves_temporary_file_is_not_news_and_the_file_it_saved_is() {
+        // What one save from the files view looks like to the watcher: the
+        // temporary file created, written and renamed away, and the target
+        // replaced. Only the target is anybody's business — the temporary
+        // name no longer exists by the time a pane could ask about it.
+        let fx = Fixture::new("watch-save-temp");
+        let target = fx.touch("docs/notes.md");
+        let temp = target.with_file_name(crate::disk::temp_name(
+            target.file_name().expect("a file name"),
+            0,
+        ));
+        let change = fx.classify([temp.clone(), temp.clone(), target.clone()]);
+        assert_eq!(change.changed, std::slice::from_ref(&target));
+        assert_eq!(change.markdown, [target]);
+
+        // Another abeam's, still there because it is mid-save: dropped too.
+        let theirs = fx.touch("docs/.notes.md.4242.abeam-save~");
+        assert!(fx.classify([theirs]).is_empty(), "a save's scaffolding woke a pane");
+        // ...and a file that only looks a little like one is ordinary news.
+        let ordinary = fx.touch("docs/notes.md~");
+        assert_eq!(fx.classify([ordinary.clone()]).changed, [ordinary]);
+    }
+
+    /// The same, through a real watcher and a real save — which on Windows is
+    /// `ReplaceFileW`, whose events nobody had written down before this.
+    #[test]
+    fn a_real_save_is_reported_under_the_files_name_and_never_the_temporary_ones() {
+        let fx = Fixture::new("watch-live-save");
+        let target = fx.touch("notes.md");
+        let watch = Watch::start(fx.root()).expect("watch a temp directory");
+
+        let opened = crate::disk::open(&target, fx.root()).expect("editable");
+        crate::disk::save(
+            &target,
+            fx.root(),
+            b"# saved\n",
+            &opened.baseline,
+            crate::disk::Options::default(),
+        )
+        .expect("saved");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Change::default();
+        while Instant::now() < deadline && !seen.changed.iter().any(|p| p.ends_with("notes.md")) {
+            seen.absorb(watch.drain());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // Two debounces more, for anything the save left still on its way.
+        let settle = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < settle {
+            seen.absorb(watch.drain());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(
+            seen.changed.iter().any(|p| p.ends_with("notes.md")),
+            "the save was never reported: {seen:?}"
+        );
+        assert!(
+            !seen.changed.iter().any(|p| crate::disk::is_save_temp(p)),
+            "a temporary file reached the panes: {seen:?}"
+        );
     }
 
     #[test]

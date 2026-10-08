@@ -21,6 +21,7 @@ dependencies = [
  "toml",
  "tui-term",
  "unicode-width",
+ "winapi",
 ]
 
 [[package]]

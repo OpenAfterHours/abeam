@@ -39,6 +39,17 @@
 //! shorter path breaks the tie. See [`Rank`], whose field order *is* the
 //! comparison, and [`subseq`], which is where "closest" is made to mean
 //! something specific enough to sort on.
+//!
+//! ## Naming a file that is not there yet
+//!
+//! `a` opens a second box in the same place the find's is — the title — and
+//! it is the find's box in every way that matters to the hands: every key is a
+//! letter, `Backspace` past the start leaves it, `Esc` cancels it and stays in
+//! the list. `Enter` hands the name to the pane, which checks it
+//! (`super::name`) and either opens an empty editor on it, opens the file it
+//! already names, or puts the reason back here, above the listing, with the
+//! box still open. The list stays drawn under the box on purpose: the names
+//! already in the directory are the ones a new name is chosen beside.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -104,6 +115,10 @@ pub enum Outcome {
     Refreshed { changed: bool },
     /// Open this file in the document view.
     Open(PathBuf),
+    /// `Enter` in the name box: make — or open — `name`, in `dir`. The pane
+    /// checks it, because what the name is allowed to be is the workspace's
+    /// question and not the list's.
+    Name { dir: PathBuf, name: String },
 }
 
 /// What a [`Cursor`] did, in the vocabulary the pane speaks.
@@ -137,6 +152,19 @@ struct Entry {
     /// colour is the first thing a terminal takes away.
     label: String,
     path: PathBuf,
+}
+
+/// The name box `a` opens. See the module doc.
+#[derive(Default)]
+struct Naming {
+    name: String,
+    /// What the name would do, said on the box as it is typed: the directories
+    /// a first save will make, or that the name is a file already. Worked out
+    /// per keystroke rather than per frame, because it asks the disk.
+    preview: Option<String>,
+    /// Why the pane refused the name `Enter` last gave it, until the name
+    /// changes.
+    refused: Option<String>,
 }
 
 /// An open find. Absent rather than empty-stringed, because "no find" and "a
@@ -177,6 +205,10 @@ pub struct Browser {
     /// parked on while the listing is the one on screen. See [`Browser::shown`].
     listing: Cursor,
     find: Option<Find>,
+    /// The name box, while it is open. A box beside the find rather than a
+    /// kind of it, because what its letters are for is different: a find
+    /// narrows a list, and this one names something that is in no list yet.
+    naming: Option<Naming>,
     /// Every file under the root, root-relative with `/` separators. Handed
     /// over by the worker walk.
     ///
@@ -220,6 +252,7 @@ impl Browser {
             // the pane is.
             listing: Cursor::new(DEFAULT_VIEWPORT),
             find: None,
+            naming: None,
             index: Arc::from(Vec::new()),
             indexed: false,
             aligned: None,
@@ -277,13 +310,48 @@ impl Browser {
         self.find.is_some()
     }
 
-    /// Close any find without opening anything, and show the reader the row
-    /// they were on before it. Leaving the list entirely is one of the ways a
-    /// query ends: coming back to a stale one is never what the next `Alt+E`
-    /// means.
+    /// Is the name box open?
+    pub fn naming(&self) -> bool {
+        self.naming.is_some()
+    }
+
+    /// Is either box open — is every printable key a letter right now? The
+    /// question `f` has to ask before it is a key.
+    pub fn typing(&self) -> bool {
+        self.finding() || self.naming()
+    }
+
+    /// Close any find or name box without opening anything, and show the
+    /// reader the row they were on before it. Leaving the list entirely is one
+    /// of the ways a query ends: coming back to a stale one is never what the
+    /// next `Alt+E` means.
     pub fn cancel_find(&mut self) {
+        self.naming = None;
         if self.close_find() {
             self.listing.reveal();
+        }
+    }
+
+    /// The pane has done what the name asked — made an editor for it, or
+    /// opened the file it named — and the box is spent.
+    pub fn close_name(&mut self) {
+        self.naming = None;
+    }
+
+    /// The pane refused the name, with the sentence that says why; the box
+    /// stays open so it can be mended.
+    pub fn refuse_name(&mut self, why: String) {
+        if let Some(naming) = self.naming.as_mut() {
+            naming.refused = Some(why);
+        }
+    }
+
+    /// Read the directory on screen again now, cooldown or not: a file was
+    /// just made in it, and the list must not be the one place that has not
+    /// heard.
+    pub fn relist(&mut self) {
+        if self.listed {
+            self.reload();
         }
     }
 
@@ -339,6 +407,21 @@ impl Browser {
     /// how many files are in a directory and losing the fact that the searches
     /// cannot see it, the count is the cheaper thing to lose.
     pub fn title(&self) -> String {
+        // The box, by the find's rule below: what is typed goes first, because
+        // a title is clipped from the right and the name is the one part of it
+        // nobody can do without — it is what the hands are making. Then the
+        // place the next letter lands, the directory it goes in, and what
+        // `Enter` would do: make a directory, or open a file already there.
+        // The directory used to lead (`new file in docs/: …`), and in a pane
+        // forty-odd columns wide behind `esc→cancel` a deep one pushed the
+        // name off the border before its first letter.
+        if let Some(naming) = &self.naming {
+            let preview = naming
+                .preview
+                .as_ref()
+                .map_or_else(String::new, |what| format!(" · {what}"));
+            return format!("new file: {}▌ · in {}{preview}", naming.name, self.here());
+        }
         match &self.find {
             // The query first, prefixed with the key that opened it, because a
             // title is clipped from the right and the count is the part that
@@ -370,6 +453,22 @@ impl Browser {
     }
 
     pub fn render(&mut self, f: &mut Frame, inner: Rect) {
+        // Why the last name was refused, above the listing and taking rows from
+        // it, at least one row always left for the list: the reason is a
+        // sentence, and a border would cut it off.
+        let mut inner = inner;
+        if let Some(why) = self.naming.as_ref().and_then(|naming| naming.refused.as_ref()) {
+            let t = self.theme.theme();
+            let said = block(why, inner.width as usize, Style::new().fg(t.danger));
+            let rows = u16::try_from(said.len())
+                .unwrap_or(u16::MAX)
+                .min(inner.height.saturating_sub(1));
+            if rows > 0 {
+                f.render_widget(Paragraph::new(said), Rect { height: rows, ..inner });
+                inner.y += rows;
+                inner.height -= rows;
+            }
+        }
         let rows = self.rows();
         // The one moment the row count and the pane's height are both known,
         // which is why the cursor is told here and nowhere else.
@@ -382,7 +481,7 @@ impl Browser {
         // top of it: an elided name is worse than a narrower one.
         let text_w = inner.width - scroll::bar_width(inner.width);
         let offset = self.shown().scroll.offset;
-        let lines: Vec<Line> = if rows == 0 {
+        let mut lines: Vec<Line> = if rows == 0 {
             block(self.nothing(), text_w as usize, self.theme.theme().dim())
         } else {
             (offset..rows)
@@ -390,6 +489,9 @@ impl Browser {
                 .map(|i| self.line(i, text_w as usize))
                 .collect()
         };
+        if let Some(hint) = self.only_the_way_up() {
+            lines.extend(block(hint, text_w as usize, self.theme.theme().dim()));
+        }
 
         f.render_widget(
             Paragraph::new(lines),
@@ -402,6 +504,9 @@ impl Browser {
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
+        if self.naming.is_some() {
+            return self.name_key(key);
+        }
         match self.find {
             Some(_) => self.find_key(key),
             None => self.list_key(key),
@@ -435,7 +540,7 @@ impl Browser {
     /// copied out of the agent's transcript is one of the likelier ways a
     /// particular file gets looked up.
     pub fn paste(&mut self, text: &str) -> Outcome {
-        if self.find.is_none() {
+        if self.find.is_none() && self.naming.is_none() {
             return Outcome::Ignored;
         }
         // One line, and no control characters: a multi-line paste into a
@@ -448,6 +553,11 @@ impl Browser {
             .collect();
         if line.is_empty() {
             return Outcome::Ignored;
+        }
+        if let Some(naming) = self.naming.as_mut() {
+            naming.name.push_str(&line);
+            self.renamed();
+            return Outcome::Moved;
         }
         if let Some(find) = self.find.as_mut() {
             find.query.push_str(&line);
@@ -489,11 +599,85 @@ impl Browser {
                 Outcome::Moved
             }
             KeyCode::Char('r') => self.refresh(),
+            // A new file, in the directory on screen. Free here — no cursor,
+            // no list arm and no pane key claims it — and pane-local for the
+            // reason every bare letter in this pane is: the *intercept*
+            // paragraph at the top of `crate::keys`.
+            KeyCode::Char('a') => {
+                self.naming = Some(Naming::default());
+                Outcome::Moved
+            }
 
             // Esc and q are not ours. The shell reads an unhandled one as
             // "give focus back to the agent", which is the way out of here.
             _ => Outcome::Ignored,
         }
+    }
+
+    /// Every key while the name box is open, and every printable one is a
+    /// letter of the name — `j`, `q`, `a` and `f` included, for the find box's
+    /// reason. `Esc` cancels and stays in the list, `Backspace` past the start
+    /// does the same, `Enter` hands the name over. The arrows do nothing: the
+    /// box has no list of its own to move in, and moving the listing under a
+    /// name being typed would be moving what the name is typed beside.
+    fn name_key(&mut self, key: KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Esc => {
+                self.naming = None;
+                Outcome::Moved
+            }
+            KeyCode::Enter => match &self.naming {
+                Some(naming) => Outcome::Name {
+                    dir: self.dir.clone(),
+                    name: naming.name.clone(),
+                },
+                None => Outcome::Ignored,
+            },
+            // A letter is whatever `crate::keys::is_text` says is one, and that
+            // includes Ctrl and Alt together, which is how Windows reports
+            // AltGr: `[`, `]`, `{`, `}`, `@`, `~` and `\` live behind it on
+            // most layouts outside the US, and `app/[id]/page.tsx` is a name
+            // people type. A chord is not a letter of a name, and this box
+            // binds none; with the pane focused the agent is not listening, and
+            // the shell does nothing with a chord the pane declines, so the
+            // arm at the bottom does nothing at all.
+            KeyCode::Char(c) if crate::keys::is_text(&key) => {
+                if let Some(naming) = self.naming.as_mut() {
+                    naming.name.push(c);
+                }
+                self.renamed();
+                Outcome::Moved
+            }
+            KeyCode::Backspace => {
+                let Some(naming) = self.naming.as_mut() else {
+                    return Outcome::Ignored;
+                };
+                if naming.name.pop().is_none() {
+                    // Past the start: those keystrokes came from opening it.
+                    self.naming = None;
+                } else {
+                    self.renamed();
+                }
+                Outcome::Moved
+            }
+            _ => Outcome::Ignored,
+        }
+    }
+
+    /// The name changed: a refusal of the old one is no longer about it, and
+    /// what the new one would do is asked again.
+    fn renamed(&mut self) {
+        let Some(naming) = self.naming.as_mut() else {
+            return;
+        };
+        naming.refused = None;
+        naming.preview = match super::name::check(&self.root, &self.dir, &naming.name) {
+            Ok(super::name::Named::New {
+                makes: Some(dirs), ..
+            }) => Some(format!("creates {dirs}")),
+            Ok(super::name::Named::Existing(_)) => Some("there already: opens it".into()),
+            _ => None,
+        };
     }
 
     /// While a find is open every printable key is text — `j`, `q` and `r`
@@ -508,8 +692,14 @@ impl Browser {
     /// reason `Cursor::key` is a flavour of the vocabulary and not the whole of
     /// it. The half-page and paging keys still agree with it, because an open
     /// query is not a reason for a documented key to go quietly dead.
+    ///
+    /// A chord is `Ctrl` without `Alt` and a letter is what
+    /// `crate::keys::is_text` says, the one rule every box in abeam keeps:
+    /// `Ctrl` and `Alt` together is AltGr on Windows, and a box that read it as
+    /// a chord could not be given a `[`, a `@` or a `\` on most of the world's
+    /// keyboards.
     fn find_key(&mut self, key: KeyEvent) -> Outcome {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = crate::keys::ctrl_chord(&key);
         let page = self.shown().page() as isize;
         let half = self.shown().half() as isize;
 
@@ -531,8 +721,7 @@ impl Browser {
             // reason for a documented key to go quietly dead.
             KeyCode::Char('d') if ctrl => self.step(half),
             KeyCode::Char('u') if ctrl => self.step(-half),
-            KeyCode::Char(_) if ctrl => Outcome::Ignored,
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if crate::keys::is_text(&key) => {
                 if let Some(find) = self.find.as_mut() {
                     find.query.push(c);
                 }
@@ -798,8 +987,28 @@ impl Browser {
                 "Still walking the repository. The find will fill in a moment."
             }
             Some(_) => "No file matches. Backspace to widen it, Esc to go back to the list.",
-            None => "Nothing here that is not ignored. Backspace to go up, r to look again.",
+            // Under an open name box, whose key is not news to whoever opened
+            // it.
+            None if self.naming.is_some() => "Nothing here that is not ignored.",
+            // An empty directory is the one place a reader is most likely to
+            // want a file and least likely to have one to look at, so it names
+            // the key that makes one.
+            None => {
+                "Nothing here that is not ignored. a to name a new file, Backspace to go up, r to \
+                 look again."
+            }
         }
+    }
+
+    /// What a directory with nothing in it but the way back up says under its
+    /// `..` row: [`Browser::nothing`]'s hint, for the same reason, in the one
+    /// state that has a row and so never asks that.
+    fn only_the_way_up(&self) -> Option<&'static str> {
+        let empty = self.find.is_none()
+            && self.naming.is_none()
+            && !self.entries.is_empty()
+            && self.entries.iter().all(|e| e.kind == Kind::Parent);
+        empty.then_some("Nothing else here that is not ignored. a to name a new file.")
     }
 
     /// Where the list is, as the reader thinks of it: relative to the root,
@@ -2214,5 +2423,135 @@ mod tests {
         let mut b = browser(&dir, &[]);
         b.enter();
         assert_eq!(b.title(), "docs/ · 2 items");
+    }
+
+    // --- the name box -----------------------------------------------------
+
+    /// What Windows sends for AltGr and a key: `Ctrl` and `Alt` together, and
+    /// the character the layout puts there.
+    fn altgr(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn the_name_box_takes_altgr_letters_and_still_no_chord() {
+        // `app/[id]/page.tsx` on a German layout: both brackets are AltGr.
+        let dir = tree("name-altgr", &["a.md"]);
+        let mut b = browser(&dir, &[]);
+        assert!(moved(b.key(key(KeyCode::Char('a')))));
+        for k in [
+            key(KeyCode::Char('x')),
+            altgr('['),
+            key(KeyCode::Char('i')),
+            key(KeyCode::Char('d')),
+            altgr(']'),
+            altgr('@'),
+            altgr('€'),
+            altgr('\\'),
+            key(KeyCode::Char('y')),
+        ] {
+            assert!(moved(b.key(k)), "{k:?}");
+        }
+        assert!(b.title().starts_with("new file: x[id]@€\\y▌ · in ./"), "{}", b.title());
+        // A chord is still not a letter of a name.
+        assert!(ignored(b.key(ctrl('z'))));
+        assert!(ignored(b.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT))));
+        assert!(b.title().starts_with("new file: x[id]@€\\y▌"), "{}", b.title());
+    }
+
+    /// The box checks the name on every keystroke, so a letter the check could
+    /// not read was a crash on the keystroke that typed it: each of these is
+    /// four bytes before its dot, and the third byte is half of a letter.
+    #[test]
+    fn the_name_box_takes_letters_outside_ascii_on_every_keystroke() {
+        let dir = tree("name-unicode-box", &["a.md"]);
+        let mut b = browser(&dir, &[]);
+        for name in ["Zoë.md", "ßß.md", "a日.md", "x字", "aaé"] {
+            b.key(key(KeyCode::Char('a')));
+            for c in name.chars() {
+                assert!(moved(b.key(key(KeyCode::Char(c)))), "{name}: {c}");
+            }
+            assert!(b.title().starts_with(&format!("new file: {name}▌")), "{}", b.title());
+            b.key(key(KeyCode::Esc));
+            assert!(!b.naming());
+        }
+    }
+
+    #[test]
+    fn the_name_comes_first_in_the_title_and_the_directory_after_it() {
+        // Titles are clipped from the right, so the name — what the hands are
+        // making — goes before the directory, however deep that is.
+        let dir = tree("name-title", &["src/panes/viewer/x.rs"]);
+        let mut b = browser(&dir, &[]);
+        b.open_dir(&dir.path().join("src").join("panes").join("viewer"), None);
+        b.key(key(KeyCode::Char('a')));
+        for c in "todo/plan.md".chars() {
+            b.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            b.title(),
+            "new file: todo/plan.md▌ · in src/panes/viewer/ · creates todo/"
+        );
+        // And a file that is there says what `Enter` will do with it instead.
+        for _ in "todo/plan.md".chars() {
+            b.key(key(KeyCode::Backspace));
+        }
+        for c in "x.rs".chars() {
+            b.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            b.title(),
+            "new file: x.rs▌ · in src/panes/viewer/ · there already: opens it"
+        );
+    }
+
+    #[test]
+    fn altgr_types_into_the_find_and_its_chords_still_step() {
+        let dir = tree("find-altgr", &["a.md"]);
+        let mut b = browser(&dir, &["app/[id]/page.tsx", "jack.md", "jill.md"]);
+        b.key(key(KeyCode::Char('/')));
+        assert!(moved(b.key(altgr('['))));
+        assert_eq!(hits(&b), ["app/[id]/page.tsx"]);
+        // Back to an empty query, the box still open.
+        b.key(key(KeyCode::Backspace));
+        b.key(key(KeyCode::Char('j')));
+        assert_eq!(hits(&b).len(), 2);
+        b.key(ctrl('n'));
+        assert_eq!(b.shown().sel, 1, "Ctrl+N still steps");
+        b.key(ctrl('p'));
+        assert_eq!(b.shown().sel, 0, "and Ctrl+P");
+        assert!(ignored(b.key(ctrl('z'))), "and any other chord is nothing");
+        assert_eq!(hits(&b).len(), 2);
+    }
+
+    #[test]
+    fn an_empty_directory_names_the_key_that_makes_a_file() {
+        let dir = tree("browse-empty-a", &[]);
+        std::fs::create_dir_all(dir.path().join("empty")).unwrap();
+        let mut b = browser(&dir, &[]);
+        assert!(b.nothing().contains("a to name a new file"), "{}", b.nothing());
+        // Below the root an empty directory still has its `..` row, and the
+        // hint goes under it.
+        b.open_dir(&dir.path().join("empty"), None);
+        let shown = rendered(&mut b, 80, 6);
+        assert!(shown.contains(".."), "{shown}");
+        assert!(shown.contains("a to name a new file"), "{shown}");
+        // Not while the box it names is open.
+        b.key(key(KeyCode::Char('a')));
+        assert!(!rendered(&mut b, 80, 6).contains("a to name"));
+    }
+
+    /// One frame of the list, as text.
+    fn rendered(b: &mut Browser, width: u16, height: u16) -> String {
+        let mut term =
+            Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
+        term.draw(|f| b.render(f, Rect::new(0, 0, width, height)))
+            .expect("draw the list");
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 }

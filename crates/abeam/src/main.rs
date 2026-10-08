@@ -19,8 +19,8 @@
 //! being kept. Phase 1 of the multi-agent work chose `#[expect]` deliberately —
 //! it warns the day the lint stops firing, so a waiver cannot outlive its own
 //! argument — and three waivers were later found stale at once: two on
-//! `crate::panes::pad::buffer::Buffer::truncated`, whose consumer had arrived
-//! in the very commit that wrote them, and one on
+//! `Buffer::truncated` — then the pad's, now `crate::editor::buffer`'s — whose
+//! consumer had arrived in the very commit that wrote them, and one on
 //! `crate::agentstate::Session::session_id`, which by then had three production
 //! readers. All three were `#[allow]`, so nothing said a word. There are now no
 //! `#[expect]` left in the crate, which is why this is written down rather than
@@ -49,7 +49,9 @@ mod agentstate;
 mod app;
 mod ask;
 mod config;
+mod disk;
 mod dispatch;
+mod editor;
 mod keys;
 mod launch;
 mod layout;
